@@ -434,8 +434,76 @@ fn confirm_close(
     }
 }
 
+/// Deleting is not undone, so it names what goes and waits for a click.
+fn confirm_delete(
+    ctx: &egui::Context,
+    p: Palette,
+    path: &std::path::Path,
+    actions: &mut Vec<Action>,
+) {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let title = format!("Delete “{}”?", super::helpers::ellipsize(&name, 48));
+    let mut confirm = false;
+    let mut cancel = false;
+    let output = sheet(ctx, p, "Delete file", 380.0, SheetPlacement::Center, |ui| {
+        ui.add_space(22.0);
+        padded(ui, 22.0, |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .font(theme::semibold(15.0))
+                        .color(p.fg),
+                )
+                .wrap()
+                .selectable(false),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "It is deleted permanently, along with everything inside a folder. \
+                         This cannot be undone.",
+                    )
+                    .font(theme::regular(13.0))
+                    .color(p.secondary),
+                )
+                .wrap()
+                .selectable(false),
+            );
+            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(super::helpers::compact_path(path))
+                        .font(theme::regular(11.5))
+                        .color(p.muted),
+                )
+                .wrap()
+                .selectable(false),
+            );
+        });
+        ui.add_space(6.0);
+        footer(ui, "confirm-delete-actions", |ui| {
+            confirm = button(ui, p, "Delete", ButtonKind::Destructive).clicked();
+            cancel = button(ui, p, "Cancel", ButtonKind::Secondary).clicked();
+        });
+    });
+    if confirm {
+        actions.push(Action::Explorer(super::explorer::Event::ConfirmDelete));
+    } else if cancel || output.backdrop_clicked {
+        actions.push(Action::CloseOverlay);
+    }
+}
+
 pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut Vec<Action>) {
     match state.overlay {
+        OverlayState::DeleteFile => match &state.explorer.delete {
+            Some(path) => confirm_delete(ctx, p, path, actions),
+            // Nothing to confirm: the sheet has no reason to hold the window.
+            None => actions.push(Action::CloseOverlay),
+        },
         OverlayState::GroupDefaultDirectory(group) => {
             default_directory(ctx, p, state, group, actions)
         }

@@ -138,10 +138,38 @@ icon buttons keep a 28-point target around a 16-point glyph.
 - **Toolbar.** Belongs to the content area and drags the window. Leading: the
   workspace name and the focused terminal's program and directory. Centre: a
   command field that opens the palette, replaced by the search field while
-  searching. Trailing: find and split controls for the focused terminal. When
+  searching. Trailing: find and split controls for the focused terminal, the
+  notification bell and the file explorer toggle, which stays pressed while its
+  panel is open. When
   the sidebar is hidden the toolbar also carries the window controls, the
   sidebar toggle and "New workspace". In narrow windows the command field
   collapses to an icon and search takes the title's room.
+- **File explorer.** A panel at the trailing edge, below the toolbar and in the
+  window material, showing the focused terminal's folder; it follows that
+  terminal as it changes directory, and says why when the workspace is
+  connected over SSH. Toggling it slides it in from the trailing edge over 160
+  ms with a matching fade, from the button, the shortcut or the command
+  palette alike. As with the sidebar, the terminals follow its edge, each shell
+  is resized once to the size it will rest at, and a toggle reversed midway
+  turns around from where it is. Its leading edge resizes it (220–560 points;
+  double-click restores 300) and it always leaves the terminals 240 points. The
+  header names the folder and carries "New file", "New folder" and "Refresh".
+  Under it are the search field and, while searching or when its "…" control is
+  on, the "files to exclude" field. The tree lists every item, hidden ones
+  included, folders first; rows are 26 points, indent 14 a level, and show a
+  disclosure chevron for folders. A click opens a folder or previews a file;
+  the selected row takes the accent tint. A secondary click opens the item's
+  menu: new file or folder inside a folder, open with the default application,
+  reveal in the platform's file manager, copy path, copy relative path, rename
+  and delete. A name is typed in the tree itself, where the item is or will
+  be: Enter uses it, Escape abandons it, and a name that cannot be used
+  outlines the field in red with the reason on the next row. Deleting is
+  permanent, so it waits for a sheet that names the item. The preview is a
+  content surface at the bottom of the panel, resized by the divider above it:
+  text in the terminal face with line numbers, pictures fitted to its room,
+  and a plain statement for anything else. All reading, searching and changing
+  of files happens off the UI thread; the folders in view are read again every
+  two seconds, and a frame is drawn only when something changed.
 - **Window controls.** Close, minimize and maximize are three lights at the
   leading edge. Glyphs appear as the pointer approaches, and the lights turn
   neutral in an inactive window. Their accessible names are "Close window",

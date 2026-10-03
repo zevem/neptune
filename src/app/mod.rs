@@ -5,6 +5,7 @@ mod closing;
 mod coordinator;
 mod diagnostics;
 mod directory;
+mod explorer;
 mod image_preview;
 mod input;
 mod ssh;
@@ -106,6 +107,7 @@ pub struct App {
     updates: crate::runtime::updates::Updates,
     attachments: attachments::Attachments,
     image_preview: image_preview::ImagePreview,
+    explorer: explorer::Explorer,
     file_drag: crate::platform::file_drag::FileDragSource,
     paste_chord: crate::input::PasteChord,
     /// A paste chord pressed this frame that the toolkit did not deliver.
@@ -220,6 +222,7 @@ impl App {
             updates: Default::default(),
             attachments: attachments::Attachments::new(data.join("pasted-images")),
             image_preview: Default::default(),
+            explorer: Default::default(),
             file_drag: Default::default(),
             paste_chord: Default::default(),
             swallowed_paste: None,
@@ -410,6 +413,7 @@ impl App {
             }
         }
         self.poll_attachments();
+        self.poll_explorer(ctx);
         self.poll_saves(ctx);
         self.poll_search(ctx);
         if self.diagnostics.enabled() {
@@ -845,6 +849,24 @@ impl eframe::App for App {
             (reveal * sidebar_width).round_to_pixels(ctx.pixels_per_point())
         });
         let reveal = sliding.unwrap_or(if sidebar_open { 1.0 } else { 0.0 });
+        // The file explorer takes the trailing edge the way the sidebar takes
+        // the leading one, leaving the terminals a usable width between them.
+        let explorer_width = self
+            .ui
+            .explorer
+            .width
+            .min(bounds.width() - rest - ui::explorer::MIN_STAGE);
+        let explorer_available = explorer_width >= *ui::explorer::WIDTH.start();
+        let explorer_reveal = self.explorer_reveal(&ctx, explorer_available);
+        let explorer_open = self.ui.explorer.open && explorer_available;
+        let explorer_rest = if explorer_open { explorer_width } else { 0.0 };
+        let explorer_edge =
+            (explorer_reveal * explorer_width).round_to_pixels(ctx.pixels_per_point());
+        if explorer_reveal > 0.0 {
+            self.sync_explorer(&ctx);
+        } else {
+            self.rest_explorer(&ctx);
+        }
         let chrome = ui::chrome::ChromeView {
             workspaces: &views,
             groups: self.controller.model().groups(),
@@ -860,6 +882,7 @@ impl eframe::App for App {
             sidebar_width,
             sidebar_available,
             pane_drag: self.ui.pane_drag,
+            explorer: explorer_available.then_some(self.ui.explorer.open),
         };
         if edge > 0.0 {
             let side = Rect::from_min_size(
@@ -876,15 +899,18 @@ impl eframe::App for App {
         ui::chrome::leading_controls(ui, p, &chrome, &mut actions);
         // Panes sit in the chrome like inset content; the sidebar supplies its
         // own trailing margin.
-        let stage_from = |edge: f32| {
+        let stage_from = |edge: f32, trailing: f32| {
             Rect::from_min_max(
                 Pos2::new(bounds.left() + edge.max(metrics::GUTTER), toolbar.bottom()),
-                bounds.max - Vec2::splat(metrics::GUTTER),
+                Pos2::new(
+                    bounds.right() - trailing.max(metrics::GUTTER),
+                    bounds.bottom() - metrics::GUTTER,
+                ),
             )
         };
         let stage = ui::workspace::Placement {
-            drawn: stage_from(edge),
-            settled: stage_from(rest),
+            drawn: stage_from(edge, explorer_edge),
+            settled: stage_from(rest, explorer_rest),
         };
         let visible = self.shown();
         let cache_limit =
@@ -950,6 +976,22 @@ impl eframe::App for App {
         // A drag lasts only while its header reports it, so it cannot outlive a
         // release, a workspace switch or the pane itself.
         self.ui.pane_drag = output.dragging;
+        // Drawn over the stage's edge, so its resize handle is reachable.
+        if explorer_edge > 0.0 {
+            let panel = Rect::from_min_max(
+                Pos2::new(bounds.right() - explorer_edge, toolbar.bottom()),
+                Pos2::new(
+                    bounds.right() - explorer_edge + explorer_width,
+                    bounds.bottom(),
+                ),
+            );
+            let view = self.explorer.view(
+                !self.ui.explorer.query.trim().is_empty(),
+                explorer_reveal,
+                bounds,
+            );
+            ui::explorer::show(ui, panel, p, &view, &mut self.ui.explorer, &mut actions);
+        }
         self.preview_image(ui, p, bounds, output.image_paths.take());
         for action in actions.drain(..) {
             self.action(&ctx, action);

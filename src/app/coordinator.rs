@@ -592,6 +592,7 @@ impl App {
                 self.dispatch(ctx, Command::SetSidebar(!shown));
                 ctx.request_repaint();
             }
+            Action::Explorer(event) => self.explorer_event(ctx, event),
             Action::SidebarWidth(width) => {
                 let config = Config {
                     sidebar_width: width.clamp(170.0, 360.0),
@@ -648,6 +649,7 @@ impl App {
                 if self.ui.overlay == OverlayState::Update {
                     self.updates.dismiss();
                 }
+                self.ui.explorer.delete = None;
                 self.ui.overlay = OverlayState::None;
             }
             Action::DismissError => self.ui.error = None,

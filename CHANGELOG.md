@@ -26,6 +26,11 @@ their preparation records remain in Git history.
 - See the pull requests a CLI agent made on its terminal's tab. Claude Code and
   Codex started in a local Unix terminal can link a pull request to it; click
   its number beside the tab's close control to open it in the browser.
+- Browse the focused terminal's folder in a file explorer that slides in from
+  the right: toggle it from the toolbar or with Ctrl+Shift+O. It shows hidden
+  files, previews text and pictures, searches with a "files to exclude" filter,
+  and creates, renames, deletes, reveals and copies the path of files and
+  folders.
 - Saved workspaces now use schema version 8. Older workspace files still load,
   but earlier builds cannot save over layouts written by this one.
 
