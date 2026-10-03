@@ -11,6 +11,10 @@ their preparation records remain in Git history.
 
 ### What's New
 
+## [0.1.0-rc.3] - 2026-10-03
+
+### What's New
+
 - Read release notes in a redesigned update sheet, with wrapped lists, a status
   that stays in view while the notes scroll and actions at the trailing edge.
 - Paste a screenshot or another clipboard image into a terminal: Neptune saves
@@ -31,8 +35,45 @@ their preparation records remain in Git history.
   files, previews text and pictures, searches with a "files to exclude" filter,
   and creates, renames, deletes, reveals and copies the path of files and
   folders.
+- Set a default starting directory for a workspace group from its sidebar menu
+  or the command palette. Type a path or choose a folder with Browse; new local
+  workspaces in the group start there.
+- Choose an installed terminal font in Preferences → Text, or enter a custom
+  family or PostScript name. Apply it to every terminal without restarting
+  shells; unavailable fonts fall back to bundled JetBrains Mono.
+- Follow the focused terminal's current directory in the workspace sidebar,
+  including after changing directories or switching tabs and splits.
+- Receive Codex's background completion bells as terminal alerts, with focus
+  reporting kept current while minimized or showing a dialog.
+- Keep Linux desktop notification banners visible in GNOME instead of losing
+  them immediately after delivery.
+
+### Acceptance notes and known limitations
+
+- This candidate is a private draft for acceptance testing. Full native acceptance
+  on every platform remains pending; it is not a production-stable release.
 - Saved workspaces now use schema version 8. Older workspace files still load,
-  but earlier builds cannot save over layouts written by this one.
+  but RC1 and RC2 cannot save over layouts written by RC3. Back up workspace state
+  before testing if you need to return to an earlier candidate.
+- The reported intermittent native Wayland freeze still needs a capture of the
+  blocking state. Earlier XWayland fixes do not establish native Wayland acceptance.
+- Windows installers remain unsigned and may show an unverified-publisher or
+  SmartScreen warning. Both macOS installers require signing and notarization;
+  all installers are covered by signed update metadata and build attestations.
+- Linux x64 packages require glibc 2.35 or newer and working host graphics
+  drivers. Browser-downloaded AppImages need execute permission before launch;
+  enable it in file Properties or run `chmod u+x` on the downloaded file.
+- Workspace restoration starts fresh shells and SSH connections; arbitrary
+  running commands and process memory are not restored. Coding-agent resumption
+  and terminal pull-request links remain limited to supported providers on local
+  Unix terminals.
+- SSH requires an installed OpenSSH client and a POSIX remote shell. Remote
+  directory tracking is integrated for zsh; other shells need OSC 7 integration.
+- Kitty graphics and comprehensive complex-script shaping remain unsupported.
+  Keypad identity and some keyboard-layout information depend on the window
+  toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
+- Private drafts are excluded from website downloads and automatic updates.
+  Automatic updates never downgrade; install this candidate manually for testing.
 
 ## [0.1.0-rc.2] - 2026-10-03
 
