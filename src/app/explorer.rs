@@ -1114,7 +1114,7 @@ impl App {
     }
 
     /// How many rows the tree has, for a capture that waits for them.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn explorer_rows(&self) -> usize {
         self.explorer.rows.len()
     }
@@ -2141,16 +2141,14 @@ mod tests {
             )
         });
 
-        act(&mut app, &ctx, Event::CopyPath(root.join("src/lib.rs")));
+        // Named as the tree names it, with the platform's separators.
+        let copied = root.join("src").join("lib.rs");
+        act(&mut app, &ctx, Event::CopyPath(copied.clone()));
         assert_eq!(
             frame(&mut app, &ctx, Vec::new()),
-            [root.join("src/lib.rs").display().to_string()]
+            [copied.clone().display().to_string()]
         );
-        act(
-            &mut app,
-            &ctx,
-            Event::CopyRelativePath(root.join("src/lib.rs")),
-        );
+        act(&mut app, &ctx, Event::CopyRelativePath(copied.clone()));
         assert_eq!(
             frame(&mut app, &ctx, Vec::new()),
             [Path::new("src").join("lib.rs").display().to_string()]
