@@ -44,6 +44,8 @@ pub struct ChromeView<'a> {
     pub sidebar_available: bool,
     /// A terminal of the active workspace is being carried by its header.
     pub pane_drag: Option<PaneId>,
+    /// The file explorer is shown, or `None` in a window too narrow for it.
+    pub explorer: Option<bool>,
 }
 
 const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 170.0..=360.0;
@@ -333,6 +335,11 @@ pub fn toolbar(
                     if create.clicked() {
                         actions.push(Action::New);
                     }
+                }
+                if let Some(open) = view.explorer
+                    && super::explorer::toggle(ui, p, open, &shortcut("O"))
+                {
+                    actions.push(Action::Explorer(super::explorer::Event::Toggle));
                 }
                 if notification_bell(
                     ui,
@@ -2069,6 +2076,7 @@ mod tests {
                 sidebar_width: 216.0,
                 sidebar_available: true,
                 pane_drag: None,
+                explorer: None,
             };
             let p = Palette::new(Config::default().theme);
             let side = Rect::from_min_size(Pos2::ZERO, vec2(216.0, self.height));
@@ -2721,6 +2729,7 @@ mod tests {
                             sidebar_width: 216.0,
                             sidebar_available: true,
                             pane_drag: drag,
+                            explorer: None,
                         },
                         &mut UiState::default(),
                         &mut actions,

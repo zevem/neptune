@@ -397,7 +397,7 @@ fn percent_decoded(text: &str) -> String {
 
 /// Decodes a regular file by its contents, whatever its name claims, within
 /// fixed bounds. Returns the file's own pixel size with the scaled picture.
-fn decode(path: &Path, limit: [u32; 2]) -> Option<([u32; 2], egui::ColorImage)> {
+pub(super) fn decode(path: &Path, limit: [u32; 2]) -> Option<([u32; 2], egui::ColorImage)> {
     use image::ImageDecoder as _;
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {

@@ -3,6 +3,7 @@
 pub mod chrome;
 pub mod controls;
 pub mod dialogs;
+pub mod explorer;
 pub mod helpers;
 pub mod image_preview;
 pub mod notifications;
@@ -45,6 +46,8 @@ pub enum OverlayState {
     ConfirmClose(Close),
     /// A picture named in a terminal, as large as the window allows.
     Image,
+    /// Confirm deleting the file or folder the explorer holds for it.
+    DeleteFile,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CloseStatus {
@@ -95,6 +98,8 @@ pub struct UiState {
     pub sidebar_slide: Option<chrome::SidebarSlide>,
     /// The terminal being carried by its header, as of the last frame.
     pub pane_drag: Option<PaneId>,
+    /// The file explorer panel and what is typed in it.
+    pub explorer: explorer::State,
 }
 #[derive(Clone)]
 pub enum Action {
@@ -138,6 +143,7 @@ pub enum Action {
     Palette,
     ToggleSidebar,
     SidebarWidth(f32),
+    Explorer(explorer::Event),
     Find,
     SearchChanged,
     FindNext {

@@ -365,6 +365,8 @@ impl App {
                 } else if searching {
                     self.ui.search_open = false;
                     self.search_task = None;
+                } else if self.explorer_escape(ctx) {
+                    // A name being typed, a search or its field was left.
                 } else if self.ui.error.is_some() && self.controller.model().active_pane().is_none()
                 {
                     self.ui.error = None;
@@ -404,6 +406,7 @@ impl App {
                     egui::Key::F => Some(Action::Find),
                     egui::Key::P => Some(Action::Palette),
                     egui::Key::B => Some(Action::ToggleSidebar),
+                    egui::Key::O => Some(Action::Explorer(ui::explorer::Event::Toggle)),
                     egui::Key::Enter => Some(Action::Zoom),
                     egui::Key::C => pane.map(Action::Copy),
                     _ => None,

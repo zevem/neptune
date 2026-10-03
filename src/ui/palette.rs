@@ -398,6 +398,13 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         ),
         command(
             "View",
+            Icon::Files,
+            "Toggle file explorer",
+            shortcut("O"),
+            [Action::Explorer(super::explorer::Event::Toggle)],
+        ),
+        command(
+            "View",
             Icon::Bell,
             "Notifications",
             "",

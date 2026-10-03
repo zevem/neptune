@@ -55,6 +55,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         updates: Default::default(),
         attachments: attachments::Attachments::new(root.join("pasted-images")),
         image_preview: Default::default(),
+        explorer: Default::default(),
         file_drag: Default::default(),
         paste_chord: Default::default(),
         swallowed_paste: None,
@@ -3135,6 +3136,271 @@ fn capture_image_preview_native() {
                 open,
                 steps: 0,
                 zoom,
+            }))
+        }),
+    )
+    .unwrap();
+}
+
+/// A real Neptune window with the file explorer open on a small project.
+/// Ignored in headless CI.
+///
+/// `NEPTUNE_EXPLORER_CAPTURE` names the picture to write. `NEPTUNE_EXPLORER_STATE`
+/// picks what is shown: the tree by default, or `preview`, `image`, `binary`,
+/// `search`, `search-all` (no exclusions), `filters`, `menu`, `create`,
+/// `rename`, `rename-taken`, `delete`, `remote` or `sliding` (midway through
+/// the toggle: `NEPTUNE_EXPLORER_SLIDE_MS` after it began; 100 by default).
+/// `NEPTUNE_EXPLORER_NARROW=1` uses a 640×400 window and
+/// `NEPTUNE_EXPLORER_THEME` names a theme. The desktop's pointer and keyboard
+/// are kept out of it; a real secondary click, typing and dragging the
+/// dividers need a hand-driven native check.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "Manual native visual QA; needs a desktop and NEPTUNE_EXPLORER_CAPTURE"]
+fn capture_explorer_native() {
+    use ui::explorer::Event;
+    use winit::platform::x11::EventLoopBuilderExtX11;
+    let output = PathBuf::from(
+        std::env::var("NEPTUNE_EXPLORER_CAPTURE").expect("Set a task-owned capture path"),
+    );
+    let state = std::env::var("NEPTUNE_EXPLORER_STATE").unwrap_or_default();
+    let size = if std::env::var_os("NEPTUNE_EXPLORER_NARROW").is_some() {
+        [640.0, 400.0]
+    } else {
+        [1000.0, 680.0]
+    };
+    let data = tempfile::tempdir().unwrap();
+    let data_path = data.path().to_path_buf();
+    let theme = std::env::var("NEPTUNE_EXPLORER_THEME").unwrap_or_else(|_| "graphite".into());
+    std::fs::write(
+        data_path.join("config.toml"),
+        format!("shell = \"/bin/sh\"\ntheme = \"{theme}\"\n"),
+    )
+    .unwrap();
+    let project = data_path.join("orbit");
+    for (path, text) in [
+        (".env", "API_URL=http://localhost:8080\n"),
+        (".gitignore", "target\nnode_modules\n"),
+        (".git/HEAD", "ref: refs/heads/main\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"orbit\"\nversion = \"0.1.0\"\n",
+        ),
+        ("README.md", "# Orbit\n\nA small service.\n"),
+        (
+            "src/main.rs",
+            "use std::net::SocketAddr;\n\nmod routes;\n\n/// Starts the service on the configured address.\nfn main() {\n\tlet address: SocketAddr = \"127.0.0.1:8080\".parse().unwrap();\n\tprintln!(\"listening on {address}\");\n\troutes::serve(address);\n}\n",
+        ),
+        (
+            "src/routes.rs",
+            "pub fn serve(_address: std::net::SocketAddr) {}\n",
+        ),
+        ("src/main_test.rs", "#[test]\nfn starts() {}\n"),
+        (
+            "node_modules/left-pad/main.js",
+            "module.exports = () => {};\n",
+        ),
+        ("target/debug/main", "\0"),
+        ("docs/guide.md", "# Guide\n"),
+    ] {
+        let path = project.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    std::fs::create_dir_all(project.join("assets")).unwrap();
+    let bars = [0.35, 0.5, 0.42, 0.68, 0.8, 0.74, 0.93];
+    image::RgbImage::from_fn(960, 600, |x, y| {
+        let column = (x as usize).saturating_sub(60) / 120;
+        let inside = x >= 60 && (x - 60) % 120 < 84 && column < bars.len();
+        if inside && (540 - y.min(540)) as f32 <= bars[column] * 460.0 && y < 540 {
+            image::Rgb([64, 120, 242])
+        } else if (540..543).contains(&y) {
+            image::Rgb([150, 154, 164])
+        } else {
+            image::Rgb([247, 248, 250])
+        }
+    })
+    .save(project.join("assets/revenue-chart.png"))
+    .unwrap();
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(size)
+            .with_decorations(false),
+        event_loop_builder: Some(Box::new(|builder| {
+            builder.with_any_thread(true);
+        })),
+        ..Default::default()
+    };
+    struct NativeCapture {
+        app: App,
+        project: PathBuf,
+        state: String,
+        applied: bool,
+        /// The state under review has been set up.
+        staged: bool,
+        steps: u8,
+        slid: bool,
+        /// Milliseconds the slide has run when the capture is taken.
+        lead: u64,
+    }
+    impl NativeCapture {
+        fn act(&mut self, ctx: &egui::Context, event: Event) {
+            self.app.action(ctx, Action::Explorer(event));
+        }
+    }
+    impl eframe::App for NativeCapture {
+        fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+            eframe::App::logic(&mut self.app, ctx, frame);
+            let Some(pane) = self.app.controller.model().active_pane() else {
+                return;
+            };
+            // The slide is caught midway by the capture three seconds in.
+            if self.state == "sliding"
+                && !self.slid
+                && self.app.started.elapsed() > Duration::from_millis(3000 - self.lead)
+            {
+                self.slid = true;
+                self.act(ctx, Event::Toggle);
+            }
+            if self.app.sessions.get(pane).is_none() {
+                return;
+            }
+            let project = self.project.clone();
+            if !self.applied {
+                self.applied = true;
+                if self.state != "sliding" {
+                    self.act(ctx, Event::Toggle);
+                    // Shown at rest, not on its way in.
+                    self.app.ui.explorer.slide = None;
+                }
+                self.act(ctx, Event::Expand(project.join("src"), true));
+                self.app.ui.explorer.selected = None;
+            }
+            // The rest is asked of a panel that is showing the folder.
+            if self.staged || self.app.explorer_rows() < 3 {
+                return;
+            }
+            self.staged = true;
+            match self.state.as_str() {
+                "preview" => self.act(ctx, Event::Select(project.join("src/main.rs"))),
+                "image" => {
+                    self.act(ctx, Event::Expand(project.join("assets"), true));
+                    self.act(ctx, Event::Select(project.join("assets/revenue-chart.png")));
+                }
+                "binary" => self.act(ctx, Event::Select(project.join("target/debug/main"))),
+                "search" | "search-all" => {
+                    self.app.ui.explorer.query = "main".into();
+                    if self.state == "search-all" {
+                        self.app.ui.explorer.exclude.clear();
+                    }
+                    self.act(ctx, Event::SearchChanged);
+                }
+                "filters" => self.app.ui.explorer.filters = true,
+                "create" => self.act(
+                    ctx,
+                    Event::BeginCreate {
+                        parent: Some(project.join("src")),
+                        folder: false,
+                    },
+                ),
+                "rename" => self.act(ctx, Event::BeginRename(project.join("src/routes.rs"))),
+                "rename-taken" => {
+                    self.act(ctx, Event::BeginRename(project.join("src/routes.rs")));
+                    self.app.ui.explorer.edit.as_mut().unwrap().text = "main.rs".into();
+                }
+                "delete" => self.act(ctx, Event::Delete(project.join("docs"))),
+                "remote" => self.app.action(
+                    ctx,
+                    Action::Connect {
+                        workspace: None,
+                        destination: "deploy@example.com".into(),
+                    },
+                ),
+                _ => {}
+            }
+        }
+        fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+            eframe::App::ui(&mut self.app, ui, frame);
+            // A name that is taken is refused once the folder has been read.
+            if self.state == "rename-taken"
+                && self.staged
+                && self.steps == 0
+                && self.app.started.elapsed() > Duration::from_millis(1500)
+            {
+                self.steps = 1;
+                self.act(ui.ctx(), Event::Commit { explicit: true });
+            }
+        }
+        fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+            eframe::App::raw_input_hook(&mut self.app, ctx, input);
+            // The desktop's own pointer and keyboard have no part in the capture.
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::PointerMoved(_)
+                        | egui::Event::MouseMoved(_)
+                        | egui::Event::PointerButton { .. }
+                        | egui::Event::PointerGone
+                        | egui::Event::MouseWheel { .. }
+                )
+            });
+            if self.state != "menu" || !self.staged {
+                return;
+            }
+            // A secondary click on the third row, a step a frame.
+            let window = ctx.content_rect();
+            let pos = egui::pos2(
+                window.right() - self.app.ui.explorer.width + 90.0,
+                44.0 + 68.0 + 26.0 * 2.5,
+            );
+            self.steps = self.steps.saturating_add(1);
+            input.events.push(match self.steps {
+                3 | 4 => egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: self.steps == 3,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                _ if self.steps < 3 => egui::Event::PointerMoved(pos),
+                _ => egui::Event::PointerMoved(pos + egui::vec2(60.0, 150.0)),
+            });
+        }
+        fn on_exit(&mut self) {
+            eframe::App::on_exit(&mut self.app);
+        }
+    }
+    let root = project.clone();
+    eframe::run_native(
+        "Neptune file explorer visual QA",
+        options,
+        Box::new(move |cc| {
+            let mut app = App::new(
+                cc,
+                Launch {
+                    cwd: Some(project),
+                    data_root: Some(data_path),
+                    screenshot: Some(output),
+                    ..Default::default()
+                },
+                window_state::LoadReport::default(),
+            );
+            app.file_drag = crate::platform::file_drag::FileDragSource::detached();
+            Ok(Box::new(NativeCapture {
+                app,
+                project: root,
+                state,
+                applied: false,
+                staged: false,
+                steps: 0,
+                slid: false,
+                lead: std::env::var("NEPTUNE_EXPLORER_SLIDE_MS")
+                    .ok()
+                    .and_then(|lead| lead.parse().ok())
+                    .unwrap_or(100),
             }))
         }),
     )
