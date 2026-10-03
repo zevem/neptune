@@ -68,6 +68,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 # Already part of the window backend. File drags need the pointer position,
 # which the window toolkit does not report, and Wayland drops entirely.
 [target.'cfg(target_os = "linux")'.dependencies]
+# Already used by the desktop stack. Keep one notification sender connected to
+# the session bus; GNOME removes an app's notifications when its sender leaves.
+zbus = "5.13.2"
 x11rb = "0.13"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }

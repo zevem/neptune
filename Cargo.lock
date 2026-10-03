@@ -2113,6 +2113,7 @@ dependencies = [
  "winreg",
  "winresource",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]
