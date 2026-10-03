@@ -187,6 +187,11 @@ queued follow-ups finish. See [pi's notification extension example](https://gith
 Native delivery uses the Linux session notification service, macOS Notification
 Center (run the installed `Neptune.app` bundle) and Windows toasts. Windows
 registers Neptune’s notification identity under the current user, without admin
-rights. Native verification on each OS is required before
+rights. On Linux, the background worker keeps one session-bus connection alive
+for successive alerts: GNOME removes an application's notifications when its
+sending connection closes. Each alert still creates a separate OS notification,
+using the packaged `rs.neptune.terminal` desktop identity; OS history limits
+apply independently of Neptune's in-app history. A failed delivery lets the next
+alert reconnect. Native verification on each OS is required before
 claiming verified support; Linux test results do not establish macOS or Windows
 behavior.
