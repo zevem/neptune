@@ -17,6 +17,7 @@ pub enum Icon {
     Settings,
     Search,
     Sidebar,
+    PanelRight,
     SplitVertical,
     SplitHorizontal,
     Folder,
@@ -152,6 +153,10 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Sidebar => {
             rectangle(3.0, 4.0, 18.0, 16.0, 3.0);
             line(&[[8.5, 4.5], [8.5, 19.5]]);
+        }
+        Icon::PanelRight => {
+            rectangle(3.0, 4.0, 18.0, 16.0, 3.0);
+            line(&[[15.5, 4.5], [15.5, 19.5]]);
         }
         Icon::SplitVertical => {
             rectangle(3.0, 4.0, 18.0, 16.0, 3.0);

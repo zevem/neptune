@@ -11,6 +11,13 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- See every Claude Code and Codex agent running in any workspace in the new
+  Agents tab of the right panel: which are working, which are idle and which
+  are waiting for you to allow a tool, answer a question or approve a plan.
+  Click an agent to go to its terminal. The toolbar's panel button, which now
+  opens the file explorer and the agents as tabs, carries a dot while an agent
+  waits out of view. Codex asks once to trust the hooks that report this.
+
 ## [0.1.0-rc.3] - 2026-10-03
 
 ### What's New

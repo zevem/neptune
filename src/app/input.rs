@@ -58,6 +58,9 @@ impl App {
             let result = match input.action {
                 InputAction::Write(bytes) => {
                     self.notifications.acknowledge(Some(id));
+                    if let Some(reply) = crate::agent_activity::Reply::from_bytes(&bytes) {
+                        self.agents.reply(id, reply, Instant::now());
+                    }
                     session.scroll_to_bottom();
                     session.write(&bytes)
                 }
@@ -406,7 +409,7 @@ impl App {
                     egui::Key::F => Some(Action::Find),
                     egui::Key::P => Some(Action::Palette),
                     egui::Key::B => Some(Action::ToggleSidebar),
-                    egui::Key::O => Some(Action::Explorer(ui::explorer::Event::Toggle)),
+                    egui::Key::O => Some(Action::Panel(ui::panel::Event::Toggle)),
                     egui::Key::Enter => Some(Action::Zoom),
                     egui::Key::C => pane.map(Action::Copy),
                     _ => None,

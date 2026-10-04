@@ -1096,27 +1096,16 @@ impl Tree<'_> {
 }
 
 impl App {
-    /// Whether the panel is asked for, and how much of it shows this frame.
-    pub(super) fn explorer_reveal(&mut self, ctx: &egui::Context, available: bool) -> f32 {
-        let open = self.ui.explorer.open && available;
-        let sliding = self
-            .ui
-            .explorer
-            .slide
-            .and_then(|slide| slide.reveal(open, ctx.input(|input| input.time)))
-            .filter(|_| available);
-        if sliding.is_some() {
-            ctx.request_repaint();
-        } else {
-            self.ui.explorer.slide = None;
-        }
-        sliding.unwrap_or(if open { 1.0 } else { 0.0 })
-    }
-
-    /// How many rows the tree has, for a capture that waits for them.
-    #[cfg(all(test, target_os = "linux"))]
+    /// How many rows the tree has, for a test that waits for them.
+    #[cfg(test)]
     pub(super) fn explorer_rows(&self) -> usize {
         self.explorer.rows.len()
+    }
+
+    /// No folder is read or watched, as while the explorer is out of view.
+    #[cfg(test)]
+    pub(super) fn explorer_resting(&self) -> bool {
+        self.explorer.root.is_none() && self.explorer.watched.is_empty()
     }
 
     /// Results of workers, taken whether or not the panel is in view.
@@ -1447,31 +1436,23 @@ impl App {
         }
     }
 
+    /// The explorer is no longer the tab in view: a name being typed is
+    /// dropped, and a field that is leaving must not keep the keyboard.
+    pub(super) fn leave_explorer(&mut self, ctx: &egui::Context) {
+        self.ui.explorer.edit = None;
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused().filter(|id| {
+                use ui::explorer::{edit_id, exclude_id, query_id};
+                [query_id(), exclude_id(), edit_id()].contains(id)
+            }) {
+                memory.surrender_focus(id);
+            }
+        });
+        self.explorer.dirty = true;
+    }
+
     pub(super) fn explorer_event(&mut self, ctx: &egui::Context, event: Event) {
         match event {
-            Event::Toggle => {
-                let state = &mut self.ui.explorer;
-                state.slide = Some(ui::chrome::SidebarSlide::toggled(
-                    state.slide,
-                    state.open,
-                    ctx.input(|input| input.time),
-                ));
-                state.open = !state.open;
-                if !state.open {
-                    state.edit = None;
-                    // A field that is leaving must not keep the keyboard.
-                    ctx.memory_mut(|memory| {
-                        if let Some(id) = memory.focused().filter(|id| {
-                            use ui::explorer::{edit_id, exclude_id, query_id};
-                            [query_id(), exclude_id(), edit_id()].contains(id)
-                        }) {
-                            memory.surrender_focus(id);
-                        }
-                    });
-                }
-                self.explorer.dirty = true;
-                ctx.request_repaint();
-            }
             Event::Expand(path, expanded) => {
                 if expanded {
                     self.explorer.expanded.insert(path.clone());
@@ -2081,8 +2062,8 @@ mod tests {
                 remote: None,
             })
             .unwrap();
-        app.action(&ctx, Action::Explorer(Event::Toggle));
-        assert!(app.ui.explorer.open);
+        app.action(&ctx, Action::Panel(ui::panel::Event::Toggle));
+        assert!(app.ui.panel.open);
         (app, ctx)
     }
 
@@ -2169,12 +2150,12 @@ mod tests {
         });
 
         // Closed, it reads nothing; opened again, it is current.
-        act(&mut app, &ctx, Event::Toggle);
+        app.action(&ctx, Action::Panel(ui::panel::Event::Toggle));
         settle(&mut app, &ctx, "the panel to close", |app| {
-            app.ui.explorer.slide.is_none() && app.explorer.watched.is_empty()
+            app.ui.panel.slide.is_none() && app.explorer.watched.is_empty()
         });
         std::fs::remove_file(root.join("src/made-elsewhere.rs")).unwrap();
-        act(&mut app, &ctx, Event::Toggle);
+        app.action(&ctx, Action::Panel(ui::panel::Event::Toggle));
         settle(&mut app, &ctx, "the reopened panel", |app| {
             shown(app) == ["lib.rs"]
         });
@@ -2448,10 +2429,10 @@ mod tests {
             modifiers: chord,
         };
         frame(&mut app, &ctx, vec![toggle.clone()]);
-        assert!(!app.ui.explorer.open);
-        assert!(app.ui.explorer.slide.is_some(), "the panel slides away");
+        assert!(!app.ui.panel.open);
+        assert!(app.ui.panel.slide.is_some(), "the panel slides away");
         frame(&mut app, &ctx, vec![toggle]);
-        assert!(app.ui.explorer.open);
+        assert!(app.ui.panel.open);
     }
 
     #[test]
@@ -2470,36 +2451,36 @@ mod tests {
             frame(app, &ctx, vec![button(pos, false)]);
         };
         settle(&mut app, &ctx, "the panel to open", |app| {
-            app.ui.explorer.slide.is_none()
+            app.ui.panel.slide.is_none()
         });
         // The trailing control of the toolbar, with the sidebar showing.
         let toggle = Pos2::new(WINDOW.x - 22.0, metrics::TOOLBAR_HEIGHT * 0.5);
         click(&mut app, toggle);
-        assert!(!app.ui.explorer.open, "the toolbar button closes the panel");
+        assert!(!app.ui.panel.open, "the toolbar button closes the panel");
         settle(&mut app, &ctx, "the panel to close", |app| {
-            app.ui.explorer.slide.is_none()
+            app.ui.panel.slide.is_none()
         });
         click(&mut app, toggle);
-        assert!(app.ui.explorer.open, "and opens it again");
+        assert!(app.ui.panel.open, "and opens it again");
         settle(&mut app, &ctx, "the panel to open", |app| {
-            app.ui.explorer.slide.is_none() && app.explorer.root.is_some()
+            app.ui.panel.slide.is_none() && app.explorer.root.is_some()
         });
 
-        let width = app.ui.explorer.width;
+        let width = app.ui.panel.width;
         let edge = Pos2::new(WINDOW.x - width, 300.0);
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(edge)]);
         frame(&mut app, &ctx, vec![button(edge, true)]);
         let dragged = edge - egui::vec2(80.0, 0.0);
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(dragged)]);
         frame(&mut app, &ctx, vec![button(dragged, false)]);
-        assert_eq!(app.ui.explorer.width, width + 80.0);
+        assert_eq!(app.ui.panel.width, width + 80.0);
         // However far it is dragged, the terminals keep their room.
         let far = Pos2::new(40.0, 300.0);
-        let edge = Pos2::new(WINDOW.x - app.ui.explorer.width, 300.0);
+        let edge = Pos2::new(WINDOW.x - app.ui.panel.width, 300.0);
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(edge)]);
         frame(&mut app, &ctx, vec![button(edge, true)]);
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(far)]);
         frame(&mut app, &ctx, vec![button(far, false)]);
-        assert_eq!(app.ui.explorer.width, *ui::explorer::WIDTH.end());
+        assert_eq!(app.ui.panel.width, *ui::panel::WIDTH.end());
     }
 }

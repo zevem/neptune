@@ -526,7 +526,7 @@ impl App {
                 };
                 self.ui.overlay_focus = true;
             }
-            Action::OpenNotification(pane, generation) => {
+            Action::OpenNotification(pane, generation) | Action::OpenAgent(pane, generation) => {
                 if self
                     .controller
                     .model()
@@ -592,6 +592,7 @@ impl App {
                 self.dispatch(ctx, Command::SetSidebar(!shown));
                 ctx.request_repaint();
             }
+            Action::Panel(event) => self.panel_event(ctx, event),
             Action::Explorer(event) => self.explorer_event(ctx, event),
             Action::SidebarWidth(width) => {
                 let config = Config {

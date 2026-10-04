@@ -1,11 +1,12 @@
-//! The file explorer: a panel at the window's trailing edge showing the
-//! focused terminal's folder as a tree, with a search and a preview. It draws
-//! what the application read on its workers and reports what was asked of it.
+//! The file explorer: a tab of the panel at the window's trailing edge showing
+//! the focused terminal's folder as a tree, with a search and a preview. It
+//! draws what the application read on its workers and reports what was asked
+//! of it.
+use super::Action;
 use super::helpers::{
     animate, bare_text_edit, compact_path, elided, field_frame, galley_at, menu_item, menu_layout,
     menu_separator, place,
 };
-use super::{Action, chrome::SidebarSlide};
 use crate::{
     icons::{self, Icon},
     platform::files::REVEAL_LABEL,
@@ -15,18 +16,11 @@ use eframe::egui::{
     self, Align, Align2, CursorIcon, Id, Key, Layout, Pos2, Rect, Sense, Stroke, Ui, UiBuilder,
     Vec2, WidgetInfo, WidgetType, vec2,
 };
-use std::{
-    ops::RangeInclusive,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 /// Folders a search leaves out until the field says otherwise.
 pub const DEFAULT_EXCLUDE: &str =
     "**/node_modules/**, **/.git/**, **/dist/**, **/target/**, **/build/**";
-pub const DEFAULT_WIDTH: f32 = 300.0;
-pub const WIDTH: RangeInclusive<f32> = 220.0..=560.0;
-/// The terminals keep at least this much of the window beside the panel.
-pub const MIN_STAGE: f32 = 240.0;
 const ROW: f32 = 26.0;
 const INDENT: f32 = 14.0;
 
@@ -69,10 +63,6 @@ pub enum ScrollTarget {
 }
 
 pub struct State {
-    pub open: bool,
-    /// A toggle still sliding into place.
-    pub slide: Option<SidebarSlide>,
-    pub width: f32,
     pub query: String,
     pub exclude: String,
     /// The exclusion field is shown without a search.
@@ -92,9 +82,6 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            open: false,
-            slide: None,
-            width: DEFAULT_WIDTH,
             query: String::new(),
             exclude: DEFAULT_EXCLUDE.into(),
             filters: false,
@@ -110,8 +97,6 @@ impl Default for State {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// Show or hide the panel.
-    Toggle,
     Expand(PathBuf, bool),
     /// Preview a file.
     Select(PathBuf),
@@ -253,19 +238,6 @@ fn latching(ui: &mut Ui, p: Palette, icon: Icon, label: &str, on: bool) -> egui:
         );
     }
     response
-}
-
-/// The toolbar's control for the panel.
-pub fn toggle(ui: &mut Ui, p: Palette, open: bool, hint: &str) -> bool {
-    let surface = ui.painter().add(egui::Shape::Noop);
-    let response = icons::button_with_hint(ui, Icon::Files, "Toggle file explorer", hint);
-    if open {
-        ui.painter().set(
-            surface,
-            egui::Shape::rect_filled(response.rect.shrink(1.0), 7, p.pressed),
-        );
-    }
-    response.clicked()
 }
 
 /// A single-line field keeps the keyboard when Enter is pressed in it, and
@@ -859,7 +831,13 @@ fn preview(ui: &mut Ui, rect: Rect, p: Palette, view: &PreviewView, events: &mut
 }
 
 /// A divider that is dragged to resize what it separates.
-fn divider(ui: &mut Ui, p: Palette, handle: Rect, name: &str, label: &str) -> egui::Response {
+pub(super) fn divider(
+    ui: &mut Ui,
+    p: Palette,
+    handle: Rect,
+    name: &str,
+    label: &str,
+) -> egui::Response {
     let vertical = handle.height() > handle.width();
     let cursor = if vertical {
         CursorIcon::ResizeHorizontal
@@ -907,8 +885,7 @@ fn divider(ui: &mut Ui, p: Palette, handle: Rect, name: &str, label: &str) -> eg
     response
 }
 
-/// The panel in `rect`, which slides past the window's trailing edge while a
-/// toggle is under way.
+/// The explorer in `rect`, below the panel's tabs.
 pub fn show(
     ui: &mut Ui,
     rect: Rect,
@@ -1176,28 +1153,12 @@ fn contents(
             }
         }
     }
-
-    // The leading edge resizes the panel once it rests there.
-    if view.reveal >= 1.0 {
-        let handle = Rect::from_min_max(
-            Pos2::new(rect.left() - 3.0, rect.top() + 4.0),
-            Pos2::new(rect.left() + 3.0, rect.bottom() - 12.0),
-        );
-        let resize = divider(ui, p, handle, "explorer-resize", "Resize file explorer");
-        if resize.dragged()
-            && let Some(pointer) = resize.interact_pointer_pos()
-        {
-            state.width = (view.window.right() - pointer.x).clamp(*WIDTH.start(), *WIDTH.end());
-        }
-        if resize.double_clicked() {
-            state.width = DEFAULT_WIDTH;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::panel::DEFAULT_WIDTH;
     use eframe::egui::{Event as Input, Modifiers, PointerButton};
 
     fn run(ctx: &egui::Context, events: Vec<Input>, view: &View, state: &mut State) -> Vec<Event> {
@@ -1211,7 +1172,7 @@ mod tests {
             },
             |ui| {
                 let rect = Rect::from_min_max(
-                    Pos2::new(view.window.right() - state.width, 44.0),
+                    Pos2::new(view.window.right() - DEFAULT_WIDTH, 44.0),
                     view.window.max,
                 );
                 show(ui, rect, p, view, state, &mut actions);

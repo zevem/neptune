@@ -1,5 +1,6 @@
 //! Widgets consume presentation data and emit targeted actions. Only the controller
 //! may change durable workspace state; renderer caches remain desktop-owned.
+pub mod agents;
 pub mod chrome;
 pub mod controls;
 pub mod dialogs;
@@ -8,6 +9,7 @@ pub mod helpers;
 pub mod image_preview;
 pub mod notifications;
 pub mod palette;
+pub mod panel;
 pub mod preferences;
 pub mod search;
 pub mod theme_browser;
@@ -98,7 +100,9 @@ pub struct UiState {
     pub sidebar_slide: Option<chrome::SidebarSlide>,
     /// The terminal being carried by its header, as of the last frame.
     pub pane_drag: Option<PaneId>,
-    /// The file explorer panel and what is typed in it.
+    /// The panel at the trailing edge, which holds the tabs below.
+    pub panel: panel::State,
+    /// The file explorer tab and what is typed in it.
     pub explorer: explorer::State,
 }
 #[derive(Clone)]
@@ -143,6 +147,7 @@ pub enum Action {
     Palette,
     ToggleSidebar,
     SidebarWidth(f32),
+    Panel(panel::Event),
     Explorer(explorer::Event),
     Find,
     SearchChanged,
@@ -179,6 +184,8 @@ pub enum Action {
     OpenLink(crate::platform::links::WebLink),
     ScrollBottom(PaneId),
     OpenNotification(PaneId, u64),
+    /// Reveal the terminal an agent runs in, if it is still that terminal.
+    OpenAgent(PaneId, u64),
     DismissNotification(u64),
     ReadNotifications,
     ClearNotifications,

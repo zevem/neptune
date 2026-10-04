@@ -8,6 +8,7 @@ mod directory;
 mod explorer;
 mod image_preview;
 mod input;
+mod panel;
 mod ssh;
 #[cfg(test)]
 mod tests;
@@ -103,6 +104,8 @@ pub struct App {
     diagnostics: diagnostics::Diagnostics,
     link_opener: crate::platform::links::LinkOpener,
     notifications: crate::notifications::Notifications,
+    /// What each running CLI agent is doing, for the agents tab.
+    agents: crate::agent_activity::AgentActivities,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
     updates: crate::runtime::updates::Updates,
     attachments: attachments::Attachments,
@@ -218,6 +221,7 @@ impl App {
             diagnostics: diagnostics::Diagnostics::new(launch.diagnostics),
             link_opener: Default::default(),
             notifications: Default::default(),
+            agents: Default::default(),
             desktop_notifier: Default::default(),
             updates: Default::default(),
             attachments: attachments::Attachments::new(data.join("pasted-images")),
@@ -412,6 +416,7 @@ impl App {
                 }
             }
         }
+        self.poll_agents(ctx);
         self.poll_attachments();
         self.poll_explorer(ctx);
         self.poll_saves(ctx);
@@ -849,24 +854,26 @@ impl eframe::App for App {
             (reveal * sidebar_width).round_to_pixels(ctx.pixels_per_point())
         });
         let reveal = sliding.unwrap_or(if sidebar_open { 1.0 } else { 0.0 });
-        // The file explorer takes the trailing edge the way the sidebar takes
-        // the leading one, leaving the terminals a usable width between them.
-        let explorer_width = self
+        // The panel takes the trailing edge the way the sidebar takes the
+        // leading one, leaving the terminals a usable width between them.
+        let panel_width = self
             .ui
-            .explorer
+            .panel
             .width
-            .min(bounds.width() - rest - ui::explorer::MIN_STAGE);
-        let explorer_available = explorer_width >= *ui::explorer::WIDTH.start();
-        let explorer_reveal = self.explorer_reveal(&ctx, explorer_available);
-        let explorer_open = self.ui.explorer.open && explorer_available;
-        let explorer_rest = if explorer_open { explorer_width } else { 0.0 };
-        let explorer_edge =
-            (explorer_reveal * explorer_width).round_to_pixels(ctx.pixels_per_point());
-        if explorer_reveal > 0.0 {
+            .min(bounds.width() - rest - ui::panel::MIN_STAGE);
+        let panel_available = panel_width >= *ui::panel::WIDTH.start();
+        let panel_reveal = self.panel_reveal(&ctx, panel_available);
+        let panel_open = self.ui.panel.open && panel_available;
+        let panel_rest = if panel_open { panel_width } else { 0.0 };
+        let panel_edge = (panel_reveal * panel_width).round_to_pixels(ctx.pixels_per_point());
+        let panel_tab = self.ui.panel.tab;
+        // The explorer reads folders only while its tab is the one in view.
+        if panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Files {
             self.sync_explorer(&ctx);
         } else {
             self.rest_explorer(&ctx);
         }
+        let agents_shown = panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Agents;
         let chrome = ui::chrome::ChromeView {
             workspaces: &views,
             groups: self.controller.model().groups(),
@@ -882,7 +889,8 @@ impl eframe::App for App {
             sidebar_width,
             sidebar_available,
             pane_drag: self.ui.pane_drag,
-            explorer: explorer_available.then_some(self.ui.explorer.open),
+            panel: panel_available.then_some(self.ui.panel.open),
+            panel_attention: !agents_shown && self.agents.waiting_count() > 0,
         };
         if edge > 0.0 {
             let side = Rect::from_min_size(
@@ -909,8 +917,8 @@ impl eframe::App for App {
             )
         };
         let stage = ui::workspace::Placement {
-            drawn: stage_from(edge, explorer_edge),
-            settled: stage_from(rest, explorer_rest),
+            drawn: stage_from(edge, panel_edge),
+            settled: stage_from(rest, panel_rest),
         };
         let visible = self.shown();
         let cache_limit =
@@ -977,20 +985,44 @@ impl eframe::App for App {
         // release, a workspace switch or the pane itself.
         self.ui.pane_drag = output.dragging;
         // Drawn over the stage's edge, so its resize handle is reachable.
-        if explorer_edge > 0.0 {
+        if panel_edge > 0.0 {
             let panel = Rect::from_min_max(
-                Pos2::new(bounds.right() - explorer_edge, toolbar.bottom()),
-                Pos2::new(
-                    bounds.right() - explorer_edge + explorer_width,
-                    bounds.bottom(),
-                ),
+                Pos2::new(bounds.right() - panel_edge, toolbar.bottom()),
+                Pos2::new(bounds.right() - panel_edge + panel_width, bounds.bottom()),
             );
-            let view = self.explorer.view(
+            let rows = if agents_shown {
+                self.agent_rows()
+            } else {
+                Vec::new()
+            };
+            if !rows.is_empty() {
+                Self::tick_agents(&ctx);
+            }
+            let files = self.explorer.view(
                 !self.ui.explorer.query.trim().is_empty(),
-                explorer_reveal,
+                panel_reveal,
                 bounds,
             );
-            ui::explorer::show(ui, panel, p, &view, &mut self.ui.explorer, &mut actions);
+            let view = ui::panel::View {
+                files: &files,
+                agents: &ui::agents::View {
+                    rows: &rows,
+                    window: bounds,
+                    reveal: panel_reveal,
+                },
+                waiting: self.agents.waiting_count(),
+                window: bounds,
+                reveal: panel_reveal,
+            };
+            ui::panel::show(
+                ui,
+                panel,
+                p,
+                &view,
+                &mut self.ui.panel,
+                &mut self.ui.explorer,
+                &mut actions,
+            );
         }
         self.preview_image(ui, p, bounds, output.image_paths.take());
         for action in actions.drain(..) {
