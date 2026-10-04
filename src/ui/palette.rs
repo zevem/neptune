@@ -398,10 +398,28 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         ),
         command(
             "View",
-            Icon::Files,
-            "Toggle file explorer",
+            Icon::PanelRight,
+            "Toggle right panel",
             shortcut("O"),
-            [Action::Explorer(super::explorer::Event::Toggle)],
+            [Action::Panel(super::panel::Event::Toggle)],
+        ),
+        command(
+            "View",
+            Icon::Files,
+            "Show files",
+            "",
+            [Action::Panel(super::panel::Event::Show(
+                super::panel::Tab::Files,
+            ))],
+        ),
+        command(
+            "View",
+            Icon::Terminal,
+            "Show agents",
+            "",
+            [Action::Panel(super::panel::Event::Show(
+                super::panel::Tab::Agents,
+            ))],
         ),
         command(
             "View",

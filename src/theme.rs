@@ -70,7 +70,8 @@ pub struct Palette {
     pub green: Color32,
     pub yellow: Color32,
     pub red: Color32,
-    /// Unread terminal alerts: the pane ring, the bell dot and unread counts.
+    /// Unread terminal alerts (the pane ring, the bell dot and unread counts)
+    /// and agents waiting for a person.
     pub attention: Color32,
     pub scrim: Color32,
     pub shadow: Color32,

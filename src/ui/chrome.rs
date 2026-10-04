@@ -44,8 +44,10 @@ pub struct ChromeView<'a> {
     pub sidebar_available: bool,
     /// A terminal of the active workspace is being carried by its header.
     pub pane_drag: Option<PaneId>,
-    /// The file explorer is shown, or `None` in a window too narrow for it.
-    pub explorer: Option<bool>,
+    /// The trailing panel is shown, or `None` in a window too narrow for it.
+    pub panel: Option<bool>,
+    /// An agent waits for input where the panel does not show it.
+    pub panel_attention: bool,
 }
 
 const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 170.0..=360.0;
@@ -336,10 +338,10 @@ pub fn toolbar(
                         actions.push(Action::New);
                     }
                 }
-                if let Some(open) = view.explorer
-                    && super::explorer::toggle(ui, p, open, &shortcut("O"))
+                if let Some(open) = view.panel
+                    && super::panel::toggle(ui, p, open, view.panel_attention, &shortcut("O"))
                 {
-                    actions.push(Action::Explorer(super::explorer::Event::Toggle));
+                    actions.push(Action::Panel(super::panel::Event::Toggle));
                 }
                 if notification_bell(
                     ui,
@@ -2076,7 +2078,8 @@ mod tests {
                 sidebar_width: 216.0,
                 sidebar_available: true,
                 pane_drag: None,
-                explorer: None,
+                panel: None,
+                panel_attention: false,
             };
             let p = Palette::new(Config::default().theme);
             let side = Rect::from_min_size(Pos2::ZERO, vec2(216.0, self.height));
@@ -2729,7 +2732,8 @@ mod tests {
                             sidebar_width: 216.0,
                             sidebar_available: true,
                             pane_drag: drag,
-                            explorer: None,
+                            panel: None,
+                            panel_attention: false,
                         },
                         &mut UiState::default(),
                         &mut actions,

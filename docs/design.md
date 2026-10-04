@@ -66,8 +66,10 @@ readable. The older `accent` config field remains compatible with the three
 original themes; there is no separate accent control in preferences. Cursor and
 selection colors come from the chosen palette. Red marks destructive actions
 and stopped terminals; a destructive control's label is white unless an
-imported red is too light to carry it. Amber (`attention`) is reserved for unread
-terminal alerts: the pane ring, the bell's dot and unread counts. In the three
+imported red is too light to carry it. Amber (`attention`) is reserved for what
+waits for the person: unread terminal alerts (the pane ring, the bell's dot and
+unread counts) and agents waiting for input (their row's mark and state, their
+count on the Agents tab and the dot on the panel toggle). In the three
 original themes it turns yellow when the accent itself is orange, so an alert
 never reads as focus; an imported or custom palette supplies its ANSI yellow,
 held to 3:1 against the main surfaces.
@@ -139,20 +141,27 @@ icon buttons keep a 28-point target around a 16-point glyph.
   workspace name and the focused terminal's program and directory. Centre: a
   command field that opens the palette, replaced by the search field while
   searching. Trailing: find and split controls for the focused terminal, the
-  notification bell and the file explorer toggle, which stays pressed while its
-  panel is open. When
+  notification bell and the right panel toggle, which stays pressed while its
+  panel is open and carries a dot in the attention colour while an agent waits
+  for input where the panel does not show it. When
   the sidebar is hidden the toolbar also carries the window controls, the
   sidebar toggle and "New workspace". In narrow windows the command field
   collapses to an icon and search takes the title's room.
-- **File explorer.** A panel at the trailing edge, below the toolbar and in the
-  window material, showing the focused terminal's folder; it follows that
-  terminal as it changes directory, and says why when the workspace is
-  connected over SSH. Toggling it slides it in from the trailing edge over 160
+- **Right panel.** A panel at the trailing edge, below the toolbar and in the
+  window material. Toggling it slides it in from the trailing edge over 160
   ms with a matching fade, from the button, the shortcut or the command
   palette alike. As with the sidebar, the terminals follow its edge, each shell
   is resized once to the size it will rest at, and a toggle reversed midway
   turns around from where it is. Its leading edge resizes it (220–560 points;
-  double-click restores 300) and it always leaves the terminals 240 points. The
+  double-click restores 300) and it always leaves the terminals 240 points. A
+  34-point strip at its top holds two tabs of equal width, "Files" and
+  "Agents", drawn like terminal tabs: the one in view takes a faint fill. They
+  are chosen with the pointer or the command palette, never with Tab or the
+  arrow keys. The Agents tab counts the agents waiting for input in a pill in
+  the attention colour. The panel opens on the tab last shown.
+- **File explorer.** The Files tab shows the focused terminal's folder; it
+  follows that terminal as it changes directory, and says why when the
+  workspace is connected over SSH. The
   header names the folder and carries "New file", "New folder" and "Refresh".
   Under it are the search field and, while searching or when its "…" control is
   on, the "files to exclude" field. The tree lists every item, hidden ones
@@ -169,7 +178,21 @@ icon buttons keep a 28-point target around a 16-point glyph.
   text in the terminal face with line numbers, pictures fitted to its room,
   and a plain statement for anything else. All reading, searching and changing
   of files happens off the UI thread; the folders in view are read again every
-  two seconds, and a frame is drawn only when something changed.
+  two seconds, and a frame is drawn only when something changed. Nothing is
+  read while the Agents tab is the one in view.
+- **Agents.** The Agents tab lists every CLI agent running in a terminal of any
+  workspace, under the headings "Needs input", "Working" and "Idle", in that
+  order, each with its count. A row is 46 points: a mark, what the agent calls
+  its conversation (or the agent's name), and how long it has been in its
+  state; beneath, the state in words, the agent and its workspace. The mark is
+  filled in the attention colour while the agent waits for a person, a green
+  dot in a halo while it works and a muted ring at rest; the state is always
+  also said in words ("Needs permission", "Asked a question", "Plan needs
+  approval", "Needs input", "Working", "Idle"). The row of the focused terminal
+  takes a faint fill. Clicking a row reveals and focuses its terminal. An
+  empty list says how an agent comes to be listed. Rows change when an agent
+  reports or its title changes; nothing animates, and a list in view is drawn
+  again every 30 seconds only so that its ages stay true.
 - **Window controls.** Close, minimize and maximize are three lights at the
   leading edge. Glyphs appear as the pointer approaches, and the lights turn
   neutral in an inactive window. Their accessible names are "Close window",

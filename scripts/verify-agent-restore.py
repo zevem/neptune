@@ -50,7 +50,7 @@ def link(url):
     print('LINK: ' + json.loads(result.stdout.splitlines()[-1])['result']['content'][0]['text'], flush=True)
 resumed = flag in args
 session = args[args.index(flag)+1] if resumed else str(uuid.uuid4())
-subprocess.run(shlex.split(hook), input=json.dumps({'session_id':session,'cwd':os.getcwd(),'hook_event_name':'SessionStart'}), text=True, check=True)
+subprocess.run(hook, shell=True, input=json.dumps({'session_id':session,'cwd':os.getcwd(),'hook_event_name':'SessionStart'}), text=True, check=True)
 with open(os.environ['NEPTUNE_AGENT_TEST_LOG'], 'a') as log: log.write(json.dumps({'provider':provider,'session':session,'resumed':resumed})+'\n')
 print('\033[2J\033[H' + provider.upper() + (' RESUMED ' if resumed else ' SESSION ') + session, flush=True)
 def interrupt(*_):

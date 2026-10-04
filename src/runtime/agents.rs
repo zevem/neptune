@@ -1,5 +1,6 @@
 //! Scoped CLI adapters and a bounded, metadata-only local hook bridge.
 //! All setup and socket/file I/O runs on startup workers or the bridge worker.
+use crate::agent_activity::{Activity, Attention};
 use neptune_model::{AgentKind, AgentSession, PaneId, PullRequest};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,20 +19,132 @@ use terminal_core::SessionOptions;
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 const MAX_MESSAGE: u64 = 40 * 1024;
+/// Hook input carries tool results; only its few metadata fields are read.
+const MAX_HOOK: u64 = 4 * 1024 * 1024;
+/// A tool name longer than this is not carried.
+const MAX_TOOL: usize = 128;
 /// Links waiting for the next frame; the model keeps the most recent per pane.
 const MAX_LINKS: usize = 64;
 const ENDPOINT: &str = "NEPTUNE_AGENT_ENDPOINT";
 const TOKEN: &str = "NEPTUNE_AGENT_TOKEN";
 const SHIMS: &str = "NEPTUNE_AGENT_SHIMS";
 const RUN: &str = "NEPTUNE_AGENT_RUN";
+/// This executable, for hook commands that must read the same at every launch.
+const HELPER: &str = "NEPTUNE_AGENT_HELPER";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 enum Event {
-    Open { agent: AgentSession },
-    Session { agent: AgentSession },
+    Open {
+        agent: AgentSession,
+    },
+    Session {
+        agent: AgentSession,
+    },
     Close,
-    PullRequest { url: String },
+    PullRequest {
+        url: String,
+    },
+    Activity {
+        signal: Signal,
+    },
+    /// The CLI is gone but its reference is kept, as after a failed resume.
+    Stopped,
+}
+/// What a hook says about the agent's turn. It names the kind of moment and
+/// at most a tool; prompts, commands and results never leave the hook process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "signal", rename_all = "snake_case", deny_unknown_fields)]
+enum Signal {
+    /// A prompt was submitted.
+    Prompt,
+    /// A tool is about to run.
+    Tool,
+    /// A person is asked to allow a tool, answer a question or approve a plan.
+    Ask {
+        attention: Attention,
+        tool: Option<String>,
+        subagent: bool,
+    },
+    ToolDone {
+        tool: Option<String>,
+        subagent: bool,
+    },
+    /// A request that names no tool was answered.
+    Answered,
+    /// The turn ended or was interrupted.
+    Done,
+}
+/// An open agent's activity, and what resolves a request it is waiting on.
+struct Tracked {
+    state: Activity,
+    /// The tool whose completion answers the request.
+    tool: Option<String>,
+    /// A subagent made the request; its own tool finishing answers it.
+    asked_by_subagent: bool,
+    /// What a subagent's request interrupted.
+    before: Activity,
+}
+impl Tracked {
+    fn idle() -> Self {
+        Self {
+            state: Activity::Idle,
+            tool: None,
+            asked_by_subagent: false,
+            before: Activity::Idle,
+        }
+    }
+    /// Whether the signal is worth a frame: a change, or a turn boundary that
+    /// confirms a state the title may have overruled.
+    fn apply(&mut self, signal: Signal) -> bool {
+        let waiting = matches!(self.state, Activity::NeedsInput(_));
+        let (next, confirmed) = match signal {
+            Signal::Prompt => (Activity::Working, true),
+            Signal::Done => (Activity::Idle, true),
+            // Tools of one batch start together; the request stands until
+            // its own tool finishes.
+            Signal::Tool if waiting => return false,
+            Signal::Tool => (Activity::Working, false),
+            // A late notice of a request that is already shown, or was answered.
+            Signal::Ask { tool: None, .. } if waiting => return false,
+            Signal::Ask {
+                attention,
+                tool,
+                subagent,
+            } => {
+                if !waiting {
+                    self.before = self.state;
+                }
+                self.tool = tool;
+                self.asked_by_subagent = subagent;
+                self.state = Activity::NeedsInput(attention);
+                return true;
+            }
+            Signal::ToolDone { tool, subagent } if waiting => {
+                // Another tool finishing, or the same tool run by someone
+                // else, leaves the request standing.
+                if self.tool.is_some()
+                    && (subagent != self.asked_by_subagent || (tool.is_some() && self.tool != tool))
+                {
+                    return false;
+                }
+                let next = if subagent {
+                    self.before
+                } else {
+                    Activity::Working
+                };
+                (next, false)
+            }
+            Signal::ToolDone { subagent: true, .. } => return false,
+            Signal::ToolDone { .. } => (Activity::Working, false),
+            Signal::Answered if waiting => (Activity::Working, false),
+            Signal::Answered => return false,
+        };
+        let changed = self.state != next;
+        self.state = next;
+        self.tool = None;
+        changed || confirmed
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +157,8 @@ struct Slot {
     generation: u64,
     token: String,
     run: Option<String>,
+    /// Set while an invocation is open.
+    activity: Option<Tracked>,
     wake: Wake,
     _startup: Option<tempfile::TempDir>,
 }
@@ -51,6 +166,8 @@ struct Slot {
 struct Shared {
     slots: BTreeMap<PaneId, Slot>,
     changes: BTreeMap<PaneId, (u64, Option<AgentSession>)>,
+    /// The latest activity per pane since the last frame; `None` once closed.
+    activity: BTreeMap<PaneId, (u64, Option<Activity>)>,
     links: Vec<(PaneId, u64, PullRequest)>,
     retired: Vec<tempfile::TempDir>,
 }
@@ -175,6 +292,7 @@ impl AgentBridge {
                     .lock()
                     .map_err(|_| std::io::Error::other("Agent bridge unavailable"))?;
                 shared.changes.remove(&pane);
+                shared.activity.remove(&pane);
                 shared.links.retain(|link| link.0 != pane);
                 let old = shared.slots.insert(
                     pane,
@@ -182,6 +300,7 @@ impl AgentBridge {
                         generation,
                         token,
                         run: None,
+                        activity: None,
                         wake,
                         _startup: Some(startup),
                     },
@@ -200,6 +319,7 @@ impl AgentBridge {
                 shared.retired.push(startup);
             }
             shared.changes.remove(&pane);
+            shared.activity.remove(&pane);
             shared.links.retain(|link| link.0 != pane);
         }
     }
@@ -216,6 +336,7 @@ impl AgentBridge {
                 shared.retired.push(startup);
             }
             shared.changes.remove(&pane);
+            shared.activity.remove(&pane);
             shared.links.retain(|link| link.0 != pane);
         }
     }
@@ -226,6 +347,18 @@ impl AgentBridge {
                 std::mem::take(&mut shared.changes)
                     .into_iter()
                     .map(|(pane, (generation, agent))| (pane, generation, agent))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// What each agent turned to since the last call; `None` when it left.
+    pub fn drain_activity(&self) -> Vec<(PaneId, u64, Option<Activity>)> {
+        self.shared
+            .lock()
+            .map(|mut shared| {
+                std::mem::take(&mut shared.activity)
+                    .into_iter()
+                    .map(|(pane, (generation, activity))| (pane, generation, activity))
                     .collect()
             })
             .unwrap_or_default()
@@ -413,9 +546,40 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
         wake();
         return true;
     }
+    if matches!(message.event, Event::Stopped) {
+        if slot.run.as_ref() != Some(&message.run) {
+            return false;
+        }
+        slot.run = None;
+        slot.activity = None;
+        let (generation, wake) = (slot.generation, slot.wake.clone());
+        shared.activity.insert(pane, (generation, None));
+        drop(shared);
+        wake();
+        return true;
+    }
+    if let Event::Activity { signal } = message.event {
+        // Only the open invocation describes this pane.
+        if slot.run.as_ref() != Some(&message.run) {
+            return false;
+        }
+        let Some(tracked) = slot.activity.as_mut() else {
+            return false;
+        };
+        if tracked.apply(signal) {
+            let (state, generation, wake) = (tracked.state, slot.generation, slot.wake.clone());
+            shared.activity.insert(pane, (generation, Some(state)));
+            drop(shared);
+            wake();
+        }
+        return true;
+    }
+    let mut reset = None;
     let agent = match message.event {
         Event::Open { agent } if agent.is_valid() => {
             slot.run = Some(message.run);
+            slot.activity = Some(Tracked::idle());
+            reset = Some(Some(Activity::Idle));
             Some(agent)
         }
         Event::Session { agent } if slot.run.as_ref() == Some(&message.run) && agent.is_valid() => {
@@ -423,12 +587,18 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
         }
         Event::Close if slot.run.as_ref() == Some(&message.run) => {
             slot.run = None;
+            slot.activity = None;
+            reset = Some(None);
             None
         }
         _ => return false,
     };
     let generation = slot.generation;
     let wake = slot.wake.clone();
+    // A new conversation in the same run keeps what the agent is doing.
+    if let Some(activity) = reset {
+        shared.activity.insert(pane, (generation, activity));
+    }
     shared.changes.insert(pane, (generation, agent));
     drop(shared);
     wake();
@@ -467,29 +637,37 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
     match args.first().map(String::as_str) {
         Some("--agent-hook") => {
             let provider = kind(args.get(1).map(String::as_str).unwrap_or_default())?;
-            #[derive(Deserialize)]
-            struct Hook {
-                session_id: String,
-                cwd: PathBuf,
-                hook_event_name: String,
-            }
             let mut bytes = Vec::new();
             std::io::stdin()
-                .take(MAX_MESSAGE + 1)
+                .take(MAX_HOOK + 1)
                 .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 <= MAX_MESSAGE
-                && let Ok(hook) = serde_json::from_slice::<Hook>(&bytes)
-            {
-                let agent = AgentSession {
-                    kind: provider,
-                    session_id: Some(hook.session_id),
-                    cwd: hook.cwd,
-                };
-                if hook.hook_event_name == "SessionStart" && agent.is_valid() {
-                    let _ = send(
-                        Event::Session { agent },
-                        &std::env::var(RUN).unwrap_or_default(),
-                    );
+            // Input too large to read whole still marks the moment its hook names.
+            let hook = serde_json::from_slice::<Hook>(&bytes)
+                .ok()
+                .filter(|_| bytes.len() as u64 <= MAX_HOOK)
+                .or_else(|| {
+                    args.get(2).map(|event| Hook {
+                        hook_event_name: event.clone(),
+                        ..Hook::default()
+                    })
+                });
+            if let Some(hook) = hook {
+                let run = std::env::var(RUN).unwrap_or_default();
+                if hook.hook_event_name == "SessionStart"
+                    && hook.agent_id.is_none()
+                    && let (Some(session_id), Some(cwd)) = (&hook.session_id, &hook.cwd)
+                {
+                    let agent = AgentSession {
+                        kind: provider,
+                        session_id: Some(session_id.clone()),
+                        cwd: cwd.clone(),
+                    };
+                    if agent.is_valid() {
+                        let _ = send(Event::Session { agent }, &run);
+                    }
+                }
+                if let Some(signal) = signal(provider, &hook) {
+                    let _ = send(Event::Activity { signal }, &run);
                 }
             }
             Ok(Some(0))
@@ -501,6 +679,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
                 eprintln!(
                     "Neptune: resume failed; the session reference is kept. Restart this terminal for a fresh shell."
                 );
+                let _ = send(Event::Stopped, &std::env::var(RUN).unwrap_or_default());
             } else {
                 let _ = send(Event::Close, &std::env::var(RUN).unwrap_or_default());
             }
@@ -544,6 +723,107 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
             Ok(Some(run_agent(agent.kind, &arguments, Some(&agent))?))
         }
         _ => Ok(None),
+    }
+}
+/// The fields of a hook's input that say what kind of moment it is.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Hook {
+    hook_event_name: String,
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    tool_name: Option<String>,
+    /// Set for events inside a subagent.
+    agent_id: Option<String>,
+    notification_type: Option<String>,
+    permission_mode: Option<String>,
+    source: Option<String>,
+    trigger: Option<String>,
+}
+/// What a hook means for the agent's activity, if anything.
+fn signal(provider: AgentKind, hook: &Hook) -> Option<Signal> {
+    let subagent = hook.agent_id.is_some();
+    let lead = |signal| (!subagent).then_some(signal);
+    let tool = hook
+        .tool_name
+        .clone()
+        .filter(|tool| !tool.is_empty() && tool.len() <= MAX_TOOL);
+    // Tools that put a question or a plan in front of a person.
+    let asks = match (provider, hook.tool_name.as_deref()) {
+        (AgentKind::Claude, Some("AskUserQuestion")) => Some(Attention::Question),
+        (AgentKind::Claude, Some("ExitPlanMode")) => Some(Attention::Plan),
+        (AgentKind::Codex, Some("request_user_input")) => Some(Attention::Question),
+        _ => None,
+    };
+    let ask = |attention| {
+        Some(Signal::Ask {
+            attention,
+            tool: tool.clone(),
+            subagent,
+        })
+    };
+    let notice = |attention| {
+        Some(Signal::Ask {
+            attention,
+            tool: None,
+            subagent,
+        })
+    };
+    match hook.hook_event_name.as_str() {
+        // Compaction restarts the session in the middle of a turn.
+        "SessionStart" if hook.source.as_deref() != Some("compact") => lead(Signal::Done),
+        "UserPromptSubmit" => lead(Signal::Prompt),
+        "PreToolUse" => match asks {
+            Some(attention) => ask(attention),
+            None => lead(Signal::Tool),
+        },
+        "PermissionRequest" => match asks {
+            Some(attention) => ask(attention),
+            // The request is decided without a person when nothing is asked.
+            None if hook.permission_mode.as_deref() == Some("bypassPermissions") => None,
+            None => ask(Attention::Permission),
+        },
+        "PostToolUse" | "PostToolUseFailure" => Some(Signal::ToolDone { tool, subagent }),
+        "Notification" => match hook.notification_type.as_deref()? {
+            "permission_prompt" | "worker_permission_prompt" => notice(Attention::Permission),
+            "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input" => {
+                notice(Attention::Input)
+            }
+            "elicitation_complete" | "elicitation_response" => Some(Signal::Answered),
+            _ => None,
+        },
+        "Elicitation" => notice(Attention::Input),
+        "ElicitationResult" => Some(Signal::Answered),
+        "Stop" | "StopFailure" | "Interrupt" => lead(Signal::Done),
+        // A compaction the person asked for ends without a Stop.
+        "PostCompact" if hook.trigger.as_deref() == Some("manual") => lead(Signal::Done),
+        _ => None,
+    }
+}
+/// Hook events that say what the agent is doing, beyond `SessionStart`.
+fn activity_hooks(provider: AgentKind) -> &'static [&'static str] {
+    match provider {
+        AgentKind::Claude => &[
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PermissionRequest",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "Notification",
+            "Elicitation",
+            "ElicitationResult",
+            "Stop",
+            "StopFailure",
+            "PostCompact",
+        ],
+        AgentKind::Codex => &[
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PermissionRequest",
+            "PostToolUse",
+            "Stop",
+            "Interrupt",
+        ],
     }
 }
 fn resolve(provider: AgentKind) -> anyhow::Result<PathBuf> {
@@ -676,8 +956,23 @@ fn run_agent(
     let helper = std::env::current_exe()?.to_string_lossy().into_owned();
     match provider {
         AgentKind::Claude => {
+            let mut hooks = serde_json::Map::new();
+            hooks.insert(
+                "SessionStart".into(),
+                serde_json::json!([{"hooks":[{"type":"command","command":hook}]}]),
+            );
+            // In order, so states follow each other as the agent reached them;
+            // the helper answers in milliseconds and never blocks a tool.
+            for event in activity_hooks(provider) {
+                hooks.insert(
+                    (*event).into(),
+                    serde_json::json!([{"hooks":[{
+                        "type":"command","command":format!("{hook} {event}"),"timeout":5
+                    }]}]),
+                );
+            }
             let settings = serde_json::json!({
-                "hooks":{"SessionStart":[{"hooks":[{"type":"command","command":hook}]}]},
+                "hooks":hooks,
                 "permissions":{"allow":["mcp__neptune__link_pull_request"]},
             });
             let servers = serde_json::json!({"mcpServers":{"neptune":{"command":helper,"args":["--agent-mcp"]}}});
@@ -687,6 +982,23 @@ fn run_agent(
             command.args(["--settings", &settings.to_string()]);
         }
         AgentKind::Codex => {
+            // Codex asks before it runs a hook it has not seen, and a changed
+            // command is one. The helper is named through the environment so
+            // the commands stay the same when this executable moves, as a
+            // mounted image does at every launch.
+            let hook = format!("\"${HELPER}\" --agent-hook {}", provider.executable());
+            let activity: Vec<String> = activity_hooks(provider)
+                .iter()
+                .map(|event| {
+                    // Codex allows an interrupt hook three seconds and says so
+                    // at every start when asked for more.
+                    let timeout = if *event == "Interrupt" { 3 } else { 5 };
+                    format!(
+                        "hooks.{event}=[{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
+                        toml::Value::String(format!("{hook} {event}"))
+                    )
+                })
+                .collect();
             let hook = toml::Value::String(hook).to_string();
             // Hook processes need this terminal's environment, not a shared daemon's.
             // Older Codex versions still open normally; they can restore the CLI only.
@@ -705,11 +1017,14 @@ fn run_agent(
                         "hooks.SessionStart=[{{hooks=[{{type=\"command\",command={hook}}}]}}]"
                     ),
                 ]);
+                for hook in &activity {
+                    command.args(["-c", hook]);
+                }
                 command.args([
                     "-c",
                     &format!(
                         "mcp_servers.neptune.command={}",
-                        toml::Value::String(helper)
+                        toml::Value::String(helper.clone())
                     ),
                     "-c",
                     "mcp_servers.neptune.args=[\"--agent-mcp\"]",
@@ -721,6 +1036,7 @@ fn run_agent(
                     (TOKEN, std::env::var(TOKEN).unwrap_or_default()),
                     (ENDPOINT, std::env::var(ENDPOINT).unwrap_or_default()),
                     (RUN, run.clone()),
+                    (HELPER, helper.clone()),
                 ] {
                     let value = toml::Value::String(value);
                     command.args([
@@ -743,7 +1059,7 @@ fn run_agent(
         let mut supervisor = std::process::Command::new("/bin/sh");
         supervisor.args(["-c", "helper=$1; resumed=$2; shift 2; trap ':' INT QUIT; \"$@\"; result=$?; \"$helper\" --agent-close \"$result\" \"$resumed\"; exit \"$result\"", "neptune-agent"])
             .arg(std::env::current_exe()?).arg(if resumed.is_some() { "1" } else { "0" })
-            .arg(command.get_program()).args(command.get_args()).env(RUN, &run);
+            .arg(command.get_program()).args(command.get_args()).env(RUN, &run).env(HELPER, &helper);
         if let Some(agent) = resumed {
             supervisor.current_dir(&agent.cwd);
         }
@@ -754,7 +1070,7 @@ fn run_agent(
         if let Some(agent) = resumed {
             command.current_dir(&agent.cwd);
         }
-        let result = command.env(RUN, &run).status();
+        let result = command.env(RUN, &run).env(HELPER, &helper).status();
         let _ = send(Event::Close, &run);
         Ok(result?.code().unwrap_or(1))
     }
@@ -772,6 +1088,394 @@ mod tests {
     }
     const FIRST: &str = "019a1234-5678-7000-8000-123456789abc";
     const SECOND: &str = "019a1234-5678-7000-8000-123456789def";
+    fn hook(event: &str) -> Hook {
+        Hook {
+            hook_event_name: event.into(),
+            ..Hook::default()
+        }
+    }
+    fn tool(event: &str, tool: &str) -> Hook {
+        Hook {
+            tool_name: Some(tool.into()),
+            ..hook(event)
+        }
+    }
+    fn ask(attention: Attention, tool: Option<&str>, subagent: bool) -> Signal {
+        Signal::Ask {
+            attention,
+            tool: tool.map(str::to_owned),
+            subagent,
+        }
+    }
+    fn done(tool: Option<&str>, subagent: bool) -> Signal {
+        Signal::ToolDone {
+            tool: tool.map(str::to_owned),
+            subagent,
+        }
+    }
+    #[test]
+    fn hooks_name_the_moment_and_never_what_was_typed_or_run() {
+        use AgentKind::{Claude, Codex};
+        // Real payloads carry prompts, commands and results; none is read.
+        let payload = serde_json::json!({
+            "session_id": FIRST, "cwd": "/tmp", "hook_event_name": "PostToolUse",
+            "tool_name": "Bash", "tool_input": {"command": "cat secret"},
+            "tool_response": {"stdout": "hunter2"}, "prompt": "my prompt",
+            "permission_mode": "default", "transcript_path": "/tmp/t.jsonl",
+        });
+        let parsed: Hook = serde_json::from_value(payload).unwrap();
+        let sent = serde_json::to_string(&signal(Claude, &parsed).unwrap()).unwrap();
+        assert_eq!(
+            sent,
+            r#"{"signal":"tool_done","tool":"Bash","subagent":false}"#
+        );
+
+        for provider in [Claude, Codex] {
+            assert_eq!(
+                signal(provider, &hook("UserPromptSubmit")),
+                Some(Signal::Prompt)
+            );
+            assert_eq!(
+                signal(provider, &tool("PreToolUse", "Bash")),
+                Some(Signal::Tool)
+            );
+            assert_eq!(
+                signal(provider, &tool("PermissionRequest", "Bash")),
+                Some(ask(Attention::Permission, Some("Bash"), false))
+            );
+            assert_eq!(
+                signal(provider, &tool("PostToolUse", "Bash")),
+                Some(done(Some("Bash"), false))
+            );
+            assert_eq!(signal(provider, &hook("Stop")), Some(Signal::Done));
+            assert_eq!(signal(provider, &hook("SessionStart")), Some(Signal::Done));
+            assert_eq!(signal(provider, &hook("SubagentStop")), None);
+            assert_eq!(signal(provider, &hook("SessionEnd")), None);
+        }
+        assert_eq!(signal(Codex, &hook("Interrupt")), Some(Signal::Done));
+        assert_eq!(signal(Claude, &hook("StopFailure")), Some(Signal::Done));
+        assert_eq!(
+            signal(Claude, &tool("PostToolUseFailure", "Bash")),
+            Some(done(Some("Bash"), false))
+        );
+        // Questions and plans ask through a tool, whatever the permission mode.
+        for (provider, name, attention) in [
+            (Claude, "AskUserQuestion", Attention::Question),
+            (Claude, "ExitPlanMode", Attention::Plan),
+            (Codex, "request_user_input", Attention::Question),
+        ] {
+            for event in ["PreToolUse", "PermissionRequest"] {
+                let mut asked = tool(event, name);
+                asked.permission_mode = Some("bypassPermissions".into());
+                assert_eq!(
+                    signal(provider, &asked),
+                    Some(ask(attention, Some(name), false)),
+                    "{event} {name}"
+                );
+            }
+        }
+        // Another agent's question tool is an ordinary tool here.
+        assert_eq!(
+            signal(Codex, &tool("PreToolUse", "AskUserQuestion")),
+            Some(Signal::Tool)
+        );
+        // Nothing is asked of a person when permissions are bypassed.
+        let mut bypassed = tool("PermissionRequest", "Bash");
+        bypassed.permission_mode = Some("bypassPermissions".into());
+        assert_eq!(signal(Claude, &bypassed), None);
+        // A compaction restarts the session mid-turn; one asked for ends quietly.
+        let mut compact = hook("SessionStart");
+        compact.source = Some("compact".into());
+        assert_eq!(signal(Claude, &compact), None);
+        let mut manual = hook("PostCompact");
+        assert_eq!(signal(Claude, &manual), None);
+        manual.trigger = Some("manual".into());
+        assert_eq!(signal(Claude, &manual), Some(Signal::Done));
+        for (kind, expected) in [
+            (
+                "permission_prompt",
+                Some(ask(Attention::Permission, None, false)),
+            ),
+            (
+                "elicitation_dialog",
+                Some(ask(Attention::Input, None, false)),
+            ),
+            (
+                "agent_needs_input",
+                Some(ask(Attention::Input, None, false)),
+            ),
+            ("elicitation_complete", Some(Signal::Answered)),
+            ("idle_prompt", None),
+            ("auth_success", None),
+        ] {
+            let mut notice = hook("Notification");
+            notice.notification_type = Some(kind.into());
+            assert_eq!(signal(Claude, &notice), expected, "{kind}");
+        }
+        assert_eq!(signal(Claude, &hook("Notification")), None);
+        // A subagent's turn is not the pane's; only its requests reach a person.
+        let inside = |mut hook: Hook| {
+            hook.agent_id = Some("agent-1".into());
+            hook
+        };
+        for event in ["UserPromptSubmit", "Stop", "SessionStart"] {
+            assert_eq!(signal(Claude, &inside(hook(event))), None, "{event}");
+        }
+        assert_eq!(signal(Claude, &inside(tool("PreToolUse", "Bash"))), None);
+        assert_eq!(
+            signal(Claude, &inside(tool("PermissionRequest", "Bash"))),
+            Some(ask(Attention::Permission, Some("Bash"), true))
+        );
+        assert_eq!(
+            signal(Claude, &inside(tool("PostToolUse", "Bash"))),
+            Some(done(Some("Bash"), true))
+        );
+        // A name too long to be a tool's is not carried.
+        let long = "x".repeat(MAX_TOOL + 1);
+        assert_eq!(
+            signal(Claude, &tool("PostToolUse", &long)),
+            Some(done(None, false))
+        );
+    }
+    #[test]
+    fn activity_follows_the_turn_and_a_request_stands_until_it_is_resolved() {
+        use Activity::{Idle, NeedsInput, Working};
+        let mut tracked = Tracked::idle();
+        let mut step = |signal: Signal, changed: bool, state: Activity| {
+            assert_eq!(tracked.apply(signal.clone()), changed, "{signal:?}");
+            assert_eq!(tracked.state, state, "{signal:?}");
+        };
+        step(Signal::Prompt, true, Working);
+        step(Signal::Tool, false, Working);
+        step(done(Some("Read"), false), false, Working);
+        // A turn boundary is reported even when it changes nothing.
+        step(Signal::Prompt, true, Working);
+        step(
+            ask(Attention::Permission, Some("Bash"), false),
+            true,
+            NeedsInput(Attention::Permission),
+        );
+        // Tools of the same batch start and finish around the request.
+        step(Signal::Tool, false, NeedsInput(Attention::Permission));
+        step(
+            done(Some("Read"), false),
+            false,
+            NeedsInput(Attention::Permission),
+        );
+        // A late notice of the same request does not rename it.
+        step(
+            ask(Attention::Input, None, false),
+            false,
+            NeedsInput(Attention::Permission),
+        );
+        step(done(Some("Bash"), false), true, Working);
+        step(Signal::Done, true, Idle);
+        step(Signal::Done, true, Idle);
+        step(Signal::Answered, false, Idle);
+        // A question asked twice, by the tool and by its permission request.
+        step(Signal::Prompt, true, Working);
+        step(
+            ask(Attention::Question, Some("AskUserQuestion"), false),
+            true,
+            NeedsInput(Attention::Question),
+        );
+        step(
+            ask(Attention::Question, Some("AskUserQuestion"), false),
+            true,
+            NeedsInput(Attention::Question),
+        );
+        step(done(Some("AskUserQuestion"), false), true, Working);
+        // A request without a tool is answered by any tool finishing, or by word.
+        step(
+            ask(Attention::Input, None, false),
+            true,
+            NeedsInput(Attention::Input),
+        );
+        step(Signal::Answered, true, Working);
+        step(
+            ask(Attention::Input, None, false),
+            true,
+            NeedsInput(Attention::Input),
+        );
+        step(done(None, false), true, Working);
+        // Ending the turn clears a request nobody answered.
+        step(
+            ask(Attention::Plan, Some("ExitPlanMode"), false),
+            true,
+            NeedsInput(Attention::Plan),
+        );
+        step(Signal::Done, true, Idle);
+        // A subagent working in the background leaves the pane at rest, and
+        // its request gives way to what it interrupted.
+        step(done(Some("Read"), true), false, Idle);
+        step(
+            ask(Attention::Permission, Some("Bash"), true),
+            true,
+            NeedsInput(Attention::Permission),
+        );
+        step(done(Some("Bash"), true), true, Idle);
+        step(Signal::Prompt, true, Working);
+        step(
+            ask(Attention::Permission, Some("Bash"), true),
+            true,
+            NeedsInput(Attention::Permission),
+        );
+        // The same tool finishing for the lead is not the subagent's answer,
+        step(
+            done(Some("Bash"), false),
+            false,
+            NeedsInput(Attention::Permission),
+        );
+        step(done(Some("Bash"), true), true, Working);
+        // nor a subagent's the lead's.
+        step(
+            ask(Attention::Permission, Some("Bash"), false),
+            true,
+            NeedsInput(Attention::Permission),
+        );
+        step(
+            done(Some("Bash"), true),
+            false,
+            NeedsInput(Attention::Permission),
+        );
+        step(done(Some("Bash"), false), true, Working);
+    }
+    #[test]
+    fn activity_is_bound_to_the_open_invocation_and_leaves_with_it() {
+        let bridge = AgentBridge::default();
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake = woken.clone();
+        bridge.shared.lock().unwrap().slots.insert(
+            PaneId::new(1),
+            Slot {
+                generation: 7,
+                token: "one".into(),
+                run: None,
+                activity: None,
+                wake: Arc::new(move || {
+                    wake.fetch_add(1, Ordering::Relaxed);
+                }),
+                _startup: None,
+            },
+        );
+        let emit = |token: &str, run: &str, event| {
+            apply_message(
+                &bridge.shared,
+                Message {
+                    token: token.into(),
+                    run: run.into(),
+                    event,
+                },
+            )
+        };
+        let activity = |signal| Event::Activity { signal };
+        let woke = || woken.swap(0, Ordering::Relaxed);
+        // Nothing is open yet.
+        assert!(!emit("one", "a", activity(Signal::Prompt)));
+        assert!(bridge.drain_activity().is_empty());
+        assert!(emit(
+            "one",
+            "a",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+        assert_eq!(
+            bridge.drain_activity(),
+            [(PaneId::new(1), 7, Some(Activity::Idle))]
+        );
+        woke();
+        // A stranger and another invocation do not describe this pane.
+        assert!(!emit("two", "a", activity(Signal::Prompt)));
+        assert!(!emit("one", "b", activity(Signal::Prompt)));
+        assert_eq!(woke(), 0);
+        // Reports between frames coalesce to the latest.
+        assert!(emit("one", "a", activity(Signal::Prompt)));
+        assert!(emit("one", "a", activity(Signal::Tool)));
+        assert_eq!(woke(), 1, "a tool within a working turn wakes nothing");
+        assert!(emit(
+            "one",
+            "a",
+            activity(ask(Attention::Question, Some("AskUserQuestion"), false))
+        ));
+        assert_eq!(
+            bridge.drain_activity(),
+            [(
+                PaneId::new(1),
+                7,
+                Some(Activity::NeedsInput(Attention::Question))
+            )]
+        );
+        assert!(bridge.drain_activity().is_empty());
+        // A new conversation in the same run keeps what the agent is doing.
+        assert!(emit(
+            "one",
+            "a",
+            Event::Session {
+                agent: agent(SECOND)
+            }
+        ));
+        assert!(bridge.drain_activity().is_empty());
+        assert!(emit("one", "a", Event::Close));
+        assert_eq!(bridge.drain_activity(), [(PaneId::new(1), 7, None)]);
+        assert!(!emit("one", "a", activity(Signal::Done)), "a late hook");
+        // Leaving and returning within a frame is a fresh agent at rest.
+        assert!(!emit("one", "a", activity(Signal::Prompt)));
+        assert!(emit(
+            "one",
+            "c",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+        assert!(emit("one", "c", activity(Signal::Prompt)));
+        assert!(emit("one", "c", Event::Close));
+        assert!(emit(
+            "one",
+            "d",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+        assert_eq!(
+            bridge.drain_activity(),
+            [(PaneId::new(1), 7, Some(Activity::Idle))]
+        );
+        // A resume that failed keeps the reference but is no running agent.
+        bridge.drain();
+        assert!(!emit("one", "c", Event::Stopped), "an earlier invocation");
+        assert!(emit("one", "d", Event::Stopped));
+        assert_eq!(bridge.drain_activity(), [(PaneId::new(1), 7, None)]);
+        assert!(bridge.drain().is_empty(), "the reference is untouched");
+        assert!(!emit("one", "d", activity(Signal::Prompt)));
+        assert!(emit(
+            "one",
+            "e",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+        bridge.drain_activity();
+        // What has not reached a frame leaves with its pane.
+        assert!(emit("one", "e", activity(Signal::Prompt)));
+        bridge.close(PaneId::new(1));
+        assert!(bridge.drain_activity().is_empty());
+    }
+    #[test]
+    fn unknown_activity_is_refused_rather_than_guessed() {
+        for message in [
+            r#"{"token":"t","run":"r","event":{"event":"activity","signal":{"signal":"ask","attention":"plan","tool":null,"subagent":false,"text":"x"}}}"#,
+            r#"{"token":"t","run":"r","event":{"event":"activity","signal":{"signal":"typing"}}}"#,
+            r#"{"token":"t","run":"r","event":{"event":"activity","signal":{"signal":"ask","attention":"urgent","tool":null,"subagent":false}}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Message>(message).is_err(),
+                "{message}"
+            );
+        }
+        let message = r#"{"token":"t","run":"r","event":{"event":"activity","signal":{"signal":"ask","attention":"plan","tool":"ExitPlanMode","subagent":false}}}"#;
+        assert!(serde_json::from_str::<Message>(message).is_ok());
+    }
     #[test]
     fn pull_requests_link_only_to_the_pane_of_the_invocation_that_is_open() {
         let bridge = AgentBridge::default();
@@ -781,6 +1485,7 @@ mod tests {
                 generation: 7,
                 token: "one".into(),
                 run: None,
+                activity: None,
                 wake: Arc::new(|| {}),
                 _startup: None,
             },
@@ -830,6 +1535,7 @@ mod tests {
                     generation: 7,
                     token: token.into(),
                     run: None,
+                    activity: None,
                     wake: Arc::new(|| {}),
                     _startup: None,
                 },

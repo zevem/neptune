@@ -320,6 +320,10 @@ impl SessionManager {
     pub fn agent_changes(&self) -> Vec<(PaneId, u64, Option<neptune_model::AgentSession>)> {
         self.agents.drain()
     }
+    /// What agents turned to since the last call; `None` for one that left.
+    pub fn agent_activity(&self) -> Vec<(PaneId, u64, Option<crate::agent_activity::Activity>)> {
+        self.agents.drain_activity()
+    }
     pub fn pull_request_links(&self) -> Vec<(PaneId, u64, neptune_model::PullRequest)> {
         self.agents.drain_links()
     }

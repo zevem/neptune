@@ -51,6 +51,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         diagnostics: diagnostics::Diagnostics::new(false),
         link_opener: Default::default(),
         notifications: Default::default(),
+        agents: Default::default(),
         desktop_notifier: Default::default(),
         updates: Default::default(),
         attachments: attachments::Attachments::new(root.join("pasted-images")),
@@ -3150,7 +3151,11 @@ fn capture_image_preview_native() {
 /// `search`, `search-all` (no exclusions), `filters`, `menu`, `create`,
 /// `rename`, `rename-taken`, `delete`, `remote` or `sliding` (midway through
 /// the toggle: `NEPTUNE_EXPLORER_SLIDE_MS` after it began; 100 by default).
-/// `NEPTUNE_EXPLORER_NARROW=1` uses a 640×400 window and
+/// `agents` shows the agents tab with an agent in each state across three
+/// workspaces, `agents-empty` shows it with none, and `agents-closed` closes
+/// the panel on them, leaving the toolbar's mark for an agent that waits.
+/// `NEPTUNE_EXPLORER_NARROW=1` uses a 640×400 window,
+/// `NEPTUNE_EXPLORER_SIDEBAR=closed` hides the sidebar and
 /// `NEPTUNE_EXPLORER_THEME` names a theme. The desktop's pointer and keyboard
 /// are kept out of it; a real secondary click, typing and dragging the
 /// dividers need a hand-driven native check.
@@ -3243,10 +3248,101 @@ fn capture_explorer_native() {
         slid: bool,
         /// Milliseconds the slide has run when the capture is taken.
         lead: u64,
+        /// The terminals that stand in for agents, and whether each is set up.
+        fleet: Vec<(PaneId, bool)>,
     }
     impl NativeCapture {
         fn act(&mut self, ctx: &egui::Context, event: Event) {
             self.app.action(ctx, Action::Explorer(event));
+        }
+        /// Three workspaces whose terminals report as agents in every state.
+        fn stage_agents(&mut self, ctx: &egui::Context) {
+            use crate::agent_activity::{Activity, Attention};
+            use neptune_model::{AgentKind, AgentSession};
+            if self.fleet.is_empty() {
+                let first = self.app.controller.model().active_pane().unwrap();
+                let home = self.app.controller.model().active_workspace().unwrap();
+                self.app
+                    .action(ctx, Action::Split(first, neptune_model::Axis::Vertical));
+                for name in ["website", "billing-api"] {
+                    let cwd = self.project.join(name);
+                    std::fs::create_dir_all(&cwd).unwrap();
+                    self.app.dispatch(
+                        ctx,
+                        Command::AddWorkspace {
+                            cwd,
+                            name: name.into(),
+                            remote: None,
+                            group: None,
+                        },
+                    );
+                }
+                self.app.dispatch(ctx, Command::SelectWorkspace(home));
+                self.app.action(ctx, Action::Focus(first));
+                self.fleet = self
+                    .app
+                    .controller
+                    .model()
+                    .workspaces()
+                    .iter()
+                    .flat_map(|workspace| workspace.panes().iter().map(|pane| (pane.id(), false)))
+                    .collect();
+            }
+            let agents = [
+                (
+                    AgentKind::Claude,
+                    "\u{25d0} Refactor the retry queue",
+                    Activity::Working,
+                    200,
+                ),
+                (
+                    AgentKind::Codex,
+                    "orbit",
+                    Activity::NeedsInput(Attention::Permission),
+                    45,
+                ),
+                (
+                    AgentKind::Claude,
+                    "\u{2733} Landing page copy and pricing table",
+                    Activity::NeedsInput(Attention::Question),
+                    700,
+                ),
+                (AgentKind::Codex, "billing-api", Activity::Idle, 4000),
+            ];
+            for (index, (pane, done)) in self.fleet.clone().into_iter().enumerate() {
+                let Some((kind, title, activity, age)) = agents.get(index).copied() else {
+                    continue;
+                };
+                let Some(session) = self.app.sessions.get(pane).filter(|_| !done) else {
+                    continue;
+                };
+                session
+                    .write(format!(" printf '\\033]0;{title}\\007'; clear\n").as_bytes())
+                    .unwrap();
+                let generation = self.app.sessions.generation(pane).unwrap();
+                let cwd = self.app.controller.model().pane(pane).unwrap().cwd().into();
+                self.app.dispatch(
+                    ctx,
+                    Command::PaneAgentChanged {
+                        pane,
+                        generation,
+                        agent: Some(AgentSession {
+                            kind,
+                            session_id: None,
+                            cwd,
+                        }),
+                    },
+                );
+                self.app.agents.report(
+                    pane,
+                    generation,
+                    Some(activity),
+                    Instant::now() - Duration::from_secs(age),
+                );
+                // The title printed above is the agent's, not its shell's.
+                self.app.agents.title(pane, kind, "", Instant::now());
+                self.fleet[index].1 = true;
+            }
         }
     }
     impl eframe::App for NativeCapture {
@@ -3261,7 +3357,8 @@ fn capture_explorer_native() {
                 && self.app.started.elapsed() > Duration::from_millis(3000 - self.lead)
             {
                 self.slid = true;
-                self.act(ctx, Event::Toggle);
+                self.app
+                    .action(ctx, Action::Panel(ui::panel::Event::Toggle));
             }
             if self.app.sessions.get(pane).is_none() {
                 return;
@@ -3269,13 +3366,21 @@ fn capture_explorer_native() {
             let project = self.project.clone();
             if !self.applied {
                 self.applied = true;
+                if std::env::var("NEPTUNE_EXPLORER_SIDEBAR").is_ok_and(|side| side == "closed") {
+                    self.app.action(ctx, Action::ToggleSidebar);
+                    self.app.ui.sidebar_slide = None;
+                }
                 if self.state != "sliding" {
-                    self.act(ctx, Event::Toggle);
+                    self.app
+                        .action(ctx, Action::Panel(ui::panel::Event::Toggle));
                     // Shown at rest, not on its way in.
-                    self.app.ui.explorer.slide = None;
+                    self.app.ui.panel.slide = None;
                 }
                 self.act(ctx, Event::Expand(project.join("src"), true));
                 self.app.ui.explorer.selected = None;
+            }
+            if self.staged && matches!(self.state.as_str(), "agents" | "agents-closed") {
+                self.stage_agents(ctx);
             }
             // The rest is asked of a panel that is showing the folder.
             if self.staged || self.app.explorer_rows() < 3 {
@@ -3283,6 +3388,15 @@ fn capture_explorer_native() {
             }
             self.staged = true;
             match self.state.as_str() {
+                "agents" | "agents-empty" => self.app.action(
+                    ctx,
+                    Action::Panel(ui::panel::Event::Show(ui::panel::Tab::Agents)),
+                ),
+                "agents-closed" => {
+                    self.app
+                        .action(ctx, Action::Panel(ui::panel::Event::Toggle));
+                    self.app.ui.panel.slide = None;
+                }
                 "preview" => self.act(ctx, Event::Select(project.join("src/main.rs"))),
                 "image" => {
                     self.act(ctx, Event::Expand(project.join("assets"), true));
@@ -3354,8 +3468,8 @@ fn capture_explorer_native() {
             // A secondary click on the third row, a step a frame.
             let window = ctx.content_rect();
             let pos = egui::pos2(
-                window.right() - self.app.ui.explorer.width + 90.0,
-                44.0 + 68.0 + 26.0 * 2.5,
+                window.right() - self.app.ui.panel.width + 90.0,
+                44.0 + ui::panel::TABS + 68.0 + 26.0 * 2.5,
             );
             self.steps = self.steps.saturating_add(1);
             input.events.push(match self.steps {
@@ -3397,6 +3511,7 @@ fn capture_explorer_native() {
                 staged: false,
                 steps: 0,
                 slid: false,
+                fleet: Vec::new(),
                 lead: std::env::var("NEPTUNE_EXPLORER_SLIDE_MS")
                     .ok()
                     .and_then(|lead| lead.parse().ok())
