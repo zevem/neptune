@@ -2,6 +2,11 @@
 use neptune_terminal::{Launch, app, config, persistence::window_state};
 
 fn main() -> anyhow::Result<()> {
+    // SAFETY: nothing has started a thread yet.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        neptune_terminal::platform::host_env::restore()
+    };
     if let Some(code) =
         neptune_terminal::runtime::agents::cli(&std::env::args().skip(1).collect::<Vec<_>>())?
     {

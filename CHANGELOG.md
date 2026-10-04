@@ -18,6 +18,12 @@ their preparation records remain in Git history.
   opens the file explorer and the agents as tabs, carries a dot while an agent
   waits out of view. Codex asks once to trust the hooks that report this.
 
+### Fixes
+
+- Run `cargo`, `rustc` and other rustup tools in zsh when Neptune is launched
+  from the AppImage. Terminals and the programs Neptune opens no longer inherit
+  the AppImage's launcher variables or its bundled libraries.
+
 ## [0.1.0-rc.3] - 2026-10-03
 
 ### What's New

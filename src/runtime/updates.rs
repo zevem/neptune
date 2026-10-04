@@ -115,7 +115,11 @@ fn platform() -> &'static str {
     } else if cfg!(all(windows, target_arch = "x86_64")) {
         "windows-x64"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        if std::env::var_os("APPIMAGE").is_none()
+        #[cfg(target_os = "linux")]
+        let appimage = crate::platform::host_env::appimage();
+        #[cfg(not(target_os = "linux"))]
+        let appimage = false;
+        if !appimage
             && std::env::current_exe()
                 .ok()
                 .is_some_and(|path| path == Path::new("/usr/bin/neptune"))
