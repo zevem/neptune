@@ -547,7 +547,9 @@ mod tests {
         // Where the terminals close first, git is still at work after them.
         settle(&mut app, &ctx, "the removal", |app| {
             app.controller.model().pane(opened).is_none()
-                && (!tree.path.exists() || app.ui.error.is_some())
+                && (app.ui.error.is_some()
+                    || !tree.path.exists()
+                        && git(&root, &["branch", "--format=%(refname:short)"]) == "main")
         });
         assert!(app.ui.error.is_none(), "{:?}", app.ui.error);
         assert!(!tree.path.exists());
