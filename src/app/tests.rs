@@ -57,11 +57,14 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         updates: Default::default(),
         relaunch: false,
         relaunch_arguments: Vec::new(),
+        pull_requests: Default::default(),
         attachments: attachments::Attachments::new(root.join("pasted-images")),
         image_preview: Default::default(),
         explorer: Default::default(),
+        changes: Default::default(),
         file_drag: Default::default(),
         paste_chord: Default::default(),
+        worktrees: Default::default(),
         swallowed_paste: None,
     };
     (app, sender)

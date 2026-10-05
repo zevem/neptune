@@ -25,6 +25,7 @@ pub enum Error {
     IdentityExhausted,
     SpawnLimit,
     SpawnDepth,
+    InvalidWorktree,
 }
 
 impl std::fmt::Display for Error {
@@ -61,6 +62,9 @@ impl std::fmt::Display for Error {
             Self::SpawnDepth => f.write_str(
                 "An agent started by an agent that was itself started by one cannot start another",
             ),
+            Self::InvalidWorktree => {
+                f.write_str("A worktree needs a local workspace, a branch and its own directory")
+            }
         }
     }
 }
@@ -108,6 +112,7 @@ pub struct Pane {
     pub(crate) agent: Option<crate::AgentSession>,
     pub(crate) pull_requests: Vec<crate::PullRequest>,
     pub(crate) spawned_by: Option<PaneId>,
+    pub(crate) worktree: Option<crate::Worktree>,
     pub(crate) generation: u64,
     pub(crate) lifecycle: Lifecycle,
 }
@@ -122,6 +127,10 @@ impl Pane {
     /// The terminal whose agent started this one's, while both agents last.
     pub fn spawned_by(&self) -> Option<PaneId> {
         self.spawned_by
+    }
+    /// The git worktree Neptune made for this terminal's agent.
+    pub fn worktree(&self) -> Option<&crate::Worktree> {
+        self.worktree.as_ref()
     }
     pub fn id(&self) -> PaneId {
         self.id
@@ -151,6 +160,8 @@ pub struct PaneSpec {
     pub pull_requests: Vec<crate::PullRequest>,
     /// The terminal whose agent started this one's.
     pub spawned_by: Option<PaneId>,
+    /// The git worktree Neptune made for this terminal's agent.
+    pub worktree: Option<crate::Worktree>,
 }
 #[derive(Debug, Clone)]
 pub struct WorkspaceSpec {
@@ -531,6 +542,13 @@ impl Model {
                 {
                     return Err(Error::InvalidLayout("invalid pull request links"));
                 }
+                if pane
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|worktree| !worktree.is_valid() || remote.is_some())
+                {
+                    return Err(Error::InvalidWorktree);
+                }
                 if remote.is_none() && pane.remote_cwd.is_some() {
                     return Err(Error::InvalidLayout("local pane has a remote directory"));
                 }
@@ -587,6 +605,7 @@ impl Model {
                         agent: pane.agent,
                         pull_requests: pane.pull_requests,
                         spawned_by: pane.spawned_by,
+                        worktree: pane.worktree,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
                     })
@@ -651,6 +670,7 @@ impl Model {
                         agent: pane.agent.clone(),
                         pull_requests: pane.pull_requests.clone(),
                         spawned_by: pane.spawned_by,
+                        worktree: pane.worktree.clone(),
                     })
                     .collect(),
                 layout: workspace.layout.clone(),
