@@ -24,7 +24,7 @@ Hold Command on macOS or Ctrl on Linux/Windows to reveal small shortcut hints in
 
 New workspace opens and selects a fresh shell at `~` immediately. Rename it later by double-clicking its sidebar row or choosing Rename workspace from its menu or the command palette.
 
-The directory beneath a local workspace's name follows its focused terminal. Switching between tabs or split panes updates that directory; inactive workspaces show their last focused terminal's directory. Long paths are shortened to fit the sidebar. SSH workspaces show their host there.
+The directory beneath a local workspace's name follows its focused terminal. Switching between tabs or split panes updates that directory; inactive workspaces show their last focused terminal's directory. Long paths are shortened to fit the sidebar. SSH workspaces show their host there. When that directory is inside a Git repository, its branch follows the path (or the short name of the commit, when no branch is checked out), with a dot while the repository has changes that are not committed. The branch is read again every five seconds while the sidebar is in view, less often while another window is the active one, and not at all while Neptune is minimized.
 
 ## Workspace groups
 
@@ -177,13 +177,23 @@ Neptune also remembers the window's size and maximized state when closed. Window
 
 ## Right panel
 
-The **Toggle right panel** button at the trailing end of the toolbar, Ctrl+Shift+O (Command+O on macOS) or the command palette slides a panel in from the right. Its two tabs, **Files** and **Agents**, are chosen by clicking them or with **Show files** and **Show agents** in the command palette, which also open the panel. The panel opens on the tab it last showed. Drag its leading edge to resize it, or double-click the edge for the default width. It starts closed with each launch; its width, its tab and what is typed in it are not saved.
+The **Toggle right panel** button at the trailing end of the toolbar, Ctrl+Shift+O (Command+O on macOS) or the command palette slides a panel in from the right. Its three tabs, **Files**, **Agents** and **Changes**, are chosen by clicking them or with **Show files**, **Show agents** and **Show changes** in the command palette, which also open the panel. The panel opens on the tab it last showed. Drag its leading edge to resize it, or double-click the edge for the default width. It starts closed with each launch; its width, its tab and what is typed in it are not saved.
 
 ## Agents
 
 The **Agents** tab lists every Claude Code and Codex agent running in a local terminal of any workspace, including workspaces and tabs out of view. Agents are grouped by what they are doing: **Needs input** first (an agent asking to allow a tool, asking a question, waiting for a plan to be approved, or otherwise blocked on you), then **Working**, then **Idle**. Each row shows the agent's name for its conversation, its state, which agent it is, its workspace and how long it has been in that state. Click a row to go to its terminal. While an agent waits for input and the list is not in view, the panel's toolbar button carries a dot, and the Agents tab shows how many are waiting.
 
 An agent is listed while its CLI runs: it appears when `claude` or `codex` starts and leaves when the CLI exits or its terminal is restarted or closed. Agents started inside SSH sessions, on Windows, as batch commands (`claude -p`, `codex exec`) or through an alias or absolute path that bypasses Neptune's adapters are not listed. Codex asks once to trust the hooks that report its activity; until it does, its state is read from its terminal title alone, about two seconds behind. See [agent sessions](agent-sessions.md#agent-activity) for how states are detected and where they can lag.
+
+## Changes
+
+The **Changes** tab of the right panel shows what Git says about the folder of the focused terminal, and follows that terminal when it changes directory or when another terminal is focused. Its header names the branch, with the number of commits to push and to pull when the branch has an upstream. The whole repository is listed, even when the terminal is in a folder inside it.
+
+Choose what to compare under the header. **Working tree** lists the files that differ from the last commit: staged, unstaged and new files together. **Branch** lists everything the branch holds since it left the main one, committed or not, which is what a pull request for it would contain. The main branch is the default branch of `origin`, or else `origin/main`, `origin/master`, `main` or `master`, whichever exists first.
+
+Each row shows a letter for what happened to the file (**M** modified, **A** added, **D** deleted, **R** renamed, **U** untracked, **!** in conflict), its name and folder, and the lines added and removed. Click a file to see its diff at the bottom of the panel, with removed lines in red and added lines in green; click it again or use the diff's close button to put it away. Drag the divider above the diff to resize it. The list and the diff in view are read again about every two seconds, so an agent's edits appear as it makes them; **Refresh changes** reads them at once.
+
+Neptune only reads: it never stages, commits, checks out or fetches, and it does not take Git's index lock, so it does not get in the way of commands you run. It runs the `git` on your `PATH`, with `core.fsmonitor` off and without external diff or text-conversion programs, so a repository's own configuration cannot start a program for it. Very long lists and diffs are cut off and say so; files that are not text show no diff. A folder outside a repository, a workspace connected over SSH and a computer without Git each say why nothing is listed. Nothing is read while another tab is in view or while Neptune is minimized, and it is read five times less often while another window is the active one. Nothing shown here is saved or written to diagnostics.
 
 ## File explorer
 

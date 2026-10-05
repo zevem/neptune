@@ -11,6 +11,13 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Review what changed without leaving the terminal. The new Changes tab of
+  the right panel shows the branch of the focused terminal's folder and the
+  files that differ, with a diff of the one you click. Choose **Working tree**
+  for work that is not committed yet, or **Branch** for everything the branch
+  holds since it left the main one. Each workspace's row in the sidebar now
+  shows its branch, with a dot while it has uncommitted changes. Needs Git
+  installed.
 - See every Claude Code and Codex agent running in any workspace in the new
   Agents tab of the right panel: which are working, which are idle and which
   are waiting for you to allow a tool, answer a question or approve a plan.

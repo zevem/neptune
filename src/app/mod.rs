@@ -1,12 +1,14 @@
 //! Thin eframe composition: widgets emit actions, the controller owns transitions,
 //! workers own processes/storage, and caches consume immutable terminal snapshots.
 mod attachments;
+mod changes;
 mod closing;
 mod coordinator;
 mod delegation;
 mod diagnostics;
 mod directory;
 mod explorer;
+mod git;
 mod image_preview;
 mod input;
 mod panel;
@@ -116,6 +118,8 @@ pub struct App {
     attachments: attachments::Attachments,
     image_preview: image_preview::ImagePreview,
     explorer: explorer::Explorer,
+    /// What git says about the folders in view.
+    changes: changes::Changes,
     file_drag: crate::platform::file_drag::FileDragSource,
     paste_chord: crate::input::PasteChord,
     /// A paste chord pressed this frame that the toolkit did not deliver.
@@ -234,6 +238,7 @@ impl App {
             attachments: attachments::Attachments::new(data.join("pasted-images")),
             image_preview: Default::default(),
             explorer: Default::default(),
+            changes: Default::default(),
             file_drag: Default::default(),
             paste_chord: Default::default(),
             swallowed_paste: None,
@@ -438,6 +443,7 @@ impl App {
         self.serve_agents(ctx);
         self.poll_attachments();
         self.poll_explorer(ctx);
+        self.poll_changes(ctx);
         self.poll_saves(ctx);
         self.poll_search(ctx);
         if self.diagnostics.enabled() {
@@ -517,11 +523,16 @@ impl App {
                 let (unread, latest) = self
                     .notifications
                     .attention(|pane| w.panes().iter().any(|p| p.id() == pane));
+                let cwd = w.pane(w.active()).map_or(w.cwd(), |pane| pane.cwd());
                 WorkspaceView {
                     id: w.id(),
                     group: w.group(),
                     name: w.name().into(),
-                    cwd: w.pane(w.active()).map_or(w.cwd(), |pane| pane.cwd()).into(),
+                    cwd: cwd.into(),
+                    branch: self
+                        .changes
+                        .branch(std::path::Path::new(cwd))
+                        .filter(|_| w.remote().is_none()),
                     remote: w.remote().map(|remote| remote.destination().to_owned()),
                     // Terminals without a tab are counted where they are listed.
                     panes: w.layout().panes().len(),
@@ -907,6 +918,12 @@ impl eframe::App for App {
             self.rest_explorer(&ctx);
         }
         let agents_shown = panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Agents;
+        // Git is asked about what is in view: the sidebar's rows and the tab.
+        self.sync_changes(
+            &ctx,
+            edge > 0.0,
+            panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Changes,
+        );
         let chrome = ui::chrome::ChromeView {
             workspaces: &views,
             groups: self.controller.model().groups(),
@@ -1037,8 +1054,15 @@ impl eframe::App for App {
                 panel_reveal,
                 bounds,
             );
+            let selected = self.ui.changes.selected.clone();
+            let changes = self.changes.view(
+                (self.ui.changes.scope, selected.as_deref()),
+                panel_reveal,
+                bounds,
+            );
             let view = ui::panel::View {
                 files: &files,
+                changes: &changes,
                 agents: &ui::agents::View {
                     rows: &rows,
                     window: bounds,
@@ -1054,7 +1078,10 @@ impl eframe::App for App {
                 p,
                 &view,
                 &mut self.ui.panel,
-                &mut self.ui.explorer,
+                ui::panel::Contents {
+                    files: &mut self.ui.explorer,
+                    changes: &mut self.ui.changes,
+                },
                 &mut actions,
             );
         }
