@@ -456,7 +456,10 @@ mod tests {
         // Asked for again, the worktree gets another agent in a tab of its
         // own, whether the same CLI or the other one, and nothing is made twice.
         app.action(&ctx, Action::Worktree(Event::New(opened)));
-        assert_eq!(app.ui.worktree.agent, AgentKind::Codex);
+        // The sheet offers the CLI the terminal runs, where one can be run.
+        if cfg!(unix) {
+            assert_eq!(app.ui.worktree.agent, AgentKind::Codex);
+        }
         settle(
             &mut app,
             &ctx,
