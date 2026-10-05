@@ -89,8 +89,8 @@ their preparation records remain in Git history.
 
 ### Acceptance notes and known limitations
 
-- This candidate is a private draft for acceptance testing. Full native acceptance
-  on every platform remains pending; it is not a production-stable release.
+- Full native acceptance on every platform remains pending; this is a release
+  candidate, not a production-stable release.
 - In-place updates are verified on Linux only by replacing and restarting a
   test AppImage; the macOS bundle replacement has not yet run on a Mac.
 - Saved workspaces now use schema version 11, which records which terminal's
@@ -124,8 +124,8 @@ their preparation records remain in Git history.
 - Kitty graphics and comprehensive complex-script shaping remain unsupported.
   Keypad identity and some keyboard-layout information depend on the window
   toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
-- Private drafts are excluded from website downloads and automatic updates.
-  Automatic updates never downgrade; install this candidate manually for testing.
+- This release candidate is available through the Beta channel. Automatic
+  updates never downgrade; select Beta in Preferences → Updates to receive previews.
 
 ### Fixes
 
@@ -172,8 +172,8 @@ their preparation records remain in Git history.
 
 ### Acceptance notes and known limitations
 
-- This candidate is a private draft for acceptance testing. Full native acceptance
-  on every platform remains pending; it is not a production-stable release.
+- Full native acceptance on every platform remains pending; this is a release
+  candidate, not a production-stable release.
 - Saved workspaces now use schema version 8. Older workspace files still load,
   but RC1 and RC2 cannot save over layouts written by RC3. Back up workspace state
   before testing if you need to return to an earlier candidate.
@@ -194,8 +194,8 @@ their preparation records remain in Git history.
 - Kitty graphics and comprehensive complex-script shaping remain unsupported.
   Keypad identity and some keyboard-layout information depend on the window
   toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
-- Private drafts are excluded from website downloads and automatic updates.
-  Automatic updates never downgrade; install this candidate manually for testing.
+- This release candidate is available through the Beta channel. Automatic
+  updates never downgrade; select Beta in Preferences → Updates to receive previews.
 
 ## [0.1.0-rc.2] - 2026-10-03
 
@@ -217,8 +217,8 @@ their preparation records remain in Git history.
 
 ### Acceptance notes and known limitations
 
-- This candidate is a private draft for acceptance testing. Full native acceptance
-  on every platform remains pending; it is not a production-stable release.
+- Full native acceptance on every platform remains pending; this is a release
+  candidate, not a production-stable release.
 - Saved workspaces now use schema version 7. Older workspace files still load,
   but RC1 cannot save over layouts written by RC2. Back up workspace state before
   testing if you need to return to RC1.
@@ -238,8 +238,8 @@ their preparation records remain in Git history.
 - Kitty graphics and comprehensive complex-script shaping remain unsupported.
   Keypad identity and some keyboard-layout information depend on the window
   toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
-- Private drafts are excluded from website downloads and automatic updates.
-  Automatic updates never downgrade; install this candidate manually for testing.
+- This release candidate is available through the Beta channel. Automatic
+  updates never downgrade; select Beta in Preferences → Updates to receive previews.
 
 ## [0.1.0-rc.1] - 2026-10-02
 

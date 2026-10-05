@@ -1,0 +1,92 @@
+name: Correct public release notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public candidate whose private-draft wording is being corrected
+        required: true
+        default: v0.1.0-rc.4
+        type: choice
+        options:
+          - v0.1.0-rc.4
+          - v0.1.0-rc.3
+          - v0.1.0-rc.2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-refs/tags/${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify existing installers and prepare notes-only correction
+    if: github.repository == 'zevem/neptune' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Require CI to have passed for this exact main commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" --jq '.workflow_runs | any(.head_branch == "main" and .status == "completed" and .conclusion == "success")' | jq -e '. == true'
+      - name: Verify original signatures, checksums and all eight release attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python3 scripts/correct_release_notes.py prepare "$RELEASE_TAG" correction
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: notes-correction-${{ inputs.tag }}
+          path: correction
+          if-no-files-found: error
+          retention-days: 14
+
+  correct:
+    name: Approve, sign, attest and replace only release notes metadata
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Owner approval is required for this one-time immutability exception.
+    # The environment currently allows only v* tags: its reviewer gate stays
+    # enabled; main access must be explicitly authorized before this can run.
+    environment: desktop-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: notes-correction-${{ inputs.tag }}
+          path: correction
+      - name: Sign corrected manifest and regenerate checksums without rebuilding installers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: python3 scripts/correct_release_notes.py seal correction
+      - name: Attest the three corrected metadata assets under this maintenance workflow
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: correction/after/*
+      - name: Replace only metadata, verify downloads and preserve every installer identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/correct_release_notes.py publish correction
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: notes-correction-result-${{ inputs.tag }}
+          path: correction
+          if-no-files-found: error
+          retention-days: 14
