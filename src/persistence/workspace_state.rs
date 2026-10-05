@@ -1002,7 +1002,7 @@ mod tests {
         assert_eq!(panes[0].agent(), Some(&reference));
         assert_eq!(
             StateSnapshot::from_model(&model).workspaces[0].panes[0].attachments,
-            [attached.clone()]
+            std::slice::from_ref(&attached)
         );
         assert_eq!(
             StateSnapshot::from_model(&model).workspaces[0].panes[0].pull_requests,
