@@ -11,7 +11,7 @@ impl App {
         let Some(id) = self.controller.model().active_pane() else {
             return;
         };
-        if !matches!(context, RoutingContext::TerminalPane(_)) {
+        if self.hints.is_some() || !matches!(context, RoutingContext::TerminalPane(_)) {
             return;
         }
         if self
@@ -231,6 +231,9 @@ impl App {
         ctx: &egui::Context,
         mut unshifted_key: impl FnMut(egui::Key) -> Option<egui::Key>,
     ) {
+        if self.hint_input(ctx) {
+            return;
+        }
         let mut actions = Vec::new();
         for event in ctx.input(|i| i.events.clone()) {
             let egui::Event::Key {
@@ -338,6 +341,54 @@ impl App {
                         }
                     });
                 });
+                continue;
+            }
+            let hint_chord = key == egui::Key::H
+                && m.shift
+                && !m.alt
+                && if cfg!(target_os = "macos") {
+                    m.mac_cmd && !m.ctrl
+                } else {
+                    m.ctrl && !m.mac_cmd
+                };
+            if hint_chord {
+                let owns = self.ui.overlay == OverlayState::None
+                    && !egui::Popup::is_any_open(ctx)
+                    && ctx.memory(|memory| {
+                        memory.focused().is_none() || memory.focused() == self.terminal_focus
+                    });
+                if owns {
+                    if pressed && let Some(pane) = self.controller.model().active_pane() {
+                        actions.push(Action::CopyHints(pane));
+                        if !self.hint_keys.contains(&key) {
+                            self.hint_keys.push(key);
+                        }
+                    }
+                    ctx.input_mut(|input| {
+                        let mut text_for_key = false;
+                        input.events.retain(|event| match event {
+                            egui::Event::Key {
+                                key: value,
+                                modifiers,
+                                pressed,
+                                ..
+                            } => {
+                                let matched = *value == key && *modifiers == m;
+                                text_for_key = matched && *pressed;
+                                !matched
+                            }
+                            egui::Event::Text(text) => {
+                                let keep = !(text_for_key && text.eq_ignore_ascii_case("h"));
+                                text_for_key = false;
+                                keep
+                            }
+                            _ => {
+                                text_for_key = false;
+                                true
+                            }
+                        });
+                    });
+                }
                 continue;
             }
             if !pressed {

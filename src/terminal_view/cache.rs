@@ -33,6 +33,7 @@ pub struct Cache {
     pub(super) pressed_link: Option<super::links::Link>,
     /// The current primary gesture belongs to a link, including its release frame.
     pub link_pointer_owned: bool,
+    pub(super) hints: Option<super::hints::Hints>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -133,6 +134,7 @@ impl Cache {
         self.colors = None;
         self.key = None;
         self.revision = u64::MAX;
+        self.hints = None;
         self.pressed_link = None;
         self.link_pointer_owned = false;
     }
@@ -143,7 +145,11 @@ impl Cache {
     pub fn estimated_bytes(&self) -> usize {
         let storage = std::mem::size_of::<Self>()
             + self.rows.capacity() * std::mem::size_of::<CachedRow>()
-            + self.sources.capacity() * std::mem::size_of::<Arc<[terminal_core::Cell]>>();
+            + self.sources.capacity() * std::mem::size_of::<Arc<[terminal_core::Cell]>>()
+            + self
+                .hints
+                .as_ref()
+                .map_or(0, super::hints::Hints::estimated_bytes);
         storage + self.rows.iter().map(|row| {
             row.text.capacity()
                 + row.text_columns.capacity() * std::mem::size_of::<(usize, usize)>()
@@ -201,6 +207,7 @@ impl Cache {
             return None;
         }
         if self.key.is_none_or(|previous| !previous.same_layout(key)) {
+            self.hints = None;
             self.rows.clear();
             self.sources.clear();
             self.revision = u64::MAX;
@@ -217,6 +224,9 @@ impl Cache {
         config: &Config,
         p: Palette,
     ) {
+        if self.hints.is_some() {
+            return;
+        }
         let font = crate::platform::fonts::terminal_font(config.font_size, false);
         self.columns = snapshot.columns as u16;
         self.lines = snapshot.screen_lines as u16;

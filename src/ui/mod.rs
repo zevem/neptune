@@ -164,6 +164,7 @@ pub enum Action {
     Changes(changes::Event),
     Worktree(worktrees::Event),
     Find,
+    CopyHints(PaneId),
     SearchChanged,
     FindNext {
         reverse: bool,
@@ -200,6 +201,7 @@ pub enum Action {
     Resize(PaneId, crate::terminal_view::geometry::ResizeRequest),
     Selection(PaneId, crate::terminal_view::SelectionInteraction),
     OpenLink(crate::platform::links::WebLink),
+    OpenTerminalLink(PaneId, crate::terminal_view::LinkTarget),
     ScrollBottom(PaneId),
     OpenNotification(PaneId, u64),
     /// Reveal the terminal an agent runs in, if it is still that terminal.

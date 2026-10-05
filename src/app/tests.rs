@@ -50,6 +50,10 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         _font_shortcut_monitor: Default::default(),
         diagnostics: diagnostics::Diagnostics::new(false),
         link_opener: Default::default(),
+        editor_opener: Default::default(),
+        hints: None,
+        hint_keys: Vec::new(),
+        file_location: None,
         notifications: Default::default(),
         agents: Default::default(),
         delegation: Default::default(),
@@ -3538,4 +3542,226 @@ fn capture_explorer_native() {
         }),
     )
     .unwrap();
+}
+
+/// Real GPU/native captures of the hint overlay, file-location preview and
+/// Preferences picker, in isolated storage. Input injection here proves app
+/// routing; actual OS key/pointer/clipboard integration is checked separately.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "Native visual QA; needs a desktop and NEPTUNE_HINT_CAPTURE"]
+fn capture_file_locations_native() {
+    use winit::platform::x11::EventLoopBuilderExtX11;
+    let output = PathBuf::from(
+        std::env::var("NEPTUNE_HINT_CAPTURE").expect("Set a task-owned capture path"),
+    );
+    let screen = std::env::var("NEPTUNE_HINT_SCREEN").unwrap_or_else(|_| "hints".into());
+    let narrow = std::env::var_os("NEPTUNE_HINT_NARROW").is_some();
+    let split = std::env::var_os("NEPTUNE_HINT_SPLIT").is_some();
+    let data = tempfile::tempdir().unwrap();
+    let data_path = data.path().to_path_buf();
+    let project = data_path.join("project");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(
+        project.join("src/foo.rs"),
+        (1..=100)
+            .map(|i| {
+                if i == 42 {
+                    "fn main() { println!(\"Hello, Neptune\"); }\n".into()
+                } else {
+                    format!("// source line {i}\n")
+                }
+            })
+            .collect::<String>(),
+    )
+    .unwrap();
+    std::fs::write(
+        data_path.join("config.toml"),
+        "shell = \"/bin/sh\"\ncheck_updates = false\n",
+    )
+    .unwrap();
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(if narrow {
+                [640.0, 400.0]
+            } else {
+                [1000.0, 640.0]
+            })
+            .with_decorations(false),
+        event_loop_builder: Some(Box::new(|builder| {
+            builder.with_any_thread(true);
+        })),
+        ..Default::default()
+    };
+    struct Capture {
+        app: App,
+        output: Option<PathBuf>,
+        screen: String,
+        applied: bool,
+        ready_at: Option<Instant>,
+        click: u8,
+        split: bool,
+        split_created: bool,
+    }
+    impl eframe::App for Capture {
+        fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+            eframe::App::logic(&mut self.app, ctx, frame);
+        }
+        fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+            let before = self.app.hints.map(|(pane, _)| {
+                let cache = &self.app.renders[&pane].cache;
+                (pane, cache.hinting(), cache.columns, cache.lines)
+            });
+            eframe::App::ui(&mut self.app, ui, frame);
+            if let Some((pane, hinting, columns, lines)) = before
+                && (!self.app.renders[&pane].cache.hinting() || self.app.hints.is_none())
+            {
+                println!(
+                    "Hints ended: cached {hinting}, grid {columns}x{lines} -> {}x{}, focused {}, active {:?}",
+                    self.app.renders[&pane].cache.columns,
+                    self.app.renders[&pane].cache.lines,
+                    ui.input(|i| i.focused),
+                    self.app.hints
+                );
+            }
+            if self.applied && self.screen == "hints" && self.app.capture_sent {
+                assert!(self.app.hints.is_some(), "Hints closed before capture");
+            }
+            if self.applied && self.screen == "explorer" && self.app.capture_sent {
+                assert_eq!(self.app.ui.explorer.preview_location, Some((42, 4)));
+                println!(
+                    "Explorer target {:?}; pending scroll {}; panel open {}",
+                    self.app.ui.explorer.preview_location,
+                    self.app.ui.explorer.preview_jump,
+                    self.app.ui.panel.open
+                );
+            }
+            if !self.applied
+                && self
+                    .app
+                    .controller
+                    .model()
+                    .active_pane()
+                    .and_then(|pane| self.app.sessions.get(pane))
+                    .is_some_and(|session| {
+                        session.viewport().rows.iter().any(|row| {
+                            row.iter().map(|cell| cell.c).collect::<String>().trim()
+                                == "hint-fixture-ready"
+                        })
+                    })
+            {
+                // A startup output event can precede the viewport's final
+                // resize. Start hints after the native layout has settled.
+                let ready_at = self.ready_at.get_or_insert_with(Instant::now);
+                if ready_at.elapsed() < Duration::from_millis(500) {
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                    return;
+                }
+                let pane = self.app.controller.model().active_pane().unwrap();
+                if self.split && !self.split_created {
+                    self.app
+                        .action(ui.ctx(), Action::Split(pane, neptune_model::Axis::Vertical));
+                    self.app.action(ui.ctx(), Action::Focus(pane));
+                    self.split_created = true;
+                    self.ready_at = None;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                if self.screen.starts_with("preferences") {
+                    self.app.action(ui.ctx(), Action::Settings);
+                    if self.screen != "preferences-general" {
+                        self.app.ui.preference_view =
+                            ui::preferences::View::searching("file locations");
+                    }
+                } else if self.screen == "palette" {
+                    self.app.action(ui.ctx(), Action::Palette);
+                    self.app.ui.palette_query = "hints".into();
+                } else if self.screen == "explorer" {
+                    self.app.action(
+                        ui.ctx(),
+                        Action::OpenTerminalLink(
+                            pane,
+                            crate::terminal_view::LinkTarget::File(
+                                crate::platform::editor::FileLocation::parse("src/foo.rs:42:4")
+                                    .unwrap(),
+                            ),
+                        ),
+                    );
+                } else if self.screen != "link" {
+                    self.app.action(ui.ctx(), Action::CopyHints(pane));
+                }
+                self.app.screenshot = self.output.take();
+                self.app.started = Instant::now();
+                self.applied = true;
+                ui.ctx().request_repaint();
+            }
+        }
+        fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+            eframe::App::raw_input_hook(&mut self.app, ctx, input);
+            // Desktop focus is shared. These visual fixtures own their input;
+            // preserve screenshot replies, then add only this fixture's events.
+            input
+                .events
+                .retain(|event| matches!(event, egui::Event::Screenshot { .. }));
+            input.focused = true;
+            if self.screen == "link"
+                && self.applied
+                && let Some(pane) = self.app.controller.model().active_pane()
+                && let Some(body) = self
+                    .app
+                    .terminal_focus
+                    .and_then(|id| ctx.read_response(id))
+                    .map(|r| r.rect)
+                && let Some(session) = self.app.sessions.get(pane)
+                && let Some(render) = self.app.renders.get(&pane)
+            {
+                let snapshot = session.viewport();
+                for (y, row) in snapshot.rows.iter().enumerate() {
+                    let text: String = row.iter().map(|cell| cell.c).collect();
+                    if let Some(x) = text.find("src/foo.rs:42:4") {
+                        input
+                            .events
+                            .push(egui::Event::ModifiersChanged(egui::Modifiers::CTRL));
+                        input.events.push(egui::Event::PointerMoved(
+                            body.min
+                                + egui::vec2(
+                                    (x as f32 + 4.5) * render.cache.cell.x,
+                                    (y as f32 + 0.5) * render.cache.cell.y,
+                                ),
+                        ));
+                        break;
+                    }
+                }
+            }
+            if self.screen == "preferences-menu"
+                && self.applied
+                && self.click < 3
+                && self.app.started.elapsed() > Duration::from_millis(800)
+                && let Some(response) = ctx.read_response(egui::Id::new("preferences-file-editor"))
+            {
+                let pos = response.rect.center();
+                self.click += 1;
+                input.events.push(if self.click == 1 {
+                    egui::Event::PointerMoved(pos)
+                } else {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: self.click == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    }
+                });
+            }
+        }
+        fn on_exit(&mut self) {
+            eframe::App::on_exit(&mut self.app);
+        }
+    }
+    eframe::run_native("Neptune file locations visual QA", options, Box::new(move |cc| {
+        let mut app = App::new(cc, Launch { cwd: Some(project), data_root: Some(data_path), command: Some(" clear; printf '\\n  error: expected expression\\n    --> src/foo.rs:42:4\\n\\n  Updated Cargo.toml and /tmp/build.log\\n  commit bd61a05e7a52c118d9e77d869a5d9ecb266ada55\\n  https://example.com/build/42\\n\\n  hint-fixture-ready\\n'".into()), screenshot: Some(output), ..Default::default() }, window_state::LoadReport::default());
+        app.file_drag = crate::platform::file_drag::FileDragSource::detached();
+        let output = app.screenshot.take();
+        Ok(Box::new(Capture { app, output, screen, applied: false, ready_at: None, click: 0, split, split_created: false }))
+    })).unwrap();
 }

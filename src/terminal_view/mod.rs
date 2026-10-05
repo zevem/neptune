@@ -2,9 +2,11 @@
 
 mod cache;
 pub mod geometry;
+mod hints;
 mod links;
 mod paint;
 
 pub use cache::Cache;
-pub use links::ImagePath;
+pub use hints::HintInput;
+pub use links::{ImagePath, LinkTarget};
 pub use paint::{PaintResult, SelectionInteraction};

@@ -111,6 +111,17 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             command(
                 "Terminal",
                 Icon::Copy,
+                "Copy with hints",
+                if cfg!(target_os = "macos") {
+                    "⌘⇧H".into()
+                } else {
+                    shortcut("H")
+                },
+                [Action::CopyHints(pane)],
+            ),
+            command(
+                "Terminal",
+                Icon::Copy,
                 "Copy selection",
                 shortcut("C"),
                 [Action::Copy(pane)],

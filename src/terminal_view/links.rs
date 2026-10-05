@@ -1,7 +1,10 @@
 //! Link hit testing uses only the visible, owned cells and terminal columns.
 
 use super::Cache;
-use crate::platform::links::{MAX_URL_BYTES, WebLink};
+use crate::platform::{
+    editor::FileLocation,
+    links::{MAX_URL_BYTES, WebLink},
+};
 use eframe::egui::{self, Rect};
 use terminal_core::{Cell, Flags, Point};
 
@@ -10,6 +13,9 @@ const MAX_PATH_CELLS: usize = 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_IMAGE_PATHS: usize = 8;
 const IMAGE_EXTENSIONS: [&str; 6] = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"];
+
+/// Text, its UTF-8-byte/terminal-cell positions, and its final visible cell.
+pub(super) type Token = (String, Vec<(usize, usize)>, usize);
 
 /// Text under the pointer that may name a picture. Whether it does is for
 /// the reader of the file to say; the grid only knows how it is spelled.
@@ -21,8 +27,24 @@ pub struct ImagePath {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkTarget {
+    Web(WebLink),
+    File(FileLocation),
+}
+
+impl LinkTarget {
+    #[cfg(test)]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Web(url) => url.as_str(),
+            Self::File(file) => &file.path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Link {
-    pub url: WebLink,
+    pub target: LinkTarget,
     /// Inclusive linear cell indices in the visible viewport.
     pub start: usize,
     pub end: usize,
@@ -34,9 +56,15 @@ impl Cache {
         ui: &egui::Ui,
         response: &egui::Response,
         rect: Rect,
-    ) -> (Option<Link>, Option<WebLink>) {
+    ) -> (Option<Link>, Option<LinkTarget>) {
+        if self.hints.is_some() {
+            self.pressed_link = None;
+            self.link_pointer_owned = true;
+            return (None, None);
+        }
         self.link_pointer_owned = self.pressed_link.is_some();
-        let hit = |cache: &Self, pos: egui::Pos2| cache.link_at(cache.grid_point(rect, pos)?);
+        let hit =
+            |cache: &Self, pos: egui::Pos2| cache.link_at_inner(cache.grid_point(rect, pos)?, true);
         let mut open = None;
         let contains_pointer = response.contains_pointer();
         let clicked = response.clicked_by(egui::PointerButton::Primary);
@@ -60,7 +88,7 @@ impl Cache {
                         && link_modifier(*modifiers)
                         && hit(self, *pos).as_ref() == Some(&pressed)
                     {
-                        open = Some(pressed.url);
+                        open = Some(pressed.target);
                     }
                 }
             }
@@ -71,7 +99,7 @@ impl Cache {
         let hovered =
             if response.contains_pointer() && ui.input(|input| link_modifier(input.modifiers)) {
                 ui.input(|input| input.pointer.hover_pos())
-                    .and_then(|pos| hit(self, pos))
+                    .and_then(|pos| self.link_at(self.grid_point(rect, pos)?))
             } else {
                 None
             };
@@ -262,7 +290,10 @@ impl Cache {
     }
 
     pub(super) fn link_at(&self, point: Point) -> Option<Link> {
-        let columns = usize::from(self.columns);
+        self.link_at_inner(point, false)
+    }
+
+    fn link_at_inner(&self, point: Point, allow_bare: bool) -> Option<Link> {
         let index = self.cell_index(point)?;
         let cell = self.source_cell(index)?;
         if cell
@@ -272,11 +303,17 @@ impl Cache {
             return None;
         }
         if let Some(target) = &cell.hyperlink {
-            let url = WebLink::new(target)?;
+            let target = WebLink::new(target).map(LinkTarget::Web).or_else(|| {
+                target
+                    .get(..7)
+                    .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
+                    .and_then(|_| FileLocation::parse(target))
+                    .map(LinkTarget::File)
+            })?;
+            let spelling = cell.hyperlink.as_deref();
             let same_link = |index| {
                 self.source_cell(index).is_some_and(|cell| {
-                    !cell.flags.contains(Flags::HIDDEN)
-                        && cell.hyperlink.as_deref() == Some(target.as_ref())
+                    !cell.flags.contains(Flags::HIDDEN) && cell.hyperlink.as_deref() == spelling
                 })
             };
             let mut start = index;
@@ -287,11 +324,77 @@ impl Cache {
             while end - start < MAX_URL_BYTES && same_link(end + 1) {
                 end += 1;
             }
-            return Some(Link { url, start, end });
+            return Some(Link { target, start, end });
         }
 
-        // Inspect just the token under the pointer, crossing soft wraps but
-        // never hard line breaks. Work and temporary storage are bounded.
+        let quoted = self.quoted_token_at(index);
+        let is_quoted = quoted.is_some();
+        let (text, positions, _) = quoted.or_else(|| self.token_at(index))?;
+        let byte = positions.iter().find(|(_, cell)| *cell == index)?.0;
+        for (offset, _) in text.char_indices() {
+            let candidate = &text[offset..];
+            if !candidate
+                .get(..7)
+                .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+                && !candidate
+                    .get(..8)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+            {
+                continue;
+            }
+            if text[..offset]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+            {
+                continue;
+            }
+            let candidate = trim_url(candidate);
+            let limit = offset + candidate.len();
+            if byte < offset || byte >= limit {
+                continue;
+            }
+            let url = WebLink::new(candidate)?;
+            let start = positions.iter().find(|(byte, _)| *byte == offset)?.1;
+            let end = positions.iter().rev().find(|(byte, _)| *byte < limit)?.1;
+            let end = end + usize::from(self.source_cell(end)?.flags.contains(Flags::WIDE_CHAR));
+            return Some(Link {
+                target: LinkTarget::Web(url),
+                start,
+                end,
+            });
+        }
+        // Strip prose punctuation and balanced enclosing delimiters. Quoted
+        // spellings may contain spaces; token_at retains those quotes.
+        let (offset, candidate) = if is_quoted {
+            (0, text.as_str())
+        } else {
+            plain_candidate(&text)
+        };
+        let file = FileLocation::parse(candidate)
+            .or_else(|| allow_bare.then(|| FileLocation::path(candidate)).flatten())?;
+        if byte < offset || byte >= offset + candidate.len() {
+            return None;
+        }
+        let start = positions.iter().find(|(byte, _)| *byte == offset)?.1;
+        let end = positions
+            .iter()
+            .rev()
+            .find(|(byte, _)| *byte < offset + candidate.len())?
+            .1;
+        Some(Link {
+            target: LinkTarget::File(file),
+            start,
+            end: end + usize::from(self.source_cell(end)?.flags.contains(Flags::WIDE_CHAR)),
+        })
+    }
+
+    pub(super) fn token_at(&self, index: usize) -> Option<Token> {
+        let columns = usize::from(self.columns);
+        let cell = self.source_cell(index)?;
+        if matches!(cell.c, '"' | '\'' | '`') {
+            return self.quoted_token_at(index);
+        }
         if delimiter(cell) {
             return None;
         }
@@ -326,6 +429,23 @@ impl Cache {
         {
             return None;
         }
+        // A hard break in the middle of nonblank text is not a complete path
+        // boundary. In particular, never turn the suffix of a clipped URL or
+        // filename into a new relative file link.
+        if start.is_multiple_of(columns)
+            && start > 0
+            && !self.connected(start - 1, start)
+            && self
+                .source_cell(start - 1)
+                .is_some_and(|cell| !delimiter(cell))
+            || (end + 1).is_multiple_of(columns)
+                && !self.connected(end, end + 1)
+                && self
+                    .source_cell(end + 1)
+                    .is_some_and(|cell| !delimiter(cell))
+        {
+            return None;
+        }
         let mut text = String::new();
         let mut positions = Vec::new();
         for index in start..=end {
@@ -343,40 +463,66 @@ impl Cache {
                 return None;
             }
         }
-        let byte = positions.iter().find(|(_, cell)| *cell == index)?.0;
-        for (offset, _) in text.char_indices() {
-            let candidate = &text[offset..];
-            if !candidate
-                .get(..7)
-                .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
-                && !candidate
-                    .get(..8)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
-            {
-                continue;
+        Some((text, positions, end))
+    }
+
+    /// Quoted file spellings can contain spaces. Read at most one bounded
+    /// logical line, then pair quotes so prose before/after a quote stays out.
+    fn quoted_token_at(&self, index: usize) -> Option<Token> {
+        let mut start = index;
+        while start > 0 && index - start < MAX_PATH_CELLS && self.connected(start - 1, start) {
+            start -= 1;
+        }
+        let mut at = start;
+        let limit = start + MAX_PATH_CELLS * 2;
+        while at < limit {
+            let cell = self.source_cell(at)?;
+            if cell.flags.contains(Flags::HIDDEN) {
+                return None;
             }
-            if text[..offset]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
-            {
-                continue;
+            if matches!(cell.c, '"' | '\'' | '`') {
+                let quote = cell.c;
+                let opening = at;
+                at += 1;
+                let mut text = String::new();
+                let mut positions = Vec::new();
+                while at < limit && self.connected(at - 1, at) {
+                    let cell = self.source_cell(at)?;
+                    if cell.flags.contains(Flags::HIDDEN) {
+                        return None;
+                    }
+                    if cell.c == quote {
+                        if (opening..=at).contains(&index) && FileLocation::path(&text).is_some() {
+                            return Some((text, positions, at));
+                        }
+                        break;
+                    }
+                    if !cell
+                        .flags
+                        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                    {
+                        positions.push((text.len(), at));
+                        text.push(cell.c);
+                        text.extend(&cell.extra);
+                        if text.len() > MAX_PATH_BYTES {
+                            break;
+                        }
+                    }
+                    at += 1;
+                }
             }
-            let candidate = trim_url(candidate);
-            let limit = offset + candidate.len();
-            if byte < offset || byte >= limit {
-                continue;
+            if at >= index && self.source_cell(at).is_none() {
+                return None;
             }
-            let url = WebLink::new(candidate)?;
-            let start = positions.iter().find(|(byte, _)| *byte == offset)?.1;
-            let end = positions.iter().rev().find(|(byte, _)| *byte < limit)?.1;
-            let end = end + usize::from(self.source_cell(end)?.flags.contains(Flags::WIDE_CHAR));
-            return Some(Link { url, start, end });
+            if !self.connected(at, at + 1) {
+                return None;
+            }
+            at += 1;
         }
         None
     }
 
-    fn source_cell(&self, index: usize) -> Option<&Cell> {
+    pub(super) fn source_cell(&self, index: usize) -> Option<&Cell> {
         let columns = usize::from(self.columns);
         if columns == 0 {
             return None;
@@ -384,7 +530,7 @@ impl Cache {
         self.sources.get(index / columns)?.get(index % columns)
     }
 
-    fn connected(&self, left: usize, right: usize) -> bool {
+    pub(super) fn connected(&self, left: usize, right: usize) -> bool {
         let columns = usize::from(self.columns);
         columns > 0
             && (!right.is_multiple_of(columns)
@@ -398,7 +544,7 @@ fn link_modifier(modifiers: egui::Modifiers) -> bool {
     (modifiers.ctrl || modifiers.mac_cmd) && !modifiers.shift && !modifiers.alt
 }
 
-fn delimiter(cell: &Cell) -> bool {
+pub(super) fn delimiter(cell: &Cell) -> bool {
     if cell
         .flags
         .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -460,7 +606,7 @@ fn image_end(text: &str, at: usize) -> Option<usize> {
         .min()
 }
 
-fn trim_url(mut url: &str) -> &str {
+pub(super) fn trim_url(mut url: &str) -> &str {
     let mut unmatched = [0_i32; 3];
     for c in url.chars() {
         match c {
@@ -528,7 +674,7 @@ mod tests {
     fn plain_links_keep_queries_and_balanced_parentheses_and_exclude_prose() {
         let cache = cache("See (https://example.com/a_(b)?x=1&y=2#part). next", 80);
         assert_eq!(
-            cache.link_at(Point::new(0, 12)).unwrap().url.as_str(),
+            cache.link_at(Point::new(0, 12)).unwrap().target.as_str(),
             "https://example.com/a_(b)?x=1&y=2#part"
         );
         for column in [0, 4, 43, 44, 45, 48] {
@@ -547,7 +693,7 @@ mod tests {
         }
         cache.display_offset = 9;
         let link = cache.link_at(Point::new(-8, 5)).unwrap();
-        assert_eq!(link.url.as_str(), "https://example.com/wrapped/path");
+        assert_eq!(link.target.as_str(), "https://example.com/wrapped/path");
         assert_eq!((link.start, link.end), (0, 31));
         Arc::make_mut(&mut cache.sources[0])[15]
             .flags
@@ -563,7 +709,7 @@ mod tests {
         row[21].flags.insert(Flags::WIDE_CHAR_SPACER);
         row[22].extra.push('\u{301}');
         let link = cache.link_at(Point::new(0, 21)).unwrap();
-        assert_eq!(link.url.as_str(), "https://example.com/界e\u{301}");
+        assert_eq!(link.target.as_str(), "https://example.com/界e\u{301}");
         assert_eq!(link.end, 22);
         assert!(cache.link_at(Point::new(0, 23)).is_none());
     }
@@ -576,11 +722,22 @@ mod tests {
             cell.hyperlink = Some(Arc::from("https://target.example/"));
         }
         assert_eq!(
-            cache.link_at(Point::new(0, 9)).unwrap().url.as_str(),
+            cache.link_at(Point::new(0, 9)).unwrap().target.as_str(),
             "https://target.example/"
         );
         Arc::make_mut(&mut cache.sources[0])[9].hyperlink = Some(Arc::from("file:///tmp/file"));
-        assert!(cache.link_at(Point::new(0, 9)).is_none());
+        assert_eq!(
+            cache.link_at(Point::new(0, 9)).unwrap().target.as_str(),
+            "/tmp/file"
+        );
+        for target in [
+            "javascript:alert(1)",
+            "mailto:someone@example.com",
+            "file:///tmp/%xx",
+        ] {
+            Arc::make_mut(&mut cache.sources[0])[9].hyperlink = Some(Arc::from(target));
+            assert!(cache.link_at(Point::new(0, 9)).is_none(), "{target}");
+        }
         Arc::make_mut(&mut cache.sources[0])[10]
             .flags
             .insert(Flags::HIDDEN);
@@ -776,6 +933,42 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_click_opens_bare_filenames_in_agent_output() {
+        let mut gesture = Gesture::new();
+        gesture.cache = cache("  └ Read AGENTS.md", 80);
+        gesture.cache.cell = egui::vec2(8.0, 20.0);
+        let modifiers = egui::Modifiers::CTRL;
+        let pos = egui::pos2(94.0, 20.0);
+        let (_, cursor) = gesture.frame(vec![egui::Event::PointerMoved(pos)], modifiers);
+        assert_eq!(cursor, egui::CursorIcon::PointingHand);
+        gesture.frame(vec![Gesture::button(pos, true, modifiers)], modifiers);
+        let (release, _) = gesture.frame(vec![Gesture::button(pos, false, modifiers)], modifiers);
+        assert_eq!(
+            release.open_link,
+            Some(LinkTarget::File(FileLocation {
+                path: "AGENTS.md".into(),
+                line: 1,
+                column: 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn extensionless_clicks_are_checked_without_turning_prose_into_hover_links() {
+        let mut gesture = Gesture::new();
+        gesture.cache = cache("  └ Read launch-helper", 80);
+        gesture.cache.cell = egui::vec2(8.0, 20.0);
+        let modifiers = egui::Modifiers::CTRL;
+        let pos = egui::pos2(94.0, 20.0);
+        let (_, cursor) = gesture.frame(vec![egui::Event::PointerMoved(pos)], modifiers);
+        assert_eq!(cursor, egui::CursorIcon::Text);
+        gesture.frame(vec![Gesture::button(pos, true, modifiers)], modifiers);
+        let (release, _) = gesture.frame(vec![Gesture::button(pos, false, modifiers)], modifiers);
+        assert_eq!(release.open_link.unwrap().as_str(), "launch-helper");
+        assert!(release.interaction.is_none());
+    }
+
+    #[test]
     fn ordinary_clicks_and_shift_selection_do_not_open_links() {
         for modifiers in [
             egui::Modifiers::NONE,
@@ -824,5 +1017,179 @@ mod tests {
             .flags
             .insert(Flags::WRAPLINE);
         assert!(cache.link_at(Point::new(0, 5)).is_none());
+    }
+}
+
+/// The token without compiler trailing colons and prose wrappers.
+pub(super) fn plain_candidate(text: &str) -> (usize, &str) {
+    let text = text.trim_end_matches(['.', ',', ';', ':', '!']);
+    let start = text.len() - text.trim_start_matches(['(', '[', '{', '"', '\'']).len();
+    let candidate = text[start..].trim_end_matches([')', ']', '}', '"', '\'']);
+    (start, candidate)
+}
+
+#[cfg(test)]
+mod file_location_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn cache(text: &str, columns: usize) -> Cache {
+        let mut cache = Cache::default();
+        cache.columns = columns as u16;
+        cache.sources = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(columns)
+            .map(|chars| {
+                let mut row: Vec<_> = chars
+                    .iter()
+                    .enumerate()
+                    .map(|(column, c)| Cell {
+                        column,
+                        c: *c,
+                        ..Default::default()
+                    })
+                    .collect();
+                row.resize_with(columns, Cell::default);
+                Arc::from(row)
+            })
+            .collect();
+        cache.lines = cache.sources.len() as u16;
+        cache
+    }
+
+    #[test]
+    fn plain_paths_have_no_extension_allowlist_and_keep_their_hit_boundaries() {
+        for path in [
+            "AGENTS.md",
+            "Cargo.toml",
+            ".env",
+            "README",
+            "LICENSE",
+            "Makefile",
+            "Dockerfile",
+            "foo.any-new-extension",
+            "foo.c++",
+            "file.未知",
+            "src/file",
+            "./script",
+            "../other/file.txt",
+            "~/config",
+            "/tmp/file",
+            "C:\\src\\file",
+            "文件.md",
+        ] {
+            let text = format!("Read ({path}), done");
+            let cache = cache(&text, 160);
+            for column in 6..6 + path.chars().count() {
+                let link = cache.link_at(Point::new(0, column)).expect(path);
+                assert_eq!(
+                    link.target,
+                    LinkTarget::File(FileLocation::path(path).unwrap()),
+                    "{path}"
+                );
+                assert_eq!(
+                    (link.start, link.end),
+                    (6, 5 + path.chars().count()),
+                    "{path}"
+                );
+            }
+            for column in [0, 5, 6 + path.chars().count(), 7 + path.chars().count()] {
+                assert!(
+                    cache.link_at(Point::new(0, column)).is_none(),
+                    "{path}, col {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_locations_exclude_diagnostic_punctuation_and_keep_terminal_columns() {
+        let cache = cache("--> (src/foo.rs:42:7): next", 60);
+        assert_eq!(
+            cache.link_at(Point::new(0, 10)).unwrap().target,
+            LinkTarget::File(FileLocation {
+                path: "src/foo.rs".into(),
+                line: 42,
+                column: 7
+            })
+        );
+        for col in [0, 4, 20, 21, 22, 23] {
+            assert!(cache.link_at(Point::new(0, col)).is_none(), "col {col}");
+        }
+    }
+
+    #[test]
+    fn quoted_locations_with_spaces_and_unicode_stay_whole() {
+        let cache = cache("at \"/tmp/My Sources/é.rs:42:3\" done", 80);
+        for col in [5, 9, 15, 24] {
+            assert_eq!(
+                cache.link_at(Point::new(0, col)).unwrap().target,
+                LinkTarget::File(FileLocation {
+                    path: "/tmp/My Sources/é.rs".into(),
+                    line: 42,
+                    column: 3
+                })
+            );
+        }
+        assert!(cache.link_at(Point::new(0, 31)).is_none());
+    }
+
+    #[test]
+    fn quoted_plain_paths_preserve_spaces_and_literal_punctuation() {
+        for path in [
+            "/tmp/My Sources/é.rs",
+            "notes.md,",
+            "file.md.",
+            "[literal].txt",
+        ] {
+            let text = format!("at \"{path}\" done");
+            let cache = cache(&text, 100);
+            for column in 4..4 + path.chars().count() {
+                assert_eq!(
+                    cache.link_at(Point::new(0, column)).unwrap().target,
+                    LinkTarget::File(FileLocation::path(path).unwrap()),
+                    "{path}, col {column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_file_links_cross_soft_wraps_and_include_wide_character_spacers() {
+        let mut cache = cache("src/a_long_file.rs", 12);
+        Arc::make_mut(&mut cache.sources[0])[11]
+            .flags
+            .insert(Flags::WRAPLINE);
+        cache.display_offset = 6;
+        let link = cache.link_at(Point::new(-5, 1)).unwrap();
+        assert_eq!(link.target.as_str(), "src/a_long_file.rs");
+        assert_eq!((link.start, link.end), (0, 17));
+
+        let mut cache = self::cache("src/界 ", 20);
+        let row = Arc::make_mut(&mut cache.sources[0]);
+        row[4].flags.insert(Flags::WIDE_CHAR);
+        row[5].flags.insert(Flags::WIDE_CHAR_SPACER);
+        let link = cache.link_at(Point::new(0, 5)).unwrap();
+        assert_eq!(link.target.as_str(), "src/界");
+        assert_eq!((link.start, link.end), (0, 5));
+    }
+
+    #[test]
+    fn file_locations_cross_soft_wraps_and_never_hard_lines() {
+        let mut cache = cache("src/a_long_file.rs:42:9", 12);
+        assert!(cache.link_at(Point::new(0, 7)).is_none());
+        Arc::make_mut(&mut cache.sources[0])[11]
+            .flags
+            .insert(Flags::WRAPLINE);
+        cache.display_offset = 6;
+        assert_eq!(
+            cache.link_at(Point::new(-5, 7)).unwrap().target,
+            LinkTarget::File(FileLocation {
+                path: "src/a_long_file.rs".into(),
+                line: 42,
+                column: 9
+            })
+        );
     }
 }

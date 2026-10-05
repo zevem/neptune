@@ -96,3 +96,24 @@ in the [user guide](usage.md#updates).
 ## Website
 
 The landing page and downloads for [neptune.rs](https://neptune.rs) live in [`website/`](../website/README.md): a Vercel-hosted Next.js site with server-cached GitHub release discovery. Its window demo follows the app's theme and layout code. It is separate from the Cargo workspace and uses Bun.
+
+## File-location and hint captures
+
+File locations, keyboard hints and the installed-editor setting use a fresh
+native window and task-owned storage for each capture:
+
+```sh
+NEPTUNE_HINT_CAPTURE="$PWD/artifacts/native-hints.png" \
+  cargo test -p neptune-terminal --lib app::tests::capture_file_locations_native --locked -- --ignored --nocapture
+```
+
+`NEPTUNE_HINT_SCREEN=explorer` opens the printed location at line 42;
+`preferences` shows the searchable setting, `preferences-general` shows General,
+and `preferences-menu` opens the installed-editor menu. `palette` shows the
+keyboard entry point. `NEPTUNE_HINT_NARROW=1` uses a
+640×400 window and `NEPTUNE_HINT_SPLIT=1` adds a second pane.
+`NEPTUNE_HINT_SCREEN=link` reviews the modifier-hover underline. Each launch
+exits after capture and removes its temporary data root. These captures use real
+PTY output and GPU rendering with application events; OS modifier-click,
+keyboard entry, the terminal context menu and clipboard ownership need a
+separate native input check.

@@ -18,7 +18,7 @@ pub enum SelectionInteraction {
 pub struct PaintResult {
     pub response: egui::Response,
     pub interaction: Option<SelectionInteraction>,
-    pub open_link: Option<crate::platform::links::WebLink>,
+    pub open_link: Option<super::LinkTarget>,
     /// Readings of a picture path the pointer rests on, likeliest first.
     pub image_paths: Vec<super::ImagePath>,
 }
@@ -41,7 +41,11 @@ impl Cache {
             egui::Sense::click_and_drag(),
         );
         let (hovered_link, open_link) = self.link_interaction(ui, &response, rect);
-        let image_paths = self.image_path_hover(ui, &response, rect);
+        let image_paths = if self.hints.is_none() {
+            self.image_path_hover(ui, &response, rect)
+        } else {
+            Vec::new()
+        };
         response.clone().on_hover_cursor(if hovered_link.is_some() {
             egui::CursorIcon::PointingHand
         } else {
@@ -254,6 +258,7 @@ impl Cache {
                 );
             }
         }
+        self.paint_hints(ui, rect, p);
         let interaction = response.interact_pointer_pos().and_then(|pos| {
             if self.link_pointer_owned {
                 return None;

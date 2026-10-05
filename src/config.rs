@@ -18,6 +18,9 @@ pub struct Config {
     pub line_height: f32,
     pub scrollback: usize,
     pub shell: Option<String>,
+    /// Editor executable and arguments, with {file}, {line} and {column}.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub editor: Vec<String>,
     /// Arguments for `shell`, such as `-d Ubuntu` for `wsl.exe`. Omitted when
     /// empty, so settings without arguments still load in older versions.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -132,6 +135,7 @@ impl Default for Config {
             line_height: 1.4,
             scrollback: 10_000,
             shell: None,
+            editor: Vec::new(),
             shell_args: Vec::new(),
             cursor: Cursor::Block,
             cursor_blink: false,
@@ -222,6 +226,7 @@ impl Config {
             self.sidebar_width.is_finite() && (170.0..=360.0).contains(&self.sidebar_width),
             "sidebar_width must be between 170 and 360"
         );
+        crate::platform::editor::validate_command(&self.editor)?;
         if let Some(shell) = &self.shell {
             anyhow::ensure!(!shell.trim().is_empty(), "shell cannot be empty");
         }
@@ -999,5 +1004,36 @@ font_size = 15.0
         assert_eq!(bytes.len(), LENGTH);
         assert!(bytes.iter().all(|byte| *byte == bytes[0]));
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    #[test]
+    fn editor_settings_default_to_explorer_and_validate_and_round_trip_custom_commands() {
+        let legacy: Config = toml::from_str("font_size = 14.0").unwrap();
+        assert!(legacy.editor.is_empty());
+        let mut config = Config {
+            editor: vec![
+                "cursor".into(),
+                "--goto".into(),
+                "{file}:{line}:{column}".into(),
+            ],
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        for args in [
+            vec!["".into(), "{file}".into()],
+            vec!["code".into(), "--goto".into()],
+            vec!["code".into(), "{file}\n".into()],
+        ] {
+            config.editor = args;
+            assert!(config.validate().is_err());
+        }
     }
 }

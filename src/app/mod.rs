@@ -9,6 +9,7 @@ mod diagnostics;
 mod directory;
 mod explorer;
 mod git;
+mod hints;
 mod image_preview;
 mod input;
 mod panel;
@@ -107,6 +108,10 @@ pub struct App {
     _font_shortcut_monitor: crate::platform::keyboard::FontShortcutMonitor,
     diagnostics: diagnostics::Diagnostics,
     link_opener: crate::platform::links::LinkOpener,
+    editor_opener: crate::platform::files::FileOpener,
+    hints: Option<(PaneId, u64)>,
+    hint_keys: Vec<egui::Key>,
+    file_location: Option<hints::PendingLocation>,
     notifications: crate::notifications::Notifications,
     /// What each running CLI agent is doing, for the agents tab.
     agents: crate::agent_activity::AgentActivities,
@@ -235,6 +240,10 @@ impl App {
             overlay_was_open: false,
             diagnostics: diagnostics::Diagnostics::new(launch.diagnostics),
             link_opener: Default::default(),
+            editor_opener: Default::default(),
+            hints: None,
+            hint_keys: Vec::new(),
+            file_location: None,
             notifications: Default::default(),
             agents: Default::default(),
             delegation: Default::default(),
@@ -275,6 +284,10 @@ impl App {
                 && self.ui.overlay != OverlayState::Update,
         ) {
             self.restart_updated(ctx);
+        }
+        self.poll_file_location(ctx);
+        if let Some(Err(error)) = self.editor_opener.poll() {
+            self.ui.error = Some(error.into());
         }
         if let Some(Err(error)) = self.link_opener.poll() {
             self.ui.error = Some(error.into());

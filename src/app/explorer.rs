@@ -870,7 +870,7 @@ impl Explorer {
 
     /// Shows `path` in the preview. A file already shown keeps its content
     /// until the new reading arrives.
-    fn show_preview(&mut self, ctx: &egui::Context, path: PathBuf, reset: bool) {
+    pub(super) fn show_preview(&mut self, ctx: &egui::Context, path: PathBuf, reset: bool) {
         if self.previews.is_none() {
             let (sender, requests) = mpsc::channel();
             let replies = self.replies.0.clone();
@@ -1473,6 +1473,8 @@ impl App {
                 self.explorer.dirty = true;
             }
             Event::Select(path) => {
+                self.ui.explorer.preview_location = None;
+                self.ui.explorer.preview_jump = false;
                 self.ui.explorer.selected = Some((path.clone(), false));
                 self.ui.explorer.scroll_to = None;
                 self.explorer.show_preview(ctx, path, false);
