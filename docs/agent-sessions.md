@@ -70,10 +70,11 @@ saved reference is kept.
 `--no-restore` and `restore_workspaces = false` retain their existing meaning.
 Neptune restores new processes, not unfinished tool execution or process memory.
 Only provider, session ID, directory, the addresses of
-[linked pull requests](#linked-pull-requests), the terminal whose agent
+[linked pull requests](#linked-pull-requests), the paths and titles of
+[attached files](#attached-files), the terminal whose agent
 [started an agent](#agents-that-start-agents) and the
-[worktree made for an agent](#agents-in-worktrees) are saved in workspace schema 10,
-which reads versions 1–9; version 10 also widens the CLIs a reference can
+[worktree made for an agent](#agents-in-worktrees) are saved in workspace schema 11,
+which reads versions 1–10; version 10 widened the CLIs a reference can
 name. Invalid references receive the same recovery-copy protection
 as other damaged workspace state. Prompts, transcripts, arbitrary commands,
 credentials and permission-bypass flags are not saved or replayed. Transcripts
@@ -93,7 +94,7 @@ host for this change.
 
 ## Linked pull requests
 
-An agent started through the adapters is also given one Neptune tool,
+An agent started through the adapters is also given Neptune's tools. One is
 `link_pull_request`, with a pull request's address
 (`https://host/owner/repo/pull/N`). Its instructions ask the agent to call it
 after it creates a pull request and when it starts work on an existing one,
@@ -160,8 +161,55 @@ restarted or closed, or the workspace changes SSH hosts. Only an address that
 names a pull request over HTTPS is accepted; it is saved without credentials,
 query or fragment, and nothing else about the pull request is stored.
 
+## Attached files
+
+A path in a terminal does not show you a picture. An agent started through the
+adapters is therefore given a second tool, `attach_file`, with a file's `path`
+and an optional `title` of a few words. Its instructions ask the agent to call
+it for each screenshot, image, recording, report or other file it makes for
+you to look at, and whenever you ask it to attach or show one. The path may be
+absolute, relative to the agent's directory or begin with `~/`; the file must
+exist, and a folder is refused.
+
+The terminal's tab then shows a paperclip and the number of attached files,
+before a merged worktree's mark, the count of started agents and the pull
+request numbers; a terminal
+alone in view has no tab, so the toolbar shows it. Click it for the list,
+newest first. Each row has the file's title, or its name, above the folder it
+is in, and a small copy of the picture when the file is one (PNG, JPEG, GIF,
+WebP or BMP, decided by its contents). A row does this:
+
+| Click | What happens |
+| --- | --- |
+| A picture's row | The picture at full size over the window. The wheel and the plus and minus keys zoom, 0 fits it again, the arrow keys and the controls at the window's sides step through the terminal's other attached pictures, and a click or Escape closes it. The folder control in its caption shows the file in the file manager. |
+| Another file's row | The file opens with its default application. |
+| The folder control | The file manager opens with the file selected. |
+| The cross (**Dismiss**) | The file leaves the list. The file itself is not touched. |
+
+**Dismiss all** under the rows empties the list. The list stays open
+while you dismiss files and closes when you open one.
+
+A terminal keeps its 24 most recent files. Attaching the same path again moves
+it to the top with its new title and reads its picture afresh, so an agent can
+replace a screenshot it has retaken. A file that was moved or deleted since
+stays on the list, marked "No longer there", until you remove it.
+
+Attached files belong to the agent's run in that terminal, like linked pull
+requests: they return with the agent when workspaces are restored, and leave
+when the agent exits, the terminal is restarted or closed, or the workspace
+changes SSH hosts. Only the path and the title are kept and saved; Neptune
+does not copy the file, so it shows what is at the path when you open it.
+Pictures are read on a worker within fixed limits (64 MB a file, 16,384 pixels
+a side), one at a time, for the workspace in view. Paths, titles and pictures
+are not logged or sent to diagnostics.
+
+As with pull requests, this depends on the agent following its instructions:
+a screenshot it only names in its answer is not attached. Ask it to attach the
+file. Only Claude Code and Codex in local terminals are given the tool; an
+agent of another kind, or one on an SSH host, has none.
+
 Claude Code receives Neptune's tools as an invocation-scoped server through
-`--mcp-config`, and permission for the ones that read, link or answer through
+`--mcp-config`, and permission for the ones that read, link, attach or answer through
 `--settings`; its other servers and permissions are unchanged. Codex receives it through
 `-c mcp_servers.neptune…` overrides, on versions that expose `--no-daemon`, and
 may ask before the first call according to its approval settings. The server is
@@ -335,7 +383,7 @@ to disk or diagnostics. A terminal you have in view is not read: its question
 is reported without its text.
 
 Permissions. Neptune allows Claude Code `wait_for_agent`, `list_agents`,
-`reply_to_parent` and `link_pull_request` for the launch. Starting or
+`reply_to_parent`, `link_pull_request` and `attach_file` for the launch. Starting or
 reopening an agent, typing for one, pressing keys for one and closing one
 hand work to another CLI or stop it, so `spawn_agent`, `reopen_agent`,
 `send_agent_message`, `press_agent_keys` and `close_agent` are decided by
@@ -546,7 +594,9 @@ callback credential, and each CLI invocation has its own identity. Closed or
 replaced panes and late hooks from exited invocations cannot overwrite a newer
 session. A linked pull request is accepted only from the invocation that is open
 in its pane, and reaches the model as a generation-tagged
-`PanePullRequestLinked` command. The state of a linked pull request stays out
+`PanePullRequestLinked` command; an attached file takes the same path as a
+`PaneFileAttached` command, and the tool server checks that the file exists
+before it sends the path. The state of a linked pull request stays out
 of the model: `runtime/pull_requests.rs` owns one worker that runs `gh api
 graphql` off the frame and wakes the application when a state changed. Pending updates coalesce per pane; hooks wake the application on change,
 so idle integrations do not poll or repaint. Socket reads have byte and total-time
@@ -660,6 +710,15 @@ keeps it; and the worktree returns with its agent after a close and reopen.
 `cargo test -p neptune-terminal --lib worktree --locked` runs the git
 operations (merge, squash, removal) and the application flow against
 temporary repositories.
+
+`python3 scripts/verify-agent-attachments.py` covers attached files the same
+way: fixtures attach files through each provider's tool server by absolute
+and relative path, a folder and a missing file are refused, the toolbar and
+each tab count their own terminal's files, the list reveals a file and opens
+another through stand-in launchers, a picture opens at full size and steps to
+its neighbour by key and by control, files are removed one at a time and all
+at once, and the lists return after a close and reopen and leave with their
+agent.
 
 `python3 scripts/verify-agent-restore.py` runs deterministic CLI fixtures in an
 isolated native app, with fresh storage and a unique inspection endpoint. It
@@ -791,3 +850,14 @@ signed in; Gemini CLI's working and action-required titles and Oh My Pi's
 working and asking titles are read from their sources), a real SSH
 connection to another machine, `tmux` on a host, other login shells than
 Bash and Zsh, the desktop banner of an alert, macOS and Windows.
+
+Attached files were checked on 2026-10-05 in the Linux development build with
+`inspection` (Wayland session, XWayland window). The deterministic native
+regression passed, with captures of the toolbar count, the list alone and in
+a split, the full view and its neighbour reviewed at 1100×700, and the list
+and the full view at 640×440. Focused model, persistence, runtime, widget and
+application tests, Clippy for the model and the desktop library and the
+architecture boundary check passed. Not exercised: the installed Claude Code
+and Codex calling `attach_file` from its instructions alone, a real file
+manager and default application (the regression records what would be
+launched), macOS, Windows and native Wayland.

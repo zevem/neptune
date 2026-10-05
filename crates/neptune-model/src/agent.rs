@@ -158,6 +158,62 @@ impl PullRequest {
     }
 }
 
+/// A file an agent attached to its terminal for the user to look at: a
+/// screenshot, a report, a recording. Only where the file is and what the
+/// agent called it; never its contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    path: PathBuf,
+    title: Option<String>,
+}
+impl Attachment {
+    /// A terminal keeps its most recent attachments.
+    pub const MAX_PER_PANE: usize = 24;
+    /// Characters of a title; a longer one is cut here.
+    pub const MAX_TITLE: usize = 120;
+    const MAX_PATH: usize = 4096;
+
+    /// Accepts an absolute path of ordinary length. A title is kept as one
+    /// line without control characters, and left out when nothing remains.
+    pub fn new(path: PathBuf, title: Option<&str>) -> Option<Self> {
+        let text = path.as_os_str();
+        if !path.is_absolute()
+            || text.len() > Self::MAX_PATH
+            || text.as_encoded_bytes().contains(&0)
+            || path.file_name().is_none()
+        {
+            return None;
+        }
+        let title = title
+            .map(|title| {
+                title
+                    .split(|c: char| c.is_whitespace() || c.is_control())
+                    .filter(|word| !word.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(Self::MAX_TITLE)
+                    .collect::<String>()
+            })
+            .filter(|title| !title.is_empty());
+        Some(Self { path, title })
+    }
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+    /// What the agent called the file, if it said.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    /// The file's own name.
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +291,118 @@ mod tests {
         ] {
             assert_eq!(PullRequest::parse(url), None, "{url}");
         }
+    }
+    #[test]
+    fn attachments_are_absolute_paths_with_one_line_titles() {
+        let root = std::env::temp_dir();
+        let file = root.join("shots").join("after.png");
+        let kept = Attachment::new(file.clone(), Some("  After:\n the\tnew \u{7}dialog ")).unwrap();
+        assert_eq!(kept.path(), file);
+        assert_eq!(kept.name(), "after.png");
+        assert_eq!(kept.title(), Some("After: the new dialog"));
+        assert_eq!(
+            Attachment::new(file.clone(), Some(" \n ")).unwrap().title(),
+            None
+        );
+        let long = Attachment::new(file.clone(), Some(&"é".repeat(500))).unwrap();
+        assert_eq!(long.title().unwrap().chars().count(), Attachment::MAX_TITLE);
+        assert_eq!(Attachment::new("shots/after.png".into(), None), None);
+        assert_eq!(Attachment::new(root.join("x".repeat(5000)), None), None);
+        assert_eq!(Attachment::new(root.join("a\0b"), None), None);
+    }
+    #[test]
+    fn attachments_follow_the_agent_are_bounded_and_can_be_removed() {
+        let root = std::env::temp_dir();
+        let mut controller = Controller::new(Model::default());
+        controller
+            .dispatch(Command::AddWorkspace {
+                cwd: root.clone(),
+                name: "a".into(),
+                remote: None,
+                group: None,
+            })
+            .unwrap();
+        let pane = controller.model().active_pane().unwrap();
+        let generation = controller.model().pane(pane).unwrap().generation();
+        let file = |name: &str| root.join(name);
+        let attach = |controller: &mut Controller, generation, name: &str, title: Option<&str>| {
+            controller
+                .dispatch(Command::PaneFileAttached {
+                    pane,
+                    generation,
+                    attachment: Attachment::new(file(name), title).unwrap(),
+                })
+                .unwrap();
+        };
+        let names = |controller: &Controller| -> Vec<String> {
+            controller
+                .model()
+                .pane(pane)
+                .unwrap()
+                .attachments()
+                .iter()
+                .map(Attachment::name)
+                .collect()
+        };
+        // Without an agent there is nobody to attach anything.
+        attach(&mut controller, generation, "a.png", None);
+        assert!(names(&controller).is_empty());
+        controller
+            .dispatch(Command::PaneAgentChanged {
+                pane,
+                generation,
+                agent: Some(agent()),
+            })
+            .unwrap();
+        attach(&mut controller, generation + 1, "a.png", None);
+        assert!(names(&controller).is_empty());
+        attach(&mut controller, generation, "a.png", None);
+        attach(&mut controller, generation, "b.txt", None);
+        // The same file again is the newest, under its new title.
+        attach(&mut controller, generation, "a.png", Some("After"));
+        assert_eq!(names(&controller), ["b.txt", "a.png"]);
+        let pane_ref = controller.model().pane(pane).unwrap();
+        assert_eq!(pane_ref.attachments()[1].title(), Some("After"));
+        assert!(controller.is_dirty());
+        // The user removes one, then all of them.
+        controller
+            .dispatch(Command::RemoveAttachment {
+                pane,
+                path: file("b.txt"),
+            })
+            .unwrap();
+        assert_eq!(names(&controller), ["a.png"]);
+        for number in 0..Attachment::MAX_PER_PANE + 3 {
+            attach(&mut controller, generation, &format!("{number}.png"), None);
+        }
+        let kept = names(&controller);
+        assert_eq!(kept.len(), Attachment::MAX_PER_PANE);
+        assert_eq!(kept[0], "3.png");
+        let restored = Model::restore(
+            controller.model().specs(),
+            Some(WorkspaceId::new(1)),
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.pane(pane).unwrap().attachments().len(),
+            Attachment::MAX_PER_PANE
+        );
+        controller
+            .dispatch(Command::ClearAttachments { pane })
+            .unwrap();
+        assert!(names(&controller).is_empty());
+        // They leave with the agent, like its other links.
+        attach(&mut controller, generation, "a.png", None);
+        controller
+            .dispatch(Command::PaneAgentChanged {
+                pane,
+                generation,
+                agent: None,
+            })
+            .unwrap();
+        assert!(names(&controller).is_empty());
     }
     #[test]
     fn linked_pull_requests_follow_the_agent_and_are_bounded_and_durable() {
@@ -553,6 +721,7 @@ mod tests {
             remote_cwd: None,
             agent: None,
             pull_requests: Vec::new(),
+            attachments: Vec::new(),
             spawned_by: None,
             worktree: None,
         });

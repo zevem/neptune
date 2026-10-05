@@ -56,6 +56,8 @@ struct View {
     texture: egui::TextureHandle,
     request: Option<u64>,
     zoom: ui::image_preview::Zoom,
+    /// The terminal whose attached pictures this is one of.
+    gallery: Option<PaneId>,
 }
 
 struct Read {
@@ -263,9 +265,54 @@ impl App {
                 texture: shown.texture,
                 request: None,
                 zoom: Default::default(),
+                gallery: None,
             });
             self.ui.overlay = OverlayState::Image;
         }
+    }
+
+    /// Shows a picture a terminal's agent attached at full size, starting
+    /// from the small copy its list holds.
+    pub(super) fn view_attached(&mut self, pane: PaneId, picture: attached::Picture) {
+        self.image_preview.hover = None;
+        self.image_preview.card = None;
+        self.image_preview.view = Some(View {
+            path: picture.path,
+            name: picture.label,
+            pixels: picture.pixels,
+            texture: picture.texture,
+            request: None,
+            zoom: Default::default(),
+            gallery: Some(pane),
+        });
+        self.ui.overlay = OverlayState::Image;
+    }
+
+    /// Leaves the attached picture in view for one `by` places along its
+    /// terminal's list, round its ends.
+    pub(super) fn step_attached(&mut self, by: isize) {
+        let Some((pane, path)) = self
+            .image_preview
+            .view
+            .as_ref()
+            .and_then(|view| Some((view.gallery?, view.path.clone())))
+        else {
+            return;
+        };
+        let mut pictures = self.attached_pictures(pane);
+        let Some(index) = pictures.iter().position(|picture| picture.path == path) else {
+            return;
+        };
+        let next = (index as isize + by).rem_euclid(pictures.len() as isize) as usize;
+        if next != index {
+            self.view_attached(pane, pictures.swap_remove(next));
+        }
+    }
+
+    /// The file of the picture shown at full size.
+    #[cfg(test)]
+    pub(super) fn viewed_image(&self) -> Option<&Path> {
+        self.image_preview.view.as_ref().map(|view| &*view.path)
     }
 
     /// The clicked picture over the dimmed window, read again in more
@@ -299,16 +346,36 @@ impl App {
                 view.request = request;
             }
         }
-        let Some(view) = &mut preview.view else {
+        // Where an attached picture stands among its terminal's others.
+        let position = self
+            .image_preview
+            .view
+            .as_ref()
+            .and_then(|view| Some((view.gallery?, &view.path)))
+            .and_then(|(pane, path)| {
+                let pictures = self.attached_pictures(pane);
+                let index = pictures.iter().position(|picture| &picture.path == path)?;
+                Some((index + 1, pictures.len()))
+            });
+        let Some(view) = &mut self.image_preview.view else {
             return;
         };
         let full = ui::image_preview::View {
             texture: &view.texture,
             name: &view.name,
             pixels: view.pixels,
+            position,
         };
-        if ui::image_preview::view(ui, p, bounds, full, &mut view.zoom) {
-            self.action(ctx, Action::CloseOverlay);
+        use ui::image_preview::Verdict;
+        match ui::image_preview::view(ui, p, bounds, full, &mut view.zoom) {
+            Verdict::Stay => {}
+            Verdict::Close => self.action(ctx, Action::CloseOverlay),
+            Verdict::Previous => self.step_attached(-1),
+            Verdict::Next => self.step_attached(1),
+            Verdict::Reveal => {
+                let path = view.path.clone();
+                self.action(ctx, Action::RevealAttachment(path));
+            }
         }
     }
 }

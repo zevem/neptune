@@ -3,11 +3,12 @@
 //! messages and replies an agent exchanges with the agents it started.
 use super::agents::{AgentReport, Answer, Event, MAX_TEXT, Status, label};
 use crate::agent_activity::Attention;
-use neptune_model::{AgentKind, PullRequest};
+use neptune_model::{AgentKind, Attachment, PullRequest};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     io::{BufRead, Read, Write},
+    path::PathBuf,
     sync::mpsc::{Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
@@ -26,6 +27,7 @@ const START_WAIT: Duration = Duration::from_secs(20);
 const MAX_PROMPT: usize = MAX_TEXT - 1024;
 
 const LINK: &str = "link_pull_request";
+const ATTACH: &str = "attach_file";
 const SPAWN: &str = "spawn_agent";
 const WAIT: &str = "wait_for_agent";
 const TELL: &str = "send_agent_message";
@@ -38,6 +40,9 @@ const PRESS: &str = "press_agent_keys";
 const INSTRUCTIONS: &str = "This terminal runs in Neptune, which shows the pull requests you link next to the terminal's tab. \
 Call link_pull_request with the pull request's URL right after you create a pull request, and when you start work on an existing one. \
 Link every pull request of a stack. Linking the same pull request again is safe.\n\n\
+Neptune also lists the files you attach on this terminal's tab, where the user opens them and looks at images at full size. \
+A path printed in a terminal does not show the user an image: call attach_file with the path of each screenshot, image, recording, report or other file you make for the user to look at, \
+and whenever the user asks you to attach, show or share a file. Give each a short title that says what it shows. Attaching the same file again is safe.\n\n\
 Neptune can also start another coding agent, Claude Code or Codex, in a terminal of its own, so that you can hand it part of the work. \
 Use it when the user asks for the other agent or for work to be split between agents. \
 spawn_agent starts one with a task, wait_for_agent returns what it answered, send_agent_message continues the conversation with it, \
@@ -65,13 +70,16 @@ pub(super) trait Pause {
 }
 
 fn tool_names() -> impl Iterator<Item = &'static str> {
-    [LINK, SPAWN, WAIT, TELL, LIST, CLOSE, REOPEN, PRESS, REPLY].into_iter()
+    [
+        LINK, ATTACH, SPAWN, WAIT, TELL, LIST, CLOSE, REOPEN, PRESS, REPLY,
+    ]
+    .into_iter()
 }
-/// The tools a launch allows without asking: those that read, link or
-/// answer. Starting an agent, typing for one and closing one hand work to
+/// The tools a launch allows without asking: those that read, link, attach
+/// or answer. Starting an agent, typing for one and closing one hand work to
 /// another CLI or stop it, so each agent's own permission rules decide them.
 pub(super) fn allowed_tools() -> impl Iterator<Item = &'static str> {
-    [LINK, WAIT, LIST, REPLY].into_iter()
+    [LINK, ATTACH, WAIT, LIST, REPLY].into_iter()
 }
 /// What a tool does, for a CLI that decides from it whether to ask first.
 fn hints(read_only: bool, destructive: bool, open_world: bool) -> Value {
@@ -100,6 +108,26 @@ fn tools(spawned: bool) -> Vec<Value> {
                     "description": "The pull request's address, such as https://github.com/owner/repo/pull/123",
                 }},
                 "required": ["url"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": ATTACH,
+            "annotations": hints(false, false, false),
+            "description": "Attach a file to this Neptune terminal tab for the user to look at: a screenshot or other image, a recording, a report, a log, a document. The tab lists the attached files, shows images at full size, opens a file with its application and shows it in the file manager. Attach what you made for the user to review, and what the user asks you to attach or show. Call it once for each file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "The file's path on this machine, absolute or relative to your working directory",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "A few words saying what the file shows, such as \"After: the settings dialog\"; the file's name is shown without one",
+                    },
+                },
+                "required": ["path"],
                 "additionalProperties": false,
             },
         }),
@@ -343,6 +371,31 @@ fn text<'a>(arguments: &'a Value, field: &str, limit: usize) -> Result<&'a str, 
     }
 }
 
+/// The file an agent names, which must be there to be looked at. A relative
+/// path is the agent's own, read from this process's directory, and `~` is
+/// the user's home.
+fn attachment(path: &str, title: Option<&str>) -> Result<Attachment, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("path names no file.".to_owned());
+    }
+    let home = path
+        .strip_prefix("~/")
+        .and_then(|rest| Some(directories::BaseDirs::new()?.home_dir().join(rest)));
+    let path = home.unwrap_or_else(|| PathBuf::from(path));
+    let path =
+        std::path::absolute(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    match std::fs::metadata(&path) {
+        Err(error) => Err(format!("{}: {error}", path.display())),
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "{} is a folder; attach the files in it one at a time.",
+            path.display()
+        )),
+        Ok(_) => Attachment::new(path.clone(), title)
+            .ok_or_else(|| format!("{} is not a path Neptune can keep.", path.display())),
+    }
+}
+
 /// Runs one tool. `None` when the call was cancelled while it waited.
 fn call(
     tool: &str,
@@ -375,6 +428,30 @@ fn call(
                 Some(_) => {
                     Err("Not linked: Neptune is not tracking an agent in this terminal.".to_owned())
                 }
+            }
+        }
+        ATTACH => {
+            let title = arguments.get("title").and_then(Value::as_str);
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match attachment(path, title) {
+                Err(reason) => Err(format!("Not attached: {reason}")),
+                Ok(file)
+                    if host.send(Event::Attachment {
+                        path: file.path().into(),
+                        title: file.title().map(str::to_owned),
+                    }) =>
+                {
+                    Ok(format!(
+                        "Attached {} to this terminal tab, where the user can open it.",
+                        file.name()
+                    ))
+                }
+                Ok(_) => Err(
+                    "Not attached: Neptune is not tracking an agent in this terminal.".to_owned(),
+                ),
             }
         }
         SPAWN => (|| {
@@ -864,6 +941,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         linked: Vec<String>,
+        attached: Vec<(PathBuf, Option<String>)>,
         asked: Vec<Event>,
         answers: VecDeque<Answer>,
         reported: Vec<String>,
@@ -874,6 +952,10 @@ mod tests {
                 Event::PullRequest { url } => {
                     self.linked.push(url);
                     self.linked.len() == 1
+                }
+                Event::Attachment { path, title } => {
+                    self.attached.push((path, title));
+                    true
                 }
                 Event::Report { text, done: false } => {
                     self.reported.push(text);
@@ -967,6 +1049,7 @@ mod tests {
         assert_eq!(answers[0]["result"]["protocolVersion"], "2024-11-05");
         let instructions = answers[0]["result"]["instructions"].as_str().unwrap();
         assert!(instructions.contains(LINK) && instructions.contains(SPAWN));
+        assert!(instructions.contains(ATTACH));
         assert!(!instructions.contains(REPLY));
         let names: Vec<_> = answers[1]["result"]["tools"]
             .as_array()
@@ -974,7 +1057,10 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, [LINK, SPAWN, WAIT, TELL, LIST, CLOSE, REOPEN, PRESS]);
+        assert_eq!(
+            names,
+            [LINK, ATTACH, SPAWN, WAIT, TELL, LIST, CLOSE, REOPEN, PRESS]
+        );
         assert_eq!(answers[2]["result"]["isError"], false);
         assert_eq!(
             answers[2]["result"]["content"][0]["text"],
@@ -994,6 +1080,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn files_are_attached_by_path_when_they_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let shot = directory.path().join("after shot.png");
+        std::fs::write(&shot, "picture").unwrap();
+        let mut host = Fake::default();
+        let attach = |host: &mut Fake, arguments| run(host, false, ATTACH, arguments);
+        let (text, error) = attach(
+            &mut host,
+            json!({"path": shot.to_str().unwrap(), "title": "After:\nthe dialog"}),
+        );
+        assert!(!error, "{text}");
+        assert!(text.contains("after shot.png"), "{text}");
+        // A folder, a missing file and no path at all are refused, with why.
+        for (path, reason) in [
+            (directory.path().to_str().unwrap(), "is a folder"),
+            (
+                directory.path().join("gone.png").to_str().unwrap(),
+                "gone.png",
+            ),
+            ("  ", "names no file"),
+        ] {
+            let (text, error) = attach(&mut host, json!({"path": path}));
+            assert!(error && text.starts_with("Not attached: "), "{text}");
+            assert!(text.contains(reason), "{text}");
+        }
+        assert_eq!(
+            host.attached,
+            [(shot, Some("After: the dialog".to_owned()))]
+        );
+        // A relative path is absolute by the time it leaves this process.
+        let relative = attachment("Cargo.toml", None).unwrap();
+        assert!(relative.path().is_absolute() && relative.title().is_none());
+    }
     #[test]
     fn an_agent_starts_another_waits_for_it_and_carries_on_the_conversation() {
         let directory = tempfile::tempdir().unwrap();

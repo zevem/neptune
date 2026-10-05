@@ -1,6 +1,7 @@
 //! Widgets consume presentation data and emit targeted actions. Only the controller
 //! may change durable workspace state; renderer caches remain desktop-owned.
 pub mod agents;
+pub mod attached;
 pub mod changes;
 pub mod chrome;
 pub mod controls;
@@ -200,6 +201,14 @@ pub enum Action {
     Resize(PaneId, crate::terminal_view::geometry::ResizeRequest),
     Selection(PaneId, crate::terminal_view::SelectionInteraction),
     OpenLink(crate::platform::links::WebLink),
+    /// Show an attached picture at full size, or open another kind of file
+    /// with its application.
+    OpenAttachment(PaneId, PathBuf),
+    /// Show an attached file in the file manager.
+    RevealAttachment(PathBuf),
+    /// Take one attached file, or all of them, off a terminal's list.
+    RemoveAttachment(PaneId, PathBuf),
+    ClearAttachments(PaneId),
     ScrollBottom(PaneId),
     OpenNotification(PaneId, u64),
     /// Reveal the terminal an agent runs in, if it is still that terminal.
