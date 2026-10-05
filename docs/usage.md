@@ -114,6 +114,15 @@ same at any time and says first what would be lost; a branch with unmerged
 commits is kept. The same sheet lists the repository's worktrees to reopen or
 remove. See [agents in worktrees](agent-sessions.md#agents-in-worktrees).
 
+An agent can also attach files for you to look at. Ask for it ("attach
+screenshots of what you changed") and the agent's tab shows a paperclip with
+a count. Click it for the list, newest first, each file with its picture where
+it is one. Click a picture to see it at full size, where the arrow keys or the
+controls at the sides step through the terminal's other pictures; click any
+other file to open it with its application. The folder control on a row shows
+the file in your file manager and the cross dismisses it from the list without touching the file. See
+[attached files](agent-sessions.md#attached-files).
+
 ## Notifications
 
 Processes can request attention through BEL, OSC 9, OSC 99 and OSC 777. BEL produces a generic **Terminal bell** alert. Pane rings, sidebar unread badges and the toolbar notification popover keep track of alerts, with optional native desktop banners. See [notifications and agent setup](notifications.md) for Claude Code, Codex, OpenCode, pi and shell examples.

@@ -20,6 +20,8 @@ pub struct PanePresentation {
     pub agent: Option<AgentKind>,
     /// Pull requests the agent linked to the terminal, oldest first.
     pub pull_requests: Vec<helpers::LinkedPullRequest>,
+    /// The files the agent attached to the terminal, oldest first.
+    pub attached: Vec<super::attached::File>,
     /// The agents this terminal's agent started, oldest first.
     pub spawned: Vec<super::agents::Spawned>,
     /// The git worktree made for the terminal's agent, which names its tab.
@@ -416,13 +418,29 @@ fn tab(
         (rect.left() + 72.0, spawned.left, rect.center().y),
         p,
     );
+    // And the files it attached before all of them.
+    let attached = super::attached::AttachedChip::layout(
+        ui,
+        ui.id().with(("tab-attached", id)),
+        (
+            id,
+            if closable {
+                &presentation.attached
+            } else {
+                &[]
+            },
+        ),
+        (rect.left() + 72.0, merged.left, rect.center().y),
+        p,
+    );
     let hovered = response.hovered()
         || close_response
             .as_ref()
             .is_some_and(|response| response.hovered())
         || chips.hovered()
         || spawned.hovered()
-        || merged.hovered();
+        || merged.hovered()
+        || attached.hovered();
 
     // A place with one terminal reads as a plain title, as it always has.
     let fill = if shown && !alone {
@@ -447,13 +465,14 @@ fn tab(
     } else {
         0.0
     };
-    let right = if !chips.is_empty() || !spawned.is_empty() || !merged.is_empty() {
-        merged.left - 5.0
-    } else if closable && close_alpha > 0.0 {
-        close.left() - 3.0
-    } else {
-        rect.right() - 7.0
-    };
+    let right =
+        if !chips.is_empty() || !spawned.is_empty() || !merged.is_empty() || !attached.is_empty() {
+            attached.left - 5.0
+        } else if closable && close_alpha > 0.0 {
+            close.left() - 3.0
+        } else {
+            rect.right() - 7.0
+        };
     // A worktree's tab is named by its branch, and says what runs there
     // where another tab names its folder.
     let branch = presentation.worktree.as_ref().map(|tab| &tab.branch);
@@ -500,6 +519,7 @@ fn tab(
     chips.paint(&painter, p, actions);
     spawned.paint(&painter, p, actions);
     merged.paint(&painter, p, actions);
+    attached.paint(&painter, p, actions);
     if let Some(close_response) = close_response {
         if close_alpha > 0.0 {
             if close_response.hovered() {
@@ -1461,6 +1481,7 @@ mod tests {
                             PanePresentation {
                                 agent: None,
                                 pull_requests: Vec::new(),
+                                attached: Vec::new(),
                                 spawned: Vec::new(),
                                 worktree: None,
                                 unread: 0,
@@ -1614,6 +1635,7 @@ mod tests {
         let presentation = PanePresentation {
             agent: None,
             pull_requests: Vec::new(),
+            attached: Vec::new(),
             spawned: Vec::new(),
             worktree: None,
             unread: 1,
@@ -1817,6 +1839,7 @@ mod tests {
                 let presentation = PanePresentation {
                     agent: None,
                     pull_requests: Vec::new(),
+                    attached: Vec::new(),
                     spawned: Vec::new(),
                     worktree: None,
                     unread: 0,
