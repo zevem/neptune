@@ -120,6 +120,20 @@ fn main() -> anyhow::Result<()> {
         .map_err(|_| {
             anyhow::anyhow!("Storage restoration worker stopped; saved data is preserved")
         })??;
+    // An update restarts into the same storage, not the one-time options.
+    for (option, path) in [
+        ("--config", &launch.config),
+        ("--data-root", &launch.data_root),
+    ] {
+        if let Some(path) = path {
+            launch.relaunch_arguments.push(option.into());
+            launch.relaunch_arguments.push(
+                std::path::absolute(path)
+                    .unwrap_or_else(|_| path.clone())
+                    .into(),
+            );
+        }
+    }
     launch.data_root = Some(data);
     if let Some(size) = launch.size {
         window.state.inner_size = size;

@@ -397,6 +397,17 @@ impl App {
                     self.updates.open(ctx);
                 }
             }
+            Action::InstallUpdate(version) => {
+                if self
+                    .updates
+                    .release
+                    .as_ref()
+                    .is_some_and(|release| release.version == version)
+                {
+                    self.updates.install(ctx);
+                }
+            }
+            Action::RestartUpdate => self.restart_updated(ctx),
             Action::CancelUpdate => self.updates.cancel(),
             Action::DismissUpdate => self.updates.dismiss(),
             Action::Create(cwd, name) => self.create_workspace(ctx, cwd, name, None, None),
@@ -515,7 +526,10 @@ impl App {
             }
             Action::ClosePane(pane) => self.request_close(ctx, Close::Pane(pane)),
             Action::CloseWorkspace(id) => self.request_close(ctx, Close::Workspace(id)),
-            Action::WindowClose => self.request_close(ctx, Close::App),
+            Action::WindowClose => {
+                self.relaunch = false;
+                self.request_close(ctx, Close::App)
+            }
             Action::New => {
                 if let Some(dirs) = directories::BaseDirs::new() {
                     self.action(ctx, Action::Create(dirs.home_dir().into(), None));

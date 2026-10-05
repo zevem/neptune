@@ -55,6 +55,8 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         delegation: Default::default(),
         desktop_notifier: Default::default(),
         updates: Default::default(),
+        relaunch: false,
+        relaunch_arguments: Vec::new(),
         attachments: attachments::Attachments::new(root.join("pasted-images")),
         image_preview: Default::default(),
         explorer: Default::default(),
@@ -2831,6 +2833,9 @@ fn capture_update_native() {
                 app.updates.release = Some(crate::runtime::updates::tests::visual_release());
                 app.updates.status = crate::runtime::updates::UpdateStatus::Available;
             }
+            if screen == "preferences-installed" {
+                crate::runtime::updates::tests::installed(&mut app.updates);
+            }
             if screen.starts_with("preferences") {
                 use ui::preferences::Pane;
                 if let Ok(query) = std::env::var("NEPTUNE_PREFERENCES_SEARCH") {
@@ -2848,14 +2853,23 @@ fn capture_update_native() {
                 }
                 app.updates.release = Some(release);
                 use crate::runtime::updates::UpdateStatus;
+                use crate::runtime::updates::tests::prepare;
+                match screen.as_str() {
+                    "ready" => prepare(&mut app.updates, false),
+                    "restart" | "installed" => prepare(&mut app.updates, true),
+                    _ => {}
+                }
                 app.updates.status = match screen.as_str() {
-                    "ready" => UpdateStatus::Ready,
+                    "ready" | "restart" => UpdateStatus::Ready,
+                    "installed" => UpdateStatus::Installed,
                     "error" => UpdateStatus::Error("Could not complete the update. Check your connection and try again. Unverified downloads are never opened.".into()),
                     _ => UpdateStatus::Available,
                 };
             }
             let overlay = match screen.as_str() {
-                "preferences" | "preferences-update" => OverlayState::Settings,
+                "preferences" | "preferences-update" | "preferences-installed" => {
+                    OverlayState::Settings
+                }
                 "notification" => OverlayState::None,
                 _ => OverlayState::Update,
             };

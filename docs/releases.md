@@ -335,8 +335,9 @@ unsigned output out of the final artifact set when that policy becomes mandatory
 
 ## Desktop update behavior
 
-The updater is a desktop-owned service in `src/runtime/updates.rs`, with explicit
-native handoff in `src/platform/updates.rs` and egui presentation in `src/ui/updates.rs`.
+The updater is a desktop-owned service in `src/runtime/updates.rs`, with in-place
+installation, relaunch and the manual native handoff in `src/platform/updates.rs`
+and egui presentation in `src/ui/updates.rs`.
 It adds no terminal/model/PTY dependency and has no custom update backend.
 
 Preferences → Updates has **Check automatically** (default on), **Release channel**
@@ -362,22 +363,52 @@ release notes and all five artifact names/sizes/hashes. Neptune verifies its
 Ed25519 signature with the embedded trust anchor **before showing an offer**,
 then checks exact SHA-256 and size after downloading, and checks again before
 handoff. Artifact URLs are derived only from that authenticated tag/name in the
-official repository, use HTTPS, bounded redirects and TLS validation. macOS
-handoffs mark the DMG quarantined as a download. GitHub attestations provide
+official repository, use HTTPS, bounded redirects and TLS validation. A DMG the
+user opens is marked quarantined as a download; one Neptune installs itself is
+not, as its bytes are already authenticated. GitHub attestations provide
 additional independently verifiable workflow provenance.
 
 A quiet notification offers **What's New / Later** without taking terminal focus.
 The native sheet shows version, authenticated notes, release link and install
-instructions. Download and open are separate intentional actions. Closing the
+instructions. Download and install are separate intentional actions. Closing the
 sheet, Escape or Later suppresses that version's notification for the session;
-manual review remains available. macOS opens the verified DMG, Windows launches
-the verified interactive installer, and Linux shows the verified AppImage/DEB in
-a file manager. DEB installations choose DEB; portable/source builds choose
-AppImage. Installation/relaunch is user-controlled; Neptune never silently
-replaces itself, closes PTYs or requests elevated installation.
+manual review remains available.
+
+A macOS app bundle and a Linux AppImage update in place: after the download is
+verified, **Restart to update** replaces the installation and restarts Neptune.
+No new artifact or manifest field is involved; the same signed DMG/AppImage is
+used.
+
+- **Linux AppImage:** the verified file is copied beside the running AppImage
+  (the path the AppImage runtime reported at launch), given its permissions and
+  renamed over it. The path, and any desktop integration that points at it, is
+  unchanged; a version in the file's name is not updated.
+- **macOS:** Neptune mounts the verified DMG without showing it, copies
+  `Neptune.app` into a hidden folder beside the installed bundle, requires
+  `codesign --verify --deep --strict` to pass, then swaps the two bundles and
+  removes the old one. A failed swap restores the installed bundle.
+
+The replacement happens while Neptune is still running, so a failure is reported
+in the sheet with the installation untouched. Neptune then quits through the
+usual close confirmation, including the running-process warning, and starts the
+new version with the same `--config`/`--data-root` once state is flushed and
+sessions are shut down. Workspaces return with fresh shells, as on any launch.
+Cancelling that confirmation keeps the old process running with the new version
+on disk; Preferences → Updates and the sheet offer **Restart to update**, and
+any later launch starts the new version. An installation cannot be cancelled
+midway, and the old process stops checking for updates once it has installed one.
+
+Where Neptune cannot write (a read-only volume, a translocated or unowned
+`/Applications` bundle, a root-owned AppImage), the sheet says so and falls back
+to the manual handoff: macOS opens the verified DMG, and Linux shows the verified
+file in a file manager. Windows always launches the verified interactive
+installer and DEB installations show the DEB; neither is replaced in place.
+Source builds outside an app bundle or AppImage choose the manual AppImage/DMG
+handoff. Neptune never replaces itself or closes PTYs without the user asking,
+and never requests elevated installation.
 Downloads live in a private temporary directory and are removed on failure,
-cancel or exit unless explicitly handed off; after handoff they are retained for
-the installer/file manager and normal OS/user cleanup.
+cancel, exit or successful in-place installation; after a manual handoff they
+are retained for the installer/file manager and normal OS/user cleanup.
 
 ## Website downloads
 

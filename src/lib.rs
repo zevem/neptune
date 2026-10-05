@@ -29,4 +29,6 @@ pub struct Launch {
     pub size: Option<[f32; 2]>,
     pub no_restore: bool,
     pub diagnostics: bool,
+    /// The storage options of this run, repeated when an update restarts it.
+    pub relaunch_arguments: Vec<std::ffi::OsString>,
 }

@@ -7,15 +7,23 @@
 //! `cargo`, and host programs would load Neptune's bundled libraries.
 use std::{
     ffi::{OsStr, OsString},
-    path::Path,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
-static APPIMAGE: OnceLock<bool> = OnceLock::new();
+static APPIMAGE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The AppImage file this process was launched from, read before [`restore`]
+/// takes it out of the environment.
+pub fn appimage_path() -> Option<&'static Path> {
+    APPIMAGE
+        .get_or_init(|| std::env::var_os("APPIMAGE").map(PathBuf::from))
+        .as_deref()
+}
 
 /// Whether this process was launched from an AppImage.
 pub fn appimage() -> bool {
-    *APPIMAGE.get_or_init(|| std::env::var_os("APPIMAGE").is_some())
+    appimage_path().is_some()
 }
 
 /// Restore the environment the user launched Neptune from.

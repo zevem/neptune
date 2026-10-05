@@ -111,6 +111,9 @@ pub struct App {
     delegation: delegation::Delegation,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
     updates: crate::runtime::updates::Updates,
+    /// Start the installed update once this approved exit completes.
+    relaunch: bool,
+    relaunch_arguments: Vec<std::ffi::OsString>,
     attachments: attachments::Attachments,
     image_preview: image_preview::ImagePreview,
     explorer: explorer::Explorer,
@@ -228,6 +231,8 @@ impl App {
             delegation: Default::default(),
             desktop_notifier: Default::default(),
             updates: Default::default(),
+            relaunch: false,
+            relaunch_arguments: launch.relaunch_arguments,
             attachments: attachments::Attachments::new(data.join("pasted-images")),
             image_preview: Default::default(),
             explorer: Default::default(),
@@ -250,13 +255,15 @@ impl App {
             }
         }
         self.updates.configure(self.config.release_channel);
-        self.updates.poll(
+        if self.updates.poll(
             ctx,
             self.startup.is_none()
                 && !self.ephemeral
                 && self.config.check_updates
                 && self.ui.overlay != OverlayState::Update,
-        );
+        ) {
+            self.restart_updated(ctx);
+        }
         if let Some(Err(error)) = self.link_opener.poll() {
             self.ui.error = Some(error.into());
         }
@@ -755,6 +762,7 @@ impl eframe::App for App {
         self.poll(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_approved {
             window::send(ctx, WindowOperation::CancelClose);
+            self.relaunch = false;
             self.request_close(ctx, Close::App);
             // A close from the taskbar can reach a hidden window. Show the
             // confirmation rather than leave it unanswerable.
@@ -1256,6 +1264,12 @@ impl eframe::App for App {
         }
         let complete = self.sessions.shutdown(Duration::from_secs(2));
         self.diagnostics.shutdown(complete);
+        if self.relaunch
+            && let Some(target) = self.updates.installed()
+            && let Err(error) = crate::platform::updates::relaunch(target, &self.relaunch_arguments)
+        {
+            eprintln!("Could not restart Neptune after updating: {error}");
+        }
     }
 }
 /// Where a workspace opens when no directory was chosen for it.
