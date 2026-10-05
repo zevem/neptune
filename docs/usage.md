@@ -235,7 +235,12 @@ Drag files from a file manager or another application onto a terminal to paste t
 
 Preferences → Updates controls automatic checks and Stable/Beta channels.
 Checks/downloads run off the UI thread; updates require signature/hash verification
-and explicit download/install actions. Running shells are never silently closed
+and explicit download/install actions. On macOS and for the Linux AppImage,
+**Restart to update** installs the verified download over the app you are running
+and restarts it; there is nothing to drag, replace or make executable. Your
+workspaces come back with fresh shells, and Neptune asks before quitting while
+commands are running. The Windows installer and the DEB package are still
+installed by hand. Running shells are never silently closed
 or replaced. Beta can advance to a newer stable; neither channel downgrades.
 
 See [installation](installation.md) for downloads and the

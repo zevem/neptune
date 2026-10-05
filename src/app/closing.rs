@@ -28,6 +28,21 @@ impl App {
             .collect()
     }
 
+    /// Quit through the usual confirmation, then start the installed update.
+    /// Closing the window any other way leaves the restart to the user.
+    pub(super) fn restart_updated(&mut self, ctx: &egui::Context) {
+        if self.updates.installed().is_some() {
+            self.relaunch = true;
+            self.request_close(ctx, Close::App);
+        }
+    }
+
+    /// Choosing to restart for an update is itself the decision to quit; only
+    /// running processes are still worth a question.
+    fn confirms_close(&self) -> bool {
+        self.config.confirm_close && !self.relaunch
+    }
+
     pub(super) fn request_close(&mut self, ctx: &egui::Context, target: Close) {
         if self
             .pending_close
@@ -38,7 +53,7 @@ impl App {
             return;
         }
         self.pending_close = None;
-        if !self.config.confirm_close && !self.config.warn_running_processes {
+        if !self.confirms_close() && !self.config.warn_running_processes {
             self.finish_close(ctx, target);
             return;
         }
@@ -121,7 +136,7 @@ impl App {
             };
         } else if pending.unknown > 0 && self.config.warn_running_processes {
             self.ui.close_status = CloseStatus::Unknown;
-        } else if self.config.confirm_close {
+        } else if self.confirms_close() {
             self.ui.close_status = CloseStatus::General;
         } else {
             self.finish_close(ctx, pending.target);
@@ -524,5 +539,29 @@ mod tests {
         assert!(!app.exit_approved);
         app.action(&ctx, Action::Confirm(Close::App));
         assert!(app.exit_approved);
+    }
+
+    #[test]
+    fn restarting_for_an_update_asks_only_about_processes_and_a_plain_close_forgets_it() {
+        let (mut app, ctx, _root, _pane) = setup();
+        app.config.warn_running_processes = false;
+        // Nothing is installed, so there is nothing to restart into.
+        app.action(&ctx, Action::RestartUpdate);
+        assert!(!app.relaunch && !app.exit_approved);
+        crate::runtime::updates::tests::installed(&mut app.updates);
+        app.action(&ctx, Action::RestartUpdate);
+        assert!(app.config.confirm_close);
+        assert!(app.relaunch && app.exit_approved);
+
+        let (mut app, ctx, _root, _pane) = setup();
+        crate::runtime::updates::tests::installed(&mut app.updates);
+        app.action(&ctx, Action::RestartUpdate);
+        assert_eq!(app.ui.overlay, OverlayState::ConfirmClose(Close::App));
+        assert_eq!(app.ui.close_status, CloseStatus::Unknown);
+        assert!(app.relaunch && !app.exit_approved);
+        // Closing the window instead quits without starting the new version.
+        app.action(&ctx, Action::WindowClose);
+        app.action(&ctx, Action::Confirm(Close::App));
+        assert!(!app.relaunch && app.exit_approved);
     }
 }

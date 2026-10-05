@@ -1,5 +1,6 @@
-//! Bounded background update discovery and authenticated installer downloads.
-//! No self-replacement, shell access, terminal telemetry or implicit installation.
+//! Bounded background update discovery, authenticated installer downloads and
+//! in-place installation the user asks for. No shell access, terminal telemetry
+//! or implicit installation.
 
 use anyhow::{Context, Result, ensure};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -298,17 +299,7 @@ fn download(release: &VerifiedRelease, cancel: &AtomicBool) -> Result<PreparedUp
     let mut response = agent(Duration::from_secs(5 * 60))
         .get(format!("{DOWNLOADS}/{}/{}", release.tag, asset.name))
         .call()?;
-    let prepared = save_download(response.body_mut().as_reader(), asset, cancel)?;
-    #[cfg(target_os = "macos")]
-    ensure!(
-        std::process::Command::new("/usr/bin/xattr")
-            .args(["-w", "com.apple.quarantine", "0083;00000000;Neptune;"])
-            .arg(&prepared.path)
-            .status()?
-            .success(),
-        "Could not apply macOS download quarantine"
-    );
-    Ok(prepared)
+    save_download(response.body_mut().as_reader(), asset, cancel)
 }
 
 fn save_download(
@@ -360,15 +351,24 @@ pub enum UpdateStatus {
     Ready,
     Opening,
     Opened,
+    Installing,
+    /// The new version is on disk; this process is still the old one.
+    Installed,
     Error(String),
 }
 
-fn handoff(
-    mut prepared: PreparedUpdate,
-    asset: &ReleaseAsset,
-    cancel: &AtomicBool,
-    open: impl FnOnce(&Path) -> Result<()>,
-) -> Result<PreparedUpdate> {
+/// What the user can do next with the release on offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStep {
+    Download,
+    /// Replace this installation with the verified download and restart.
+    Install,
+    /// Hand the verified download to the installer or file manager.
+    Open,
+    Restart,
+}
+
+fn recheck(prepared: &PreparedUpdate, asset: &ReleaseAsset, cancel: &AtomicBool) -> Result<()> {
     ensure!(
         !cancel.load(Ordering::Relaxed),
         "Installer handoff cancelled"
@@ -384,6 +384,31 @@ fn handoff(
         !cancel.load(Ordering::Relaxed),
         "Installer handoff cancelled"
     );
+    Ok(())
+}
+
+/// Install the verified download in place. A download that cannot be installed
+/// here is handed back for the manual handoff; one that changed is dropped.
+fn install(
+    prepared: PreparedUpdate,
+    asset: &ReleaseAsset,
+    cancel: &AtomicBool,
+    install: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Completion> {
+    recheck(&prepared, asset, cancel)?;
+    Ok(match install(&prepared.path) {
+        Ok(()) => Completion::Installed,
+        Err(_) => Completion::NotInstalled(prepared),
+    })
+}
+
+fn handoff(
+    mut prepared: PreparedUpdate,
+    asset: &ReleaseAsset,
+    cancel: &AtomicBool,
+    open: impl FnOnce(&Path) -> Result<()>,
+) -> Result<PreparedUpdate> {
+    recheck(&prepared, asset, cancel)?;
     open(&prepared.path)?;
     // The installer/file manager can outlive Neptune. Retain only after a
     // successful explicit handoff; failed or cancelled private files are dropped.
@@ -397,6 +422,8 @@ enum Completion {
     Checked(Option<VerifiedRelease>),
     Downloaded(PreparedUpdate),
     Opened(PreparedUpdate),
+    Installed,
+    NotInstalled(PreparedUpdate),
 }
 struct Pending {
     channel: ReleaseChannel,
@@ -408,6 +435,9 @@ pub struct Updates {
     pub status: UpdateStatus,
     pub release: Option<VerifiedRelease>,
     prepared: Option<PreparedUpdate>,
+    /// What an in-place installation replaces; `None` where the download is
+    /// handed to the installer or file manager instead.
+    target: Option<PathBuf>,
     pending: Option<Pending>,
     next_check: Instant,
     channel: ReleaseChannel,
@@ -420,6 +450,7 @@ impl Default for Updates {
             status: UpdateStatus::Idle,
             release: None,
             prepared: None,
+            target: crate::platform::updates::install_target(),
             pending: None,
             next_check: Instant::now() + Duration::from_secs(15),
             channel: Default::default(),
@@ -445,7 +476,35 @@ impl Updates {
             self.dismissed.push_back(release.version.clone());
         }
     }
+    pub fn next_step(&self) -> NextStep {
+        if self.status == UpdateStatus::Installed {
+            NextStep::Restart
+        } else if self.prepared.is_none() && self.status != UpdateStatus::Installing {
+            NextStep::Download
+        } else if self.target.is_some() {
+            NextStep::Install
+        } else {
+            NextStep::Open
+        }
+    }
+    /// The installation to start again once the new version is on disk.
+    pub fn installed(&self) -> Option<&Path> {
+        self.target
+            .as_deref()
+            .filter(|_| self.status == UpdateStatus::Installed)
+    }
+    /// An installation cannot be interrupted halfway, and afterwards only a
+    /// restart is left to do.
+    fn settled(&self) -> bool {
+        matches!(
+            self.status,
+            UpdateStatus::Installing | UpdateStatus::Installed
+        )
+    }
     pub fn cancel(&mut self) {
+        if self.settled() {
+            return;
+        }
         // Keep the slot reserved until the worker exits: channel switching and
         // retry cannot accumulate background network/download workers.
         if let Some(pending) = &self.pending {
@@ -460,7 +519,7 @@ impl Updates {
         };
     }
     pub fn configure(&mut self, channel: ReleaseChannel) {
-        if self.channel != channel {
+        if self.channel != channel && !self.settled() {
             self.cancel();
             self.channel = channel;
             self.release = None;
@@ -501,6 +560,9 @@ impl Updates {
         });
     }
     pub fn check(&mut self, ctx: &egui::Context) {
+        if self.settled() {
+            return;
+        }
         self.next_check = Instant::now() + CHECK_INTERVAL;
         let channel = self.channel;
         self.start(ctx, UpdateStatus::Checking, move |cancel| {
@@ -536,7 +598,30 @@ impl Updates {
             });
         }
     }
-    pub fn poll(&mut self, ctx: &egui::Context, automatic: bool) {
+    pub fn install(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        if let Some(prepared) = self.prepared.take() {
+            let asset = self
+                .release
+                .as_ref()
+                .and_then(|release| release.asset().ok())
+                .cloned();
+            self.start(ctx, UpdateStatus::Installing, move |cancel| {
+                let asset = asset.context("Missing verified installer identity")?;
+                install(prepared, &asset, &cancel, |download| {
+                    crate::platform::updates::install(download, &target)
+                })
+            });
+        }
+    }
+    /// Returns whether an installation has just finished and a restart is due.
+    pub fn poll(&mut self, ctx: &egui::Context, automatic: bool) -> bool {
+        let mut installed = false;
         let completion =
             self.pending
                 .as_ref()
@@ -582,22 +667,36 @@ impl Updates {
                         self.dismiss();
                         self.status = UpdateStatus::Opened;
                     }
+                    Ok(Completion::Installed) => {
+                        self.dismiss();
+                        self.status = UpdateStatus::Installed;
+                        installed = true;
+                    }
+                    Ok(Completion::NotInstalled(prepared)) => {
+                        // Read-only or unowned locations keep the manual path.
+                        self.prepared = Some(prepared);
+                        self.target = None;
+                        self.status = UpdateStatus::Error("Neptune could not replace itself in this location. Open the verified download to install it yourself.".into());
+                    }
                     Err(_) => self.status = UpdateStatus::Error("Could not complete the update. Check your connection and try again. Unverified downloads are never opened.".into()),
                 }
             }
         }
-        if automatic && !self.busy() {
+        if automatic && !self.busy() && !self.settled() {
             if Instant::now() >= self.next_check {
                 self.check(ctx);
             }
             ctx.request_repaint_after(self.next_check.saturating_duration_since(Instant::now()));
         }
+        installed
     }
 }
 
 impl Drop for Updates {
     fn drop(&mut self) {
-        self.cancel();
+        if let Some(pending) = &self.pending {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -629,7 +728,6 @@ pub(crate) mod tests {
         )
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn visual_release() -> VerifiedRelease {
         let (bytes, signature, key) = signed("0.2.0");
         verify_manifest(
@@ -903,6 +1001,115 @@ pub(crate) mod tests {
         assert!(save_download(&b"tampered installer"[..], &asset, &cancel).is_err());
         cancel.store(true, Ordering::Relaxed);
         assert!(save_download(&bytes[..], &asset, &cancel).is_err());
+    }
+
+    /// A verified download as the sheet sees it, installable in place or not.
+    pub(crate) fn prepare(updates: &mut Updates, in_place: bool) {
+        updates.target = in_place.then(|| "/opt/Neptune.AppImage".into());
+        updates.prepared = Some(PreparedUpdate {
+            directory: None,
+            path: PathBuf::new(),
+        });
+    }
+
+    /// The new version on disk, with this process still the old one.
+    pub(crate) fn installed(updates: &mut Updates) {
+        updates.release = Some(visual_release());
+        updates.target = Some("/opt/Neptune.AppImage".into());
+        updates.status = UpdateStatus::Installed;
+    }
+
+    fn ready(target: Option<&str>) -> (Updates, mpsc::SyncSender<Result<Completion>>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut updates = Updates::default();
+        updates.release = Some(visual_release());
+        updates.target = target.map(Into::into);
+        updates.status = UpdateStatus::Installing;
+        updates.pending = Some(Pending {
+            channel: ReleaseChannel::Stable,
+            receiver,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        (updates, sender)
+    }
+
+    #[test]
+    fn an_installation_cannot_be_cancelled_and_leaves_only_a_restart() {
+        let ctx = egui::Context::default();
+        let (mut updates, sender) = ready(Some("/opt/Neptune.AppImage"));
+        assert_eq!(updates.next_step(), NextStep::Install);
+        assert_eq!(updates.installed(), None);
+        // Neither Cancel nor a channel change may lose track of a replacement
+        // that is already under way.
+        updates.cancel();
+        updates.configure(ReleaseChannel::Beta);
+        assert_eq!(updates.status, UpdateStatus::Installing);
+        sender.send(Ok(Completion::Installed)).unwrap();
+        assert!(updates.poll(&ctx, true));
+        assert_eq!(updates.status, UpdateStatus::Installed);
+        assert_eq!(updates.next_step(), NextStep::Restart);
+        assert_eq!(
+            updates.installed(),
+            Some(Path::new("/opt/Neptune.AppImage"))
+        );
+        assert!(updates.notification().is_none());
+        // The old process stops offering the release it has just installed.
+        updates.check(&ctx);
+        updates.configure(ReleaseChannel::Beta);
+        assert!(!updates.poll(&ctx, true));
+        assert!(!updates.busy());
+        assert_eq!(updates.status, UpdateStatus::Installed);
+    }
+
+    #[test]
+    fn a_location_neptune_cannot_replace_falls_back_to_the_manual_handoff() {
+        let ctx = egui::Context::default();
+        let bytes = b"verified installer";
+        let asset = ReleaseAsset {
+            platform: platform().into(),
+            name: "Neptune-test.AppImage".into(),
+            size: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(bytes)),
+        };
+        let cancel = AtomicBool::new(false);
+        let prepared = save_download(&bytes[..], &asset, &cancel).unwrap();
+        let path = prepared.path.clone();
+        let completion = install(prepared, &asset, &cancel, |_| {
+            anyhow::bail!("Read-only location")
+        })
+        .unwrap();
+        let (mut updates, sender) = ready(Some("/Volumes/Neptune/Neptune.app"));
+        sender.send(Ok(completion)).unwrap();
+        assert!(!updates.poll(&ctx, false));
+        assert!(matches!(updates.status, UpdateStatus::Error(_)));
+        assert_eq!(updates.next_step(), NextStep::Open);
+        assert_eq!(updates.installed(), None);
+        assert!(path.exists());
+        drop(updates);
+        assert!(!path.exists());
+
+        // A download that changed is never installed, and is not kept.
+        let prepared = save_download(&bytes[..], &asset, &cancel).unwrap();
+        let path = prepared.path.clone();
+        std::fs::write(&path, b"tampered installer").unwrap();
+        assert!(
+            install(prepared, &asset, &cancel, |_| panic!(
+                "Tampered installer installed"
+            ))
+            .is_err()
+        );
+        assert!(!path.exists());
+
+        let prepared = save_download(&bytes[..], &asset, &cancel).unwrap();
+        let path = prepared.path.clone();
+        assert!(matches!(
+            install(prepared, &asset, &cancel, |download| {
+                assert_eq!(std::fs::read(download).unwrap(), bytes);
+                Ok(())
+            }),
+            Ok(Completion::Installed)
+        ));
+        assert!(!path.exists());
     }
 
     #[test]

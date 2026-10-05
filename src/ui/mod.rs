@@ -185,6 +185,10 @@ pub enum Action {
     ReviewUpdate,
     DownloadUpdate(String),
     OpenUpdate(String),
+    /// Replace this installation with the verified download, then restart.
+    InstallUpdate(String),
+    /// Restart into the version that was just installed.
+    RestartUpdate,
     CancelUpdate,
     DismissUpdate,
     Confirm(Close),

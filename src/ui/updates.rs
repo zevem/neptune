@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     icons::{self, Icon},
-    runtime::updates::{UpdateStatus, Updates},
+    runtime::updates::{NextStep, UpdateStatus, Updates},
     theme::{self, Palette, metrics},
 };
 use eframe::egui::{
@@ -27,7 +27,21 @@ fn status(updates: &Updates) -> String {
             .map(|release| format!("Neptune {} is available.", release.version))
             .unwrap_or_default(),
         UpdateStatus::Downloading => "Downloading and verifying…".into(),
+        UpdateStatus::Ready if updates.next_step() == NextStep::Install => {
+            "Download verified. Restart Neptune to update.".into()
+        }
         UpdateStatus::Ready => "Download verified. Ready to open.".into(),
+        UpdateStatus::Installing => "Installing the update…".into(),
+        UpdateStatus::Installed => updates
+            .release
+            .as_ref()
+            .map(|release| {
+                format!(
+                    "Neptune {} is installed. Restart to start using it.",
+                    release.version
+                )
+            })
+            .unwrap_or_default(),
         UpdateStatus::Opening => "Opening your download…".into(),
         UpdateStatus::Opened => {
             "Download opened. Finish installation, then relaunch Neptune.".into()
@@ -45,11 +59,12 @@ pub fn preferences_status(
     rows: &mut Group,
     actions: &mut Vec<Action>,
 ) {
+    let installed = updates.status == UpdateStatus::Installed;
     rows.row(
         ui,
         &format!("Neptune {}", env!("CARGO_PKG_VERSION")),
         |ui| {
-            ui.add_enabled_ui(!updates.busy(), |ui| {
+            ui.add_enabled_ui(!updates.busy() && !installed, |ui| {
                 if button(ui, p, "Check for updates", ButtonKind::Secondary).clicked() {
                     actions.push(Action::CheckUpdates);
                 }
@@ -57,16 +72,28 @@ pub fn preferences_status(
         },
     );
     if let Some(release) = &updates.release {
-        let label = format!("Neptune {} is available", release.version);
-        rows.row(ui, &label, |ui| {
-            if button(ui, p, "Review update", ButtonKind::Secondary).clicked() {
-                actions.push(Action::ReviewUpdate);
-            }
-        });
+        if installed {
+            let label = format!("Neptune {} is installed", release.version);
+            rows.row(ui, &label, |ui| {
+                if button(ui, p, "Restart to update", ButtonKind::Secondary).clicked() {
+                    actions.push(Action::RestartUpdate);
+                }
+            });
+        } else {
+            let label = format!("Neptune {} is available", release.version);
+            rows.row(ui, &label, |ui| {
+                if button(ui, p, "Review update", ButtonKind::Secondary).clicked() {
+                    actions.push(Action::ReviewUpdate);
+                }
+            });
+        }
     }
     // An idle updater has nothing to add to the installed version, nor an
-    // offered release to the row that names it.
-    if !matches!(updates.status, UpdateStatus::Idle | UpdateStatus::Available) {
+    // offered or installed release to the row that names it.
+    if !matches!(
+        updates.status,
+        UpdateStatus::Idle | UpdateStatus::Available | UpdateStatus::Installed
+    ) {
         rows.note(ui, &status(updates));
     }
 }
@@ -296,7 +323,10 @@ fn status_card(ui: &mut Ui, p: Palette, updates: &Updates) {
                         UpdateStatus::Error(_) => {
                             icons::paint(ui.painter(), icon, Icon::Warning, p.red);
                         }
-                        UpdateStatus::Ready | UpdateStatus::Opened | UpdateStatus::Current => {
+                        UpdateStatus::Ready
+                        | UpdateStatus::Opened
+                        | UpdateStatus::Installed
+                        | UpdateStatus::Current => {
                             icons::paint(ui.painter(), icon, Icon::Check, p.green);
                         }
                         _ if updates.busy() => {
@@ -319,8 +349,10 @@ fn status_card(ui: &mut Ui, p: Palette, updates: &Updates) {
     ui.add_space(STATUS_SPACE);
 }
 
-fn install_guidance() -> &'static str {
-    if cfg!(target_os = "macos") {
+fn install_guidance(updates: &Updates) -> &'static str {
+    if matches!(updates.next_step(), NextStep::Install | NextStep::Restart) {
+        "Neptune replaces itself with the verified download and restarts. Workspaces and directories come back with fresh shells; running commands do not, so finish them first."
+    } else if cfg!(target_os = "macos") {
         "Open the verified disk image, quit Neptune when you're ready, then drag Neptune into Applications."
     } else if cfg!(windows) {
         "Open the verified installer and follow its steps. Save your shell work before closing Neptune. Windows signing is not available yet."
@@ -397,7 +429,9 @@ pub fn show(ctx: &egui::Context, p: Palette, updates: &Updates, actions: &mut Ve
                                 .color(p.secondary),
                         );
                         ui.add_space(8.0);
-                        ui.add(egui::Label::new(body(install_guidance(), p.secondary)).wrap());
+                        ui.add(
+                            egui::Label::new(body(install_guidance(updates), p.secondary)).wrap(),
+                        );
                         ui.add_space(18.0);
                     });
                 });
@@ -413,31 +447,30 @@ pub fn show(ctx: &egui::Context, p: Palette, updates: &Updates, actions: &mut Ve
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if let Some(release) = &updates.release {
+                        let version = release.version.clone();
+                        let (label, action) = match updates.next_step() {
+                            NextStep::Download => {
+                                ("Download update", Action::DownloadUpdate(version))
+                            }
+                            NextStep::Install => {
+                                ("Restart to update", Action::InstallUpdate(version))
+                            }
+                            NextStep::Open if cfg!(target_os = "linux") => {
+                                ("Show download", Action::OpenUpdate(version))
+                            }
+                            NextStep::Open => ("Open installer", Action::OpenUpdate(version)),
+                            NextStep::Restart => ("Restart to update", Action::RestartUpdate),
+                        };
                         ui.add_enabled_ui(!updates.busy(), |ui| {
-                            if matches!(updates.status, UpdateStatus::Ready | UpdateStatus::Opened)
-                            {
-                                if button(
-                                    ui,
-                                    p,
-                                    if cfg!(target_os = "linux") {
-                                        "Show download"
-                                    } else {
-                                        "Open installer"
-                                    },
-                                    ButtonKind::Primary,
-                                )
-                                .clicked()
-                                {
-                                    actions.push(Action::OpenUpdate(release.version.clone()));
-                                }
-                            } else if button(ui, p, "Download update", ButtonKind::Primary)
-                                .clicked()
-                            {
-                                actions.push(Action::DownloadUpdate(release.version.clone()));
+                            if button(ui, p, label, ButtonKind::Primary).clicked() {
+                                actions.push(action);
                             }
                         });
                     }
-                    if updates.busy() && button(ui, p, "Cancel", ButtonKind::Secondary).clicked() {
+                    if updates.busy()
+                        && updates.status != UpdateStatus::Installing
+                        && button(ui, p, "Cancel", ButtonKind::Secondary).clicked()
+                    {
                         actions.push(Action::CancelUpdate);
                     }
                     close |= button(ui, p, "Later", ButtonKind::Secondary).clicked();

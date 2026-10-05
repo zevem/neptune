@@ -33,6 +33,11 @@ their preparation records remain in Git history.
   effort level and its CLI's ultra mode (ultracode or Ultra).
   One you closed can be opened again with its conversation, and a question a
   started agent's CLI asks before it begins is passed on to you at once.
+- Update without reinstalling on macOS and with the Linux AppImage. Once an
+  update is downloaded and verified, **Restart to update** replaces the app you
+  are running and restarts it, with your workspaces restored. There is no disk
+  image to drag to Applications and no AppImage to replace by hand. Updating
+  *to* this version from an earlier one is still done by hand, one last time.
 - See where an agent's pull request stands on its tab. The linked number now
   shows whether its checks pass, fail or are still running and how many review
   comments are unresolved, and changes colour and icon once the pull request is
@@ -49,6 +54,9 @@ their preparation records remain in Git history.
   anything, and keeps a branch that has unmerged commits.
 
 ### Acceptance notes and known limitations
+
+- In-place updates are verified on Linux only by replacing and restarting a
+  test AppImage; the macOS bundle replacement has not yet run on a Mac.
 
 - Saved workspaces now use schema version 10, which records which terminal's
   agent started another's, which of those terminals have no tab, and the git
