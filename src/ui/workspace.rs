@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use terminal_core::{Mode as TermMode, SessionMetadata, SessionStatus, ViewportSnapshot};
 
 pub struct PanePresentation {
+    pub generation: u64,
+    pub ports: Vec<crate::runtime::ports::Port>,
     /// The CLI agent the terminal is running, which takes dropped files.
     pub agent: Option<AgentKind>,
     /// Pull requests the agent linked to the terminal, oldest first.
@@ -441,6 +443,14 @@ fn tab(
         (rect.left() + 72.0, merged.left, rect.center().y),
         p,
     );
+    let ports = super::ports::Chips::layout(
+        ui,
+        ui.id().with(("tab-ports", id)),
+        &presentation.ports,
+        Some((id, presentation.generation)),
+        (rect.left() + 40.0, attached.left, rect.center().y),
+        p,
+    );
     let hovered = response.hovered()
         || close_response
             .as_ref()
@@ -448,7 +458,8 @@ fn tab(
         || chips.hovered()
         || spawned.hovered()
         || merged.hovered()
-        || attached.hovered();
+        || attached.hovered()
+        || ports.hovered();
 
     // A place with one terminal reads as a plain title, as it always has.
     let fill = if shown && !alone {
@@ -473,14 +484,18 @@ fn tab(
     } else {
         0.0
     };
-    let right =
-        if !chips.is_empty() || !spawned.is_empty() || !merged.is_empty() || !attached.is_empty() {
-            attached.left - 5.0
-        } else if closable && close_alpha > 0.0 {
-            close.left() - 3.0
-        } else {
-            rect.right() - 7.0
-        };
+    let right = if !chips.is_empty()
+        || !spawned.is_empty()
+        || !merged.is_empty()
+        || !attached.is_empty()
+        || !ports.is_empty()
+    {
+        ports.left - 5.0
+    } else if closable && close_alpha > 0.0 {
+        close.left() - 3.0
+    } else {
+        rect.right() - 7.0
+    };
     // A worktree's tab is named by its branch, and says what runs there
     // where another tab names its folder.
     let branch = presentation.worktree.as_ref().map(|tab| &tab.branch);
@@ -528,6 +543,7 @@ fn tab(
     spawned.paint(&painter, p, actions);
     merged.paint(&painter, p, actions);
     attached.paint(&painter, p, actions);
+    ports.paint(&painter, p, actions);
     if let Some(close_response) = close_response {
         if close_alpha > 0.0 {
             if close_response.hovered() {
@@ -1430,6 +1446,7 @@ mod tests {
             cwd: "/tmp".into(),
             reported_cwd: None,
             process_id: None,
+            remote_process_id: None,
             status: SessionStatus::Running,
             bell_count: 0,
         }
@@ -1487,6 +1504,8 @@ mod tests {
                         (
                             id,
                             PanePresentation {
+                                generation: 1,
+                                ports: Vec::new(),
                                 agent: None,
                                 pull_requests: Vec::new(),
                                 attached: Vec::new(),
@@ -1641,6 +1660,8 @@ mod tests {
         let mut bench = Bench::new();
         // The first place holds two tabs, with the first in view.
         let presentation = PanePresentation {
+            generation: 1,
+            ports: Vec::new(),
             agent: None,
             pull_requests: Vec::new(),
             attached: Vec::new(),
@@ -1845,6 +1866,8 @@ mod tests {
         let presentations: BTreeMap<_, _> = [left, right]
             .map(|id| {
                 let presentation = PanePresentation {
+                    generation: 1,
+                    ports: Vec::new(),
                     agent: None,
                     pull_requests: Vec::new(),
                     attached: Vec::new(),

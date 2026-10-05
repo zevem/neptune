@@ -11,6 +11,9 @@ fi
 if [ -n "$3" ]; then
     eval "$3"
 fi
+# exec below retains this PID, so remote discovery can follow this pane's
+# descendants without reading command lines, environment or terminal contents.
+printf '\033]777;neptune;pid;%s\007' "$$"
 
 case "${SHELL##*/}" in
 zsh)

@@ -10,6 +10,7 @@ pub mod fonts;
 pub mod host_env;
 pub(crate) mod keyboard;
 pub mod links;
+pub(crate) mod ports;
 pub mod shells;
 pub mod updates;
 pub mod window;

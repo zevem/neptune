@@ -14,6 +14,7 @@ mod hints;
 mod image_preview;
 mod input;
 mod panel;
+mod ports;
 mod ssh;
 #[cfg(test)]
 mod tests;
@@ -113,6 +114,7 @@ pub struct App {
     hints: Option<(PaneId, u64)>,
     hint_keys: Vec<egui::Key>,
     file_location: Option<hints::PendingLocation>,
+    ports: crate::runtime::ports::Ports,
     notifications: crate::notifications::Notifications,
     /// What each running CLI agent is doing, for the agents tab.
     agents: crate::agent_activity::AgentActivities,
@@ -247,6 +249,7 @@ impl App {
             hints: None,
             hint_keys: Vec::new(),
             file_location: None,
+            ports: Default::default(),
             notifications: Default::default(),
             agents: Default::default(),
             delegation: Default::default(),
@@ -484,6 +487,7 @@ impl App {
             }
         }
         self.poll_agents(ctx);
+        self.poll_ports(ctx);
         self.serve_agents(ctx);
         self.poll_attachments();
         self.poll_attached(ctx);
@@ -628,6 +632,8 @@ impl App {
                         session.acknowledge_repaint();
                     }
                     PanePresentation {
+                        generation: pane.generation(),
+                        ports: self.ports.view(pane.id(), pane.generation()).to_vec(),
                         agent: pane.agent().map(|agent| agent.kind),
                         pull_requests: pane
                             .pull_requests()
@@ -652,6 +658,8 @@ impl App {
                         _ => "Starting shell…".into(),
                     };
                     PanePresentation {
+                        generation: pane.generation(),
+                        ports: Vec::new(),
                         agent: None,
                         pull_requests: Vec::new(),
                         attached: Vec::new(),
@@ -668,6 +676,7 @@ impl App {
                             cwd: pane.cwd().into(),
                             reported_cwd: None,
                             process_id: None,
+                            remote_process_id: None,
                             status: match pane.lifecycle() {
                                 Lifecycle::Failed(error) => SessionStatus::Error(error.clone()),
                                 _ => SessionStatus::Running,
@@ -994,6 +1003,13 @@ impl eframe::App for App {
             attached,
             spawned,
             worktree,
+            ports: active_pane
+                .and_then(|pane| presentations.get(&pane))
+                .filter(|_| tabs <= 1)
+                .map_or(&[], |p| p.ports.as_slice()),
+            pane_generation: active_pane
+                .and_then(|pane| self.controller.model().pane(pane))
+                .map_or(0, |p| p.generation()),
             zoomed: self.ui.zoomed,
             window: bounds,
             sidebar: reveal,
@@ -1267,6 +1283,12 @@ impl eframe::App for App {
                         .and_then(|pane| self.controller.model().pane(pane))
                         .and_then(|pane| pane.worktree())
                         .map(|worktree| worktree.branch.as_str()),
+                    pane_generation: active_pane
+                        .and_then(|pane| self.controller.model().pane(pane))
+                        .map_or(0, |p| p.generation()),
+                    ports: active_pane
+                        .and_then(|pane| presentations.get(&pane))
+                        .map_or(&[], |p| p.ports.as_slice()),
                     layout: self
                         .controller
                         .model()
@@ -1339,6 +1361,7 @@ impl eframe::App for App {
         self.release_closed_overlay_focus(&ctx);
     }
     fn on_exit(&mut self) {
+        self.ports.shutdown(Duration::from_secs(8));
         // Capture reports received since the final frame before flushing state.
         let ctx = egui::Context::default();
         let metadata: Vec<_> = self
