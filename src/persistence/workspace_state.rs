@@ -12,7 +12,7 @@ use std::{
 /// Version 9 adds the pane whose agent started a pane's agent. Version 8 added
 /// workspace group default directories and the pull requests an agent linked
 /// to its pane. Versions 1–8 remain readable.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -105,6 +105,9 @@ pub struct SavedPane {
     /// The pane whose agent started this pane's agent, from schema version 9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<PaneId>,
+    /// The git worktree made for the pane's agent, from schema version 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<neptune_model::Worktree>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +168,7 @@ impl StateSnapshot {
                             // An agent that has not opened yet cannot be
                             // resumed, so neither can its link.
                             spawned_by: pane.spawned_by().filter(|_| pane.agent().is_some()),
+                            worktree: pane.worktree().cloned(),
                         })
                         .collect(),
                     layout: SavedLayout::from_layout(workspace.layout()),
@@ -236,6 +240,7 @@ impl SavedWorkspace {
                         .filter_map(|url| neptune_model::PullRequest::parse(url))
                         .collect(),
                     spawned_by: pane.spawned_by,
+                    worktree: pane.worktree,
                     agent: pane.agent,
                 })
                 .collect(),
@@ -516,6 +521,15 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                     pane.id
                 ));
             }
+            if pane.worktree.as_ref().is_some_and(|worktree| {
+                !worktree.is_valid() || !worktree.path.is_dir() || workspace.ssh.is_some()
+            }) {
+                report.diagnostics.push(format!(
+                    "Pane {}: its worktree is unavailable; opening an ordinary terminal",
+                    pane.id
+                ));
+                pane.worktree = None;
+            }
             if !pane.cwd.is_dir() {
                 report.diagnostics.push(format!(
                     "Pane {} in {:?}: missing directory {}; using {}",
@@ -736,6 +750,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 agent: None,
                 pull_requests: Vec::new(),
                 spawned_by: None,
+                worktree: None,
             });
         }
         if panes.is_empty() {
@@ -753,6 +768,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 agent: None,
                 pull_requests: Vec::new(),
                 spawned_by: None,
+                worktree: None,
             });
             next_pane += 1;
         }
@@ -1027,6 +1043,43 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_round_trips_and_one_that_is_gone_leaves_an_ordinary_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspaces.json");
+        let tree = directory.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let mut snapshot = sample(directory.path());
+        let worktree = neptune_model::Worktree {
+            repository: directory.path().into(),
+            path: tree.clone(),
+            branch: "fix/login".into(),
+            start: "0123456789abcdef0123456789abcdef01234567".into(),
+        };
+        snapshot.workspaces[0].panes[0].cwd = tree.clone();
+        snapshot.workspaces[0].panes[0].worktree = Some(worktree.clone());
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.workspaces()[0].panes()[0].worktree(), Some(&worktree));
+        assert_eq!(
+            StateSnapshot::from_model(&model).workspaces[0].panes[0].worktree,
+            Some(worktree)
+        );
+
+        // Removed outside Neptune: the terminal opens in the workspace's
+        // directory, and the original bytes are kept before any save.
+        std::fs::remove_dir(&tree).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write && report.diagnostics.len() == 3);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        let model = report.model.unwrap();
+        let pane = &model.workspaces()[0].panes()[0];
+        assert!(pane.worktree().is_none());
+        assert_eq!(pane.cwd(), directory.path());
+    }
+
+    #[test]
     fn current_unversioned_fixture_migrates_without_losing_layout_or_selection() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspaces.json");
@@ -1183,7 +1236,7 @@ mod tests {
     fn earlier_schema_versions_are_read_without_loss_and_saved_as_the_current_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspaces.json");
-        for version in [1, 2, 3, 4, 5, 6, 7, 8] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
             let mut saved = serde_json::to_value(sample(directory.path())).unwrap();
             saved["version"] = version.into();
             saved.as_object_mut().unwrap().remove("groups");
@@ -1340,6 +1393,7 @@ mod tests {
             agent: None,
             pull_requests: Vec::new(),
             spawned_by: None,
+            worktree: None,
         }];
         second.layout = SavedLayout::Pane {
             pane: PaneId::new(3),

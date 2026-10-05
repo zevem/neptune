@@ -405,6 +405,7 @@ impl App {
                     egui::Key::E => {
                         pane.map(|id| Action::Split(id, neptune_model::Axis::Horizontal))
                     }
+                    egui::Key::G => pane.map(|id| Action::Worktree(ui::worktrees::Event::New(id))),
                     egui::Key::W => pane.map(Action::ClosePane),
                     egui::Key::F => Some(Action::Find),
                     egui::Key::P => Some(Action::Palette),

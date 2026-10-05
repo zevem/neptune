@@ -76,6 +76,14 @@ pub enum Command {
         pane: PaneId,
         cwd: PathBuf,
     },
+    /// Opens a tab following `pane` in a git worktree made for an agent,
+    /// and has its shell open `agent` there. The tab is named by the branch.
+    OpenWorktree {
+        workspace: WorkspaceId,
+        pane: PaneId,
+        worktree: crate::Worktree,
+        agent: Option<crate::AgentKind>,
+    },
     /// Focusing a tab that is out of view brings it into view.
     FocusPane {
         workspace: WorkspaceId,
@@ -333,6 +341,7 @@ impl Controller {
                         agent: None,
                         pull_requests: Vec::new(),
                         spawned_by: None,
+                        worktree: None,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
                     }],
@@ -496,6 +505,37 @@ impl Controller {
                 effects.push(self.add_pane(workspace, pane, None, cwd)?);
                 dirty = true;
             }
+            Command::OpenWorktree {
+                workspace,
+                pane,
+                worktree,
+                agent,
+            } => {
+                // git ran on this machine, so the terminal has to as well.
+                if !worktree.is_valid()
+                    || self
+                        .model
+                        .workspace(workspace)
+                        .ok_or(Error::UnknownWorkspace(workspace))?
+                        .remote
+                        .is_some()
+                {
+                    return Err(Error::InvalidWorktree);
+                }
+                effects.push(self.add_pane(workspace, pane, None, worktree.path.clone())?);
+                let ws = self.model.workspace_mut(workspace)?;
+                let id = ws.active;
+                if let Some(item) = ws.panes.iter_mut().find(|item| item.id == id) {
+                    // Without a conversation yet: the shell opens the CLI anew.
+                    item.agent = agent.map(|kind| crate::AgentSession {
+                        kind,
+                        session_id: None,
+                        cwd: worktree.path.clone(),
+                    });
+                    item.worktree = Some(worktree);
+                }
+                dirty = true;
+            }
             Command::FocusPane { workspace, pane } => {
                 let was_active = self.model.active == Some(workspace);
                 let ws = self.model.workspace_mut(workspace)?;
@@ -593,6 +633,7 @@ impl Controller {
                         pane.agent = None;
                         pane.pull_requests.clear();
                         pane.spawned_by = None;
+                        pane.worktree = None;
                         effects.push(Effect::StopSession {
                             pane: pane.id,
                             generation: previous,
@@ -770,6 +811,7 @@ impl Controller {
                     agent: None,
                     pull_requests: Vec::new(),
                     spawned_by: Some(parent),
+                    worktree: None,
                     generation: 1,
                     lifecycle: Lifecycle::Starting,
                 });
@@ -925,6 +967,7 @@ impl Controller {
             agent: None,
             pull_requests: Vec::new(),
             spawned_by: None,
+            worktree: None,
             generation: 1,
             lifecycle: Lifecycle::Starting,
         });
@@ -1604,6 +1647,135 @@ mod tests {
         let ws = controller.model().workspace(workspace).unwrap();
         assert_eq!(split_ids(ws.layout()), [SplitId::new(1)]);
         assert_eq!(ws.layout().shown(), [middle, split]);
+    }
+
+    fn worktree(branch: &str) -> crate::Worktree {
+        crate::Worktree {
+            repository: std::env::temp_dir().join("repo"),
+            path: std::env::temp_dir().join("repo.worktrees").join(branch),
+            branch: branch.into(),
+            start: "c".repeat(40),
+        }
+    }
+
+    #[test]
+    fn a_worktree_opens_as_a_focused_tab_whose_shell_starts_the_agent_there() {
+        let (mut controller, workspace, first) = setup();
+        let tree = worktree("fix-login");
+        let effects = controller
+            .dispatch(Command::OpenWorktree {
+                workspace,
+                pane: first,
+                worktree: tree.clone(),
+                agent: Some(crate::AgentKind::Codex),
+            })
+            .unwrap();
+        let opened = controller.model().active_pane().unwrap();
+        assert_eq!(
+            without_save(effects)[0],
+            Effect::StartSession {
+                pane: opened,
+                generation: 1,
+                cwd: tree.path.clone(),
+                remote: None,
+                remote_cwd: None,
+                replacement: false,
+            }
+        );
+        assert_eq!(group(&controller, first), (vec![first, opened], opened));
+        let item = controller.model().pane(opened).unwrap();
+        assert_eq!(item.worktree(), Some(&tree));
+        assert_eq!(
+            item.agent(),
+            Some(&crate::AgentSession {
+                kind: crate::AgentKind::Codex,
+                session_id: None,
+                cwd: tree.path.clone(),
+            })
+        );
+        // Tabs and splits beside it are ordinary terminals.
+        let beside = tab(&mut controller, opened);
+        assert!(
+            controller
+                .model()
+                .pane(beside)
+                .unwrap()
+                .worktree()
+                .is_none()
+        );
+
+        // The worktree outlives its agent and a restart, and is restored.
+        controller
+            .dispatch(Command::PaneAgentChanged {
+                pane: opened,
+                generation: 1,
+                agent: None,
+            })
+            .unwrap();
+        controller.dispatch(Command::RestartPane(opened)).unwrap();
+        assert_eq!(
+            controller.model().pane(opened).unwrap().worktree(),
+            Some(&tree)
+        );
+        let restored =
+            Model::restore(controller.model().specs(), None, true, Default::default()).unwrap();
+        assert_eq!(restored.pane(opened).unwrap().worktree(), Some(&tree));
+
+        // A terminal on another machine has no local worktree.
+        controller
+            .dispatch(Command::SetWorkspaceRemote {
+                workspace,
+                remote: Some("devbox".into()),
+            })
+            .unwrap();
+        assert!(
+            controller
+                .model()
+                .pane(opened)
+                .unwrap()
+                .worktree()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_unusable_worktree_or_a_remote_workspace_opens_nothing() {
+        let (mut controller, workspace, first) = setup();
+        let before = controller.model().clone();
+        let open = |worktree| Command::OpenWorktree {
+            workspace,
+            pane: first,
+            worktree,
+            agent: None,
+        };
+        let unusable = crate::Worktree {
+            branch: "-D".into(),
+            ..worktree("x")
+        };
+        assert_eq!(
+            controller.dispatch(open(unusable)),
+            Err(Error::InvalidWorktree)
+        );
+        assert_eq!(controller.model(), &before);
+        controller
+            .dispatch(Command::SetWorkspaceRemote {
+                workspace,
+                remote: Some("devbox".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            controller.dispatch(open(worktree("x"))),
+            Err(Error::InvalidWorktree)
+        );
+        let mut specs = before.specs();
+        specs[0].panes[0].worktree = Some(crate::Worktree {
+            start: "main".into(),
+            ..worktree("x")
+        });
+        assert_eq!(
+            Model::restore(specs, None, true, Default::default()),
+            Err(Error::InvalidWorktree)
+        );
     }
 
     #[test]
@@ -2548,6 +2720,7 @@ mod tests {
                     agent: None,
                     pull_requests: Vec::new(),
                     spawned_by: None,
+                    worktree: None,
                 },
                 PaneSpec {
                     id: PaneId::new(2),
@@ -2556,6 +2729,7 @@ mod tests {
                     agent: None,
                     pull_requests: Vec::new(),
                     spawned_by: None,
+                    worktree: None,
                 },
             ],
             layout: Layout::pane(PaneId::new(1)),

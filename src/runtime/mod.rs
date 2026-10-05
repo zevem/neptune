@@ -5,3 +5,4 @@ pub mod persistence;
 pub mod pull_requests;
 pub mod sessions;
 pub mod updates;
+pub mod worktrees;

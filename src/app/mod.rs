@@ -15,6 +15,7 @@ mod panel;
 mod ssh;
 #[cfg(test)]
 mod tests;
+mod worktrees;
 use crate::{
     Launch,
     config::{self, Config},
@@ -122,6 +123,8 @@ pub struct App {
     changes: changes::Changes,
     file_drag: crate::platform::file_drag::FileDragSource,
     paste_chord: crate::input::PasteChord,
+    /// Git worktrees made for agents, and the worker that runs git for them.
+    worktrees: worktrees::Worktrees,
     /// A paste chord pressed this frame that the toolkit did not deliver.
     swallowed_paste: Option<egui::Modifiers>,
 }
@@ -241,6 +244,7 @@ impl App {
             changes: Default::default(),
             file_drag: Default::default(),
             paste_chord: Default::default(),
+            worktrees: Default::default(),
             swallowed_paste: None,
         }
     }
@@ -593,6 +597,7 @@ impl App {
                             })
                             .collect(),
                         spawned: self.spawned_agents(pane.id()),
+                        worktree: self.worktree_tab(pane),
                         unread: self.notifications.unread(Some(pane.id())),
                         metadata: session.metadata(),
                         snapshot: shown.then(|| session.viewport()),
@@ -608,6 +613,7 @@ impl App {
                         agent: None,
                         pull_requests: Vec::new(),
                         spawned: Vec::new(),
+                        worktree: self.worktree_tab(pane),
                         unread: self.notifications.unread(Some(pane.id())),
                         metadata: SessionMetadata {
                             title,
@@ -778,6 +784,7 @@ impl eframe::App for App {
         self.frame_started = Instant::now();
         self.file_drag.attach(frame, ctx);
         self.poll_directory(ctx);
+        self.poll_worktrees(ctx);
         window::sync_minimized(
             ctx,
             frame
@@ -842,11 +849,12 @@ impl eframe::App for App {
         let subtitle = active_pane
             .and_then(|pane| presentations.get(&pane))
             .map(|presentation| {
-                format!(
-                    "{} — {}",
-                    ui::workspace::pane_label(&presentation.metadata),
-                    presentation.location()
-                )
+                let label = ui::workspace::pane_label(&presentation.metadata);
+                // A worktree is known by its branch, as its tab would be.
+                match &presentation.worktree {
+                    Some(worktree) => format!("{} — {label}", worktree.branch),
+                    None => format!("{label} — {}", presentation.location()),
+                }
             })
             .unwrap_or_default();
         // A terminal alone in view has no tab, so the toolbar carries its links.
@@ -866,6 +874,9 @@ impl eframe::App for App {
             .and_then(|pane| presentations.get(&pane))
             .filter(|_| tabs <= 1)
             .map_or(&[][..], |presentation| &presentation.spawned);
+        let worktree = active_pane
+            .filter(|_| tabs <= 1)
+            .and_then(|pane| Some((pane, presentations.get(&pane)?.worktree.as_ref()?)));
         let sidebar_available = bounds.width() >= metrics::SIDEBAR_MIN_WINDOW;
         let sidebar_open = self.controller.model().sidebar() && sidebar_available;
         // Only a toggle slides. A window too narrow for the sidebar, like
@@ -933,6 +944,7 @@ impl eframe::App for App {
             subtitle: &subtitle,
             pull_requests,
             spawned,
+            worktree,
             zoomed: self.ui.zoomed,
             window: bounds,
             sidebar: reveal,
@@ -1193,6 +1205,19 @@ impl eframe::App for App {
                 &mut self.ui,
                 &ui::palette::PaletteView {
                     pane: self.controller.model().active_pane(),
+                    local: self
+                        .controller
+                        .model()
+                        .active_workspace()
+                        .and_then(|id| self.controller.model().workspace(id))
+                        .is_some_and(|workspace| workspace.remote().is_none()),
+                    worktree: self
+                        .controller
+                        .model()
+                        .active_pane()
+                        .and_then(|pane| self.controller.model().pane(pane))
+                        .and_then(|pane| pane.worktree())
+                        .map(|worktree| worktree.branch.as_str()),
                     layout: self
                         .controller
                         .model()
