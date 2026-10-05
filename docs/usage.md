@@ -21,7 +21,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 
 Workspace navigation, independent shell panes, split layouts, scrollback, terminal search, selection/clipboard, a command palette, and settings are integrated in the native interface. Every action is listed in the command palette with its shortcut; secondary-click a terminal or a workspace for its menu, double-click a workspace to rename it, drag a workspace to reorder the sidebar, and drag the sidebar's edge to resize it. Terminals in a workspace are tabs: several can share one place with one in view, and a split puts places side by side. A new split takes an equal share of the row or column it joins rather than half of one terminal, and closing a terminal gives its space back to that whole row or column; the others keep their proportions, so terminals of one size stay one size and a terminal you made larger stays larger. Double-click a divider to even its row or column, or run "Even terminal sizes" from the command palette to even every one in the workspace. With several terminals in a workspace, drag one by its tab to rearrange them: drop it on an edge of a place to sit beside it (on an edge of its own place to split it away from its neighbours), on the centre or among the tabs of another place to join them, or on a workspace in the sidebar to move it there with its shell still running. Escape cancels the drag, and the command palette lists "Move terminal to …" for each other workspace. Terminal text uses bundled JetBrains Mono; interface text uses Geist. Font licenses accompany the assets.
 
-Hold Command on macOS or Ctrl on Linux/Windows to reveal small shortcut hints in the top-right of the first nine workspace rows. The hints follow the workspace order and disappear when you release the modifier; `⇧` means Shift. Selecting a workspace with its shortcut or the palette opens its group if it is collapsed.
+Hold Command on macOS, Ctrl on Linux/Windows, or Alt to reveal small shortcut hints in the top-right of the first nine workspace rows. The hints follow the workspace order and show the configured shortcut. They disappear when you release the modifier; an unbound workspace has no hint. Selecting a workspace with its shortcut or the palette opens its group if it is collapsed.
 
 New workspace opens and selects a fresh shell at `~` immediately. Rename it later by double-clicking its sidebar row or choosing Rename workspace from its menu or the command palette.
 
@@ -178,7 +178,7 @@ neptune --help
 
 ## Preferences and themes
 
-[config.example.toml](../config.example.toml) documents the supported settings: 715 themes shared by the window and terminal, custom themes, window zoom, terminal font family, font size and line height, scrollback limit, shell executable and arguments, cursor style/blink, sidebar width, workspace restoration, and the two independent close warnings. Window zoom is available in Preferences under Appearance; changes there or through zoom shortcuts are saved and restored on the next launch, including with workspace restoration disabled. Settings are validated; unknown keys are rejected. Workspace restoration restores directories, split positions, and focused panes, and launches fresh shell processes; a remote workspace opens new SSH connections to its host. Recognized coding agents can resume their provider-owned conversations through saved session references; arbitrary commands and process memory are never serialized.
+[config.example.toml](../config.example.toml) documents the supported settings: 715 themes shared by the window and terminal, custom themes, window zoom, terminal font family, font size and line height, scrollback limit, shell executable and arguments, [custom keybindings](#custom-keybindings), cursor style/blink, sidebar width, workspace restoration, and the two independent close warnings. Window zoom is available in Preferences under Appearance; changes there or through zoom shortcuts are saved and restored on the next launch, including with workspace restoration disabled. Settings are validated; unknown keys are rejected. Workspace restoration restores directories, split positions, and focused panes, and launches fresh shell processes; a remote workspace opens new SSH connections to its host. Recognized coding agents can resume their provider-owned conversations through saved session references; arbitrary commands and process memory are never serialized.
 
 Preferences → Shell lists the shells found on this computer, as Windows Terminal lists profiles. On Windows it offers Command Prompt, Windows PowerShell, PowerShell 7, WSL distributions, Git Bash, Visual Studio developer prompts and Windows Terminal profiles that have their own command line (such as the Anaconda prompts). On macOS and Linux it offers the shells in `/etc/shells` and common shells on `PATH` or in Homebrew. **System default** keeps the platform's own startup, including a login shell on macOS and Linux; **Custom…** takes any program. A new choice applies to new terminals.
 
@@ -292,3 +292,46 @@ or replaced. Beta can advance to a newer stable; neither channel downgrades.
 See [installation](installation.md) for downloads and the
 [release guide](releases.md#desktop-update-behavior) for update verification
 and channel behavior.
+
+
+### Custom keybindings
+
+In **Preferences → General → Keyboard**, choose **Open config file** to open the active config in its default application. You can also search Preferences for "keybindings" or "shortcuts". Neptune creates a config with your current settings if none exists; existing files are kept intact, including invalid configurations. The button uses the file passed with `--config` when supplied.
+
+Expand **Shortcut reference** in that card to see every action's exact config name and platform defaults, accepted key names, modifier syntax and examples. Click anywhere on its header, or use Tab to focus it and Enter or Space to expand or collapse it. Config files Neptune creates or saves include the same commented reference inside `[keybindings]`. Uncomment the actions you want to change; keep just one entry per action. Opening an existing file preserves it, so its reference remains available in Preferences.
+
+Edit the `[keybindings]` table in `config.toml` (or the file passed with `--config`) and restart Neptune. Each action accepts a list of up to eight shortcuts. An omitted action keeps its platform defaults; a supplied list replaces every default for that action, and `[]` disables its shortcuts. Buttons, menus and palette commands remain available. Their hints show the first effective shortcut.
+
+```toml
+[keybindings]
+split-right = ["Alt+H", "Primary+Shift+F10"]
+split-below = ["Alt+J"]
+command-palette = ["Primary+Shift+P", "F12"]
+copy = []
+paste = ["Primary+Shift+V"]
+```
+
+Chords contain modifiers separated by `+`, followed by one logical key. Names are case insensitive. `Primary` means Command on macOS and Ctrl on Linux/Windows. Use `Ctrl`/`Control`, `Shift`, `Alt`/`Option`, or `Super`/`Cmd`/`Command`/`Meta` (the last group is supported on macOS). Modifiers must match exactly: `Alt+H` does not match `Alt+Shift+H`. Keys include letters, digits, `F1`–`F35`, `Enter`, `Tab`, `Space`, `Backspace`, `Delete`, `Insert`, `Home`, `End`, `PageUp`/`PgUp`, `PageDown`/`PgDn`, `Left`/`Right`/`Up`/`Down`, and punctuation such as `Comma`, `Minus`, `Equals`, `Slash` and `Plus`. Write `Ctrl+Plus` for the plus key. Dedicated `Copy`, `Cut` and `Paste` keyboard keys can be bound without modifiers. On Windows, Shift+Insert is also a default paste shortcut. Ctrl+Insert cannot be rebound there because the window toolkit reports it as Ctrl+C. These are Neptune TOML entries; Ghostty and kitty config syntax is not imported.
+
+| Actions | Config names |
+| --- | --- |
+| Create and arrange terminals | `new-workspace`, `new-worktree`, `new-tab`, `split-right`, `split-below`, `zoom-pane` |
+| Close and restart | `close-pane`, `close-workspace`, `restart-pane` |
+| Clipboard, history and search | `copy`, `copy-hints`, `paste`, `clear-scrollback`, `find` |
+| Move through terminals | `next-tab`, `previous-tab`, `focus-left`, `focus-right`, `focus-up`, `focus-down` |
+| Move through workspaces | `next-workspace`, `previous-workspace`, `workspace-1` through `workspace-9` |
+| Window and panels | `command-palette`, `preferences`, `toggle-sidebar`, `toggle-right-panel`, `show-files`, `show-agents`, `notifications`, `browse-themes` |
+| App zoom | `zoom-in`, `zoom-out`, `reset-zoom` |
+| Terminal text size | `increase-font-size`, `decrease-font-size`, `reset-font-size` |
+
+A shortcut cannot belong to two actions, including actions whose defaults you retained. To move a default shortcut to another action, clear its original owner's list first. For example, on Linux/Windows:
+
+```toml
+[keybindings]
+split-right = []
+find = ["Ctrl+Shift+D"]
+```
+
+Unknown actions, malformed chords, duplicates and conflicts reject the configuration with an error. Neptune opens using defaults and preserves the invalid file: Preferences changes remain temporary until you fix the file and restart. Reset to defaults in Preferences restores default shortcuts along with the other settings.
+
+Custom terminal shortcuts respect sheets, menus and editable fields. App zoom, text size, Preferences, the command palette and panel toggles can also work there when bound with Ctrl/Command or a function key. Escape stays reserved for cancellation; search-field navigation, menu navigation, Shift+PageUp/PageDown history scrolling and pointer gestures retain their existing behavior. Ordinary Ctrl+C and Ctrl+V continue to reach the terminal unless you explicitly bind them. A custom shortcut consumes its associated text and key release, so it is not also sent to the shell. Custom keys follow the logical key reported by the current layout; the default macOS text-size and numbered-workspace shortcuts keep their existing layout handling.

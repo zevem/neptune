@@ -82,6 +82,7 @@ pub struct View {
     query: String,
     font: FontPicker,
     editors: crate::platform::editor::Detection,
+    keybinding_reference: Option<String>,
     /// The search field takes the keyboard when the sheet appears.
     focus_search: bool,
 }
@@ -93,6 +94,7 @@ impl View {
         self.focus_search = true;
         self.font.cancel();
         self.editors.refresh();
+        self.keybinding_reference = None;
     }
 
     /// The sheet with a search under way.
@@ -155,6 +157,7 @@ enum Setting {
     RestoreWorkspaces,
     ConfirmClose,
     WarnProcesses,
+    Keybindings,
     Reset,
     Theme,
     WindowZoom,
@@ -173,7 +176,7 @@ enum Setting {
 
 /// Each setting with its pane, its label and the other words people use for
 /// it. A search reads the pane's name and the label as well as these.
-const INDEX: [(Setting, Pane, &str, &str); 18] = [
+const INDEX: [(Setting, Pane, &str, &str); 19] = [
     (
         Setting::FileEditor,
         Pane::General,
@@ -197,6 +200,12 @@ const INDEX: [(Setting, Pane, &str, &str); 18] = [
         Pane::General,
         "Warn about running processes",
         "close closing quit exit kill job jobs command program busy process warning alert",
+    ),
+    (
+        Setting::Keybindings,
+        Pane::General,
+        "Keyboard shortcuts",
+        "keybindings keybind bindings hotkeys remap customize config configuration file toml keyboard keys actions names syntax reference",
     ),
     (
         Setting::Reset,
@@ -555,7 +564,15 @@ pub fn show(
                         .show(ui, |ui| {
                             padded(ui, 20.0, |ui| {
                                 if listed(Pane::General) {
-                                    general(ui, p, &shown, &mut config, &mut view.editors);
+                                    general(
+                                        ui,
+                                        p,
+                                        &shown,
+                                        &mut config,
+                                        &mut view.keybinding_reference,
+                                        &mut view.editors,
+                                        actions,
+                                    );
                                 }
                                 if listed(Pane::Appearance) {
                                     appearance(ui, p, &shown, &mut config, state);
@@ -704,10 +721,50 @@ fn general(
     p: Palette,
     shown: &Shown,
     config: &mut Config,
+    reference: &mut Option<String>,
     editors: &mut crate::platform::editor::Detection,
+    actions: &mut Vec<Action>,
 ) {
-    use Setting::{ConfirmClose, Reset, RestoreWorkspaces, WarnProcesses};
+    use Setting::{ConfirmClose, Keybindings, Reset, RestoreWorkspaces, WarnProcesses};
     let pane = Pane::General;
+    card(
+        ui,
+        p,
+        shown,
+        pane,
+        "Keyboard",
+        &[Keybindings],
+        |ui, rows| {
+            rows.row(ui, "Keyboard shortcuts", |ui| {
+                if button(ui, p, "Open config file", ButtonKind::Secondary).clicked() {
+                    actions.push(Action::OpenConfig);
+                }
+            });
+            rows.note(
+                ui,
+                "Edit [keybindings] in your config file to customize shortcuts. Restart Neptune to apply changes.",
+            );
+            let mut visible = reference.is_some();
+            if rows
+                .disclosure(ui, "Shortcut reference", &mut visible)
+                .changed()
+            {
+                *reference = visible.then(crate::keybindings::Keybindings::reference);
+            }
+            if let Some(reference) = reference {
+                padded(ui, 14.0, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(reference.as_str())
+                                .font(egui::FontId::monospace(11.5))
+                                .color(p.secondary),
+                        )
+                        .wrap(),
+                    );
+                });
+            }
+        },
+    );
     card(
         ui,
         p,
@@ -879,11 +936,18 @@ fn appearance(
             });
             rows.note(
                 ui,
-                if cfg!(target_os = "macos") {
-                    "Command+Plus / Minus zooms, Command+0 resets. Saved for next launch."
-                } else {
-                    "Ctrl+Plus / Minus zooms, Ctrl+0 resets. Saved for next launch."
-                },
+                &format!(
+                    "Zoom in: {}. Zoom out: {}. Reset: {}. Saved for next launch.",
+                    config
+                        .keybindings
+                        .hint_or_unbound(crate::keybindings::BindingAction::ZoomIn),
+                    config
+                        .keybindings
+                        .hint_or_unbound(crate::keybindings::BindingAction::ZoomOut),
+                    config
+                        .keybindings
+                        .hint_or_unbound(crate::keybindings::BindingAction::ResetZoom)
+                ),
             );
         },
     );
@@ -949,11 +1013,18 @@ fn text(
             if shown.has(FontSize) {
                 rows.note(
                     ui,
-                    if cfg!(target_os = "macos") {
-                        "Command+Shift+Plus / Minus changes the font size, Command+Shift+0 resets it."
-                    } else {
-                        "Ctrl+Shift+Plus / Minus changes the font size, Ctrl+Shift+0 resets it."
-                    },
+                    &format!(
+                        "Larger text: {}. Smaller text: {}. Reset: {}.",
+                        config
+                            .keybindings
+                            .hint_or_unbound(crate::keybindings::BindingAction::IncreaseFontSize),
+                        config
+                            .keybindings
+                            .hint_or_unbound(crate::keybindings::BindingAction::DecreaseFontSize),
+                        config
+                            .keybindings
+                            .hint_or_unbound(crate::keybindings::BindingAction::ResetFontSize)
+                    ),
                 );
             }
         },
@@ -1467,6 +1538,18 @@ mod tests {
 
     #[test]
     fn other_words_for_a_setting_find_it() {
+        for query in [
+            "keybindings",
+            "shortcuts",
+            "hotkeys",
+            "remap",
+            "config file",
+            "shortcut reference",
+            "key syntax",
+            "action names",
+        ] {
+            assert_eq!(finds(query), [Setting::Keybindings]);
+        }
         assert_eq!(finds("monospace"), [Setting::FontFamily]);
         assert_eq!(finds("font family"), [Setting::FontFamily]);
         assert_eq!(finds("custom font"), [Setting::FontFamily]);

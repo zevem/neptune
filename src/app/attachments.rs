@@ -45,7 +45,7 @@ impl App {
         }
     }
 
-    fn paste_text(&mut self, pane: PaneId, text: &str) {
+    pub(super) fn paste_text(&mut self, pane: PaneId, text: &str) {
         if let Some(session) = self.sessions.get(pane) {
             match session.paste(text) {
                 Ok(()) => self.notifications.acknowledge(Some(pane)),

@@ -1,9 +1,7 @@
 //! The command palette: every action, searchable, with its shortcut.
-use super::helpers::{
-    SheetPlacement, bare_text_edit, edit_shortcut, elided, galley_at, keycaps, place, sheet,
-    shortcut,
-};
+use super::helpers::{SheetPlacement, bare_text_edit, elided, galley_at, keycaps, place, sheet};
 use super::{Action, UiState, WorkspaceView};
+use crate::keybindings::BindingAction as Binding;
 use crate::{
     config::{Config, Theme},
     icons::{self, Icon},
@@ -114,21 +112,21 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 "Terminal",
                 Icon::Plus,
                 "New tab",
-                shortcut("T"),
+                view.config.keybindings.hint(Binding::NewTab),
                 [Action::NewTab(pane)],
             ),
             command(
                 "Terminal",
                 Icon::SplitVertical,
                 "Split right",
-                shortcut("D"),
+                view.config.keybindings.hint(Binding::SplitRight),
                 [Action::Split(pane, Axis::Vertical)],
             ),
             command(
                 "Terminal",
                 Icon::SplitHorizontal,
                 "Split below",
-                shortcut("E"),
+                view.config.keybindings.hint(Binding::SplitBelow),
                 [Action::Split(pane, Axis::Horizontal)],
             ),
             command(
@@ -143,60 +141,56 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 } else {
                     "Zoom terminal"
                 },
-                shortcut("Enter"),
+                view.config.keybindings.hint(Binding::ZoomPane),
                 [Action::Zoom],
             ),
             command(
                 "Terminal",
                 Icon::Search,
                 "Find in terminal",
-                shortcut("F"),
+                view.config.keybindings.hint(Binding::Find),
                 [Action::Find],
             ),
             command(
                 "Terminal",
                 Icon::Copy,
                 "Copy with hints",
-                if cfg!(target_os = "macos") {
-                    "⌘⇧H".into()
-                } else {
-                    shortcut("H")
-                },
+                view.config.keybindings.hint(Binding::CopyHints),
                 [Action::CopyHints(pane)],
             ),
             command(
                 "Terminal",
                 Icon::Copy,
                 "Copy selection",
-                shortcut("C"),
+                view.config.keybindings.hint(Binding::Copy),
                 [Action::Copy(pane)],
             ),
             command(
                 "Terminal",
                 Icon::Clipboard,
                 "Paste",
-                shortcut("V"),
+                view.config.keybindings.hint(Binding::Paste),
                 [Action::Paste(pane)],
             ),
             command(
                 "Terminal",
                 Icon::Eraser,
                 "Clear scrollback",
-                "",
+                view.config.keybindings.hint(Binding::ClearScrollback),
                 [Action::Clear(pane)],
             ),
             command(
                 "Terminal",
                 Icon::Refresh,
                 "Restart terminal",
-                "",
+                view.config.keybindings.hint(Binding::RestartPane),
                 [Action::Restart(pane)],
             ),
             command(
                 "Terminal",
                 Icon::Close,
                 "Close terminal",
-                shortcut("W"),
+                view.config.keybindings.hint(Binding::ClosePane),
                 [Action::ClosePane(pane)],
             ),
         ]);
@@ -208,7 +202,7 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                     "Terminal",
                     Icon::Branch,
                     "New agent in worktree",
-                    shortcut("G"),
+                    view.config.keybindings.hint(Binding::NewWorktree),
                     [Action::Worktree(super::worktrees::Event::New(pane))],
                 ),
             );
@@ -232,31 +226,41 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                     [Action::EvenSplits(workspace)],
                 ));
             }
-            for (forward, title, key) in
-                [(true, "Next tab", "PgDn"), (false, "Previous tab", "PgUp")]
-            {
+            for (forward, title) in [(true, "Next tab"), (false, "Previous tab")] {
                 if let Some(target) = layout.next_tab(pane, forward) {
                     list.push(command(
                         "Terminal",
                         Icon::Terminal,
                         title,
-                        shortcut(key),
+                        view.config.keybindings.hint(if forward {
+                            Binding::NextTab
+                        } else {
+                            Binding::PreviousTab
+                        }),
                         [Action::Focus(target)],
                     ));
                 }
             }
-            for (direction, title, arrow) in [
-                (FocusDirection::Left, "Focus pane to the left", "←"),
-                (FocusDirection::Right, "Focus pane to the right", "→"),
-                (FocusDirection::Up, "Focus pane above", "↑"),
-                (FocusDirection::Down, "Focus pane below", "↓"),
+            for (direction, title, binding) in [
+                (
+                    FocusDirection::Left,
+                    "Focus pane to the left",
+                    Binding::FocusLeft,
+                ),
+                (
+                    FocusDirection::Right,
+                    "Focus pane to the right",
+                    Binding::FocusRight,
+                ),
+                (FocusDirection::Up, "Focus pane above", Binding::FocusUp),
+                (FocusDirection::Down, "Focus pane below", Binding::FocusDown),
             ] {
                 if let Some(target) = layout.adjacent(pane, direction) {
                     list.push(command(
                         "Terminal",
                         Icon::Grid,
                         title,
-                        format!("Ctrl+Shift+{arrow}"),
+                        view.config.keybindings.hint(binding),
                         [Action::Focus(target)],
                     ));
                 }
@@ -267,7 +271,7 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         "Workspace",
         Icon::Plus,
         "New workspace",
-        shortcut("N"),
+        view.config.keybindings.hint(Binding::NewWorkspace),
         [Action::New],
     ));
     list.push(command(
@@ -388,7 +392,7 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 "Workspace",
                 Icon::Close,
                 "Close workspace",
-                "",
+                view.config.keybindings.hint(Binding::CloseWorkspace),
                 [Action::CloseWorkspace(active)],
             ),
         ]);
@@ -436,7 +440,8 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 Icon::ArrowUpRight,
                 format!("Go to {}", workspace.name),
                 if index < 9 {
-                    shortcut(&(index + 1).to_string())
+                    Binding::workspace(index)
+                        .map_or_else(String::new, |action| view.config.keybindings.hint(action))
                 } else {
                     String::new()
                 },
@@ -484,21 +489,21 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             "View",
             Icon::Sidebar,
             "Toggle sidebar",
-            shortcut("B"),
+            view.config.keybindings.hint(Binding::ToggleSidebar),
             [Action::ToggleSidebar],
         ),
         command(
             "View",
             Icon::PanelRight,
             "Toggle right panel",
-            shortcut("O"),
+            view.config.keybindings.hint(Binding::ToggleRightPanel),
             [Action::Panel(super::panel::Event::Toggle)],
         ),
         command(
             "View",
             Icon::Files,
             "Show files",
-            "",
+            view.config.keybindings.hint(Binding::ShowFiles),
             [Action::Panel(super::panel::Event::Show(
                 super::panel::Tab::Files,
             ))],
@@ -507,7 +512,7 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             "View",
             Icon::Terminal,
             "Show agents",
-            "",
+            view.config.keybindings.hint(Binding::ShowAgents),
             [Action::Panel(super::panel::Event::Show(
                 super::panel::Tab::Agents,
             ))],
@@ -525,27 +530,52 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             "View",
             Icon::Bell,
             "Notifications",
-            "",
+            view.config.keybindings.hint(Binding::Notifications),
             [Action::Notifications],
         ),
         command(
             "View",
             Icon::Settings,
             "Preferences",
-            edit_shortcut(","),
+            view.config.keybindings.hint(Binding::Preferences),
             [Action::Settings],
         ),
     ]);
-    for (title, key, action) in [
-        ("Zoom app in", "+", Action::ZoomUiIn),
-        ("Zoom app out", "-", Action::ZoomUiOut),
-        ("Reset app zoom", "0", Action::ResetUiZoom),
+    for (title, binding, action) in [
+        ("Zoom app in", Binding::ZoomIn, Action::ZoomUiIn),
+        ("Zoom app out", Binding::ZoomOut, Action::ZoomUiOut),
+        ("Reset app zoom", Binding::ResetZoom, Action::ResetUiZoom),
     ] {
         list.push(command(
             "View",
             Icon::TextSize,
             title,
-            edit_shortcut(key),
+            view.config.keybindings.hint(binding),
+            [action],
+        ));
+    }
+    for (title, binding, action) in [
+        (
+            "Increase terminal font size",
+            Binding::IncreaseFontSize,
+            Action::IncreaseFontSize,
+        ),
+        (
+            "Decrease terminal font size",
+            Binding::DecreaseFontSize,
+            Action::DecreaseFontSize,
+        ),
+        (
+            "Reset terminal font size",
+            Binding::ResetFontSize,
+            Action::ResetFontSize,
+        ),
+    ] {
+        list.push(command(
+            "Appearance",
+            Icon::TextSize,
+            title,
+            view.config.keybindings.hint(binding),
             [action],
         ));
     }
@@ -553,7 +583,7 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         "Appearance",
         Icon::Settings,
         "Browse themes",
-        "",
+        view.config.keybindings.hint(Binding::BrowseThemes),
         [Action::Themes],
     ));
     for (theme, name, icon) in [
@@ -1061,6 +1091,31 @@ mod tests {
     }
 
     #[test]
+    fn custom_keybindings_are_shown_and_disabled_actions_stay_available() {
+        let config: Config = toml::from_str(
+            r#"[keybindings]
+            split-right = ["Alt+H"]
+            copy = []
+            restart-pane = ["F12"]
+        "#,
+        )
+        .unwrap();
+        let list = commands(&PaletteView {
+            pane: Some(PaneId::new(7)),
+            ..view(&config, &[])
+        });
+        for (title, hint) in [
+            ("Split right", "Alt+H"),
+            ("Copy selection", ""),
+            ("Restart terminal", "F12"),
+        ] {
+            let command = list.iter().find(|command| command.title == title).unwrap();
+            assert_eq!(command.shortcut, hint);
+            assert!(!command.actions.is_empty());
+        }
+    }
+
+    #[test]
     fn terminal_commands_require_a_focused_pane() {
         let config = Config::default();
         let without = commands(&view(&config, &[]));
@@ -1199,10 +1254,24 @@ mod tests {
         };
         assert_eq!(titles("right split"), ["Split right"]);
         assert_eq!(titles("zoom reset"), ["Reset app zoom"]);
-        assert!(titles("font").is_empty());
+        assert_eq!(
+            titles("font"),
+            [
+                "Increase terminal font size",
+                "Decrease terminal font size",
+                "Reset terminal font size"
+            ]
+        );
         assert_eq!(
             titles("appearance"),
-            ["Browse themes", "Use Dusk theme", "Use Light theme"]
+            [
+                "Increase terminal font size",
+                "Decrease terminal font size",
+                "Reset terminal font size",
+                "Browse themes",
+                "Use Dusk theme",
+                "Use Light theme"
+            ]
         );
         assert!(titles("zzz").is_empty());
         // The active theme is not offered again.

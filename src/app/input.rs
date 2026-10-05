@@ -6,7 +6,6 @@ impl App {
         ctx: &egui::Context,
         rect: Rect,
         context: RoutingContext,
-        swallowed_paste: Option<egui::Modifiers>,
     ) {
         let Some(id) = self.controller.model().active_pane() else {
             return;
@@ -25,14 +24,6 @@ impl App {
             }
             return;
         }
-        // The toolkit keeps a paste chord to itself when the clipboard has no
-        // text. Ctrl+V still belongs to the program, which may read a picture
-        // from the clipboard itself; the host chord pastes the picture's path.
-        let terminal_chord =
-            swallowed_paste.filter(|chord| chord.ctrl && !chord.shift && !chord.mac_cmd);
-        if swallowed_paste.is_some() && terminal_chord.is_none() {
-            self.paste_clipboard(ctx, id, true);
-        }
         let Some(session) = self.sessions.get(id) else {
             return;
         };
@@ -41,19 +32,7 @@ impl App {
         };
         let mode = session.modes();
         let events = ctx.input(|i| i.events.clone());
-        let mut normalized = crate::input::normalize_events(&events, ctx.input(|i| i.modifiers));
-        if let Some(chord) = terminal_chord {
-            normalized.insert(
-                0,
-                crate::input::InputEvent::Key {
-                    key: terminal_core::input::Key::V,
-                    physical_key: None,
-                    modifiers: crate::input::modifiers(chord),
-                    pressed: true,
-                    repeat: false,
-                },
-            );
-        }
+        let normalized = crate::input::normalize_events(&events, ctx.input(|i| i.modifiers));
         for input in crate::input::route_events(context, &normalized, mode) {
             let result = match input.action {
                 InputAction::Write(bytes) => {
@@ -222,6 +201,14 @@ impl App {
     }
 }
 impl App {
+    pub(super) fn terminal_owns_shortcuts(&self, ctx: &egui::Context) -> bool {
+        self.ui.overlay == OverlayState::None
+            && !egui::Popup::is_any_open(ctx)
+            && ctx.memory(|memory| {
+                memory.focused().is_none() || memory.focused() == self.terminal_focus
+            })
+    }
+
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
         self.shortcuts_with_keymap(ctx, crate::platform::keyboard::unshifted_zoom_key);
     }
@@ -231,170 +218,113 @@ impl App {
         ctx: &egui::Context,
         mut unshifted_key: impl FnMut(egui::Key) -> Option<egui::Key>,
     ) {
+        use crate::keybindings::BindingAction as Binding;
+        if self.hints.is_some() {
+            ctx.input(|input| {
+                for event in &input.events {
+                    if let egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: false,
+                        ..
+                    } = event
+                    {
+                        self.shortcut_keys.remove(&physical_key.unwrap_or(*key));
+                    }
+                }
+            });
+        }
         if self.hint_input(ctx) {
             return;
         }
-        let mut actions = Vec::new();
-        for event in ctx.input(|i| i.events.clone()) {
-            let egui::Event::Key {
-                key,
-                physical_key,
-                pressed,
-                modifiers: m,
-                ..
-            } = event
-            else {
-                continue;
-            };
-            let direction = if m.ctrl && m.shift && !m.alt && !m.mac_cmd {
-                match key {
-                    egui::Key::ArrowLeft => Some(neptune_model::FocusDirection::Left),
-                    egui::Key::ArrowRight => Some(neptune_model::FocusDirection::Right),
-                    egui::Key::ArrowUp => Some(neptune_model::FocusDirection::Up),
-                    egui::Key::ArrowDown => Some(neptune_model::FocusDirection::Down),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(direction) = direction {
-                // Apply earlier shortcuts before checking ownership and capturing
-                // the target. Repeated arrows advance from the new focus.
-                for action in actions.drain(..) {
-                    self.action(ctx, action);
-                }
-                let terminal_owns_keys = self.ui.overlay == OverlayState::None
-                    && !egui::Popup::is_any_open(ctx)
-                    && ctx.memory(|memory| {
-                        memory.focused().is_none() || memory.focused() == self.terminal_focus
-                    });
-                if terminal_owns_keys && self.controller.model().active_pane().is_some() {
-                    if pressed
-                        && let Some(workspace) = self
-                            .controller
-                            .model()
-                            .active_workspace()
-                            .and_then(|id| self.controller.model().workspace(id))
-                        && let Some(target) =
-                            workspace.layout().adjacent(workspace.active(), direction)
-                    {
-                        self.action(ctx, Action::Focus(target));
-                    }
-                    // Consume the chord even at an outer edge, including releases
-                    // that a terminal using the Kitty protocol could otherwise see.
-                    ctx.input_mut(|input| {
-                        input.events.retain(|event| {
-                            !matches!(event, egui::Event::Key { key: value, modifiers, .. }
-                                if *value == key && *modifiers == m)
-                        });
-                    });
-                }
+        // A clipboard without text may leave only V's release. Recover the
+        // swallowed press before resolving it so remaps apply here as well.
+        if let Some(modifiers) = self.swallowed_paste.take()
+            && self.terminal_owns_shortcuts(ctx)
+        {
+            ctx.input_mut(|input| {
+                input.events.insert(
+                    0,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                )
+            });
+        }
+        if !ctx.input(|input| input.focused) {
+            self.shortcut_keys.clear();
+            self.shortcut_modifiers = egui::Modifiers::NONE;
+        }
+        let events = ctx.input(|input| input.events.clone());
+        let mut frame_modifiers = self.shortcut_modifiers;
+        for event in events {
+            if let egui::Event::ModifiersChanged(modifiers) = event {
+                frame_modifiers = modifiers;
                 continue;
             }
-            let zoom_key = if m.shift && !m.alt && (m.ctrl ^ m.mac_cmd) {
-                physical_key.and_then(&mut unshifted_key).unwrap_or(key)
-            } else {
-                key
+            if matches!(
+                event,
+                egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+            ) && !ctx.input(|input| input.events.contains(&event))
+            {
+                continue;
+            }
+            let (key, physical_key, pressed, m) = match &event {
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    modifiers,
+                    ..
+                } => (*key, *physical_key, *pressed, *modifiers),
+                egui::Event::Copy if self.terminal_owns_shortcuts(ctx) => (
+                    if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
+                        egui::Key::C
+                    } else {
+                        egui::Key::Copy
+                    },
+                    None,
+                    true,
+                    frame_modifiers,
+                ),
+                egui::Event::Cut if self.terminal_owns_shortcuts(ctx) => (
+                    if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
+                        egui::Key::X
+                    } else if cfg!(windows) && frame_modifiers.shift {
+                        egui::Key::Delete
+                    } else {
+                        egui::Key::Cut
+                    },
+                    None,
+                    true,
+                    frame_modifiers,
+                ),
+                egui::Event::Paste(_) if self.terminal_owns_shortcuts(ctx) => (
+                    if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
+                        egui::Key::V
+                    } else if cfg!(windows) && frame_modifiers.shift {
+                        egui::Key::Insert
+                    } else {
+                        egui::Key::Paste
+                    },
+                    None,
+                    true,
+                    frame_modifiers,
+                ),
+                _ => continue,
             };
-            if let Some(action) = zoom_shortcut(zoom_key, m, &self.config) {
-                if pressed {
-                    for pending in actions.drain(..) {
-                        self.action(ctx, pending);
-                    }
-                    self.action(ctx, action);
-                }
+            frame_modifiers = m;
+            if !pressed && self.shortcut_keys.remove(&physical_key.unwrap_or(key)) {
                 ctx.input_mut(|input| {
-                    // Consume the original event, including releases, rather
-                    // than the labeled key recovered from the keyboard layout.
-                    // Text belongs to the immediately preceding key press;
-                    // ordinary symbols typed later in this frame must survive.
-                    let mut shortcut_text = false;
-                    input.events.retain(|event| match event {
-                        egui::Event::Key {
-                            key: value,
-                            physical_key: physical,
-                            pressed,
-                            modifiers,
-                            ..
-                        } => {
-                            let matched =
-                                *value == key && *physical == physical_key && *modifiers == m;
-                            shortcut_text = matched && *pressed;
-                            !matched
-                        }
-                        egui::Event::Text(text) => {
-                            let consume = shortcut_text
-                                && match zoom_key {
-                                    egui::Key::Plus | egui::Key::Equals => {
-                                        matches!(text.as_str(), "+" | "=" | "*")
-                                    }
-                                    egui::Key::Minus => matches!(text.as_str(), "-" | "_"),
-                                    egui::Key::Num0 => matches!(text.as_str(), "0" | ")" | "="),
-                                    _ => false,
-                                };
-                            shortcut_text = false;
-                            !consume
-                        }
-                        _ => {
-                            shortcut_text = false;
-                            true
-                        }
-                    });
+                    consume_binding(&mut input.events, &event, key, physical_key, m)
                 });
                 continue;
             }
-            let hint_chord = key == egui::Key::H
-                && m.shift
-                && !m.alt
-                && if cfg!(target_os = "macos") {
-                    m.mac_cmd && !m.ctrl
-                } else {
-                    m.ctrl && !m.mac_cmd
-                };
-            if hint_chord {
-                let owns = self.ui.overlay == OverlayState::None
-                    && !egui::Popup::is_any_open(ctx)
-                    && ctx.memory(|memory| {
-                        memory.focused().is_none() || memory.focused() == self.terminal_focus
-                    });
-                if owns {
-                    if pressed && let Some(pane) = self.controller.model().active_pane() {
-                        actions.push(Action::CopyHints(pane));
-                        if !self.hint_keys.contains(&key) {
-                            self.hint_keys.push(key);
-                        }
-                    }
-                    ctx.input_mut(|input| {
-                        let mut text_for_key = false;
-                        input.events.retain(|event| match event {
-                            egui::Event::Key {
-                                key: value,
-                                modifiers,
-                                pressed,
-                                ..
-                            } => {
-                                let matched = *value == key && *modifiers == m;
-                                text_for_key = matched && *pressed;
-                                !matched
-                            }
-                            egui::Event::Text(text) => {
-                                let keep = !(text_for_key && text.eq_ignore_ascii_case("h"));
-                                text_for_key = false;
-                                keep
-                            }
-                            _ => {
-                                text_for_key = false;
-                                true
-                            }
-                        });
-                    });
-                }
-                continue;
-            }
-            if !pressed {
-                continue;
-            }
-            if key == egui::Key::Escape {
+            if pressed && key == egui::Key::Escape {
                 // Escape cancels a terminal drag, then leaves the topmost
                 // transient surface. With neither it belongs to the terminal:
                 // a message never takes a key the shell is waiting for, and is
@@ -432,118 +362,238 @@ impl App {
                 });
                 continue;
             }
-            let command = if cfg!(target_os = "macos") {
-                m.mac_cmd
+
+            let font_key = if m.shift && !m.alt && (m.ctrl ^ m.mac_cmd) {
+                physical_key.and_then(&mut unshifted_key).unwrap_or(key)
             } else {
-                m.ctrl && m.shift
+                key
             };
-            let pane = self.controller.model().active_pane();
-            let action = if command {
-                match key {
-                    egui::Key::T => Some(pane.map_or(Action::New, Action::NewTab)),
-                    egui::Key::N => Some(Action::New),
-                    egui::Key::PageDown | egui::Key::PageUp => self
-                        .controller
-                        .model()
-                        .active_workspace()
-                        .and_then(|id| self.controller.model().workspace(id))
-                        .and_then(|workspace| {
-                            let forward = key == egui::Key::PageDown;
-                            workspace.layout().next_tab(workspace.active(), forward)
-                        })
-                        .map(Action::Focus),
-                    egui::Key::D => pane.map(|id| Action::Split(id, neptune_model::Axis::Vertical)),
-                    egui::Key::E => {
-                        pane.map(|id| Action::Split(id, neptune_model::Axis::Horizontal))
-                    }
-                    egui::Key::G => pane.map(|id| Action::Worktree(ui::worktrees::Event::New(id))),
-                    egui::Key::W => pane.map(Action::ClosePane),
-                    egui::Key::F => Some(Action::Find),
-                    egui::Key::P => Some(Action::Palette),
-                    egui::Key::B => Some(Action::ToggleSidebar),
-                    egui::Key::O => Some(Action::Panel(ui::panel::Event::Toggle)),
-                    egui::Key::Enter => Some(Action::Zoom),
-                    egui::Key::C => pane.map(Action::Copy),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            // Workspaces are numbered in sidebar order. With Shift held the
-            // logical key is a symbol, so the digit comes from the physical key.
-            let action = action.or_else(|| {
-                let index = workspace_digit(physical_key.unwrap_or(key)).filter(|_| command)?;
-                let workspace = self.controller.model().workspaces().get(index)?;
-                Some(Action::SelectWorkspace(workspace.id()))
-            });
-            if let Some(action) = action {
-                actions.push(action);
-                ctx.input_mut(|i| {
-                    i.consume_key(m, key);
-                });
-            }
-            if (m.command || m.ctrl) && key == egui::Key::Comma {
-                actions.push(Action::Settings);
-                ctx.input_mut(|i| {
-                    i.consume_key(m, key);
-                });
-            }
-            if m.ctrl && key == egui::Key::Tab {
-                let workspaces = self.controller.model().workspaces();
-                if !workspaces.is_empty() {
-                    let current = workspaces
-                        .iter()
-                        .position(|w| Some(w.id()) == self.controller.model().active_workspace())
-                        .unwrap_or(0);
-                    let index = if m.shift {
-                        (current + workspaces.len() - 1) % workspaces.len()
-                    } else {
-                        (current + 1) % workspaces.len()
-                    };
-                    actions.push(Action::SelectWorkspace(workspaces[index].id()));
-                    ctx.input_mut(|i| {
-                        i.consume_key(m, key);
+            let Some(binding) = self
+                .config
+                .keybindings
+                .resolve(key, physical_key, m, font_key)
+            else {
+                // egui's clipboard events stand for shortcuts it swallowed.
+                // Unbound chords must still reach the terminal as keys, rather
+                // than falling back to the old host copy/paste policy.
+                if self.terminal_owns_shortcuts(ctx)
+                    && (m.ctrl
+                        || m.mac_cmd
+                        || matches!(key, egui::Key::Copy | egui::Key::Cut | egui::Key::Paste)
+                        || (cfg!(windows) && matches!(key, egui::Key::Insert | egui::Key::Delete)))
+                {
+                    ctx.input_mut(|input| {
+                        let mirrored = input
+                            .events
+                            .iter()
+                            .take_while(|value| *value != &event)
+                            .filter_map(|value| match value {
+                                egui::Event::Key {
+                                    key,
+                                    modifiers,
+                                    pressed: true,
+                                    ..
+                                } => Some((*key, *modifiers)),
+                                _ => None,
+                            })
+                            .last()
+                            == Some((key, m));
+                        if mirrored {
+                            input.events.retain(|value| value != &event);
+                            return;
+                        }
+                        for value in &mut input.events {
+                            if *value == event
+                                && matches!(
+                                    value,
+                                    egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
+                                )
+                            {
+                                *value = egui::Event::Key {
+                                    key,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: m,
+                                };
+                            }
+                        }
                     });
                 }
+                continue;
+            };
+            // Directional navigation always belongs to terminals, including
+            // at an outer edge. Custom terminal bindings also respect fields,
+            // dialogs and the command palette.
+            let directional = matches!(
+                binding,
+                Binding::FocusLeft | Binding::FocusRight | Binding::FocusUp | Binding::FocusDown
+            );
+            let terminal_only = directional
+                || matches!(binding, Binding::CopyHints | Binding::NewWorktree)
+                || (self.config.keybindings.overridden(binding)
+                    && !(binding.global()
+                        && (m.ctrl
+                            || m.mac_cmd
+                            || key
+                                .name()
+                                .strip_prefix('F')
+                                .is_some_and(|number| number.parse::<u8>().is_ok()))));
+            if terminal_only && !self.terminal_owns_shortcuts(ctx) {
+                continue;
             }
+            let action = self.binding_action(binding);
+            // Preserve defaults that belong to the shell when their target
+            // does not exist. Explicit overrides reserve the chosen chord.
+            let reserves_direction = directional && self.controller.model().active_pane().is_some();
+            if action.is_none()
+                && !reserves_direction
+                && !self.config.keybindings.overridden(binding)
+            {
+                continue;
+            }
+            if pressed {
+                self.shortcut_keys.insert(physical_key.unwrap_or(key));
+                if binding == Binding::Paste
+                    && let egui::Event::Paste(text) = &event
+                {
+                    if let Some(pane) = self.controller.model().active_pane() {
+                        self.paste_text(pane, text);
+                    }
+                } else if let Some(action) = action {
+                    self.action(ctx, action);
+                }
+            }
+            ctx.input_mut(|input| consume_binding(&mut input.events, &event, key, physical_key, m));
         }
-        for action in actions {
-            self.action(ctx, action);
-        }
+        self.shortcut_modifiers = ctx.input(|input| input.modifiers);
     }
-}
 
-fn zoom_shortcut(key: egui::Key, modifiers: egui::Modifiers, current: &Config) -> Option<Action> {
-    use egui::Key;
-    if modifiers.alt
-        || !(modifiers.ctrl || modifiers.mac_cmd)
-        || (modifiers.ctrl && modifiers.mac_cmd)
-    {
-        return None;
-    }
-    if modifiers.shift {
-        let font_size = match key {
-            Key::Plus | Key::Equals => (current.font_size + 1.0).min(32.0),
-            Key::Minus => (current.font_size - 1.0).max(9.0),
-            Key::Num0 => Config::default().font_size,
-            _ => return None,
+    fn binding_action(&self, binding: crate::keybindings::BindingAction) -> Option<Action> {
+        use crate::keybindings::BindingAction::*;
+        let pane = self.controller.model().active_pane();
+        let workspace = self
+            .controller
+            .model()
+            .active_workspace()
+            .and_then(|id| self.controller.model().workspace(id));
+        let direction = match binding {
+            FocusLeft => Some(neptune_model::FocusDirection::Left),
+            FocusRight => Some(neptune_model::FocusDirection::Right),
+            FocusUp => Some(neptune_model::FocusDirection::Up),
+            FocusDown => Some(neptune_model::FocusDirection::Down),
+            _ => None,
         };
-        return Some(Action::Preferences(Config {
-            font_size,
-            ..current.clone()
-        }));
-    }
-    match key {
-        Key::Plus | Key::Equals => Some(Action::ZoomUiIn),
-        Key::Minus if !modifiers.shift => Some(Action::ZoomUiOut),
-        Key::Num0 if !modifiers.shift => Some(Action::ResetUiZoom),
-        _ => None,
+        if let Some(direction) = direction {
+            let workspace = workspace?;
+            return workspace
+                .layout()
+                .adjacent(workspace.active(), direction)
+                .map(Action::Focus);
+        }
+        if let Some(index) = binding.workspace_index() {
+            return self
+                .controller
+                .model()
+                .workspaces()
+                .get(index)
+                .map(|workspace| Action::SelectWorkspace(workspace.id()));
+        }
+        Some(match binding {
+            NewWorkspace => Action::New,
+            NewWorktree => Action::Worktree(ui::worktrees::Event::New(pane?)),
+            NewTab => pane.map_or(Action::New, Action::NewTab),
+            SplitRight => Action::Split(pane?, neptune_model::Axis::Vertical),
+            SplitBelow => Action::Split(pane?, neptune_model::Axis::Horizontal),
+            ClosePane => Action::ClosePane(pane?),
+            CloseWorkspace => Action::CloseWorkspace(workspace?.id()),
+            Find => Action::Find,
+            CommandPalette => Action::Palette,
+            ToggleSidebar => Action::ToggleSidebar,
+            ToggleRightPanel => Action::Panel(ui::panel::Event::Toggle),
+            ZoomPane => Action::Zoom,
+            Copy => Action::Copy(pane?),
+            CopyHints => Action::CopyHints(pane?),
+            Paste => Action::Paste(pane?),
+            Preferences => Action::Settings,
+            NextTab | PreviousTab => {
+                let workspace = workspace?;
+                Action::Focus(
+                    workspace
+                        .layout()
+                        .next_tab(workspace.active(), binding == NextTab)?,
+                )
+            }
+            NextWorkspace | PreviousWorkspace => {
+                let workspaces = self.controller.model().workspaces();
+                if workspaces.is_empty() {
+                    return None;
+                }
+                let current = workspaces
+                    .iter()
+                    .position(|workspace| {
+                        Some(workspace.id()) == self.controller.model().active_workspace()
+                    })
+                    .unwrap_or(0);
+                let index = if binding == NextWorkspace {
+                    (current + 1) % workspaces.len()
+                } else {
+                    (current + workspaces.len() - 1) % workspaces.len()
+                };
+                Action::SelectWorkspace(workspaces[index].id())
+            }
+            ZoomIn => Action::ZoomUiIn,
+            ZoomOut => Action::ZoomUiOut,
+            ResetZoom => Action::ResetUiZoom,
+            IncreaseFontSize => Action::IncreaseFontSize,
+            DecreaseFontSize => Action::DecreaseFontSize,
+            ResetFontSize => Action::ResetFontSize,
+            ClearScrollback => Action::Clear(pane?),
+            RestartPane => Action::Restart(pane?),
+            Notifications => Action::Notifications,
+            ShowFiles => Action::Panel(ui::panel::Event::Show(ui::panel::Tab::Files)),
+            ShowAgents => Action::Panel(ui::panel::Event::Show(ui::panel::Tab::Agents)),
+            BrowseThemes => Action::Themes,
+            _ => return None,
+        })
     }
 }
 
-fn workspace_digit(key: egui::Key) -> Option<usize> {
-    use egui::Key::*;
-    [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9]
-        .iter()
-        .position(|digit| *digit == key)
+/// Remove the chord's press/repeat/release and its paired text/clipboard event.
+/// An ordinary character later in the same frame keeps its own input ownership.
+fn consume_binding(
+    events: &mut Vec<egui::Event>,
+    original: &egui::Event,
+    key: egui::Key,
+    physical: Option<egui::Key>,
+    modifiers: egui::Modifiers,
+) {
+    let mut paired = false;
+    events.retain(|event| match event {
+        egui::Event::Key {
+            key: value,
+            physical_key,
+            modifiers: m,
+            pressed,
+            ..
+        } => {
+            let matched = *value == key && *physical_key == physical && *m == modifiers;
+            paired = matched && *pressed;
+            !matched
+        }
+        egui::Event::Text(_) => {
+            let keep = !paired;
+            paired = false;
+            keep
+        }
+        egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => {
+            let keep = !(paired || event == original);
+            paired = false;
+            keep
+        }
+        _ => {
+            paired = false;
+            true
+        }
+    });
 }

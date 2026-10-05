@@ -12,6 +12,7 @@ shell sessions, GPU rendering, and a quiet workspace interface, with no webview.
 - Workspaces, tabs, split panes, and groups with drag-and-drop organization.
 - Local shells and SSH workspaces backed by real PTY sessions.
 - Scrollback, terminal search, selection/clipboard, and a command palette.
+- [Custom keybindings](docs/usage.md#custom-keybindings) configured in TOML.
 - 715 built-in themes and custom themes shared by the window and terminal.
 - Terminal notifications with optional native desktop banners.
 - Saved workspace layouts and directories, plus optional Claude Code, Codex,

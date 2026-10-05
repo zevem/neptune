@@ -13,6 +13,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         renders: BTreeMap::new(),
         config,
         config_path: root.join("config.toml"),
+        config_writable: true,
         fonts: crate::platform::fonts::Fonts::bundled(),
         state_path: root.join("workspaces.json"),
         window_path: root.join("window.json"),
@@ -54,6 +55,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         hints: None,
         hint_keys: Vec::new(),
         file_location: None,
+        file_opener: Default::default(),
         ports: Default::default(),
         notifications: Default::default(),
         agents: Default::default(),
@@ -72,6 +74,8 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         paste_chord: Default::default(),
         worktrees: Default::default(),
         swallowed_paste: None,
+        shortcut_keys: Default::default(),
+        shortcut_modifiers: egui::Modifiers::NONE,
     };
     (app, sender)
 }
@@ -87,6 +91,22 @@ fn loaded(config: Config, model: Model) -> Startup {
         },
         error: None,
     }
+}
+
+#[test]
+fn opening_config_during_a_capture_does_not_create_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _) = fixture(root.path());
+    app.startup = None;
+    app.action(&egui::Context::default(), Action::OpenConfig);
+    assert!(
+        app.ui
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("screenshot capture")
+    );
+    assert!(!app.config_path.exists());
 }
 
 #[test]
@@ -3766,4 +3786,402 @@ fn capture_file_locations_native() {
         let output = app.screenshot.take();
         Ok(Box::new(Capture { app, output, screen, applied: false, ready_at: None, click: 0, split, split_created: false }))
     })).unwrap();
+}
+
+fn shortcut_events(ctx: &egui::Context) -> Vec<egui::Event> {
+    ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter(|event| !matches!(event, egui::Event::ModifiersChanged(_)))
+            .cloned()
+            .collect()
+    })
+}
+
+#[test]
+fn custom_keybindings_remap_navigation_and_preserve_overlay_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, [top_left, top_right, ..]) = navigation_fixture(root.path());
+    let ctx = egui::Context::default();
+    app.config.keybindings = toml::from_str::<Config>(
+        r#"[keybindings]
+        focus-right = ["Alt+H", "F12"]
+    "#,
+    )
+    .unwrap()
+    .keybindings;
+    app.config.validate().unwrap();
+    assert!(!press(
+        &mut app,
+        &ctx,
+        key(
+            egui::Key::ArrowRight,
+            None,
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT
+        )
+    ));
+    assert_eq!(app.controller.model().active_pane(), Some(top_left));
+    app.ui.overlay = OverlayState::Palette;
+    assert!(!press(
+        &mut app,
+        &ctx,
+        key(egui::Key::H, None, egui::Modifiers::ALT)
+    ));
+    assert_eq!(app.controller.model().active_pane(), Some(top_left));
+    app.ui.overlay = OverlayState::None;
+    assert!(press(
+        &mut app,
+        &ctx,
+        key(egui::Key::F12, None, egui::Modifiers::NONE)
+    ));
+    assert_eq!(app.controller.model().active_pane(), Some(top_right));
+}
+
+#[test]
+fn custom_keybindings_consume_text_releases_and_mirrored_clipboard_once() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    app.config.keybindings = toml::from_str::<Config>(
+        r#"[keybindings]
+        increase-font-size = ["Ctrl+C", "Alt+H"]
+    "#,
+    )
+    .unwrap()
+    .keybindings;
+    let ctx = egui::Context::default();
+    let down = key(egui::Key::C, None, egui::Modifiers::CTRL);
+    let mut up = down.clone();
+    if let egui::Event::Key { pressed, .. } = &mut up {
+        *pressed = false;
+    }
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                down,
+                egui::Event::Copy,
+                up,
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            assert!(shortcut_events(ui.ctx()).is_empty());
+        },
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(app.config.font_size, 15.0);
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                key(egui::Key::H, None, egui::Modifiers::ALT),
+                egui::Event::Text("h".into()),
+                key(egui::Key::A, None, egui::Modifiers::NONE),
+                egui::Event::Text("a".into()),
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            assert_eq!(
+                shortcut_events(ui.ctx()),
+                [
+                    key(egui::Key::A, None, egui::Modifiers::NONE),
+                    egui::Event::Text("a".into())
+                ]
+            );
+        },
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(app.config.font_size, 16.0);
+}
+
+#[test]
+fn custom_keybindings_resolve_swallowed_clipboard_events_and_empty_paste() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    app.config.keybindings = toml::from_str::<Config>(
+        r#"[keybindings]
+        increase-font-size = ["Ctrl+C", "Ctrl+V", "Ctrl+X"]
+    "#,
+    )
+    .unwrap()
+    .keybindings;
+    let ctx = egui::Context::default();
+    for event in [
+        egui::Event::Copy,
+        egui::Event::Paste("clipboard".into()),
+        egui::Event::Cut,
+    ] {
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::ModifiersChanged(egui::Modifiers::CTRL), event],
+                ..Default::default()
+            },
+            |ui| {
+                app.shortcuts(ui.ctx());
+                assert!(shortcut_events(ui.ctx()).is_empty());
+            },
+        )
+        .textures_delta
+        .clear();
+    }
+    app.swallowed_paste = Some(egui::Modifiers::CTRL);
+    ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.shortcuts(ui.ctx());
+        assert!(shortcut_events(ui.ctx()).is_empty());
+    })
+    .textures_delta
+    .clear();
+    assert_eq!(app.config.font_size, 18.0);
+}
+
+#[test]
+fn custom_keybindings_disabled_clipboard_chords_reach_the_terminal_protocol() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    app.config.keybindings = toml::from_str::<Config>("[keybindings]\ncopy = []\npaste = []")
+        .unwrap()
+        .keybindings;
+    let ctx = egui::Context::default();
+    let modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Copy,
+                egui::Event::Paste("secret".into()),
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            let events = shortcut_events(ui.ctx());
+            assert_eq!(
+                events,
+                [
+                    key(egui::Key::C, None, modifiers),
+                    key(egui::Key::V, None, modifiers)
+                ]
+            );
+            let normalized = crate::input::normalize_events(&events, modifiers);
+            let routed = crate::input::route_events(
+                crate::input::RoutingContext::TerminalPane(1),
+                &normalized,
+                terminal_core::Mode::REPORT_ALL_KEYS_AS_ESC,
+            );
+            assert_eq!(routed.len(), 2);
+            assert!(
+                routed
+                    .iter()
+                    .all(|event| matches!(event.action, crate::input::InputAction::Write(_)))
+            );
+        },
+    )
+    .textures_delta
+    .clear();
+}
+
+#[test]
+fn custom_keybindings_invalid_config_cannot_be_overwritten_by_preferences() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.ephemeral = false;
+    let source = "[keybindings]\nfind = [\"invalid-key\"]";
+    std::fs::write(&app.config_path, source).unwrap();
+    let error = Config::load(&app.config_path).unwrap_err();
+    let ctx = egui::Context::default();
+    app.complete_startup(
+        &ctx,
+        Startup {
+            config: Config::default(),
+            report: LoadReport {
+                model: Some(Model::default()),
+                diagnostics: vec![],
+                can_write: true,
+                migrated: false,
+            },
+            error: Some(format!("{error:#}")),
+        },
+    );
+    app.action(
+        &ctx,
+        Action::Preferences(Config {
+            font_size: 20.0,
+            ..app.config.clone()
+        }),
+    );
+    eframe::App::on_exit(&mut app);
+    assert_eq!(std::fs::read_to_string(&app.config_path).unwrap(), source);
+    assert_eq!(app.preference_generation, 0);
+    assert!(
+        app.ui
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Fix the config file")
+    );
+}
+
+#[test]
+fn custom_keybindings_release_stays_consumed_after_modifiers_and_overlay_change() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    app.config.keybindings =
+        toml::from_str::<Config>("[keybindings]\ncommand-palette = [\"Ctrl+K\"]")
+            .unwrap()
+            .keybindings;
+    let ctx = egui::Context::default();
+    assert!(press(
+        &mut app,
+        &ctx,
+        key(egui::Key::K, Some(egui::Key::K), egui::Modifiers::CTRL)
+    ));
+    assert_eq!(app.ui.overlay, OverlayState::Palette);
+    let mut release = key(egui::Key::K, Some(egui::Key::K), egui::Modifiers::NONE);
+    if let egui::Event::Key { pressed, .. } = &mut release {
+        *pressed = false;
+    }
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![release],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            assert!(shortcut_events(ui.ctx()).is_empty());
+        },
+    )
+    .textures_delta
+    .clear();
+}
+
+#[test]
+fn custom_keybindings_survive_font_shortcuts_queued_during_startup() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    app.action(&ctx, Action::IncreaseFontSize);
+    app.action(&ctx, Action::IncreaseFontSize);
+    let mut config: Config =
+        toml::from_str("font_size = 19\n[keybindings]\nfind = [\"F12\"]").unwrap();
+    config.validate().unwrap();
+    let bindings = config.keybindings.clone();
+    sender.send(loaded(config, Model::default())).unwrap();
+    app.poll(&ctx);
+    assert_eq!(app.config.font_size, 21.0);
+    assert_eq!(app.config.keybindings, bindings);
+}
+
+#[test]
+fn custom_keybindings_unbound_clipboard_mirrors_do_not_duplicate_terminal_keys() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    let ctx = egui::Context::default();
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                key(egui::Key::C, None, egui::Modifiers::CTRL),
+                egui::Event::Copy,
+                key(egui::Key::V, None, egui::Modifiers::CTRL),
+                egui::Event::Paste("clipboard".into()),
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            assert_eq!(
+                shortcut_events(ui.ctx()),
+                [
+                    key(egui::Key::C, None, egui::Modifiers::CTRL),
+                    key(egui::Key::V, None, egui::Modifiers::CTRL)
+                ]
+            );
+        },
+    )
+    .textures_delta
+    .clear();
+}
+
+#[test]
+fn custom_keybindings_cover_dedicated_clipboard_keys_and_disable_their_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    app.config.keybindings = toml::from_str::<Config>(
+        "[keybindings]\ncopy = []\npaste = []\nincrease-font-size = [\"Cut\"]",
+    )
+    .unwrap()
+    .keybindings;
+    app.config.validate().unwrap();
+    let ctx = egui::Context::default();
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::Copy,
+                egui::Event::Paste("clipboard".into()),
+                egui::Event::Cut,
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            assert_eq!(
+                shortcut_events(ui.ctx()),
+                [
+                    key(egui::Key::Copy, None, egui::Modifiers::NONE),
+                    key(egui::Key::Paste, None, egui::Modifiers::NONE)
+                ]
+            );
+        },
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(app.config.font_size, 15.0);
+}
+
+#[test]
+fn custom_keybindings_clipboard_uses_modifiers_at_the_event_even_if_released_in_that_frame() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    app.config.keybindings =
+        toml::from_str::<Config>("[keybindings]\nincrease-font-size = [\"Ctrl+C\"]")
+            .unwrap()
+            .keybindings;
+    let ctx = egui::Context::default();
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![egui::Event::ModifiersChanged(egui::Modifiers::CTRL)],
+            ..Default::default()
+        },
+        |ui| app.shortcuts(ui.ctx()),
+    )
+    .textures_delta
+    .clear();
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                egui::Event::Copy,
+                egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            assert!(shortcut_events(ui.ctx()).is_empty());
+        },
+    )
+    .textures_delta
+    .clear();
+    assert_eq!(app.config.font_size, 15.0);
 }

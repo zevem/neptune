@@ -42,6 +42,34 @@ pub struct FileOpener {
 impl FileOpener {
     /// Only one launcher can be in flight.
     pub fn start(&mut self, handoff: Handoff, ctx: egui::Context) -> Result<(), &'static str> {
+        self.start_with(move || Ok(handoff), ctx)
+    }
+
+    /// Create a complete config only when absent, then hand it to its default app.
+    pub fn open_config(
+        &mut self,
+        path: PathBuf,
+        config: crate::config::Config,
+        ctx: egui::Context,
+    ) -> Result<(), &'static str> {
+        self.start_with(
+            move || {
+                let path = std::path::absolute(path)
+                    .map_err(|_| "Could not resolve the config file's location.")?;
+                config.create_if_missing(&path).map_err(|_| {
+                    "Could not prepare the config file. Check its path and directory permissions."
+                })?;
+                Ok(Handoff::Open(path))
+            },
+            ctx,
+        )
+    }
+
+    fn start_with(
+        &mut self,
+        prepare: impl FnOnce() -> Result<Handoff, &'static str> + Send + 'static,
+        ctx: egui::Context,
+    ) -> Result<(), &'static str> {
         self.editors
             .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         if self.editors.len() >= 8 {
@@ -54,14 +82,14 @@ impl FileOpener {
         std::thread::Builder::new()
             .name("neptune-open-file".into())
             .spawn(move || {
-                let result = match &handoff {
+                let result = prepare().and_then(|handoff| match &handoff {
                     Handoff::Edit {
                         location,
                         directories,
                         command,
                     } => launch_editor(location, directories, command),
                     _ => launch(&handoff).map(|()| None),
-                };
+                });
                 let _ = sender.send(result);
                 ctx.request_repaint();
             })
@@ -327,5 +355,23 @@ mod tests {
             arguments.unwrap(),
             format!("--goto\n{}:42:7\n", file.canonicalize().unwrap().display())
         );
+    }
+
+    #[test]
+    fn preparation_failure_skips_launch_and_allows_retry() {
+        let mut opener = FileOpener::default();
+        opener
+            .start_with(|| Err("Cannot prepare file"), egui::Context::default())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Some(result) = opener.poll() {
+                break result;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(result, Err("Cannot prepare file"));
+        assert!(opener.pending.is_none());
     }
 }

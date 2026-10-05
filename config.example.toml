@@ -79,3 +79,19 @@ release_channel = "stable" # stable | beta
 
 # Native desktop banners for BEL/OSC notifications. Pane rings and history stay enabled.
 desktop_notifications = true
+
+# Override application shortcuts. Restart Neptune after editing this file.
+# Omitted actions keep their defaults; [] disables all shortcuts for an action.
+# Lists replace defaults, and may contain up to 8 chords per action.
+# Chords match logical keys and exact modifiers, ignoring case. Use Plus for +.
+# Primary means Command on macOS and Ctrl on Linux/Windows.
+# Other modifiers: Ctrl, Shift, Alt (Option), Super (Cmd/Command on macOS only).
+# Escape is reserved for cancelling UI. Conflicts, including with defaults,
+# are rejected: disable the old owner before reassigning its shortcut.
+# See docs/usage.md#custom-keybindings for the complete action list.
+[keybindings]
+# split-right = ["Alt+H", "Primary+Shift+F10"]
+# split-below = ["Alt+J"]
+# command-palette = ["Primary+Shift+P", "F12"]
+# copy = []
+# paste = ["Primary+Shift+V"]

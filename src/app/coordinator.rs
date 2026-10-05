@@ -223,6 +223,10 @@ impl App {
                 }
                 Effect::Persist { .. } => self.save_state(),
                 Effect::SavePreferences => {
+                    if !self.config_writable {
+                        self.ui.error = Some("Preferences were not saved because the configuration could not be loaded. Fix the config file and restart Neptune.".into());
+                        continue;
+                    }
                     self.preference_generation += 1;
                     if let Some(writer) = &self.writer
                         && let Err(error) =
@@ -337,6 +341,7 @@ impl App {
             && matches!(
                 action,
                 Action::Create(..)
+                    | Action::OpenConfig
                     | Action::CreateInGroup(..)
                     | Action::CreateGroup(_)
                     | Action::ConnectInGroup(..)
@@ -345,6 +350,9 @@ impl App {
                     | Action::ZoomUiIn
                     | Action::ZoomUiOut
                     | Action::ResetUiZoom
+                    | Action::IncreaseFontSize
+                    | Action::DecreaseFontSize
+                    | Action::ResetFontSize
                     | Action::ToggleSidebar
             )
         {
@@ -614,6 +622,20 @@ impl App {
                     OverlayState::Palette
                 };
             }
+            Action::OpenConfig => {
+                if self.ephemeral {
+                    self.ui.error =
+                        Some("Config editing is unavailable during a screenshot capture.".into());
+                    return;
+                }
+                if let Err(error) = self.file_opener.open_config(
+                    self.config_path.clone(),
+                    self.config.clone(),
+                    ctx.clone(),
+                ) {
+                    self.ui.error = Some(error.into());
+                }
+            }
             Action::ToggleSidebar => {
                 let shown = self.controller.model().sidebar();
                 self.ui.sidebar_slide = Some(ui::chrome::SidebarSlide::toggled(
@@ -636,6 +658,22 @@ impl App {
                 self.action(ctx, Action::Preferences(config));
             }
             Action::Zoom => self.ui.zoomed = !self.ui.zoomed,
+            action @ (Action::IncreaseFontSize
+            | Action::DecreaseFontSize
+            | Action::ResetFontSize) => {
+                let font_size = match action {
+                    Action::IncreaseFontSize => (self.config.font_size + 1.0).min(32.0),
+                    Action::DecreaseFontSize => (self.config.font_size - 1.0).max(9.0),
+                    _ => Config::default().font_size,
+                };
+                self.action(
+                    ctx,
+                    Action::Preferences(Config {
+                        font_size,
+                        ..self.config.clone()
+                    }),
+                );
+            }
             action @ (Action::ZoomUiIn | Action::ZoomUiOut | Action::ResetUiZoom) => {
                 let zoom = match action {
                     Action::ZoomUiIn => ((self.config.window_zoom + 0.1) * 10.0).round() / 10.0,
