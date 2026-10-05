@@ -65,6 +65,7 @@ pub struct App {
     renders: BTreeMap<PaneId, PaneRender>,
     config: Config,
     config_path: PathBuf,
+    config_writable: bool,
     fonts: crate::platform::fonts::Fonts,
     state_path: PathBuf,
     window_path: PathBuf,
@@ -113,6 +114,7 @@ pub struct App {
     hints: Option<(PaneId, u64)>,
     hint_keys: Vec<egui::Key>,
     file_location: Option<hints::PendingLocation>,
+    file_opener: crate::platform::files::FileOpener,
     notifications: crate::notifications::Notifications,
     /// What each running CLI agent is doing, for the agents tab.
     agents: crate::agent_activity::AgentActivities,
@@ -138,6 +140,9 @@ pub struct App {
     worktrees: worktrees::Worktrees,
     /// A paste chord pressed this frame that the toolkit did not deliver.
     swallowed_paste: Option<egui::Modifiers>,
+    /// Host shortcuts held until release, including after modifiers or UI change.
+    shortcut_keys: std::collections::HashSet<egui::Key>,
+    shortcut_modifiers: egui::Modifiers,
 }
 impl App {
     pub fn new(
@@ -174,7 +179,7 @@ impl App {
             .spawn(move || {
                 let (config, error) = match Config::load(&settings) {
                     Ok(config) => (config, None),
-                    Err(error) => (Config::default(), Some(error.to_string())),
+                    Err(error) => (Config::default(), Some(format!("{error:#}"))),
                 };
                 let report = if restore && config.restore_workspaces {
                     load_state(&state, Limits::default())
@@ -207,6 +212,7 @@ impl App {
             renders: BTreeMap::new(),
             config: Config::default(),
             config_path,
+            config_writable: false,
             fonts: Default::default(),
             state_path,
             window_path: data.join("window.json"),
@@ -247,6 +253,7 @@ impl App {
             hints: None,
             hint_keys: Vec::new(),
             file_location: None,
+            file_opener: Default::default(),
             notifications: Default::default(),
             agents: Default::default(),
             delegation: Default::default(),
@@ -264,6 +271,8 @@ impl App {
             paste_chord: Default::default(),
             worktrees: Default::default(),
             swallowed_paste: None,
+            shortcut_keys: Default::default(),
+            shortcut_modifiers: egui::Modifiers::NONE,
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
@@ -294,6 +303,9 @@ impl App {
             self.ui.error = Some(error.into());
         }
         if let Some(Err(error)) = self.link_opener.poll() {
+            self.ui.error = Some(error.into());
+        }
+        if let Some(Err(error)) = self.file_opener.poll() {
             self.ui.error = Some(error.into());
         }
         let startup = self
@@ -506,6 +518,7 @@ impl App {
     }
     fn complete_startup(&mut self, ctx: &egui::Context, startup: Startup) {
         self.startup = None;
+        self.config_writable = startup.error.is_none();
         self.config = startup.config;
         ctx.set_zoom_factor(self.config.window_zoom);
         theme::apply(ctx, &self.config);
@@ -984,6 +997,7 @@ impl eframe::App for App {
             panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Changes,
         );
         let chrome = ui::chrome::ChromeView {
+            keybindings: &self.config.keybindings,
             workspaces: &views,
             groups: self.controller.model().groups(),
             sidebar_order: self.controller.model().sidebar_order(),
@@ -1167,9 +1181,8 @@ impl eframe::App for App {
         } else {
             crate::input::RoutingContext::Overlay
         };
-        let swallowed_paste = self.swallowed_paste.take();
         if let Some(rect) = output.active_body {
-            self.terminal_input(&ctx, rect, context, swallowed_paste);
+            self.terminal_input(&ctx, rect, context);
         }
         self.terminal_focus = output.active_terminal;
         // Sheets dim the whole window, following its rounded shape. A close

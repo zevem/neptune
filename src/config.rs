@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub keybindings: crate::keybindings::Keybindings,
     pub theme: Theme,
     pub custom_themes: Vec<crate::terminal_theme::CustomTheme>,
     /// Themes starred in the catalog, in the order they were starred.
@@ -125,6 +126,7 @@ pub enum Cursor {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            keybindings: Default::default(),
             theme: Theme::Graphite,
             custom_themes: Vec::new(),
             favorite_themes: Vec::new(),
@@ -176,6 +178,7 @@ impl Config {
     }
     pub fn validate(&mut self) -> Result<()> {
         use crate::terminal_theme::MAX_CUSTOM_THEMES;
+        self.keybindings.validate()?;
         anyhow::ensure!(
             self.custom_themes.len() <= MAX_CUSTOM_THEMES,
             "At most 128 custom themes are allowed"
@@ -276,7 +279,51 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        atomic_write(path, toml::to_string_pretty(self)?.as_bytes())
+        atomic_write(path, self.source_for_editing()?.as_bytes())
+    }
+
+    fn source_for_editing(&self) -> Result<String> {
+        let mut settings = toml::Table::try_from(self)?;
+        settings.remove("keybindings");
+        let mut source = toml::to_string_pretty(&settings)?;
+        source.push('\n');
+        source.push_str(&crate::keybindings::Keybindings::reference());
+        source.push_str(&toml::to_string_pretty(&self.keybindings)?);
+        Ok(source)
+    }
+
+    /// Prepare a first config for editing without replacing any existing file,
+    /// including an invalid config or a concurrent preferences save.
+    /// Run only on a storage worker.
+    pub(crate) fn create_if_missing(&self, path: &Path) -> Result<()> {
+        use std::io::{ErrorKind, Write};
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                anyhow::ensure!(!metadata.is_dir(), "The config path is a directory");
+                return Ok(());
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".neptune-config-")
+            .tempfile_in(parent)?;
+        temporary.write_all(self.source_for_editing()?.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        match temporary.into_temp_path().persist_noclobber(path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                std::fs::File::open(parent)?.sync_all()?;
+                Ok(())
+            }
+            Err(error) if error.error.kind() == ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error.error.into()),
+        }
     }
 }
 
@@ -402,6 +449,74 @@ fn migrate_data_dir(legacy: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_for_editing_creates_a_complete_snapshot_when_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new folder/custom settings.toml");
+        let mut config: super::Config =
+            toml::from_str("font_size = 18\n[keybindings]\nsplit-right = [\"Alt+H\"]\n").unwrap();
+        config.validate().unwrap();
+        config.create_if_missing(&path).unwrap();
+        assert_eq!(super::Config::load(&path).unwrap(), config);
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(source.contains("restart Neptune"));
+        assert!(source.contains("# workspace-9 = ["));
+        assert!(source.contains("# clear-scrollback = []"));
+        assert!(source.contains("# Chords: modifier+modifier+key"));
+        assert!(source.contains("split-right = [\"Alt+H\"]"));
+        // Later Preferences saves keep the reference available in the file.
+        config.font_size = 20.0;
+        config.save(&path).unwrap();
+        assert_eq!(super::Config::load(&path).unwrap(), config);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("# workspace-9 = [")
+        );
+    }
+
+    #[test]
+    fn config_for_editing_preserves_existing_invalid_files_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let original = "[keybindings]\nfind = [\"unknown-key\"]\n";
+        std::fs::write(&path, original).unwrap();
+        super::Config::default().create_if_missing(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        #[cfg(unix)]
+        {
+            let link = root.path().join("linked.toml");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            super::Config::default().create_if_missing(&link).unwrap();
+            assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn config_for_editing_concurrent_creation_never_replaces_a_complete_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for size in 15..19 {
+                let path = &path;
+                let start = &start;
+                scope.spawn(move || {
+                    let config = super::Config {
+                        font_size: size as f32,
+                        ..super::Config::default()
+                    };
+                    start.wait();
+                    config.create_if_missing(path).unwrap();
+                });
+            }
+        });
+        let config = super::Config::load(&path).unwrap();
+        assert!((15.0..=18.0).contains(&config.font_size));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
     use super::*;
 
     #[test]

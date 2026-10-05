@@ -5,6 +5,7 @@ pub mod app;
 pub mod config;
 pub mod icons;
 pub mod input;
+pub mod keybindings;
 pub mod notifications;
 pub mod persistence;
 pub mod platform;

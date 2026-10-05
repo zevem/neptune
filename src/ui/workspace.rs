@@ -1,6 +1,7 @@
 //! Terminal panes: rounded content surfaces arranged by the workspace layout.
-use super::helpers::{self, animate, capsule, elided, galley_at, menu_item, shortcut};
+use super::helpers::{self, animate, capsule, elided, galley_at, menu_item};
 use super::{Action, PaneRender};
+use crate::keybindings::{BindingAction as Binding, Keybindings};
 use crate::platform::file_drag::FileDrag;
 use crate::{
     config::Config,
@@ -258,30 +259,55 @@ fn pane_menu(
     id: PaneId,
     // Zoomed, on this machine, and in a worktree made for its agent.
     (zoomed, local, worktree): (bool, bool, bool),
+    bindings: &Keybindings,
     actions: &mut Vec<Action>,
 ) {
     helpers::menu_layout(ui, 240.0);
     let mut chosen: Vec<Action> = Vec::new();
-    if menu_item(ui, p, Icon::Copy, "Copy", &shortcut("C"), false) {
+    if menu_item(
+        ui,
+        p,
+        Icon::Copy,
+        "Copy",
+        &bindings.hint(Binding::Copy),
+        false,
+    ) {
         chosen.push(Action::Copy(id));
     }
-    if menu_item(ui, p, Icon::Clipboard, "Paste", &shortcut("V"), false) {
+    if menu_item(
+        ui,
+        p,
+        Icon::Clipboard,
+        "Paste",
+        &bindings.hint(Binding::Paste),
+        false,
+    ) {
         chosen.push(Action::Paste(id));
     }
     helpers::menu_separator(ui, p);
-    let hints_shortcut = if cfg!(target_os = "macos") {
-        "⌘⇧H".to_owned()
-    } else {
-        shortcut("H")
-    };
+    let hints_shortcut = bindings.hint(Binding::CopyHints);
     if menu_item(ui, p, Icon::Copy, "Copy with hints", &hints_shortcut, false) {
         chosen.push(Action::CopyHints(id));
     }
-    if menu_item(ui, p, Icon::Search, "Find…", &shortcut("F"), false) {
+    if menu_item(
+        ui,
+        p,
+        Icon::Search,
+        "Find…",
+        &bindings.hint(Binding::Find),
+        false,
+    ) {
         chosen.extend([Action::Focus(id), Action::Find]);
     }
     helpers::menu_separator(ui, p);
-    if menu_item(ui, p, Icon::Plus, "New tab", &shortcut("T"), false) {
+    if menu_item(
+        ui,
+        p,
+        Icon::Plus,
+        "New tab",
+        &bindings.hint(Binding::NewTab),
+        false,
+    ) {
         chosen.push(Action::NewTab(id));
     }
     if local
@@ -290,7 +316,7 @@ fn pane_menu(
             p,
             Icon::Branch,
             "New agent in worktree…",
-            &shortcut("G"),
+            &bindings.hint(Binding::NewWorktree),
             false,
         )
     {
@@ -301,7 +327,7 @@ fn pane_menu(
         p,
         Icon::SplitVertical,
         "Split right",
-        &shortcut("D"),
+        &bindings.hint(Binding::SplitRight),
         false,
     ) {
         chosen.extend([Action::Focus(id), Action::Split(id, Axis::Vertical)]);
@@ -311,7 +337,7 @@ fn pane_menu(
         p,
         Icon::SplitHorizontal,
         "Split below",
-        &shortcut("E"),
+        &bindings.hint(Binding::SplitBelow),
         false,
     ) {
         chosen.extend([Action::Focus(id), Action::Split(id, Axis::Horizontal)]);
@@ -329,23 +355,44 @@ fn pane_menu(
         } else {
             "Zoom terminal"
         },
-        &shortcut("Enter"),
+        &bindings.hint(Binding::ZoomPane),
         false,
     ) {
         chosen.extend([Action::Focus(id), Action::Zoom]);
     }
     helpers::menu_separator(ui, p);
-    if menu_item(ui, p, Icon::Eraser, "Clear scrollback", "", false) {
+    if menu_item(
+        ui,
+        p,
+        Icon::Eraser,
+        "Clear scrollback",
+        &bindings.hint(Binding::ClearScrollback),
+        false,
+    ) {
         chosen.push(Action::Clear(id));
     }
-    if menu_item(ui, p, Icon::Refresh, "Restart terminal", "", false) {
+    if menu_item(
+        ui,
+        p,
+        Icon::Refresh,
+        "Restart terminal",
+        &bindings.hint(Binding::RestartPane),
+        false,
+    ) {
         chosen.push(Action::Restart(id));
     }
     helpers::menu_separator(ui, p);
     if worktree && menu_item(ui, p, Icon::Trash, "Remove worktree…", "", true) {
         chosen.push(Action::Worktree(super::worktrees::Event::RemoveOf(id)));
     }
-    if menu_item(ui, p, Icon::Close, "Close terminal", &shortcut("W"), true) {
+    if menu_item(
+        ui,
+        p,
+        Icon::Close,
+        "Close terminal",
+        &bindings.hint(Binding::ClosePane),
+        true,
+    ) {
         chosen.push(Action::ClosePane(id));
     }
     if !chosen.is_empty() {
@@ -549,7 +596,10 @@ fn tab(
         }
         if close_response
             .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(format!("Close terminal   {}", shortcut("W")))
+            .on_hover_text(format!(
+                "Close terminal   {}",
+                stage.config.keybindings.hint(Binding::ClosePane)
+            ))
             .clicked()
         {
             actions.push(Action::ClosePane(id));
@@ -576,6 +626,7 @@ fn tab(
                 presentation.remote.is_none(),
                 presentation.worktree.is_some(),
             ),
+            &stage.config.keybindings,
             actions,
         )
     });
@@ -684,23 +735,45 @@ fn pane_header(
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.set_opacity(reveal);
             if show_all {
-                if icons::button_with_hint(ui, Icon::SplitHorizontal, "Split below", &shortcut("E"))
-                    .clicked()
+                if icons::button_with_hint(
+                    ui,
+                    Icon::SplitHorizontal,
+                    "Split below",
+                    &stage.config.keybindings.hint(Binding::SplitBelow),
+                )
+                .clicked()
                 {
                     actions.extend([Action::Focus(shown), Action::Split(shown, Axis::Horizontal)]);
                 }
-                if icons::button_with_hint(ui, Icon::SplitVertical, "Split right", &shortcut("D"))
-                    .clicked()
+                if icons::button_with_hint(
+                    ui,
+                    Icon::SplitVertical,
+                    "Split right",
+                    &stage.config.keybindings.hint(Binding::SplitRight),
+                )
+                .clicked()
                 {
                     actions.extend([Action::Focus(shown), Action::Split(shown, Axis::Vertical)]);
                 }
-                if icons::button_with_hint(ui, Icon::Maximize, "Zoom terminal", &shortcut("Enter"))
-                    .clicked()
+                if icons::button_with_hint(
+                    ui,
+                    Icon::Maximize,
+                    "Zoom terminal",
+                    &stage.config.keybindings.hint(Binding::ZoomPane),
+                )
+                .clicked()
                 {
                     actions.extend([Action::Focus(shown), Action::Zoom]);
                 }
             }
-            if icons::button_with_hint(ui, Icon::Plus, "New tab", &shortcut("T")).clicked() {
+            if icons::button_with_hint(
+                ui,
+                Icon::Plus,
+                "New tab",
+                &stage.config.keybindings.hint(Binding::NewTab),
+            )
+            .clicked()
+            {
                 actions.push(Action::NewTab(shown));
             }
         },
@@ -847,6 +920,7 @@ fn draw_pane(
                         presentation.remote.is_none(),
                         presentation.worktree.is_some(),
                     ),
+                    &stage.config.keybindings,
                     actions,
                 )
             });

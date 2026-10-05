@@ -3,7 +3,7 @@
 //! Paths and file contents stay out of diagnostics and saved state.
 use super::*;
 use crate::{
-    platform::files::{FileOpener, Handoff},
+    platform::files::Handoff,
     ui::explorer::{
         Edit, EditKind, Event, Hit, PreviewBody, PreviewView, Row, RowKind, ScrollTarget,
         SearchView,
@@ -160,7 +160,6 @@ pub(super) struct Explorer {
     preview_requests: u64,
     preview: Option<Preview>,
     search: Search,
-    opener: FileOpener,
 }
 
 impl Default for Explorer {
@@ -181,7 +180,6 @@ impl Default for Explorer {
             preview_requests: 0,
             preview: None,
             search: Search::default(),
-            opener: FileOpener::default(),
         }
     }
 }
@@ -1118,9 +1116,6 @@ impl App {
 
     /// Results of workers, taken whether or not the panel is in view.
     pub(super) fn poll_explorer(&mut self, ctx: &egui::Context) {
-        if let Some(Err(error)) = self.explorer.opener.poll() {
-            self.ui.error = Some(error.into());
-        }
         while let Ok(reply) = self.explorer.replies.1.try_recv() {
             match reply {
                 Reply::Listed { dir, listing } => {
@@ -1606,7 +1601,7 @@ impl App {
     }
 
     fn hand_off(&mut self, ctx: &egui::Context, handoff: Handoff) {
-        if let Err(error) = self.explorer.opener.start(handoff, ctx.clone()) {
+        if let Err(error) = self.file_opener.start(handoff, ctx.clone()) {
             self.ui.error = Some(error.into());
         }
     }

@@ -733,6 +733,73 @@ pub fn group(ui: &mut Ui, p: Palette, add_rows: impl FnOnce(&mut Ui, &mut Group)
 }
 
 impl Group {
+    fn allocate_row(&mut self, ui: &mut Ui, height: f32) -> Rect {
+        let (_, rect) = ui.allocate_space(vec2(ui.available_width(), height));
+        if self.rows > 0 {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(rect.left() + 14.0, rect.top()),
+                    Pos2::new(rect.right(), rect.top()),
+                ],
+                self.p.hairline(),
+            );
+        }
+        self.rows += 1;
+        rect
+    }
+
+    /// A full-width accordion header with an explicit expanded state.
+    pub fn disclosure(&mut self, ui: &mut Ui, label: &str, open: &mut bool) -> Response {
+        let rect = self.allocate_row(ui, 42.0);
+        let mut response = ui.interact(
+            rect,
+            ui.id().with(("group-disclosure", label)),
+            Sense::click(),
+        );
+        if response.clicked() {
+            *open = !*open;
+            response.mark_changed();
+        }
+        response.widget_info(|| {
+            WidgetInfo::labeled(WidgetType::CollapsingHeader, ui.is_enabled(), label)
+        });
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            node.set_expanded(*open);
+        });
+        if ui.is_rect_visible(rect) {
+            let surface = rect.shrink2(vec2(4.0, 4.0));
+            if response.is_pointer_button_down_on() {
+                ui.painter().rect_filled(surface, 6, self.p.pressed);
+            } else if response.hovered() {
+                ui.painter().rect_filled(surface, 6, self.p.hover);
+            }
+            if response.has_focus() {
+                focus_ring(ui.painter(), surface, 6, self.p);
+            }
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    Pos2::new(rect.left() + 20.0, rect.center().y),
+                    Vec2::splat(14.0),
+                ),
+                if *open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                self.p.secondary,
+            );
+            ui.painter().text(
+                Pos2::new(rect.left() + 36.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                theme::regular(13.0),
+                self.p.fg,
+            );
+        }
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    }
+
     /// A labelled row whose control is aligned to the trailing edge.
     pub fn row<R>(
         &mut self,
@@ -750,17 +817,7 @@ impl Group {
         height: f32,
         add_control: impl FnOnce(&mut Ui) -> R,
     ) -> R {
-        let (_, rect) = ui.allocate_space(vec2(ui.available_width(), height));
-        if self.rows > 0 {
-            ui.painter().line_segment(
-                [
-                    Pos2::new(rect.left() + 14.0, rect.top()),
-                    Pos2::new(rect.right(), rect.top()),
-                ],
-                self.p.hairline(),
-            );
-        }
-        self.rows += 1;
+        let rect = self.allocate_row(ui, height);
         ui.painter().text(
             Pos2::new(rect.left() + 14.0, rect.center().y),
             Align2::LEFT_CENTER,

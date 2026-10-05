@@ -1,9 +1,9 @@
 //! Window chrome: the full-height sidebar, the toolbar and window controls.
 use super::helpers::{
-    self, animate, edit_shortcut, elided, galley_at, keycaps, menu_item, menu_layout,
-    menu_separator, menu_submenu, shortcut,
+    self, animate, elided, galley_at, keycaps, menu_item, menu_layout, menu_separator, menu_submenu,
 };
 use super::{Action, UiState, WorkspaceView};
+use crate::keybindings::{BindingAction as Binding, Keybindings};
 use crate::{
     icons::{self, Icon},
     platform::window::{self, WindowOperation},
@@ -20,6 +20,7 @@ use neptune_model::{
 
 /// What the chrome needs to know about the frame it surrounds.
 pub struct ChromeView<'a> {
+    pub keybindings: &'a Keybindings,
     pub workspaces: &'a [WorkspaceView],
     pub groups: &'a [WorkspaceGroup],
     pub sidebar_order: &'a [SidebarItem],
@@ -337,15 +338,25 @@ pub fn toolbar(
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if view.sidebar < 1.0 {
                     ui.set_opacity(1.0 - view.sidebar);
-                    let create =
-                        icons::button_with_hint(ui, Icon::Plus, "New workspace", &shortcut("N"));
+                    let create = icons::button_with_hint(
+                        ui,
+                        Icon::Plus,
+                        "New workspace",
+                        &view.keybindings.hint(Binding::NewWorkspace),
+                    );
                     ui.set_opacity(1.0);
                     if create.clicked() {
                         actions.push(Action::New);
                     }
                 }
                 if let Some(open) = view.panel
-                    && super::panel::toggle(ui, p, open, view.panel_attention, &shortcut("O"))
+                    && super::panel::toggle(
+                        ui,
+                        p,
+                        open,
+                        view.panel_attention,
+                        &view.keybindings.hint(Binding::ToggleRightPanel),
+                    )
                 {
                     actions.push(Action::Panel(super::panel::Event::Toggle));
                 }
@@ -362,7 +373,7 @@ pub fn toolbar(
                         ui,
                         Icon::SplitHorizontal,
                         "Split below",
-                        &shortcut("E"),
+                        &view.keybindings.hint(Binding::SplitBelow),
                     )
                     .clicked()
                     {
@@ -372,26 +383,41 @@ pub fn toolbar(
                         ui,
                         Icon::SplitVertical,
                         "Split right",
-                        &shortcut("D"),
+                        &view.keybindings.hint(Binding::SplitRight),
                     )
                     .clicked()
                     {
                         actions.push(Action::Split(pane, neptune_model::Axis::Vertical));
                     }
-                    if icons::button_with_hint(ui, Icon::Terminal, "New tab", &shortcut("T"))
-                        .clicked()
+                    if icons::button_with_hint(
+                        ui,
+                        Icon::Terminal,
+                        "New tab",
+                        &view.keybindings.hint(Binding::NewTab),
+                    )
+                    .clicked()
                     {
                         actions.push(Action::NewTab(pane));
                     }
-                    if icons::button_with_hint(ui, Icon::Search, "Find in terminal", &shortcut("F"))
-                        .clicked()
+                    if icons::button_with_hint(
+                        ui,
+                        Icon::Search,
+                        "Find in terminal",
+                        &view.keybindings.hint(Binding::Find),
+                    )
+                    .clicked()
                     {
                         actions.push(Action::Find);
                     }
                 }
                 if !show_field
-                    && icons::button_with_hint(ui, Icon::Command, "Command palette", &shortcut("P"))
-                        .clicked()
+                    && icons::button_with_hint(
+                        ui,
+                        Icon::Command,
+                        "Command palette",
+                        &view.keybindings.hint(Binding::CommandPalette),
+                    )
+                    .clicked()
                 {
                     actions.push(Action::Palette);
                 }
@@ -430,7 +456,10 @@ pub fn toolbar(
             );
             if response
                 .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text(format!("Show all terminals   {}", shortcut("Enter")))
+                .on_hover_text(format!(
+                    "Show all terminals   {}",
+                    view.keybindings.hint(Binding::ZoomPane)
+                ))
                 .clicked()
             {
                 actions.push(Action::Zoom);
@@ -491,7 +520,7 @@ pub fn toolbar(
         let caps = keycaps(
             painter,
             Pos2::new(field.right() - 6.0, middle),
-            &shortcut("P"),
+            &view.keybindings.hint(Binding::CommandPalette),
             p.muted,
         );
         galley_at(
@@ -802,22 +831,14 @@ fn workspace_row(
         painter.circle_filled(Pos2::new(text_left + 3.0, row.center().y - 7.5), 3.0, p.red);
         text_left + 11.0
     };
-    let show_shortcut = position.0 < 9
+    let hint = Binding::workspace(position.0)
+        .map_or_else(String::new, |action| view.keybindings.hint(action));
+    let show_shortcut = !hint.is_empty()
         && ui.input(|input| {
             input.focused
-                && if cfg!(target_os = "macos") {
-                    input.modifiers.mac_cmd
-                } else {
-                    input.modifiers.ctrl
-                }
+                && (input.modifiers.ctrl || input.modifiers.mac_cmd || input.modifiers.alt)
         });
     let hint_width = if show_shortcut {
-        let digit = position.0 + 1;
-        let hint = if cfg!(target_os = "macos") {
-            format!("⌘{digit}")
-        } else {
-            format!("Ctrl⇧{digit}")
-        };
         keycaps(
             &painter,
             Pos2::new(row.right() - 7.0, row.top() + 13.0),
@@ -1862,7 +1883,7 @@ pub fn leading_controls(ui: &mut Ui, p: Palette, view: &ChromeView, actions: &mu
             Pos2::new(origin.x + toggle_offset(view).round(), middle),
             Icon::Sidebar,
             "Toggle sidebar",
-            &shortcut("B"),
+            &view.keybindings.hint(Binding::ToggleSidebar),
             "sidebar-toggle",
         )
         .clicked()
@@ -1971,7 +1992,10 @@ pub fn sidebar(
     );
     if response
         .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text(format!("New workspace   {}", shortcut("N")))
+        .on_hover_text(format!(
+            "New workspace   {}",
+            view.keybindings.hint(Binding::NewWorkspace)
+        ))
         .clicked()
     {
         actions.push(Action::New);
@@ -1981,7 +2005,7 @@ pub fn sidebar(
         Pos2::new(rect.right() - 24.0, create.center().y),
         Icon::Settings,
         "Preferences",
-        &edit_shortcut(","),
+        &view.keybindings.hint(Binding::Preferences),
         "sidebar-preferences",
     )
     .clicked()
@@ -2136,6 +2160,7 @@ mod tests {
                     .map(|(_, group)| *group);
             }
             let view = ChromeView {
+                keybindings: &Default::default(),
                 workspaces: &views,
                 groups: &self.groups,
                 sidebar_order: &self.sidebar_order,
@@ -2793,6 +2818,7 @@ mod tests {
                         Rect::from_min_size(Pos2::ZERO, vec2(216.0, 600.0)),
                         Palette::for_config(&config),
                         &ChromeView {
+                            keybindings: &Default::default(),
                             workspaces: &workspaces,
                             groups: &[],
                             sidebar_order: &[

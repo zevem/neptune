@@ -304,9 +304,14 @@ icon buttons keep a 28-point target around a 16-point glyph.
   cards: rows with the control at the trailing edge, and the note that explains
   them inside the same card, under a hairline. Settings apply immediately, so
   there is no confirming action; "Reset to defaults" is a row in General and
-  retains the custom themes and the favorites. The sheet keeps one height for
-  every pane and remembers the pane in view while the app runs. A sheet too
-  narrow for names keeps the list as icons with tooltips.
+  retains the custom themes and the favorites. General's Keyboard card opens
+  the active config file and explains that custom keybindings require a restart.
+  Its Shortcut reference accordion reveals selectable config names, platform
+  defaults and accepted shortcut syntax within the same card. The full header
+  is clickable, with a chevron indicating whether the reference is expanded.
+  It is also found by searching for shortcuts or keybindings. The sheet keeps
+  one height for every pane and remembers the pane in view while the app runs.
+  A sheet too narrow for names keeps the list as icons with tooltips.
   A search field leads the source list and takes the keyboard when the sheet
   opens; in a narrow sheet it takes the title's place. Typing replaces the
   pane with "Results": the matching rows as working controls, in cards named
