@@ -128,6 +128,20 @@ impl App {
                             },
                         );
                     }
+                    let spawned_by = self
+                        .controller
+                        .model()
+                        .pane(pane)
+                        .and_then(|pane| pane.spawned_by());
+                    // The task of an agent being started is held for its
+                    // shell before the session is requested.
+                    if let (Some(parent), Some(spawning)) =
+                        (spawned_by, self.delegation.spawning.as_mut())
+                        && let Some(task) = spawning.task.take()
+                    {
+                        spawning.pane = Some(pane);
+                        self.sessions.agents().register_spawn(pane, parent, task);
+                    }
                     let launch = crate::runtime::sessions::SessionLaunch {
                         terminal: options,
                         agent: if remote.is_none() {
@@ -138,6 +152,7 @@ impl App {
                                     .pane(pane)
                                     .and_then(|pane| pane.agent())
                                     .cloned(),
+                                spawned_by,
                             }
                         } else {
                             crate::runtime::sessions::AgentLaunch::Disabled

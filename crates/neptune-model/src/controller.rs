@@ -135,6 +135,13 @@ pub enum Command {
         generation: u64,
         agent: Option<crate::AgentSession>,
     },
+    /// The agent in `parent` starts another in a tab that follows its own.
+    /// Focus and the tab in view stay where they are.
+    SpawnAgent {
+        parent: PaneId,
+        generation: u64,
+        cwd: PathBuf,
+    },
     /// An agent named a pull request it made or works on in this terminal.
     PanePullRequestLinked {
         pane: PaneId,
@@ -325,6 +332,7 @@ impl Controller {
                         remote_cwd: None,
                         agent: None,
                         pull_requests: Vec::new(),
+                        spawned_by: None,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
                     }],
@@ -494,7 +502,8 @@ impl Controller {
                 if ws.pane(pane).is_none() {
                     return Err(Error::UnknownPane(pane));
                 }
-                dirty = ws.active != pane || !was_active;
+                // Opening a background terminal gives it a tab.
+                dirty = ws.reveal(pane) || ws.active != pane || !was_active;
                 ws.active = pane;
                 ws.layout.show(pane);
                 self.model.active = Some(workspace);
@@ -583,6 +592,7 @@ impl Controller {
                         pane.remote_cwd = None;
                         pane.agent = None;
                         pane.pull_requests.clear();
+                        pane.spawned_by = None;
                         effects.push(Effect::StopSession {
                             pane: pane.id,
                             generation: previous,
@@ -627,6 +637,7 @@ impl Controller {
                     .ok_or(Error::IdentityExhausted)?;
                 item.lifecycle = Lifecycle::Starting;
                 dirty |= item.agent.take().is_some();
+                dirty |= item.spawned_by.take().is_some();
                 item.pull_requests.clear();
                 effects.push(Effect::StopSession {
                     pane,
@@ -663,14 +674,24 @@ impl Controller {
                 pane,
                 generation,
                 error,
-            } => self.lifecycle(pane, generation, Lifecycle::Failed(error)),
+            } => {
+                self.lifecycle(pane, generation, Lifecycle::Failed(error));
+                if let Ok(item) = self.model.pane_mut(pane)
+                    && item.generation == generation
+                {
+                    dirty |= item.spawned_by.take().is_some();
+                    self.close_background(pane, &mut effects);
+                }
+            }
             Command::SessionExited { pane, generation } => {
                 self.lifecycle(pane, generation, Lifecycle::Exited);
                 if let Ok(item) = self.model.pane_mut(pane)
                     && item.generation == generation
                 {
                     dirty |= item.agent.take().is_some();
+                    dirty |= item.spawned_by.take().is_some();
                     item.pull_requests.clear();
+                    self.close_background(pane, &mut effects);
                 }
             }
             Command::PaneAgentChanged {
@@ -688,15 +709,79 @@ impl Controller {
                     && let Ok(item) = self.model.pane_mut(pane)
                     && item.generation == generation
                     && matches!(item.lifecycle, Lifecycle::Starting | Lifecycle::Running)
-                    && item.agent != agent
                 {
-                    // Links belong to the agent's run; they leave with it.
+                    // Links belong to the agent's run; they leave with it. An
+                    // agent that never opened leaves the one that started it too.
                     if agent.is_none() {
                         item.pull_requests.clear();
+                        dirty |= item.spawned_by.take().is_some();
                     }
-                    item.agent = agent;
-                    dirty = true;
+                    let left = agent.is_none();
+                    if item.agent != agent {
+                        item.agent = agent;
+                        dirty = true;
+                    }
+                    if left {
+                        dirty |= self.close_background(pane, &mut effects);
+                    }
                 }
+            }
+            Command::SpawnAgent {
+                parent,
+                generation,
+                cwd,
+            } => {
+                let workspace = self
+                    .model
+                    .workspace_for_pane(parent)
+                    .ok_or(Error::UnknownPane(parent))?;
+                let ws = self
+                    .model
+                    .workspace(workspace)
+                    .ok_or(Error::UnknownPane(parent))?;
+                let item = ws.pane(parent).ok_or(Error::UnknownPane(parent))?;
+                // Only the agent still open in a local terminal starts another.
+                if ws.remote.is_some()
+                    || item.generation != generation
+                    || item.agent.is_none()
+                    || !matches!(item.lifecycle, Lifecycle::Starting | Lifecycle::Running)
+                {
+                    return Err(Error::UnknownPane(parent));
+                }
+                if self.model.spawned(parent).count() >= crate::AgentSession::MAX_SPAWNED {
+                    return Err(Error::SpawnLimit);
+                }
+                if self.model.spawn_depth(parent) >= crate::AgentSession::MAX_SPAWN_DEPTH {
+                    return Err(Error::SpawnDepth);
+                }
+                // It runs out of view: no tab until someone opens it.
+                self.check_pane_capacity(ws.panes.len())?;
+                let id = PaneId::new(self.model.next_pane);
+                self.model.next_pane = self
+                    .model
+                    .next_pane
+                    .checked_add(1)
+                    .ok_or(Error::IdentityExhausted)?;
+                let ws = self.model.workspace_mut(workspace)?;
+                ws.panes.push(Pane {
+                    id,
+                    cwd: cwd.clone(),
+                    remote_cwd: None,
+                    agent: None,
+                    pull_requests: Vec::new(),
+                    spawned_by: Some(parent),
+                    generation: 1,
+                    lifecycle: Lifecycle::Starting,
+                });
+                effects.push(Effect::StartSession {
+                    pane: id,
+                    generation: 1,
+                    cwd,
+                    remote: None,
+                    remote_cwd: None,
+                    replacement: false,
+                });
+                dirty = true;
             }
             Command::PanePullRequestLinked {
                 pane,
@@ -752,6 +837,7 @@ impl Controller {
                 }
             }
         }
+        dirty |= self.model.release_spawned();
         if dirty {
             self.model.order_workspaces();
         }
@@ -838,6 +924,7 @@ impl Controller {
             remote_cwd: remote_cwd.clone(),
             agent: None,
             pull_requests: Vec::new(),
+            spawned_by: None,
             generation: 1,
             lifecycle: Lifecycle::Starting,
         });
@@ -886,6 +973,16 @@ impl Controller {
             .model
             .workspace_for_pane(target)
             .ok_or(Error::UnknownPane(target))?;
+        // Nothing is placed against a terminal that has no place itself, and
+        // one that is moved has a tab from then on.
+        if self
+            .model
+            .workspace(destination)
+            .is_some_and(|ws| ws.is_background(target))
+        {
+            return Err(Error::UnknownPane(target));
+        }
+        self.model.workspace_mut(source)?.reveal(pane);
         // A pane placed relative to itself is placed relative to the tabs it
         // shares a place with. Alone there, it is already where it would land.
         let target = if target == pane {
@@ -1031,6 +1128,28 @@ impl Controller {
                 .map(Workspace::id);
         }
         Ok(())
+    }
+
+    /// Closes a terminal that ran without a tab once the agent it was opened
+    /// for is gone: a shell nobody has seen is nobody's to keep.
+    fn close_background(&mut self, pane: PaneId, effects: &mut Vec<Effect>) -> bool {
+        let Some(ws) = self
+            .model
+            .workspace_for_pane(pane)
+            .and_then(|id| self.model.workspace_mut(id).ok())
+            .filter(|ws| ws.is_background(pane))
+        else {
+            return false;
+        };
+        let Some(position) = ws.panes.iter().position(|item| item.id == pane) else {
+            return false;
+        };
+        let removed = ws.panes.remove(position);
+        effects.push(Effect::StopSession {
+            pane,
+            generation: removed.generation,
+        });
+        true
     }
 
     fn lifecycle(&mut self, pane: PaneId, generation: u64, lifecycle: Lifecycle) {
@@ -2428,6 +2547,7 @@ mod tests {
                     remote_cwd: None,
                     agent: None,
                     pull_requests: Vec::new(),
+                    spawned_by: None,
                 },
                 PaneSpec {
                     id: PaneId::new(2),
@@ -2435,6 +2555,7 @@ mod tests {
                     remote_cwd: None,
                     agent: None,
                     pull_requests: Vec::new(),
+                    spawned_by: None,
                 },
             ],
             layout: Layout::pane(PaneId::new(1)),

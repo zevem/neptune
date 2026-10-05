@@ -33,6 +33,34 @@ pub struct Row {
     pub focused: bool,
 }
 
+/// An agent that the agent of a terminal started, for that terminal's tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spawned {
+    /// The terminal the started agent runs in.
+    pub pane: PaneId,
+    /// What the agent calls its conversation, or its own name without one.
+    pub title: String,
+    /// `None` until its CLI has opened.
+    pub activity: Option<Activity>,
+    /// `Some` until its CLI has taken its task: whether it stands at a
+    /// question of its own, which a person answers in its terminal.
+    pub starting: Option<bool>,
+}
+impl Spawned {
+    pub fn state(&self) -> &'static str {
+        match self.starting {
+            Some(true) => "Needs your answer",
+            Some(false) => "Starting",
+            None => self.activity.map_or("Starting", activity_name),
+        }
+    }
+    /// It waits for a person.
+    pub fn waits(&self) -> bool {
+        self.starting == Some(true)
+            || (self.starting.is_none() && matches!(self.activity, Some(Activity::NeedsInput(_))))
+    }
+}
+
 pub struct View<'a> {
     pub rows: &'a [Row],
     pub window: Rect,

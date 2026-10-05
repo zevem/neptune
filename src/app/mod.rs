@@ -3,6 +3,7 @@
 mod attachments;
 mod closing;
 mod coordinator;
+mod delegation;
 mod diagnostics;
 mod directory;
 mod explorer;
@@ -106,6 +107,8 @@ pub struct App {
     notifications: crate::notifications::Notifications,
     /// What each running CLI agent is doing, for the agents tab.
     agents: crate::agent_activity::AgentActivities,
+    /// What agents asked for the agents they start, between frames.
+    delegation: delegation::Delegation,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
     updates: crate::runtime::updates::Updates,
     attachments: attachments::Attachments,
@@ -222,6 +225,7 @@ impl App {
             link_opener: Default::default(),
             notifications: Default::default(),
             agents: Default::default(),
+            delegation: Default::default(),
             desktop_notifier: Default::default(),
             updates: Default::default(),
             attachments: attachments::Attachments::new(data.join("pasted-images")),
@@ -417,6 +421,7 @@ impl App {
             }
         }
         self.poll_agents(ctx);
+        self.serve_agents(ctx);
         self.poll_attachments();
         self.poll_explorer(ctx);
         self.poll_saves(ctx);
@@ -504,7 +509,8 @@ impl App {
                     name: w.name().into(),
                     cwd: w.pane(w.active()).map_or(w.cwd(), |pane| pane.cwd()).into(),
                     remote: w.remote().map(|remote| remote.destination().to_owned()),
-                    panes: w.panes().len(),
+                    // Terminals without a tab are counted where they are listed.
+                    panes: w.layout().panes().len(),
                     unread,
                     // A row shows one line; the popover has the whole alert.
                     alert: latest
@@ -554,6 +560,7 @@ impl App {
                     PanePresentation {
                         agent: pane.agent().map(|agent| agent.kind),
                         pull_requests: pane.pull_requests().to_vec(),
+                        spawned: self.spawned_agents(pane.id()),
                         unread: self.notifications.unread(Some(pane.id())),
                         metadata: session.metadata(),
                         snapshot: shown.then(|| session.viewport()),
@@ -568,6 +575,7 @@ impl App {
                     PanePresentation {
                         agent: None,
                         pull_requests: Vec::new(),
+                        spawned: Vec::new(),
                         unread: self.notifications.unread(Some(pane.id())),
                         metadata: SessionMetadata {
                             title,
@@ -822,6 +830,10 @@ impl eframe::App for App {
             .and_then(|pane| presentations.get(&pane))
             .filter(|_| tabs <= 1)
             .map_or(&[][..], |presentation| &presentation.pull_requests);
+        let spawned = active_pane
+            .and_then(|pane| presentations.get(&pane))
+            .filter(|_| tabs <= 1)
+            .map_or(&[][..], |presentation| &presentation.spawned);
         let sidebar_available = bounds.width() >= metrics::SIDEBAR_MIN_WINDOW;
         let sidebar_open = self.controller.model().sidebar() && sidebar_available;
         // Only a toggle slides. A window too narrow for the sidebar, like
@@ -882,6 +894,7 @@ impl eframe::App for App {
             pane: active_pane,
             subtitle: &subtitle,
             pull_requests,
+            spawned,
             zoomed: self.ui.zoomed,
             window: bounds,
             sidebar: reveal,

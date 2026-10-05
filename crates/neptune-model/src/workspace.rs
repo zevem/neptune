@@ -23,6 +23,8 @@ pub enum Error {
     InvalidRemote,
     RemoteMismatch,
     IdentityExhausted,
+    SpawnLimit,
+    SpawnDepth,
 }
 
 impl std::fmt::Display for Error {
@@ -51,6 +53,14 @@ impl std::fmt::Display for Error {
                 "A terminal keeps its session, so it cannot move between workspaces on different machines",
             ),
             Self::IdentityExhausted => f.write_str("Identity counter exhausted"),
+            Self::SpawnLimit => write!(
+                f,
+                "An agent can have {} agents it started open at once",
+                crate::AgentSession::MAX_SPAWNED
+            ),
+            Self::SpawnDepth => f.write_str(
+                "An agent started by an agent that was itself started by one cannot start another",
+            ),
         }
     }
 }
@@ -97,6 +107,7 @@ pub struct Pane {
     pub(crate) remote_cwd: Option<PathBuf>,
     pub(crate) agent: Option<crate::AgentSession>,
     pub(crate) pull_requests: Vec<crate::PullRequest>,
+    pub(crate) spawned_by: Option<PaneId>,
     pub(crate) generation: u64,
     pub(crate) lifecycle: Lifecycle,
 }
@@ -107,6 +118,10 @@ impl Pane {
     /// Pull requests the agent linked to this terminal, oldest first.
     pub fn pull_requests(&self) -> &[crate::PullRequest] {
         &self.pull_requests
+    }
+    /// The terminal whose agent started this one's, while both agents last.
+    pub fn spawned_by(&self) -> Option<PaneId> {
+        self.spawned_by
     }
     pub fn id(&self) -> PaneId {
         self.id
@@ -134,6 +149,8 @@ pub struct PaneSpec {
     pub remote_cwd: Option<PathBuf>,
     pub agent: Option<crate::AgentSession>,
     pub pull_requests: Vec<crate::PullRequest>,
+    /// The terminal whose agent started this one's.
+    pub spawned_by: Option<PaneId>,
 }
 #[derive(Debug, Clone)]
 pub struct WorkspaceSpec {
@@ -191,10 +208,53 @@ impl Workspace {
         self.panes.iter().find(|pane| pane.id == id)
     }
 
+    /// A terminal that runs without a tab: one an agent started for another
+    /// agent, until someone opens it.
+    pub fn is_background(&self, pane: PaneId) -> bool {
+        self.pane(pane).is_some() && !self.layout.contains(pane)
+    }
+
+    /// Gives a background terminal a tab, after the terminal whose agent
+    /// started it or else in the focused place. What is in view stays.
+    pub(crate) fn reveal(&mut self, pane: PaneId) -> bool {
+        if !self.is_background(pane) {
+            return false;
+        }
+        let target = self
+            .pane(pane)
+            .and_then(|pane| pane.spawned_by)
+            .filter(|parent| self.layout.contains(*parent))
+            .unwrap_or(self.active);
+        let shown = self.layout.tabs(target).map(|(_, shown)| shown);
+        if !self.layout.add_tab(target, pane, None) {
+            return false;
+        }
+        if let Some(shown) = shown {
+            self.layout.show(shown);
+        }
+        true
+    }
+
     /// Takes a pane that is leaving out of the layout. Focus on it passes to
     /// whatever is then in view in its place: the tab that followed it, or the
-    /// neighbouring tab group once its own is empty.
+    /// neighbouring tab group once its own is empty. Background terminals
+    /// take the place of the last one in view.
     pub(crate) fn remove_from_layout(&mut self, pane: PaneId) -> Result<(), Error> {
+        if !self.layout.contains(pane) {
+            return Ok(());
+        }
+        if self.layout.panes().len() == 1 {
+            let background: Vec<PaneId> = self
+                .panes
+                .iter()
+                .map(|item| item.id)
+                .filter(|id| *id != pane && !self.layout.contains(*id))
+                .collect();
+            self.active = pane;
+            for id in background {
+                self.reveal(id);
+            }
+        }
         let place = self.layout.shown().iter().position(|id| *id == pane);
         self.layout = self
             .layout
@@ -316,6 +376,62 @@ impl Model {
             .iter()
             .find_map(|workspace| workspace.pane(id))
     }
+    /// The terminals whose agents the agent in `parent` started, oldest first.
+    pub fn spawned(&self, parent: PaneId) -> impl Iterator<Item = &Pane> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.panes)
+            .filter(move |pane| pane.spawned_by == Some(parent))
+    }
+    /// How many agents stand between `pane` and one a person started. A chain
+    /// longer than the limit, as a loop would be, counts as past it.
+    pub(crate) fn spawn_depth(&self, pane: PaneId) -> usize {
+        let mut depth = 0;
+        let mut next = self.pane(pane).and_then(|pane| pane.spawned_by);
+        while let Some(parent) = next {
+            depth += 1;
+            if depth > crate::AgentSession::MAX_SPAWN_DEPTH {
+                break;
+            }
+            next = self.pane(parent).and_then(|pane| pane.spawned_by);
+        }
+        depth
+    }
+    /// Ends every link to a terminal that is gone or no longer runs an agent.
+    /// A background terminal whose link ended gets a tab: nothing runs out
+    /// of view that no agent answers for.
+    pub(crate) fn release_spawned(&mut self) -> bool {
+        let orphans: Vec<PaneId> = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.panes)
+            .filter(|pane| {
+                pane.spawned_by.is_some_and(|parent| {
+                    self.pane(parent)
+                        .is_none_or(|parent| parent.agent.is_none())
+                })
+            })
+            .map(|pane| pane.id)
+            .collect();
+        for pane in &orphans {
+            if let Ok(pane) = self.pane_mut(*pane) {
+                pane.spawned_by = None;
+            }
+        }
+        let mut changed = !orphans.is_empty();
+        for workspace in &mut self.workspaces {
+            let unlinked: Vec<PaneId> = workspace
+                .panes
+                .iter()
+                .filter(|pane| pane.spawned_by.is_none())
+                .map(|pane| pane.id)
+                .collect();
+            for pane in unlinked {
+                changed |= workspace.reveal(pane);
+            }
+        }
+        changed
+    }
     pub fn pane_count(&self) -> usize {
         self.workspaces
             .iter()
@@ -429,6 +545,13 @@ impl Model {
                         .ok_or(Error::IdentityExhausted)?,
                 );
             }
+            // Only a terminal an agent started for another runs without a tab.
+            let placed: HashSet<PaneId> = spec.layout.panes().into_iter().collect();
+            for pane in &spec.panes {
+                if pane.spawned_by.is_some() && !placed.contains(&pane.id) {
+                    members.remove(&pane.id);
+                }
+            }
             if !members.contains(&spec.active) {
                 return Err(Error::UnknownPane(spec.active));
             }
@@ -463,6 +586,7 @@ impl Model {
                         remote_cwd: pane.remote_cwd,
                         agent: pane.agent,
                         pull_requests: pane.pull_requests,
+                        spawned_by: pane.spawned_by,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
                     })
@@ -473,6 +597,26 @@ impl Model {
         }
         if model.pane_count() > limits.total_panes {
             return Err(Error::TotalPaneLimit);
+        }
+        // An agent is another's only while both can be resumed, and the
+        // chain ends: no terminal is its own ancestor.
+        for pane in model
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.panes)
+        {
+            let Some(parent) = pane.spawned_by else {
+                continue;
+            };
+            if pane.agent.is_none()
+                || model
+                    .pane(parent)
+                    .is_none_or(|parent| parent.agent.is_none())
+                || model.spawn_depth(pane.id) > crate::AgentSession::MAX_SPAWN_DEPTH
+                || model.spawned(parent).count() > crate::AgentSession::MAX_SPAWNED
+            {
+                return Err(Error::InvalidLayout("invalid spawned agent"));
+            }
         }
         if let Some(id) = active
             && model.workspace(id).is_none()
@@ -506,6 +650,7 @@ impl Model {
                         remote_cwd: pane.remote_cwd.clone(),
                         agent: pane.agent.clone(),
                         pull_requests: pane.pull_requests.clone(),
+                        spawned_by: pane.spawned_by,
                     })
                     .collect(),
                 layout: workspace.layout.clone(),

@@ -48,16 +48,19 @@ saved reference is kept.
 `--command` takes precedence in its target pane and starts a shell there.
 `--no-restore` and `restore_workspaces = false` retain their existing meaning.
 Neptune restores new processes, not unfinished tool execution or process memory.
-Only provider, session ID, directory and the addresses of
-[linked pull requests](#linked-pull-requests) are saved in workspace schema 8,
-which reads versions 1–7. Invalid references receive the same recovery-copy protection
+Only provider, session ID, directory, the addresses of
+[linked pull requests](#linked-pull-requests) and the terminal whose agent
+[started an agent](#agents-that-start-agents) are saved in workspace schema 9,
+which reads versions 1–8. Invalid references receive the same recovery-copy protection
 as other damaged workspace state. Prompts, transcripts, arbitrary commands,
 credentials and permission-bypass flags are not saved or replayed. Transcripts
 remain owned by the CLI. Launch-only options and temporary environment changes
 (such as a different `CODEX_HOME`) must be reapplied by the user's configuration.
 
-This integration is for local interactive CLIs. Batch/print commands, nested
-agents, SSH sessions and Windows shells do not participate. An application update
+This integration is for local interactive CLIs. Batch/print commands, SSH
+sessions and Windows shells do not participate, and neither does a CLI that one
+agent runs from its own shell, as opposed to an agent it
+[starts through Neptune](#agents-that-start-agents). An application update
 cannot discover agents launched before its adapters were installed. macOS uses
 the Unix adapter but still needs native verification; Linux/X11 is the verified
 host for this change.
@@ -88,13 +91,159 @@ restarted or closed, or the workspace changes SSH hosts. Only an address that
 names a pull request over HTTPS is accepted; it is saved without credentials,
 query or fragment, and nothing else about the pull request is read or stored.
 
-Claude Code receives the tool as an invocation-scoped server through
-`--mcp-config`, and permission for that one tool through `--settings`; its other
-servers and permissions are unchanged. Codex receives it through
+Claude Code receives Neptune's tools as an invocation-scoped server through
+`--mcp-config`, and permission for the ones that read, link or answer through
+`--settings`; its other servers and permissions are unchanged. Codex receives it through
 `-c mcp_servers.neptune…` overrides, on versions that expose `--no-daemon`, and
 may ask before the first call according to its approval settings. The server is
 the Neptune executable followed by `--agent-mcp`. A server of your own named
 `neptune` is replaced for that launch.
+
+## Agents that start agents
+
+An agent started through the adapters can hand work to another: ask Codex to
+build a feature's backend and let Claude Code build its frontend, and Codex
+starts Claude Code, gives it the task and reads its answer. Claude Code can
+start Codex the same way, and either can start more of its own kind.
+
+Neptune's tool server offers seven tools for this:
+
+| Tool | What it does |
+| --- | --- |
+| `spawn_agent` | Starts `claude` or `codex` with a task, in a directory, on a model, at an effort and in its ultra mode if they are given, and returns the agent's number once it has taken the task |
+| `wait_for_agent` | Returns when a started agent has news: a turn ended, it sent a message, it asks something, it needs a person, or it ended |
+| `send_agent_message` | Gives a started agent its next prompt |
+| `list_agents` | Says what each started agent is doing |
+| `close_agent` | Closes a started agent and its terminal |
+| `reopen_agent` | Opens a started agent again after its terminal was closed or its CLI exited, with the conversation it had |
+| `press_agent_keys` | Types the user's answer to what a started agent's CLI asks before it takes its task |
+
+A started agent runs in a terminal out of view: it has no tab, and the
+keyboard and what is in view stay where they were. The starting agent's tab
+carries a count of the agents it started, before its pull request numbers; a
+terminal alone in view has no tab, so the toolbar carries it. Click the count
+for the list, where each agent is named by its CLI and conversation and says
+what it is doing, and click an agent to open its terminal. It then has the tab
+after the agent that started it, takes the keyboard, and stays a tab like any
+other. The count turns to the attention colour while one of them waits for a
+person. Started agents are also rows of the [Agents tab](#agent-activity) like
+any other, and opening one there gives it its tab too. The sidebar counts a
+workspace's tabs, so a terminal out of view is not counted.
+
+The started CLI runs interactively, as if you had typed `claude "task"` or
+`codex "task"` there: it has its own conversation, tools, permission mode and
+settings, and once you open it you can read along, answer it or type to it.
+It does not see the conversation of the agent that started it. Neptune puts
+one sentence before the task, saying which agent started it and that the last
+message of each turn is what that agent reads. That last message is taken from
+the CLI's own Stop hook. A started agent is also offered `reply_to_parent`, to
+say something before its turn ends. A message from `send_agent_message` is
+pasted into the started agent's prompt and submitted; one sent while it works
+is taken when it gets to it, as a typed one would be.
+
+Models. `spawn_agent` takes an optional `model`, named as the CLI names it,
+and passes it as `claude --model` or `codex -m`: an alias such as `opus`,
+`sonnet` or `haiku` or a full model id for Claude Code, a model id for Codex.
+Without one the CLI uses its own default. The name is only checked to be a
+name and not an option; a model the CLI does not know is the CLI's to refuse.
+
+Effort and ultra. `spawn_agent` also takes an optional `effort` and an
+optional `ultra`. The effort is passed as `claude --effort` or as Codex's
+`model_reasoning_effort` setting for that launch, and each CLI has its own
+levels: `low`, `medium`, `high`, `xhigh` and `max` for Claude Code, and
+`minimal` and `ultra` besides those for Codex. A level the chosen CLI does
+not have is refused with the list of those it has. `ultra` asks for the CLI's
+ultra mode. For Claude Code that is ultracode, its standing multi-agent
+workflow orchestration, turned on for that session through the `ultracode`
+key of the settings Neptune passes for the launch, at whatever effort was
+given. For Codex it is the Ultra effort, so it cannot be combined with another
+effort. Both use far more tokens; the tool tells the starting agent to set
+them only when you ask.
+
+An agent that is reopened runs on the model, at the effort and in the ultra
+mode it was started with. A started agent that returns when workspaces are
+restored uses the CLI's defaults again.
+
+Directories and worktrees. A started agent works in the directory of the
+agent that started it unless `cwd` names another, which must exist. Neptune
+creates no worktree: the tools' instructions tell the starting agent to make
+one with `git worktree add` and pass its path when both agents would edit the
+same files. The started agent's row and tab show the directory it was given.
+
+Questions before the task. A CLI can open on a question of its own before it
+takes anything: whether to trust a new folder, to review hooks that changed,
+to sign in. Nobody is watching a terminal out of view, so Neptune watches for
+it. `spawn_agent` returns only once the CLI has taken its task, and a terminal
+that has drawn nothing new for four seconds without taking it is reported as
+asking: the tool's answer carries the last lines its terminal shows and tells
+the starting agent to put the question to you at once. The count turns to the
+attention colour and the agent's row reads "Needs your answer". You can open
+its terminal from the list and answer there, or tell the starting agent your
+answer, which `press_agent_keys` then types: up to eight of enter, escape,
+tab, space, the arrow keys and single letters or digits. Keys are pressed
+only for a question from before the task, never for a permission request or
+anything else a running agent asks. These lines are the only terminal
+contents that leave a terminal, and they go to the agent that started it, not
+to disk or diagnostics. A terminal you have in view is not read: its question
+is reported without its text.
+
+Permissions. Neptune allows Claude Code `wait_for_agent`, `list_agents`,
+`reply_to_parent` and `link_pull_request` for the launch. Starting or
+reopening an agent, typing for one, pressing keys for one and closing one
+hand work to another CLI or stop it, so `spawn_agent`, `reopen_agent`,
+`send_agent_message`, `press_agent_keys` and `close_agent` are decided by
+Claude Code's own permission mode and by Codex's approval settings, like any
+other tool: an agent that asks before it runs a command asks before it starts
+an agent. With permissions bypassed nothing asks, and an agent could press a
+key without having been told to; its instructions say not to. The started
+agent asks for what its own work needs, in its own terminal; `wait_for_agent`
+then reports that it is waiting for a person and what for, and nothing is
+typed over the request. Codex is given a five and a half minute limit for
+Neptune's tools in place of its one minute, so that a wait of up to five
+minutes can finish.
+
+Closing and reopening. `close_agent` closes a started agent with its
+terminal. You can also close its tab once you opened it, or it can exit by
+itself; `wait_for_agent` reports either once, with anything it had still to
+say. While the agent that started it runs, it can bring that agent back with
+`reopen_agent` and a message: a new terminal out of view runs
+`claude --resume` or `codex resume` for the conversation its CLI last named,
+in the directory and with the model, effort and ultra mode it had, and takes
+the message as its next prompt. It has a new number from then on. An agent that never named a
+conversation, or whose directory is gone, cannot be reopened and a new one is
+started instead.
+
+Lifetime. A link lasts while both agents run. It returns with them when
+workspaces are restored, out of view where it was, and the restored agents
+can go on talking. It ends when the started agent exits or its terminal is
+restarted or closed. A started agent that exits in a terminal you never
+opened takes that terminal with it; one whose terminal has a tab leaves its
+shell there. When the starting agent exits or its terminal is closed, the
+agents it started keep running, answer to no one, and each gets a tab so that
+nothing runs out of view unattended. An agent reaches only the agents it
+started, by the number it was given.
+
+Limits. An agent can have eight started agents open at once, and the eight
+most recently ended ones are remembered for reopening. An agent you started
+can start agents and those can start agents; these last cannot. A task,
+message or reply is at most 32 KB, a longer reply is cut there, and the
+sixteen most recent unread replies are kept. A terminal out of view has not
+been laid out, so its CLI draws at the default size until you open it. A
+question before the task is recognised by a terminal standing still, so a CLI
+that takes four seconds to draw anything new while starting is reported as
+asking, with what it shows, until it goes on. With Codex's hooks untrusted its
+replies are not captured: the title still says when a turn ends, and
+`reply_to_parent` still delivers. Text a person has typed but not sent in a
+started agent's prompt is submitted together with a message that arrives. The
+task, the model and the effort are the CLI's arguments, so they are visible in
+the process list like any command line. The limits of the first section apply too: no SSH
+sessions, Windows shells or bypassed adapters.
+
+Tasks, messages, replies and the lines of a question before the task pass
+through the application's memory between the two terminals. They are not saved, logged or sent to diagnostics; a reply
+nobody collected is dropped with its link. Only an agent that another agent
+started hands over the last message of its turns; every other agent's hooks
+send what they did before.
 
 ## Agent activity
 
@@ -125,6 +274,8 @@ most the kind of moment and the tool's name to the application over the pane's
 private loopback channel, prints nothing and exits 0, so it never decides
 anything for the agent. Prompts, commands, tool input and results, and the
 transcript are not sent, logged or saved; the state itself is not saved either.
+The one exception is the last message of a turn of an agent that
+[another agent started](#agents-that-start-agents), held in memory for that agent.
 The hooks run in order with a five-second limit (three for Codex's Interrupt,
 the most Codex allows) and normally take a few milliseconds; input over 4 MB is not parsed and only its event is used.
 
@@ -173,6 +324,28 @@ begins or ends. The application holds the state outside the model, drops it
 when the pane's generation, lifecycle or agent reference changes, and wakes
 itself only for the two-second and 0.4-second deadlines above.
 
+Starting an agent uses the same channel, credentials and startup path. The
+tool server's requests are answered over the loopback connection; those that
+change the workspace wait for the next frame, where a generation-tagged
+`SpawnAgent` command adds a pane that is in no layout, so focus and view do
+not move, and the model records which pane's agent started it. Only such a
+pane may be outside its workspace's layout: focusing it gives it a tab, and
+the model gives it one itself when its link ends while its agent runs, or
+closes it when its own agent is gone. The saved layout leaves it out, and it
+is restored out of view only together with its link. The task is held by the bridge and taken once
+by the new terminal's shell startup, which opens the CLI with it the way a
+restored agent is opened; it is never typed into a shell. A message for a
+started agent is pasted only while its CLI is open in that pane generation,
+and submitted a moment later under the same check. The model ends a link when
+either pane loses its agent, and the bridge follows the model each frame. While
+a started CLI has not taken its task the application compares its session's
+revision twice a second, and reads its screen once when that has not changed
+for four seconds; the bridge keeps the record of an ended agent whose CLI named
+a conversation for as long as the agent that started it runs.
+A wait polls the bridge from the tool server's own process and reads its input
+on a second thread, so a cancelled call stops and nothing it had not yet
+collected is lost.
+
 A small POSIX supervisor preserves foreground signal handling and reports normal
 CLI exit. Resumption runs as part of shell startup with quoted arguments, never
 by typing commands into a terminal that could still be showing another prompt.
@@ -202,6 +375,18 @@ its fixtures read the hooks injected for them, fire them with realistic input
 (including a 6 MB tool result) and set terminal titles, and the rows are read
 back through inspection. `NEPTUNE_EXPLORER_STATE=agents`, `agents-empty` and
 `agents-closed` of `app::tests::capture_explorer_native` capture the tab.
+
+`python3 scripts/verify-agent-delegation.py` covers agents that start agents.
+Its fixtures start Neptune's tool server as each provider is configured to and
+call its tools: one agent starts the other on a named model in a terminal out
+of view and reads its reply, sends it a message that arrives as one paste,
+sees it wait for a person, closes it and reopens it with its conversation;
+the list opens a started agent's terminal in a tab; started agents nest two
+deep and reach only their own; a terminal a person closed is reported and
+reopened; a fixture that asks before taking its task is reported with what it
+shows by the call that started it and answered with the keys given; links
+return after a close and reopen, out of view where they were, and no task or
+reply is in the saved state.
 
 `python3 scripts/verify-agent-restore.py` runs deterministic CLI fixtures in an
 isolated native app, with fresh storage and a unique inspection endpoint. It
@@ -255,3 +440,32 @@ turn and an interrupt. Codex's permission and question prompts, Claude Code's
 permission and plan prompts, subagents, tool-server input requests and
 compaction were exercised only through fixtures and unit tests. macOS and
 Windows are unverified.
+
+Agents that start agents were checked on 2026-10-04 in the Linux development
+build with `inspection` (Wayland session, XWayland window). The deterministic
+native regression passed, with captures reviewed at 1100×700 and 640×440, and
+the restore and activity regressions passed again. With the installed **Claude
+Code 2.1.289** and **Codex CLI 0.160.0** in an isolated instance at 1200×760,
+Claude Code (Haiku, permissions bypassed) started Codex on a named model out
+of view and read its reply, closed it, reopened it and got an answer that
+recalled the first; started a Claude Code on `haiku`, whose terminal was then
+opened from the list and closed by hand, and reopened that one too with its
+conversation. A Claude Code started in a folder it had not seen stopped at its
+trust question: the `spawn_agent` call that started it returned the
+question's text, the starting agent put it to the user and pressed nothing, the count
+turned to the attention colour, and after being told "No, exit"
+`press_agent_keys` pressed enter and the wait reported the exit. Codex took
+its task in a new directory without asking. In a later run that day a
+Claude Code started with `model` sonnet, `effort` low and `ultra` showed
+"Sonnet with low effort" and its ultracode mark, and a Codex started with
+`ultra` showed its model at ultra. That Codex opened on "Hooks need review":
+the installed Neptune 0.1.0-rc.3 had been used in between and had saved trust
+for its own form of the session-start hook command. The `spawn_agent` call
+returned the review screen's text and the starting agent put it to the user. From an earlier build the same day:
+both directions of a two-turn exchange, a Codex-made git worktree in which
+Claude Code wrote the file it was asked for, a late reply reaching the next
+wait, a 90-second wait without a tool timeout, and Claude Code asking before
+`spawn_agent` in its default permission mode. Not exercised with the installed
+CLIs: restore, a started agent's permission request, Codex as the starting
+agent in this version, Codex asking before a tool, and Codex with Neptune's
+hooks untrusted; fixtures and unit tests cover the first two. macOS, Windows and native Wayland are unverified.

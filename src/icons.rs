@@ -46,6 +46,7 @@ pub enum Icon {
     Star,
     Image,
     PullRequest,
+    Agents,
     File,
     Files,
     FilePlus,
@@ -351,6 +352,21 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[[6.0, 9.0], [6.0, 21.0]]);
             circle(18.0, 18.0, 3.0);
             line(&[[13.0, 6.0], [16.0, 6.0], [18.0, 8.0], [18.0, 15.0]]);
+        }
+        Icon::Agents => {
+            // One agent, and the two it started.
+            circle(12.0, 5.5, 2.5);
+            line(&[[12.0, 8.0], [12.0, 12.0]]);
+            line(&[
+                [6.0, 15.5],
+                [6.0, 13.5],
+                [7.5, 12.0],
+                [16.5, 12.0],
+                [18.0, 13.5],
+                [18.0, 15.5],
+            ]);
+            circle(6.0, 18.0, 2.5);
+            circle(18.0, 18.0, 2.5);
         }
         Icon::File | Icon::FilePlus => {
             // A sheet with its top trailing corner folded down.

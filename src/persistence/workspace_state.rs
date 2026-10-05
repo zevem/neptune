@@ -9,9 +9,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Version 8 adds workspace group default directories and the pull requests an
-/// agent linked to its pane. Versions 1–7 remain readable.
-pub const SCHEMA_VERSION: u32 = 8;
+/// Version 9 adds the pane whose agent started a pane's agent. Version 8 added
+/// workspace group default directories and the pull requests an agent linked
+/// to its pane. Versions 1–8 remain readable.
+pub const SCHEMA_VERSION: u32 = 9;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -101,6 +102,9 @@ pub struct SavedPane {
     /// Addresses of the pull requests the agent linked, from schema version 8.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pull_requests: Vec<String>,
+    /// The pane whose agent started this pane's agent, from schema version 9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<PaneId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +162,9 @@ impl StateSnapshot {
                                 .iter()
                                 .map(|link| link.url().to_owned())
                                 .collect(),
+                            // An agent that has not opened yet cannot be
+                            // resumed, so neither can its link.
+                            spawned_by: pane.spawned_by().filter(|_| pane.agent().is_some()),
                         })
                         .collect(),
                     layout: SavedLayout::from_layout(workspace.layout()),
@@ -228,6 +235,7 @@ impl SavedWorkspace {
                         .iter()
                         .filter_map(|url| neptune_model::PullRequest::parse(url))
                         .collect(),
+                    spawned_by: pane.spawned_by,
                     agent: pane.agent,
                 })
                 .collect(),
@@ -453,6 +461,10 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
     }
     let mut specs = Vec::new();
     let mut total = 0;
+    // Links between agents cross workspaces, so they are checked once every
+    // workspace has been; until then each workspace is validated without them.
+    let mut spawned = Vec::new();
+    let mut background = Vec::new();
     for mut workspace in snapshot.workspaces {
         if let Some(group) = workspace.group
             && !groups.iter().any(|folder| folder.id == group)
@@ -514,9 +526,20 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                 ));
                 pane.cwd.clone_from(&workspace.cwd);
             }
+            if let Some(parent) = pane.spawned_by.take() {
+                spawned.push((pane.id, parent));
+            }
         }
         let name = workspace.name.clone();
-        let spec = workspace.into_spec();
+        let mut spec = workspace.into_spec();
+        // A terminal saved without a tab is checked with one, and loses it
+        // again once the agent that started its agent is found.
+        let placed = spec.layout.panes();
+        for pane in &spec.panes {
+            if !placed.contains(&pane.id) && park(&mut spec.layout, Some(spec.active), pane.id) {
+                background.push(pane.id);
+            }
+        }
         let mut candidate = specs.clone();
         candidate.push(spec.clone());
         match Model::restore_grouped(candidate, groups.clone(), None, snapshot.sidebar, limits) {
@@ -527,6 +550,33 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
             Err(error) => report
                 .diagnostics
                 .push(format!("Skipped invalid workspace {name:?}: {error}")),
+        }
+    }
+    for (pane, parent) in spawned {
+        let mut linked = specs.clone();
+        if let Some(spec) = linked
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.panes)
+            .find(|spec| spec.id == pane)
+        {
+            spec.spawned_by = Some(parent);
+        }
+        if background.contains(&pane) {
+            for workspace in &mut linked {
+                unpark(&mut workspace.layout, pane);
+            }
+        }
+        match Model::restore_grouped(
+            linked.clone(),
+            groups.clone(),
+            None,
+            snapshot.sidebar,
+            limits,
+        ) {
+            Ok(_) => specs = linked,
+            Err(_) => report.diagnostics.push(format!(
+                "Pane {pane}: the agent that started its agent was unavailable; restored on its own"
+            )),
         }
     }
     let active = requested_active.filter(|id| specs.iter().any(|workspace| workspace.id == *id));
@@ -580,6 +630,39 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
         Err(error) => report
             .diagnostics
             .push(format!("Workspace state validation failed: {error}")),
+    }
+}
+
+/// Adds `pane` as the last tab beside `anchor`, or of the first place when
+/// the anchor has none.
+fn park(layout: &mut Layout, anchor: Option<PaneId>, pane: PaneId) -> bool {
+    match layout {
+        Layout::Tabs { panes, .. } => {
+            let here = anchor.is_none_or(|anchor| panes.contains(&anchor));
+            if here {
+                panes.push(pane);
+            }
+            here
+        }
+        Layout::Split { first, second, .. } => {
+            park(first, anchor, pane)
+                || park(second, anchor, pane)
+                || (anchor.is_some() && park(first, None, pane))
+        }
+    }
+}
+/// Takes back the tab `park` gave; another tab is in view in its place.
+fn unpark(layout: &mut Layout, pane: PaneId) {
+    match layout {
+        Layout::Tabs { panes, shown } => {
+            if *shown != pane {
+                panes.retain(|id| *id != pane);
+            }
+        }
+        Layout::Split { first, second, .. } => {
+            unpark(first, pane);
+            unpark(second, pane);
+        }
     }
 }
 
@@ -652,6 +735,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 remote_cwd: None,
                 agent: None,
                 pull_requests: Vec::new(),
+                spawned_by: None,
             });
         }
         if panes.is_empty() {
@@ -668,6 +752,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 remote_cwd: None,
                 agent: None,
                 pull_requests: Vec::new(),
+                spawned_by: None,
             });
             next_pane += 1;
         }
@@ -859,6 +944,64 @@ mod tests {
         let panes = model.workspaces()[0].panes();
         assert_eq!(panes[0].pull_requests().len(), 1);
         assert!(panes[1].pull_requests().is_empty());
+        // A link between two resumable agents returns; one to a terminal
+        // without an agent, to itself or to a missing terminal does not.
+        let (first, second) = (
+            snapshot.workspaces[0].panes[0].id,
+            snapshot.workspaces[0].panes[1].id,
+        );
+        let mut linked = snapshot.clone();
+        linked.workspaces[0].panes[0].pull_requests.pop();
+        linked.workspaces[0].panes[1].pull_requests.clear();
+        linked.workspaces[0].panes[1].agent = Some(reference.clone());
+        linked.workspaces[0].panes[1].spawned_by = Some(first);
+        std::fs::write(&path, serde_json::to_vec(&linked).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.pane(second).unwrap().spawned_by(), Some(first));
+        assert_eq!(
+            StateSnapshot::from_model(&model).workspaces[0].panes[1].spawned_by,
+            Some(first)
+        );
+        // A started agent's terminal without a tab returns without one, and
+        // with one when its link does not.
+        let mut hidden = linked.clone();
+        hidden.workspaces[0].layout = SavedLayout::Pane { pane: first };
+        hidden.workspaces[0].active = first;
+        std::fs::write(&path, serde_json::to_vec(&hidden).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert!(model.workspaces()[0].is_background(second));
+        assert!(matches!(
+            &StateSnapshot::from_model(&model).workspaces[0].layout,
+            SavedLayout::Pane { pane } if *pane == first
+        ));
+        hidden.workspaces[0].panes[1].spawned_by = Some(PaneId::new(99));
+        std::fs::write(&path, serde_json::to_vec(&hidden).unwrap()).unwrap();
+        let model = load_state(&path, Limits::default()).model.unwrap();
+        assert_eq!(model.workspaces()[0].layout().panes(), [first, second]);
+        assert_eq!(model.workspaces()[0].layout().shown(), [first]);
+        for (child, parent, agent) in [
+            (1, first, None),
+            (1, second, Some(reference.clone())),
+            (1, PaneId::new(99), Some(reference.clone())),
+        ] {
+            let mut broken = linked.clone();
+            broken.workspaces[0].panes[child].agent = agent;
+            broken.workspaces[0].panes[child].spawned_by = Some(parent);
+            std::fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
+            let report = load_state(&path, Limits::default());
+            assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
+            let model = report.model.unwrap();
+            assert!(
+                model.workspaces()[0]
+                    .panes()
+                    .iter()
+                    .all(|pane| pane.spawned_by().is_none())
+            );
+        }
         snapshot.workspaces[0].panes[0]
             .agent
             .as_mut()
@@ -1040,7 +1183,7 @@ mod tests {
     fn earlier_schema_versions_are_read_without_loss_and_saved_as_the_current_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspaces.json");
-        for version in [1, 2, 3, 4, 5, 6, 7] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8] {
             let mut saved = serde_json::to_value(sample(directory.path())).unwrap();
             saved["version"] = version.into();
             saved.as_object_mut().unwrap().remove("groups");
@@ -1196,6 +1339,7 @@ mod tests {
             remote_cwd: None,
             agent: None,
             pull_requests: Vec::new(),
+            spawned_by: None,
         }];
         second.layout = SavedLayout::Pane {
             pane: PaneId::new(3),

@@ -106,6 +106,32 @@ impl App {
         rows
     }
 
+    /// The agents that the agent in `parent` started, for its tab's list.
+    pub(super) fn spawned_agents(&self, parent: neptune_model::PaneId) -> Vec<ui::agents::Spawned> {
+        self.controller
+            .model()
+            .spawned(parent)
+            .map(|pane| {
+                let kind = pane.agent().map(|agent| agent.kind);
+                let title = kind
+                    .zip(self.sessions.get(pane.id()))
+                    .filter(|_| self.agents.titled(pane.id()))
+                    .and_then(|(kind, session)| {
+                        crate::agent_activity::conversation(kind, &session.metadata().title)
+                            .map(|title| format!("{} · {title}", ui::agents::kind_name(kind)))
+                    })
+                    .or_else(|| kind.map(|kind| ui::agents::kind_name(kind).to_owned()))
+                    .unwrap_or_else(|| "Agent".to_owned());
+                ui::agents::Spawned {
+                    pane: pane.id(),
+                    title,
+                    activity: self.agents.get(pane.id()).map(|(activity, _)| activity),
+                    starting: self.delegation.starting(pane.id()),
+                }
+            })
+            .collect()
+    }
+
     /// Ages are shown in minutes: a list in view is drawn again as they pass.
     pub(super) fn tick_agents(ctx: &egui::Context) {
         ctx.request_repaint_after(Duration::from_secs(30));
