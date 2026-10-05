@@ -8,9 +8,120 @@ import unittest
 from unittest.mock import patch
 
 import release
+import correct_release_notes as correction
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_notes_correction_preserves_pending_acceptance_and_channel_warning(self):
+        before = "### What's New\n\n- Existing feature.\n\n" + correction.OLD_STATUS + "\n" + correction.OLD_CHANNEL + "\n"
+        after = correction.corrected_notes(before)
+        self.assertIn("- Existing feature.", after)
+        self.assertIn("Full native acceptance on every platform remains pending", after)
+        self.assertIn("Automatic\n  updates never downgrade", after)
+        self.assertNotIn(correction.OLD_STATUS, after)
+        self.assertNotIn(correction.OLD_CHANNEL, after)
+        for invalid in (after, before + correction.OLD_STATUS, before.replace(correction.OLD_CHANNEL, ""), None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                correction.corrected_notes(invalid)
+
+    def test_notes_repair_cannot_change_installers_source_version_or_extra_fields(self):
+        before = {
+            "schema": 1, "repository": release.REPO, "version": "0.1.0-rc.4", "tag": "v0.1.0-rc.4", "commit": "a" * 40,
+            "notes": correction.OLD_STATUS + "\n" + correction.OLD_CHANNEL,
+            "assets": [{"platform": "linux-x64-appimage", "name": "original.AppImage", "size": 123, "sha256": "b" * 64}],
+        }
+        after = dict(before, notes=correction.corrected_notes(before["notes"]))
+        correction.only_notes_changed(before, after)
+        changes = [{"version": "0.1.0-rc.5"}, {"tag": "v0.1.0-rc.5"}, {"commit": "c" * 40},
+                   {"assets": []}, {"repository": "other/repo"}, {"extra": "field"}, {"notes": after["notes"] + "New feature"}]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "Only the two"):
+                correction.only_notes_changed(before, dict(after, **change))
+
+    def test_metadata_repair_rejects_other_versions_drafts_and_immutable_releases(self):
+        with patch.object(release, 'release_for_tag') as lookup:
+            with self.assertRaises(ValueError): correction.snapshot('v0.1.0-rc.5')
+            lookup.assert_not_called()
+        for flags in ({"draft": True, "prerelease": True, "immutable": False},
+                      {"draft": False, "prerelease": False, "immutable": False},
+                      {"draft": False, "prerelease": True, "immutable": True}):
+            with self.subTest(flags=flags), patch.object(release, 'release_for_tag', return_value=flags):
+                with self.assertRaisesRegex(ValueError, "editable, published prerelease"):
+                    correction.snapshot('v0.1.0-rc.4')
+
+    def test_metadata_repair_signs_exact_new_notes_with_original_installer_checksums(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'packaging').mkdir()
+            key = root / 'private.pem'
+            subprocess.run(['openssl', 'genpkey', '-algorithm', 'ED25519', '-out', str(key)], check=True)
+            public = subprocess.check_output(['openssl', 'pkey', '-in', str(key), '-pubout', '-outform', 'DER'])
+            (root / 'packaging/update-public-key.hex').write_text(public[-32:].hex())
+            directory = root / 'correction'
+            before, after = directory / 'before', directory / 'after'
+            before.mkdir(parents=True)
+            after.mkdir()
+            original = {'assets': [{'name': 'existing-installer.exe', 'sha256': 'b' * 64}],
+                        'notes': correction.OLD_STATUS + '\n' + correction.OLD_CHANNEL}
+            updated = dict(original, notes=correction.corrected_notes(original['notes']))
+            (after / 'update-manifest.json').write_text(json.dumps(updated))
+            baseline = {'release': {'tag_name': 'v0.1.0-rc.4'}}
+            with patch.object(release, 'ROOT', root), patch.object(correction, 'validate_preparation', return_value=(baseline, original)), \
+                 patch.object(correction, 'snapshot', return_value=baseline), patch.dict(os.environ, {'UPDATE_SIGNING_KEY': key.read_text()}):
+                correction.seal(directory)
+                correction.verify_signature(after)
+                sums = correction.checksums(after)
+                self.assertEqual(sums['existing-installer.exe'], 'b' * 64)
+                self.assertEqual(sums['update-manifest.json'], release.sha256(after / 'update-manifest.json'))
+                self.assertEqual(sums['update-manifest.sig'], release.sha256(after / 'update-manifest.sig'))
+                # A text edit after signing is rejected by the actual Ed25519 verifier.
+                (after / 'update-manifest.json').write_text(json.dumps(dict(updated, notes='tampered')))
+                with self.assertRaises(subprocess.CalledProcessError): correction.verify_signature(after)
+
+    def test_repair_upload_and_failure_recovery_can_only_touch_three_metadata_assets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            after, before = directory / 'after', directory / 'before'
+            after.mkdir()
+            before.mkdir()
+            for name in correction.METADATA:
+                (after / name).write_bytes(b'corrected')
+                (before / name).write_bytes(b'original')
+            baseline = {'release': {'tag_name': 'v0.1.0-rc.4'}, 'tag': {'sha': 'a' * 40},
+                        'assets': {'installer.exe': {'id': 1, 'digest': 'sha256:' + 'b' * 64}}}
+            baseline['assets'].update({name: {'id': i + 2, 'digest': 'sha256:' + release.sha256(before / name)}
+                                       for i, name in enumerate(correction.METADATA)})
+            remote = {**baseline['release'], 'assets': [{'name': name, **asset} for name, asset in baseline['assets'].items()]}
+            original = {'assets': [{'name': 'installer.exe', 'sha256': 'b' * 64}]}
+            sums = {'installer.exe': 'b' * 64, **{name: release.sha256(after / name) for name in ('update-manifest.json', 'update-manifest.sig')}}
+            calls = []
+            def upload(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 1: raise subprocess.CalledProcessError(1, command)
+                return subprocess.CompletedProcess(command, 0)
+            with patch.object(correction, 'validate_preparation', return_value=(baseline, original)), \
+                 patch.object(correction, 'verify_signature'), patch.object(correction, 'checksums', return_value=sums), \
+                 patch.object(correction, 'snapshot', return_value=baseline), patch.object(release, 'release_for_tag', return_value=remote), \
+                 patch.object(correction, 'gh_json', return_value={'object': baseline['tag']}), \
+                 patch.object(correction.subprocess, 'run', side_effect=upload):
+                with self.assertRaises(subprocess.CalledProcessError): correction.publish(directory)
+            self.assertEqual(len(calls), 2)
+            for command, folder in zip(calls, (after, before)):
+                self.assertEqual(command[:8], ['gh', 'release', 'upload', 'v0.1.0-rc.4', '--repo', release.REPO, '--clobber', str(folder / 'SHA256SUMS')])
+                self.assertEqual(set(command[7:]), {str(folder / name) for name in correction.METADATA})
+            (after / 'installer.exe').write_bytes(b'unexpected')
+            with patch.object(correction, 'validate_preparation', return_value=(baseline, original)), \
+                 patch.object(correction.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, "Only three metadata"):
+                    correction.publish(directory)
+                run.assert_not_called()
+            remote['assets'][-1]['digest'] = 'sha256:' + 'c' * 64
+            with patch.object(release, 'release_for_tag', return_value=remote), \
+                 patch.object(correction, 'gh_json', return_value={'object': baseline['tag']}), patch.object(correction.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, "changed independently"):
+                    correction.rollback(directory, baseline)
+                run.assert_not_called()
+
     def test_linux_library_notice_lookup_handles_merged_usr_aliases(self):
         spec = importlib.util.spec_from_file_location('package_linux', Path(__file__).with_name('package-linux.py'))
         packaging = importlib.util.module_from_spec(spec)
