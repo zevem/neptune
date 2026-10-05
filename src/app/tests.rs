@@ -2326,7 +2326,7 @@ fn remote_splits_follow_their_source_pane_after_focus_and_directory_changes() {
     .unwrap();
     std::fs::write(home.join(".zshrc"), "PROMPT='NEPTUNE> '\n").unwrap();
     let client = root.path().join("fake-ssh");
-    std::fs::write(&client, "#!/bin/sh\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
+    std::fs::write(&client, "#!/bin/sh\nwhile [ \"$1\" = -o ]; do shift 2; done\n[ \"$1\" = -t ] || exit 1\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
     std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut app, _sender) = fixture(root.path());
     let ctx = egui::Context::default();
