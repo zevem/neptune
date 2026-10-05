@@ -76,20 +76,63 @@ request's number beside its close control; clicking the number opens the pull
 request in the default browser. A terminal alone in view has no tab, so the
 toolbar shows its numbers after the title. One or two pull requests are shown
 side by side, the newest nearest the close control. With more, or where two do
-not fit beside the title, the newest number carries a chevron and opens a list
+not fit beside the title, one number carries a chevron and opens a list
 of them all. A terminal keeps its eight most recent links, and linking the same
 pull request again changes nothing.
 
 The link depends on the agent following those instructions: a pull request
 created through `gh` or an API is not discovered on its own, and Neptune does
-not look up branches or pull request status. Ask the agent to link a pull
-request if its number is missing.
+not look up branches. Ask the agent to link a pull request if its number is
+missing.
+
+### Pull request status
+
+A linked number also shows where its pull request stands, so that one needing
+you can be seen without opening the browser:
+
+| The pull request | Its number |
+| --- | --- |
+| Open | The accent colour |
+| Draft | Grey |
+| Merged | Purple, with the merge icon in place of the pull request icon |
+| Closed without merging | Dimmed |
+
+While a pull request is open or a draft, two marks follow its number. The
+first is for the checks of its last commit taken together: a green check when
+they pass, a red cross when one fails and a yellow ring while any is running or
+expected; a commit without checks has no mark. The second is a comment icon
+with a count, in the attention colour, of the review conversations that are not
+resolved; "99+" stands for a hundred or more. A merged or closed pull request
+carries neither. Resting the pointer on a number says the same in words, for
+example "Open · Checks failing · 2 unresolved comments". The number that
+stands for several pull requests is the newest still open or a draft, or the
+newest of all once none is; it carries the worst state of their checks and
+the sum of their unresolved conversations, and its list says each one's state.
+Where a tab is short of room the marks are given up before the number is.
+
+Neptune reads this through the [GitHub CLI](https://cli.github.com) (`gh`), as
+the account signed in to it: one request for each host names the linked pull
+requests of the workspace in view and asks for their state, the combined state
+of their checks and whether each review conversation is resolved. Neptune
+holds no token of its own, and nothing it reads is saved. Without `gh`, without
+a sign-in for the pull request's host (`gh auth login`, with `--hostname` for
+GitHub Enterprise), without a network or for a host that is not GitHub, the
+number looks as it did before and its tooltip says the status is unavailable.
+Titles, comments and other contents of a pull request are not requested.
+
+A state is read when its link first comes into view and again every 15 seconds
+while checks are running, every minute while the pull request is otherwise in
+review, every ten minutes once it is merged or closed, and every minute after a
+lookup that failed. One worker makes one request at a time, for at most 32 pull
+requests, with a 20-second limit and a bounded response; the window is drawn
+again only when a state changed. Only the workspace in view is read; the last
+state of another is kept for an hour, shown again on return and read afresh.
 
 Links belong to the agent's run in that terminal. They return with the agent
 when workspaces are restored, and leave when the agent exits, the terminal is
 restarted or closed, or the workspace changes SSH hosts. Only an address that
 names a pull request over HTTPS is accepted; it is saved without credentials,
-query or fragment, and nothing else about the pull request is read or stored.
+query or fragment, and nothing else about the pull request is stored.
 
 Claude Code receives Neptune's tools as an invocation-scoped server through
 `--mcp-config`, and permission for the ones that read, link or answer through
@@ -312,7 +355,9 @@ callback credential, and each CLI invocation has its own identity. Closed or
 replaced panes and late hooks from exited invocations cannot overwrite a newer
 session. A linked pull request is accepted only from the invocation that is open
 in its pane, and reaches the model as a generation-tagged
-`PanePullRequestLinked` command. Pending updates coalesce per pane; hooks wake the application on change,
+`PanePullRequestLinked` command. The state of a linked pull request stays out
+of the model: `runtime/pull_requests.rs` owns one worker that runs `gh api
+graphql` off the frame and wakes the application when a state changed. Pending updates coalesce per pane; hooks wake the application on change,
 so idle integrations do not poll or repaint. Socket reads have byte and total-time
 limits. Startup-file creation and cleanup stay on workers.
 
@@ -394,6 +439,14 @@ checks independent IDs in one directory, graceful close/reopen, normal exit,
 Ctrl+C and narrow-window presentation. Fixtures prove Neptune's contracts without
 sending model requests; they do not stand in for installed-provider validation.
 Build the inspection targets described in [native verification](verification.md#native-application-verification) first.
+
+`python3 scripts/verify-pull-request-status.py` links pull requests through the
+same fixtures, with a stand-in `gh` that answers from a file the script
+rewrites. It checks that the real worker asks once per round for the pull
+requests in view, reads a change of state without input, and leaves captures of
+each state alone in view, on tabs, in the list, in the Light theme and in a
+narrow window for review. The stand-in proves Neptune's request and its reading
+of the answer, not GitHub's API or an installed `gh`.
 
 The implementation was also checked in the running Linux/X11 app with the two
 installed CLIs above. Each received a no-tools request to reply with `OK`; both

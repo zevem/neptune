@@ -33,6 +33,11 @@ their preparation records remain in Git history.
   effort level and its CLI's ultra mode (ultracode or Ultra).
   One you closed can be opened again with its conversation, and a question a
   started agent's CLI asks before it begins is passed on to you at once.
+- See where an agent's pull request stands on its tab. The linked number now
+  shows whether its checks pass, fail or are still running and how many review
+  comments are unresolved, and changes colour and icon once the pull request is
+  merged. It updates on its own, through the GitHub CLI (`gh`) you are signed
+  in to; without it the number looks as before.
 
 ### Acceptance notes and known limitations
 
