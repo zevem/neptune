@@ -5,6 +5,7 @@ use neptune_model::{AgentKind, AgentSession, PaneId, PullRequest};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    collections::VecDeque,
     io::{IsTerminal, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -13,12 +14,31 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use terminal_core::SessionOptions;
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
-const MAX_MESSAGE: u64 = 40 * 1024;
+/// Room for one task, message or reply between agents, escaped.
+const MAX_MESSAGE: u64 = 256 * 1024;
+/// The longest task, message or reply one agent hands another.
+pub(super) const MAX_TEXT: usize = 32 * 1024;
+/// Every unread reply of every agent one agent started, escaped.
+const MAX_ANSWER: u64 = 32 * 1024 * 1024;
+/// Replies an agent has not collected; the oldest give way.
+const MAX_OUTBOX: usize = 16;
+/// Requests waiting for the next frame.
+const MAX_REQUESTS: usize = 64;
+/// Keys one call presses for a question a CLI asks before taking its task.
+const MAX_KEYS: usize = 8;
+/// A turn that follows a handed-over prompt starts within this long of the
+/// one before it ending, or was folded into it.
+const TURN_GRACE: Duration = Duration::from_secs(4);
+/// A CLI that has not taken its task by now is showing a prompt of its own,
+/// such as a folder trust question, which only a person answers.
+const START_GRACE: Duration = Duration::from_secs(20);
+/// A request the agent's own reviewer answers at once is not a wait.
+const ASK_HOLD: Duration = Duration::from_millis(1500);
 /// Hook input carries tool results; only its few metadata fields are read.
 const MAX_HOOK: u64 = 4 * 1024 * 1024;
 /// A tool name longer than this is not carried.
@@ -31,10 +51,13 @@ const SHIMS: &str = "NEPTUNE_AGENT_SHIMS";
 const RUN: &str = "NEPTUNE_AGENT_RUN";
 /// This executable, for hook commands that must read the same at every launch.
 const HELPER: &str = "NEPTUNE_AGENT_HELPER";
+/// Set for a CLI another agent started: its replies go to that agent.
+const SPAWNED: &str = "NEPTUNE_AGENT_SPAWNED";
+const NOT_TRACKED: &str = "Neptune is not tracking an agent in this terminal.";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
-enum Event {
+pub(super) enum Event {
     Open {
         agent: AgentSession,
     },
@@ -50,12 +73,430 @@ enum Event {
     },
     /// The CLI is gone but its reference is kept, as after a failed resume.
     Stopped,
+    /// Start another agent with a task, in a tab beside this one.
+    Spawn {
+        kind: AgentKind,
+        prompt: String,
+        cwd: PathBuf,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        /// Claude Code's ultracode, or Codex's Ultra effort.
+        #[serde(default)]
+        ultra: bool,
+    },
+    /// Open a started agent whose terminal closed again, in a terminal of
+    /// its own, to go on with its conversation.
+    Reopen {
+        agent: u64,
+        text: String,
+    },
+    /// Answer the question a started agent's CLI asks before it takes its
+    /// task, as the user said to.
+    Press {
+        agent: u64,
+        keys: Vec<String>,
+    },
+    /// What became of a `Spawn` or a `Reopen`.
+    SpawnResult {
+        request: u64,
+    },
+    /// What the agents this one started are doing, with the replies it has
+    /// not read when `take` is set.
+    Collect {
+        agent: Option<u64>,
+        take: bool,
+    },
+    /// Hand a started agent another prompt.
+    Tell {
+        agent: u64,
+        text: String,
+    },
+    /// Close a started agent's terminal.
+    Dismiss {
+        agent: u64,
+    },
+    /// A started terminal asks for the CLI and task it opens with.
+    Launch,
+    LaunchFailed {
+        reason: String,
+    },
+    /// A started agent's words for the agent that started it; `done` at the
+    /// end of a turn.
+    Report {
+        text: String,
+        done: bool,
+    },
+}
+impl Event {
+    /// Answered with an `Answer` instead of an acknowledgement.
+    fn is_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Spawn { .. }
+                | Self::Reopen { .. }
+                | Self::Press { .. }
+                | Self::SpawnResult { .. }
+                | Self::Collect { .. }
+                | Self::Tell { .. }
+                | Self::Dismiss { .. }
+                | Self::Launch
+                | Self::LaunchFailed { .. }
+        )
+    }
+}
+/// What Neptune answers a request with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+pub(super) enum Answer {
+    Refused {
+        reason: String,
+    },
+    Done,
+    /// The message was handed over; the agent was still at earlier work.
+    Told {
+        working: bool,
+    },
+    Queued {
+        request: u64,
+    },
+    Pending,
+    Spawned {
+        agent: u64,
+    },
+    Launch {
+        kind: AgentKind,
+        prompt: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        ultracode: bool,
+        /// The conversation of its own that it goes on with.
+        #[serde(default)]
+        resume: Option<String>,
+    },
+    Agents {
+        agents: Vec<AgentReport>,
+    },
+}
+/// One started agent, as the agent that started it sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct AgentReport {
+    pub agent: u64,
+    pub kind: AgentKind,
+    pub status: Status,
+    /// It has replies or a state its starter has not been told.
+    pub news: bool,
+    pub replies: Vec<String>,
+    /// It ended, and its conversation can be opened again.
+    #[serde(default)]
+    pub reopens: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum Status {
+    /// Its CLI has not taken its first prompt.
+    Starting,
+    /// Its CLI stands at a question of its own before taking its task, such
+    /// as whether to trust a folder; `screen` is what its terminal shows.
+    Asking {
+        screen: String,
+    },
+    Working,
+    Idle,
+    Waiting {
+        attention: Attention,
+    },
+    Ended {
+        reason: String,
+    },
+}
+impl Status {
+    pub(super) fn settled(&self) -> bool {
+        !matches!(self, Self::Starting | Self::Working)
+    }
+}
+/// What the terminal opened for a started agent begins with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    pub kind: AgentKind,
+    pub prompt: String,
+    /// The model its CLI is asked for; the CLI's own choice without one.
+    pub model: Option<String>,
+    /// How hard its model is asked to think, as its CLI names the level.
+    pub effort: Option<String>,
+    /// Claude Code runs with ultracode on. Codex's Ultra is an effort.
+    pub ultracode: bool,
+    /// The closed terminal it ran in before and the conversation it had
+    /// there, which it goes on with.
+    pub resume: Option<(PaneId, String)>,
+}
+impl Task {
+    #[cfg(test)]
+    pub fn new(kind: AgentKind, prompt: &str) -> Self {
+        Self {
+            kind,
+            prompt: prompt.into(),
+            model: None,
+            effort: None,
+            ultracode: false,
+            resume: None,
+        }
+    }
+}
+/// A key pressed for a question a CLI asks before it takes its task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    Enter,
+    Escape,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Char(char),
+}
+impl Press {
+    fn parse(key: &str) -> Option<Self> {
+        Some(match key.trim().to_ascii_lowercase().as_str() {
+            "enter" | "return" => Self::Enter,
+            "escape" | "esc" => Self::Escape,
+            "tab" => Self::Tab,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "space" => Self::Char(' '),
+            _ => {
+                let mut letters = key.trim().chars();
+                let letter = letters.next().filter(char::is_ascii_alphanumeric)?;
+                if letters.next().is_some() {
+                    return None;
+                }
+                Self::Char(letter)
+            }
+        })
+    }
+}
+/// What an agent asked of the application, carried out on the next frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentRequest {
+    Spawn {
+        request: u64,
+        parent: PaneId,
+        generation: u64,
+        task: Task,
+        cwd: PathBuf,
+    },
+    /// Keys for the question the CLI in `pane` asks before taking its task.
+    Press {
+        pane: PaneId,
+        generation: u64,
+        keys: Vec<Press>,
+    },
+    /// A prompt for the agent in `pane`, typed for it.
+    Tell {
+        pane: PaneId,
+        generation: u64,
+        text: String,
+    },
+    Close {
+        pane: PaneId,
+        generation: u64,
+        parent: PaneId,
+    },
+}
+/// An agent another agent started, and what passes between the two. Held
+/// in memory only: tasks and replies are never saved or logged.
+struct Child {
+    parent: PaneId,
+    kind: AgentKind,
+    /// The task its CLI opens with, until its terminal takes it.
+    launch: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    ultracode: bool,
+    /// The conversation its CLI goes on with, taken along with the task.
+    resume: Option<String>,
+    /// Its conversation as its CLI last named it, to open it again.
+    session: Option<AgentSession>,
+    /// What its terminal showed once it stood still before taking its task.
+    asking: Option<String>,
+    /// Replies its starter has not collected.
+    outbox: VecDeque<String>,
+    /// Prompts handed over whose turns have not ended.
+    owed: u32,
+    /// When a prompt was last handed over or a turn last ended.
+    marked: Instant,
+    /// Its first turn has begun.
+    started: bool,
+    ended: Option<String>,
+    /// The settled state its starter was last told.
+    seen: Option<Status>,
+}
+impl Child {
+    fn end(&mut self, reason: &str) {
+        if self.ended.is_none() {
+            self.ended = Some(reason.into());
+            self.launch = None;
+        }
+    }
+    fn task(parent: PaneId, task: Task) -> Self {
+        Self {
+            parent,
+            kind: task.kind,
+            launch: Some(task.prompt),
+            model: task.model,
+            effort: task.effort,
+            ultracode: task.ultracode,
+            resume: task.resume.map(|resume| resume.1),
+            session: None,
+            asking: None,
+            outbox: VecDeque::new(),
+            owed: 1,
+            marked: Instant::now(),
+            started: false,
+            ended: None,
+            seen: None,
+        }
+    }
+    /// Its turn began: whatever it asked before taking its task is answered.
+    fn start(&mut self) {
+        self.started = true;
+        self.asking = None;
+    }
+    /// It ended, and its CLI named a conversation that can be opened again.
+    fn reopens(&self) -> bool {
+        self.ended.is_some()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.session_id.is_some())
+    }
+    fn status(&self, slot: Option<&Slot>, now: Instant) -> Status {
+        if let Some(reason) = &self.ended {
+            return Status::Ended {
+                reason: reason.clone(),
+            };
+        }
+        let Some(slot) = slot else {
+            // Its terminal is still being opened while its task waits.
+            if self.launch.is_some() {
+                return Status::Starting;
+            }
+            return Status::Ended {
+                reason: "its terminal was closed".into(),
+            };
+        };
+        let Some(state) = slot.state().filter(|_| self.started) else {
+            return match &self.asking {
+                Some(screen) if !self.started => Status::Asking {
+                    screen: screen.clone(),
+                },
+                _ => Status::Starting,
+            };
+        };
+        match state {
+            Activity::Working => Status::Working,
+            Activity::NeedsInput(attention)
+                if now.saturating_duration_since(slot.since) >= ASK_HOLD =>
+            {
+                Status::Waiting { attention }
+            }
+            Activity::NeedsInput(_) => Status::Working,
+            // The turn of a prompt just handed over has yet to begin.
+            Activity::Idle
+                if self.owed > 0
+                    && now.saturating_duration_since(self.marked.max(slot.since)) < TURN_GRACE =>
+            {
+                Status::Working
+            }
+            Activity::Idle => Status::Idle,
+        }
+    }
+}
+pub(super) fn label(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Claude => "Claude Code",
+        AgentKind::Codex => "Codex",
+    }
+}
+/// A model name as a CLI takes one: a short word, never an option.
+fn model_name(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (value.len() <= 80
+        && value.starts_with(|first: char| first.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric() || "._:/-[]@".contains(letter)))
+    .then_some(value)
+}
+/// The effort a CLI is started with and whether Claude Code runs with
+/// ultracode, from what was asked. Each CLI has its own levels, and "ultra"
+/// means ultracode for Claude Code and the Ultra effort for Codex.
+fn effort_level(
+    kind: AgentKind,
+    effort: Option<&str>,
+    ultra: bool,
+) -> Result<(Option<String>, bool), String> {
+    let levels: &[&str] = match kind {
+        AgentKind::Claude => &["low", "medium", "high", "xhigh", "max"],
+        AgentKind::Codex => &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    };
+    let effort = effort
+        .map(|effort| effort.trim().to_ascii_lowercase())
+        .filter(|effort| !effort.is_empty());
+    if let Some(effort) = &effort
+        && !levels.contains(&effort.as_str())
+    {
+        return Err(format!(
+            "effort for {} is one of: {}.{}",
+            label(kind),
+            levels.join(", "),
+            if kind == AgentKind::Claude && effort == "ultra" {
+                " For ultracode, set ultra to true."
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(match kind {
+        AgentKind::Claude => (effort, ultra),
+        AgentKind::Codex if ultra => {
+            if effort.as_deref().is_some_and(|effort| effort != "ultra") {
+                return Err(
+                    "Ultra is Codex's highest effort: give ultra or another effort, not both."
+                        .into(),
+                );
+            }
+            (Some("ultra".into()), false)
+        }
+        AgentKind::Codex => (effort, false),
+    })
+}
+/// Keeps the start of text longer than one agent hands another.
+fn clip(text: &str) -> String {
+    if text.len() <= MAX_TEXT {
+        return text.to_owned();
+    }
+    let mut end = MAX_TEXT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[Neptune cut this short: it was longer than {} KB.]",
+        &text[..end],
+        MAX_TEXT / 1024
+    )
 }
 /// What a hook says about the agent's turn. It names the kind of moment and
 /// at most a tool; prompts, commands and results never leave the hook process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "signal", rename_all = "snake_case", deny_unknown_fields)]
-enum Signal {
+pub(super) enum Signal {
     /// A prompt was submitted.
     Prompt,
     /// A tool is about to run.
@@ -157,15 +598,46 @@ struct Slot {
     generation: u64,
     token: String,
     run: Option<String>,
+    /// The CLI of the open invocation.
+    kind: Option<AgentKind>,
     /// Set while an invocation is open.
     activity: Option<Tracked>,
+    /// What the application shows once the terminal's title has corrected
+    /// the hooks; a later hook is news again.
+    shown: Option<Activity>,
+    /// Since when the agent has been in its present state.
+    since: Instant,
     wake: Wake,
     _startup: Option<tempfile::TempDir>,
+}
+impl Slot {
+    /// What the open agent is doing, as far as hooks and title say.
+    fn state(&self) -> Option<Activity> {
+        let reported = self.activity.as_ref()?.state;
+        self.run.as_ref().map(|_| self.shown.unwrap_or(reported))
+    }
+    fn show(&mut self, shown: Option<Activity>, now: Instant) {
+        let before = self.state();
+        self.shown = shown;
+        if self.state() != before {
+            self.since = now;
+        }
+    }
 }
 #[derive(Default)]
 struct Shared {
     slots: BTreeMap<PaneId, Slot>,
-    changes: BTreeMap<PaneId, (u64, Option<AgentSession>)>,
+    /// The latest reference per pane since the last frame, and whether an
+    /// agent left the pane before it: one that leaves and one that opens
+    /// between two frames are two changes.
+    changes: BTreeMap<PaneId, (u64, Option<AgentSession>, bool)>,
+    /// Agents started by agents, by the pane each runs in.
+    children: BTreeMap<PaneId, Child>,
+    requests: Vec<AgentRequest>,
+    /// Spawn requests and what became of each once the application answered.
+    /// Each is answered only to the pane that asked.
+    spawns: BTreeMap<u64, (PaneId, Option<Result<PaneId, String>>)>,
+    next_request: u64,
     /// The latest activity per pane since the last frame; `None` once closed.
     activity: BTreeMap<PaneId, (u64, Option<Activity>)>,
     links: Vec<(PaneId, u64, PullRequest)>,
@@ -199,11 +671,12 @@ impl AgentBridge {
         generation: u64,
         options: &mut SessionOptions,
         resume: Option<&AgentSession>,
+        spawned_by: Option<PaneId>,
         wake: Wake,
     ) -> std::io::Result<()> {
         #[cfg(not(unix))]
         {
-            let _ = (pane, generation, options, resume, wake);
+            let _ = (pane, generation, options, resume, spawned_by, wake);
             return Ok(());
         }
         #[cfg(unix)]
@@ -249,9 +722,18 @@ impl AgentBridge {
                             if read_message(&mut stream, &mut bytes).is_err() {
                                 continue;
                             }
-                            let taken = serde_json::from_slice::<Message>(&bytes)
-                                .is_ok_and(|message| apply_message(&shared, message));
-                            let _ = stream.write_all(if taken { b"ok" } else { b"no" });
+                            let reply = match serde_json::from_slice::<Message>(&bytes) {
+                                Ok(message) if message.event.is_request() => {
+                                    serde_json::to_vec(&answer(&shared, message))
+                                        .unwrap_or_default()
+                                }
+                                Ok(message) => {
+                                    let taken = apply_message(&shared, message);
+                                    if taken { b"ok" } else { b"no" }.to_vec()
+                                }
+                                Err(_) => b"no".to_vec(),
+                            };
+                            let _ = stream.write_all(&reply);
                         }
                     })?;
                 *state = Some(Listener {
@@ -285,7 +767,55 @@ impl AgentBridge {
                 (RUN.into(), String::new()),
                 ("PATH".into(), format!("{shim_path}:{path}")),
             ]);
-            configure_shell(options, startup.path(), &std::env::current_exe()?, resume)?;
+            // What the shell opens with: a task another agent handed over,
+            // a saved agent, or nothing.
+            let start = {
+                let mut shared = self
+                    .shared
+                    .lock()
+                    .map_err(|_| std::io::Error::other("Agent bridge unavailable"))?;
+                let resume = resume.filter(|agent| agent.is_valid());
+                let fresh = shared.children.get(&pane).is_some_and(|child| {
+                    Some(child.parent) == spawned_by
+                        && child.launch.is_some()
+                        && child.ended.is_none()
+                });
+                match (spawned_by, resume) {
+                    (Some(_), _) if fresh => Start::Spawned,
+                    (Some(parent), Some(agent)) => {
+                        shared.children.insert(
+                            pane,
+                            Child {
+                                launch: None,
+                                session: Some(agent.clone()),
+                                owed: 0,
+                                started: true,
+                                // At rest when it was saved: no news.
+                                seen: Some(Status::Idle),
+                                ..Child::task(
+                                    parent,
+                                    Task {
+                                        kind: agent.kind,
+                                        prompt: String::new(),
+                                        model: None,
+                                        effort: None,
+                                        ultracode: false,
+                                        resume: None,
+                                    },
+                                )
+                            },
+                        );
+                        Start::Resume(agent, true)
+                    }
+                    (_, resume) => {
+                        if let Some(child) = shared.children.get_mut(&pane) {
+                            child.end("its terminal was restarted");
+                        }
+                        resume.map_or(Start::Shell, |agent| Start::Resume(agent, false))
+                    }
+                }
+            };
+            configure_shell(options, startup.path(), &std::env::current_exe()?, start)?;
             let (old, retired) = {
                 let mut shared = self
                     .shared
@@ -294,13 +824,17 @@ impl AgentBridge {
                 shared.changes.remove(&pane);
                 shared.activity.remove(&pane);
                 shared.links.retain(|link| link.0 != pane);
+                shared.requests.retain(|request| !request.targets(pane));
                 let old = shared.slots.insert(
                     pane,
                     Slot {
                         generation,
                         token,
                         run: None,
+                        kind: None,
                         activity: None,
+                        shown: None,
+                        since: Instant::now(),
                         wake,
                         _startup: Some(startup),
                     },
@@ -313,14 +847,7 @@ impl AgentBridge {
     }
     pub fn close(&self, pane: PaneId) {
         if let Ok(mut shared) = self.shared.lock() {
-            if let Some(mut slot) = shared.slots.remove(&pane)
-                && let Some(startup) = slot._startup.take()
-            {
-                shared.retired.push(startup);
-            }
-            shared.changes.remove(&pane);
-            shared.activity.remove(&pane);
-            shared.links.retain(|link| link.0 != pane);
+            shared.retire(pane);
         }
     }
     pub fn close_generation(&self, pane: PaneId, generation: u64) {
@@ -330,26 +857,187 @@ impl AgentBridge {
                 .get(&pane)
                 .is_some_and(|slot| slot.generation == generation)
         {
-            if let Some(mut slot) = shared.slots.remove(&pane)
-                && let Some(startup) = slot._startup.take()
-            {
-                shared.retired.push(startup);
-            }
-            shared.changes.remove(&pane);
-            shared.activity.remove(&pane);
-            shared.links.retain(|link| link.0 != pane);
+            shared.retire(pane);
         }
     }
+    /// The agent each pane turned to since the last call, preceded by `None`
+    /// where another left the pane first.
     pub fn drain(&self) -> Vec<(PaneId, u64, Option<AgentSession>)> {
         self.shared
             .lock()
             .map(|mut shared| {
                 std::mem::take(&mut shared.changes)
                     .into_iter()
-                    .map(|(pane, (generation, agent))| (pane, generation, agent))
+                    .flat_map(|(pane, (generation, agent, left))| {
+                        let left = (left && agent.is_some()).then_some((pane, generation, None));
+                        left.into_iter().chain([(pane, generation, agent)])
+                    })
                     .collect()
             })
             .unwrap_or_default()
+    }
+    /// Stands in for an agent asking, where a test has no CLI to ask.
+    #[cfg(test)]
+    pub fn request(&self, request: AgentRequest) {
+        let mut shared = self.shared.lock().unwrap();
+        if let AgentRequest::Spawn {
+            request, parent, ..
+        } = &request
+        {
+            shared.spawns.insert(*request, (*parent, None));
+        }
+        shared.requests.push(request);
+    }
+    /// What the application answered a spawn request with.
+    #[cfg(test)]
+    pub fn spawned(&self, request: u64) -> Option<Result<PaneId, String>> {
+        self.shared
+            .lock()
+            .unwrap()
+            .spawns
+            .get(&request)
+            .and_then(|spawn| spawn.1.clone())
+    }
+    /// What agents asked for since the last call, in arrival order.
+    pub fn drain_requests(&self) -> Vec<AgentRequest> {
+        self.shared
+            .lock()
+            .map(|mut shared| std::mem::take(&mut shared.requests))
+            .unwrap_or_default()
+    }
+    /// The task a pane being opened for a started agent begins with. Called
+    /// before its session is requested, so its shell finds the task.
+    pub fn register_spawn(&self, pane: PaneId, parent: PaneId, task: Task) {
+        if let Ok(mut shared) = self.shared.lock() {
+            // One that is opened again leaves the record of its closed terminal.
+            if let Some((closed, _)) = &task.resume
+                && shared
+                    .children
+                    .get(closed)
+                    .is_some_and(|child| child.parent == parent && child.ended.is_some())
+            {
+                shared.children.remove(closed);
+            }
+            // Ended agents nobody asked about again give way to new ones.
+            let ended: Vec<PaneId> = shared
+                .children
+                .iter()
+                .filter(|(_, child)| child.parent == parent && child.ended.is_some())
+                .map(|(pane, _)| *pane)
+                .collect();
+            for pane in ended.iter().rev().skip(AgentSession::MAX_SPAWNED) {
+                shared.children.remove(pane);
+            }
+            shared.children.insert(pane, Child::task(parent, task));
+        }
+    }
+    /// Started agents whose CLI has not taken its task, by pane and
+    /// generation: the application watches whether their terminals stand still.
+    pub fn starting(&self) -> Vec<(PaneId, u64)> {
+        self.shared
+            .lock()
+            .map(|shared| {
+                shared
+                    .children
+                    .iter()
+                    .filter(|(_, child)| !child.started && child.ended.is_none())
+                    .filter_map(|(pane, _)| Some((*pane, shared.slots.get(pane)?.generation)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// What the terminal of a started agent shows now that it has stood
+    /// still without taking its task, or `None` once it moves again. The
+    /// agent that started it is told, and tells the user.
+    pub fn asking(&self, pane: PaneId, generation: u64, screen: Option<String>) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let shared = &mut *shared;
+            if shared
+                .slots
+                .get(&pane)
+                .is_some_and(|slot| slot.generation == generation)
+                && let Some(child) = shared.children.get_mut(&pane)
+                && !child.started
+                && child.ended.is_none()
+                && child.asking != screen
+            {
+                child.asking = screen;
+                child.seen = None;
+            }
+        }
+    }
+    /// Forgets an agent whose terminal could not be opened; the request's
+    /// answer says why.
+    pub fn forget_spawn(&self, pane: PaneId) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.children.remove(&pane);
+        }
+    }
+    /// Answers a spawn request with the pane opened for it, or why none was.
+    pub fn spawn_result(&self, request: u64, result: Result<PaneId, String>) {
+        if let Ok(mut shared) = self.shared.lock()
+            && let Some((_, slot)) = shared.spawns.get_mut(&request)
+        {
+            *slot = Some(result);
+        }
+    }
+    /// What the application shows for the agent in `pane`, which follows the
+    /// terminal's title where no hook reports.
+    pub fn observe(&self, pane: PaneId, generation: u64, activity: Activity) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let shared = &mut *shared;
+            if let Some(slot) = shared.slots.get_mut(&pane)
+                && slot.generation == generation
+                && slot.activity.is_some()
+            {
+                slot.show(Some(activity), Instant::now());
+                if activity == Activity::Working
+                    && let Some(child) = shared.children.get_mut(&pane)
+                {
+                    child.start();
+                }
+            }
+        }
+    }
+    /// The links the model holds, as (started, starter). An agent whose link
+    /// is gone has ended for its starter, and is forgotten once the starter
+    /// was told or has left.
+    pub fn sync_spawned(&self, links: &[(PaneId, PaneId)]) {
+        if let Ok(mut shared) = self.shared.lock() {
+            let shared = &mut *shared;
+            if shared.children.is_empty() {
+                return;
+            }
+            let slots = &shared.slots;
+            shared.children.retain(|pane, child| {
+                if links.contains(&(*pane, child.parent)) {
+                    return true;
+                }
+                child.end("its agent exited or its terminal was closed");
+                // One that can be opened again is kept for as long as the
+                // agent that started it might ask for it.
+                let told = matches!(child.seen, Some(Status::Ended { .. }));
+                (!told || child.reopens())
+                    && slots
+                        .get(&child.parent)
+                        .is_some_and(|parent| parent.run.is_some())
+            });
+        }
+    }
+    /// Whether the agent another agent started in `pane` is still open
+    /// there, so that words typed for it reach it and not a shell.
+    pub fn takes_prompt(&self, pane: PaneId, generation: u64) -> bool {
+        self.shared.lock().is_ok_and(|shared| {
+            shared.slots.get(&pane).is_some_and(|slot| {
+                // Nothing is typed over a request to a person, however new.
+                slot.generation == generation
+                    && slot.run.is_some()
+                    && !matches!(slot.state(), Some(Activity::NeedsInput(_)))
+            }) && shared
+                .children
+                .get(&pane)
+                .is_some_and(|child| child.ended.is_none())
+        })
     }
     /// What each agent turned to since the last call; `None` when it left.
     pub fn drain_activity(&self) -> Vec<(PaneId, u64, Option<Activity>)> {
@@ -371,12 +1059,83 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 }
+impl AgentRequest {
+    fn targets(&self, pane: PaneId) -> bool {
+        match self {
+            Self::Spawn { parent, .. } => *parent == pane,
+            Self::Tell { pane: target, .. }
+            | Self::Press { pane: target, .. }
+            | Self::Close { pane: target, .. } => *target == pane,
+        }
+    }
+}
+impl Shared {
+    /// Queues the opening of a terminal for an agent `parent` starts, and
+    /// names the request its answer is asked for by.
+    fn queue_spawn(
+        &mut self,
+        parent: PaneId,
+        generation: u64,
+        task: Task,
+        cwd: PathBuf,
+    ) -> Result<u64, String> {
+        let live = self
+            .children
+            .values()
+            .filter(|child| child.parent == parent && child.ended.is_none())
+            .count();
+        if live >= AgentSession::MAX_SPAWNED {
+            return Err(format!(
+                "{live} agents this one started are still open, which is the most Neptune keeps. Close one with close_agent first."
+            ));
+        }
+        if self.requests.len() >= MAX_REQUESTS || self.spawns.len() >= MAX_REQUESTS {
+            return Err("Neptune is busy; try again in a moment.".into());
+        }
+        self.next_request += 1;
+        let request = self.next_request;
+        self.spawns.insert(request, (parent, None));
+        self.requests.push(AgentRequest::Spawn {
+            request,
+            parent,
+            generation,
+            task,
+            cwd,
+        });
+        Ok(request)
+    }
+    /// Forgets a pane whose terminal closed or was replaced.
+    fn retire(&mut self, pane: PaneId) {
+        if let Some(mut slot) = self.slots.remove(&pane)
+            && let Some(startup) = slot._startup.take()
+        {
+            self.retired.push(startup);
+        }
+        self.changes.remove(&pane);
+        self.activity.remove(&pane);
+        self.links.retain(|link| link.0 != pane);
+        self.requests.retain(|request| !request.targets(pane));
+        self.spawns.retain(|_, spawn| spawn.0 != pane);
+        if let Some(child) = self.children.get_mut(&pane) {
+            child.end("its terminal was closed");
+        }
+    }
+}
+/// What a terminal's shell opens with.
+#[cfg(unix)]
+enum Start<'a> {
+    Shell,
+    /// A saved agent, and whether another agent started it.
+    Resume(&'a AgentSession, bool),
+    /// The task another agent handed over, held by the bridge.
+    Spawned,
+}
 #[cfg(unix)]
 fn configure_shell(
     options: &mut SessionOptions,
     directory: &std::path::Path,
     helper: &std::path::Path,
-    resume: Option<&AgentSession>,
+    start: Start,
 ) -> std::io::Result<()> {
     let default_shell = options.shell.is_none();
     // Configured arguments are the user's: start the shell as given instead
@@ -391,12 +1150,19 @@ fn configure_shell(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let resume_json = resume
-        .filter(|agent| agent.is_valid())
-        .map(serde_json::to_string)
-        .transpose()?;
+    // The helper's arguments: always three, for shells started without a
+    // startup file of Neptune's.
+    let launch: Option<[String; 3]> = match start {
+        Start::Shell => None,
+        Start::Resume(agent, spawned) => Some([
+            "--agent-restore".into(),
+            serde_json::to_string(agent)?,
+            if spawned { "spawned" } else { "" }.into(),
+        ]),
+        Start::Spawned => Some(["--agent-spawn".into(), String::new(), String::new()]),
+    };
     let mut setup = "export PATH=\"$NEPTUNE_AGENT_SHIMS:$PATH\"\n".to_owned();
-    if let Some(resume) = &resume_json {
+    if let Some(launch) = &launch {
         if name == "zsh" {
             // Powerlevel10k's instant prompt keeps stdio off the terminal until the
             // first prompt, later than any startup file; the agent needs it now.
@@ -404,9 +1170,11 @@ fn configure_shell(
         }
         // Quoted literal data, never interpolated terminal input. This runs after user startup files.
         setup.push_str(&format!(
-            "{} --agent-restore {}\n",
+            "{} {} {} {}\n",
             quote(&helper.to_string_lossy()),
-            quote(resume)
+            launch[0],
+            quote(&launch[1]),
+            quote(&launch[2])
         ));
     }
     match name {
@@ -476,17 +1244,17 @@ fn configure_shell(
             ];
         }
         _ => {
-            if let Some(resume) = resume_json {
+            if let Some(launch) = launch {
                 options.shell = Some("/bin/sh".into());
                 let args = std::mem::take(&mut options.args);
                 options.args = vec![
                     "-c".into(),
-                    "\"$1\" --agent-restore \"$2\"; shift 2; exec \"$@\"".into(),
+                    "\"$1\" \"$2\" \"$3\" \"$4\"; shift 4; exec \"$@\"".into(),
                     "neptune".into(),
                     helper.to_string_lossy().into_owned(),
-                    resume,
-                    shell,
                 ];
+                options.args.extend(launch);
+                options.args.push(shell);
                 options.args.extend(args);
             }
         }
@@ -524,9 +1292,10 @@ fn option_env(options: &SessionOptions, key: &str) -> Option<String> {
 }
 /// Reports whether the event was taken for its pane.
 fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
-    let Ok(mut shared) = shared.lock() else {
+    let Ok(mut guard) = shared.lock() else {
         return false;
     };
+    let shared = &mut *guard;
     let Some((&pane, slot)) = shared
         .slots
         .iter_mut()
@@ -534,75 +1303,503 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
     else {
         return false;
     };
+    let now = Instant::now();
+    let (generation, wake) = (slot.generation, slot.wake.clone());
+    let open = slot.run.as_ref() == Some(&message.run);
     if let Event::PullRequest { url } = &message.event {
         // Only the invocation that opened in this pane may link to it.
-        let link = PullRequest::parse(url).filter(|_| slot.run.as_ref() == Some(&message.run));
-        let (generation, wake) = (slot.generation, slot.wake.clone());
+        let link = PullRequest::parse(url).filter(|_| open);
         let Some(link) = link.filter(|_| shared.links.len() < MAX_LINKS) else {
             return false;
         };
         shared.links.push((pane, generation, link));
-        drop(shared);
+        drop(guard);
         wake();
         return true;
     }
     if matches!(message.event, Event::Stopped) {
-        if slot.run.as_ref() != Some(&message.run) {
+        if !open {
             return false;
         }
         slot.run = None;
         slot.activity = None;
-        let (generation, wake) = (slot.generation, slot.wake.clone());
+        slot.shown = None;
+        if let Some(child) = shared.children.get_mut(&pane) {
+            child.end("its saved session could not be resumed");
+            child.session = None;
+        }
         shared.activity.insert(pane, (generation, None));
-        drop(shared);
+        drop(guard);
         wake();
         return true;
     }
     if let Event::Activity { signal } = message.event {
         // Only the open invocation describes this pane.
-        if slot.run.as_ref() != Some(&message.run) {
+        if !open {
             return false;
         }
+        let before = slot.state();
+        let prompt = signal == Signal::Prompt;
         let Some(tracked) = slot.activity.as_mut() else {
             return false;
         };
-        if tracked.apply(signal) {
-            let (state, generation, wake) = (tracked.state, slot.generation, slot.wake.clone());
+        let news = tracked.apply(signal);
+        let state = tracked.state;
+        if prompt && let Some(child) = shared.children.get_mut(&pane) {
+            child.start();
+        }
+        if news {
+            // A hook is newer than what the title last corrected.
+            slot.shown = None;
+            if slot.state() != before {
+                slot.since = now;
+            }
             shared.activity.insert(pane, (generation, Some(state)));
-            drop(shared);
+            drop(guard);
             wake();
         }
         return true;
     }
+    if let Event::Report { text, done } = message.event {
+        // Only an open agent that another started has anyone to tell.
+        let Some(child) = shared
+            .children
+            .get_mut(&pane)
+            .filter(|child| open && child.ended.is_none())
+        else {
+            return false;
+        };
+        if !text.trim().is_empty() {
+            if child.outbox.len() >= MAX_OUTBOX {
+                child.outbox.pop_front();
+            }
+            child.outbox.push_back(clip(&text));
+        }
+        child.seen = None;
+        if !done {
+            return true;
+        }
+        child.owed = child.owed.saturating_sub(1);
+        child.marked = now;
+        child.start();
+        // The turn is over whichever of this and its hook's signal is first.
+        let before = slot.state();
+        if let Some(tracked) = slot.activity.as_mut() {
+            tracked.apply(Signal::Done);
+            slot.shown = None;
+            if slot.state() != before {
+                slot.since = now;
+            }
+            shared
+                .activity
+                .insert(pane, (generation, Some(Activity::Idle)));
+        }
+        drop(guard);
+        wake();
+        return true;
+    }
     let mut reset = None;
+    // An invocation that opens over one that never reported leaving ends it.
+    let mut left = false;
     let agent = match message.event {
         Event::Open { agent } if agent.is_valid() => {
+            left = slot.run.is_some();
             slot.run = Some(message.run);
+            slot.kind = Some(agent.kind);
             slot.activity = Some(Tracked::idle());
+            slot.shown = None;
+            slot.since = now;
             reset = Some(Some(Activity::Idle));
             Some(agent)
         }
-        Event::Session { agent } if slot.run.as_ref() == Some(&message.run) && agent.is_valid() => {
-            Some(agent)
-        }
-        Event::Close if slot.run.as_ref() == Some(&message.run) => {
+        Event::Session { agent } if open && agent.is_valid() => Some(agent),
+        Event::Close if open => {
+            left = true;
             slot.run = None;
+            slot.kind = None;
             slot.activity = None;
+            slot.shown = None;
             reset = Some(None);
             None
         }
         _ => return false,
     };
-    let generation = slot.generation;
-    let wake = slot.wake.clone();
+    if left {
+        // The agents it started have no one to answer, and it answers no one.
+        shared.children.retain(|_, child| child.parent != pane);
+        shared.requests.retain(
+            |request| !matches!(request, AgentRequest::Spawn { parent, .. } if *parent == pane),
+        );
+        shared.spawns.retain(|_, spawn| spawn.0 != pane);
+        if let Some(child) = shared.children.get_mut(&pane).filter(|_| agent.is_none()) {
+            child.end("its agent exited");
+        }
+    }
+    if let (Some(agent), Some(child)) = (&agent, shared.children.get_mut(&pane))
+        && child.ended.is_none()
+    {
+        child.session = Some(agent.clone());
+    }
     // A new conversation in the same run keeps what the agent is doing.
     if let Some(activity) = reset {
         shared.activity.insert(pane, (generation, activity));
     }
-    shared.changes.insert(pane, (generation, agent));
-    drop(shared);
+    let left = left || shared.changes.get(&pane).is_some_and(|change| change.2);
+    shared.changes.insert(pane, (generation, agent, left));
+    drop(guard);
     wake();
     true
+}
+/// The task a started agent opens with, led by who handed it over and how
+/// its answer travels back.
+fn delegation(parent: AgentKind, prompt: &str) -> String {
+    format!(
+        "[{} in another Neptune terminal started you and handed you the task below. \
+It reads the last message of each of your turns and nothing else you write, so end \
+each turn with what you did and what it needs to know.]\n\n{prompt}",
+        label(parent)
+    )
+}
+/// Answers a request and wakes the application where it has work to do.
+fn answer(shared: &Mutex<Shared>, message: Message) -> Answer {
+    let (answer, wake) = respond(shared, message);
+    if let Some(wake) = wake {
+        wake();
+    }
+    answer
+}
+fn respond(shared: &Mutex<Shared>, message: Message) -> (Answer, Option<Wake>) {
+    let refused = |reason: String| (Answer::Refused { reason }, None);
+    let unknown = |agent: u64| {
+        refused(format!(
+            "Agent {agent} is not an agent this one started, or it ended and that was already reported."
+        ))
+    };
+    let Ok(mut guard) = shared.lock() else {
+        return refused("Neptune is unavailable.".into());
+    };
+    let shared = &mut *guard;
+    let Some((&pane, slot)) = shared
+        .slots
+        .iter()
+        .find(|(_, slot)| slot.token == message.token)
+    else {
+        return refused(NOT_TRACKED.into());
+    };
+    let (generation, wake, kind) = (slot.generation, slot.wake.clone(), slot.kind);
+    let open = slot.run.as_ref() == Some(&message.run);
+    let now = Instant::now();
+    match message.event {
+        // A started terminal asks before its CLI, and so any run, exists.
+        Event::Launch => {
+            let launch = shared
+                .children
+                .get_mut(&pane)
+                .filter(|child| child.ended.is_none())
+                .and_then(|child| {
+                    let prompt = child.launch.take()?;
+                    child.marked = now;
+                    Some(Answer::Launch {
+                        kind: child.kind,
+                        prompt,
+                        model: child.model.clone(),
+                        effort: child.effort.clone(),
+                        ultracode: child.ultracode,
+                        resume: child.resume.take(),
+                    })
+                });
+            match launch {
+                Some(launch) => (launch, None),
+                None => refused("No agent is waiting to start in this terminal.".into()),
+            }
+        }
+        Event::LaunchFailed { reason } => {
+            let Some(child) = shared.children.get_mut(&pane) else {
+                return refused("No agent was starting in this terminal.".into());
+            };
+            let reason: String = reason.chars().take(300).collect();
+            child.end(&format!("it could not start ({reason})"));
+            // The model drops the link along with the agent that never opened.
+            shared.changes.insert(pane, (generation, None, false));
+            (Answer::Done, Some(wake))
+        }
+        _ if !open => refused(NOT_TRACKED.into()),
+        Event::Spawn {
+            kind: wanted,
+            prompt,
+            cwd,
+            model,
+            effort,
+            ultra,
+        } => {
+            let Some(kind) = kind else {
+                return refused(NOT_TRACKED.into());
+            };
+            if prompt.trim().is_empty() || prompt.len() > MAX_TEXT || !cwd.is_absolute() {
+                return refused("The task or its directory is not usable.".into());
+            }
+            let model = match model.as_deref().map(model_name) {
+                Some(None) => {
+                    return refused(
+                        "model is not a model name as the agent's CLI takes one, such as opus or gpt-5.1-codex.".into(),
+                    );
+                }
+                Some(Some(model)) => Some(model.to_owned()),
+                None => None,
+            };
+            let (effort, ultracode) = match effort_level(wanted, effort.as_deref(), ultra) {
+                Ok(level) => level,
+                Err(reason) => return refused(reason),
+            };
+            let task = Task {
+                kind: wanted,
+                prompt: delegation(kind, &prompt),
+                model,
+                effort,
+                ultracode,
+                resume: None,
+            };
+            match shared.queue_spawn(pane, generation, task, cwd) {
+                Ok(request) => (Answer::Queued { request }, Some(wake)),
+                Err(reason) => refused(reason),
+            }
+        }
+        Event::Reopen { agent, text } => {
+            let id = PaneId::new(agent);
+            let Some(kind) = kind else {
+                return refused(NOT_TRACKED.into());
+            };
+            let Some(child) = shared
+                .children
+                .get(&id)
+                .filter(|child| child.parent == pane)
+            else {
+                return unknown(agent);
+            };
+            if child.ended.is_none() {
+                return refused(format!(
+                    "Agent {agent} is still open; send_agent_message reaches it."
+                ));
+            }
+            let session = child
+                .session
+                .as_ref()
+                .filter(|_| child.reopens())
+                .and_then(|session| Some((session.session_id.clone()?, session.cwd.clone())));
+            let Some((session, cwd)) = session else {
+                return refused(format!(
+                    "Agent {agent} left no conversation that can be opened again. Start a new agent with spawn_agent."
+                ));
+            };
+            if !cwd.is_dir() {
+                return refused(format!(
+                    "Agent {agent} worked in {}, which no longer exists. Start a new agent with spawn_agent.",
+                    cwd.display()
+                ));
+            }
+            if text.trim().is_empty() || text.len() > MAX_TEXT {
+                return refused("The message is empty or too long.".into());
+            }
+            let task = Task {
+                kind: child.kind,
+                prompt: format!(
+                    "[{} reopened your terminal, which had been closed, and says:]\n\n{text}",
+                    label(kind)
+                ),
+                model: child.model.clone(),
+                effort: child.effort.clone(),
+                ultracode: child.ultracode,
+                resume: Some((id, session)),
+            };
+            match shared.queue_spawn(pane, generation, task, cwd) {
+                Ok(request) => (Answer::Queued { request }, Some(wake)),
+                Err(reason) => refused(reason),
+            }
+        }
+        Event::Press { agent, keys } => {
+            let id = PaneId::new(agent);
+            let target = shared.slots.get(&id);
+            let Some(child) = shared
+                .children
+                .get_mut(&id)
+                .filter(|child| child.parent == pane)
+            else {
+                return unknown(agent);
+            };
+            let Some(target) = target
+                .filter(|target| matches!(child.status(Some(target), now), Status::Asking { .. }))
+            else {
+                return refused(format!(
+                    "Agent {agent} is not showing a question from before it took its task. Keys are pressed only for those; whatever else it asks is the user's to answer in its terminal."
+                ));
+            };
+            let pressed: Option<Vec<Press>> = keys.iter().map(|key| Press::parse(key)).collect();
+            let Some(keys) = pressed.filter(|keys| (1..=MAX_KEYS).contains(&keys.len())) else {
+                return refused(format!(
+                    "keys are up to {MAX_KEYS} of: enter, escape, tab, space, up, down, left, right, or one letter or digit each."
+                ));
+            };
+            if shared.requests.len() >= MAX_REQUESTS {
+                return refused("Neptune is busy; try again in a moment.".into());
+            }
+            // Its terminal is watched again from here.
+            child.asking = None;
+            child.seen = None;
+            child.marked = now;
+            shared.requests.push(AgentRequest::Press {
+                pane: id,
+                generation: target.generation,
+                keys,
+            });
+            (Answer::Done, Some(wake))
+        }
+        Event::SpawnResult { request } => {
+            match shared.spawns.get(&request).filter(|spawn| spawn.0 == pane) {
+                None => refused("Neptune lost track of that request; try again.".into()),
+                Some((_, None)) => (Answer::Pending, None),
+                Some(_) => match shared.spawns.remove(&request).and_then(|spawn| spawn.1) {
+                    Some(Ok(pane)) => (Answer::Spawned { agent: pane.get() }, None),
+                    Some(Err(reason)) => refused(reason),
+                    None => (Answer::Pending, None),
+                },
+            }
+        }
+        Event::Collect { agent, take } => {
+            let mut agents = Vec::new();
+            for (id, child) in shared
+                .children
+                .iter_mut()
+                .filter(|(id, child)| child.parent == pane && agent.is_none_or(|a| a == id.get()))
+            {
+                let status = child.status(shared.slots.get(id), now);
+                let settled = status.settled()
+                    || (status == Status::Starting
+                        && now.saturating_duration_since(child.marked) >= START_GRACE);
+                let news =
+                    !child.outbox.is_empty() || (settled && child.seen.as_ref() != Some(&status));
+                let reopens = child.reopens();
+                let replies = if take {
+                    child.outbox.drain(..).collect()
+                } else {
+                    Vec::new()
+                };
+                if !settled {
+                    child.seen = None;
+                } else if take {
+                    child.seen = Some(status.clone());
+                    // A prompt folded into the turn before it is not owed one.
+                    if status == Status::Idle {
+                        child.owed = 0;
+                    }
+                }
+                agents.push(AgentReport {
+                    agent: id.get(),
+                    kind: child.kind,
+                    status,
+                    news,
+                    replies,
+                    reopens,
+                });
+            }
+            match agent {
+                Some(agent) if agents.is_empty() => unknown(agent),
+                _ => (Answer::Agents { agents }, None),
+            }
+        }
+        Event::Tell { agent, text } => {
+            let id = PaneId::new(agent);
+            let target = shared.slots.get(&id);
+            let Some(child) = shared
+                .children
+                .get_mut(&id)
+                .filter(|child| child.parent == pane)
+            else {
+                return unknown(agent);
+            };
+            // A request to a person stands from its first moment for what is
+            // typed, though it is reported only once it has stood a while.
+            if target.is_some_and(|slot| matches!(slot.state(), Some(Activity::NeedsInput(_)))) {
+                return refused(format!(
+                    "Agent {agent} is waiting for a person to answer it in its tab, so nothing can be typed for it. Tell the user."
+                ));
+            }
+            let working = match child.status(target, now) {
+                Status::Ended { reason } => {
+                    return refused(format!("Agent {agent} is no longer running: {reason}."));
+                }
+                Status::Starting => {
+                    return refused(format!(
+                        "Agent {agent} has not taken its first task yet. Wait for it with wait_for_agent."
+                    ));
+                }
+                Status::Asking { .. } => {
+                    return refused(format!(
+                        "Agent {agent} is asking something before it takes its task, so a message would answer that instead. wait_for_agent shows what it asks."
+                    ));
+                }
+                Status::Waiting { .. } => {
+                    return refused(format!(
+                        "Agent {agent} is waiting for a person to answer it in its tab, so nothing can be typed for it. Tell the user."
+                    ));
+                }
+                Status::Working => true,
+                Status::Idle => false,
+            };
+            let Some(target) = target else {
+                return unknown(agent);
+            };
+            if text.trim().is_empty() || text.len() > MAX_TEXT {
+                return refused("The message is empty or too long.".into());
+            }
+            if shared.requests.len() >= MAX_REQUESTS {
+                return refused("Neptune is busy; try again in a moment.".into());
+            }
+            child.owed = child.owed.saturating_add(1);
+            child.marked = now;
+            child.seen = None;
+            shared.requests.push(AgentRequest::Tell {
+                pane: id,
+                generation: target.generation,
+                text,
+            });
+            (Answer::Told { working }, Some(wake))
+        }
+        Event::Dismiss { agent } => {
+            let id = PaneId::new(agent);
+            let target = shared.slots.get(&id).map(|slot| slot.generation);
+            let Some(child) = shared
+                .children
+                .get_mut(&id)
+                .filter(|child| child.parent == pane)
+            else {
+                return unknown(agent);
+            };
+            if child.ended.is_some() {
+                return refused(format!(
+                    "Agent {agent} has already ended; a terminal it left is the user's to close.{}",
+                    if child.reopens() {
+                        " reopen_agent opens it again with its conversation."
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            let Some(target) = target else {
+                return refused(format!(
+                    "Agent {agent} is still starting; try again in a moment."
+                ));
+            };
+            child.end("the agent that started it closed it");
+            child.seen = Some(child.status(None, now));
+            shared.requests.push(AgentRequest::Close {
+                pane: id,
+                generation: target,
+                parent: pane,
+            });
+            (Answer::Done, Some(wake))
+        }
+        _ => refused("Neptune does not answer that.".into()),
+    }
 }
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -616,6 +1813,18 @@ fn kind(value: &str) -> anyhow::Result<AgentKind> {
 }
 /// Delivers one event and reports whether the bridge took it for this pane.
 fn send(event: Event, run: &str) -> anyhow::Result<bool> {
+    Ok(exchange(event, run)? == b"ok")
+}
+/// Makes a request of the application for the agent open in this terminal.
+fn ask(event: Event, run: &str) -> Answer {
+    exchange(event, run)
+        .ok()
+        .and_then(|reply| serde_json::from_slice(&reply).ok())
+        .unwrap_or(Answer::Refused {
+            reason: "Neptune did not answer. This terminal may have been restarted.".into(),
+        })
+}
+fn exchange(event: Event, run: &str) -> anyhow::Result<Vec<u8>> {
     let endpoint: std::net::SocketAddr = std::env::var(ENDPOINT)?.parse()?;
     anyhow::ensure!(endpoint.ip().is_loopback(), "Invalid agent bridge address");
     let message = Message {
@@ -628,9 +1837,9 @@ fn send(event: Event, run: &str) -> anyhow::Result<bool> {
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.write_all(&serde_json::to_vec(&message)?)?;
     stream.shutdown(std::net::Shutdown::Write)?;
-    let mut ack = [0; 2];
-    stream.read_exact(&mut ack)?;
-    Ok(&ack == b"ok")
+    let mut reply = Vec::new();
+    stream.take(MAX_ANSWER).read_to_end(&mut reply)?;
+    Ok(reply)
 }
 /// Private CLI entry points, handled before desktop initialization. Never logs hook input.
 pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
@@ -666,6 +1875,18 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
                         let _ = send(Event::Session { agent }, &run);
                     }
                 }
+                // An agent another agent started hands over the last message
+                // of its turn; nobody else's words leave the hook process.
+                if std::env::var_os(SPAWNED).is_some()
+                    && hook.agent_id.is_none()
+                    && matches!(
+                        hook.hook_event_name.as_str(),
+                        "Stop" | "StopFailure" | "Interrupt"
+                    )
+                {
+                    let text = clip(hook.last_assistant_message.as_deref().unwrap_or_default());
+                    let _ = send(Event::Report { text, done: true }, &run);
+                }
                 if let Some(signal) = signal(provider, &hook) {
                     let _ = send(Event::Activity { signal }, &run);
                 }
@@ -686,17 +1907,86 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
             Ok(Some(0))
         }
         Some("--agent-mcp") => {
-            let run = std::env::var(RUN).unwrap_or_default();
+            struct Bridge(String);
+            impl super::agent_mcp::Host for Bridge {
+                fn send(&mut self, event: Event) -> bool {
+                    send(event, &self.0).unwrap_or(false)
+                }
+                fn ask(&mut self, event: Event) -> Answer {
+                    ask(event, &self.0)
+                }
+            }
             super::agent_mcp::serve(
-                std::io::stdin().lock(),
+                std::io::stdin(),
                 std::io::stdout().lock(),
-                &mut |url| send(Event::PullRequest { url: url.into() }, &run).unwrap_or(false),
+                &mut Bridge(std::env::var(RUN).unwrap_or_default()),
+                std::env::var_os(SPAWNED).is_some(),
             )?;
             Ok(Some(0))
         }
         Some("--agent-run") => {
             let provider = kind(args.get(1).map(String::as_str).unwrap_or_default())?;
-            Ok(Some(run_agent(provider, &args[2..], None)?))
+            Ok(Some(run_agent(provider, &args[2..], None, false, false)?))
+        }
+        Some("--agent-spawn") => {
+            // Shell startup can run this again, as a sourced file does; only
+            // the first time finds a task waiting.
+            let Answer::Launch {
+                kind,
+                prompt,
+                model,
+                effort,
+                ultracode,
+                resume,
+            } = ask(Event::Launch, "")
+            else {
+                return Ok(Some(0));
+            };
+            let failed = |reason: String| {
+                eprintln!("Neptune: the agent could not start: {reason}");
+                let _ = ask(Event::LaunchFailed { reason }, "");
+                Ok(Some(0))
+            };
+            // The same terminal a restored agent needs.
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                return failed("its shell's startup left input or output off the terminal".into());
+            }
+            let resumed = resume.map(|session| AgentSession {
+                kind,
+                session_id: Some(session),
+                cwd: std::env::current_dir().unwrap_or_default(),
+            });
+            let mut arguments = Vec::new();
+            if let Some(agent) = &resumed {
+                if !agent.is_valid() {
+                    return failed("its conversation could not be found again".into());
+                }
+                arguments.extend(resume_arguments(agent));
+            }
+            if let Some(model) = model {
+                arguments.extend([
+                    match kind {
+                        AgentKind::Claude => "--model",
+                        AgentKind::Codex => "-m",
+                    }
+                    .to_owned(),
+                    model,
+                ]);
+            }
+            if let Some(effort) = effort {
+                arguments.extend(match kind {
+                    AgentKind::Claude => ["--effort".to_owned(), effort],
+                    AgentKind::Codex => [
+                        "-c".to_owned(),
+                        format!("model_reasoning_effort={}", toml::Value::String(effort)),
+                    ],
+                });
+            }
+            arguments.push(prompt);
+            match run_agent(kind, &arguments, resumed.as_ref(), true, ultracode) {
+                Ok(status) => Ok(Some(status)),
+                Err(error) => failed(error.to_string()),
+            }
         }
         Some("--agent-restore") => {
             let agent: AgentSession = serde_json::from_str(
@@ -709,20 +1999,31 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
             if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                 return Ok(Some(0));
             }
-            let arguments = match &agent.session_id {
-                Some(id) => vec![
-                    match agent.kind {
-                        AgentKind::Claude => "--resume",
-                        AgentKind::Codex => "resume",
-                    }
-                    .into(),
-                    id.clone(),
-                ],
-                None => Vec::new(),
-            };
-            Ok(Some(run_agent(agent.kind, &arguments, Some(&agent))?))
+            let arguments = resume_arguments(&agent);
+            let spawned = args.get(2).is_some_and(|mark| mark == "spawned");
+            Ok(Some(run_agent(
+                agent.kind,
+                &arguments,
+                Some(&agent),
+                spawned,
+                false,
+            )?))
         }
         _ => Ok(None),
+    }
+}
+/// What a CLI is given to go on with a conversation of its own.
+fn resume_arguments(agent: &AgentSession) -> Vec<String> {
+    match &agent.session_id {
+        Some(id) => vec![
+            match agent.kind {
+                AgentKind::Claude => "--resume",
+                AgentKind::Codex => "resume",
+            }
+            .into(),
+            id.clone(),
+        ],
+        None => Vec::new(),
     }
 }
 /// The fields of a hook's input that say what kind of moment it is.
@@ -739,6 +2040,8 @@ struct Hook {
     permission_mode: Option<String>,
     source: Option<String>,
     trigger: Option<String>,
+    /// What the agent last said, read only for one another agent started.
+    last_assistant_message: Option<String>,
 }
 /// What a hook means for the agent's activity, if anything.
 fn signal(provider: AgentKind, hook: &Hook) -> Option<Signal> {
@@ -904,10 +2207,14 @@ fn interactive(provider: AgentKind, args: &[String]) -> bool {
     // Conservative around option-led subcommands too: never relaunch a batch job.
     !args.iter().any(|arg| commands.contains(&arg.as_str()))
 }
+/// `spawned` marks a CLI another agent started, whose replies return to it;
+/// `ultracode` starts Claude Code with ultracode on.
 fn run_agent(
     provider: AgentKind,
     args: &[String],
     resumed: Option<&AgentSession>,
+    spawned: bool,
+    ultracode: bool,
 ) -> anyhow::Result<i32> {
     let executable = resolve(provider)?;
     let mut command = std::process::Command::new(executable);
@@ -971,10 +2278,16 @@ fn run_agent(
                     }]}]),
                 );
             }
-            let settings = serde_json::json!({
+            let mut settings = serde_json::json!({
                 "hooks":hooks,
-                "permissions":{"allow":["mcp__neptune__link_pull_request"]},
+                "permissions":{"allow":super::agent_mcp::allowed_tools()
+                    .map(|tool| format!("mcp__neptune__{tool}"))
+                    .collect::<Vec<_>>()},
             });
+            // Session-scoped: the user's own setting stands for other launches.
+            if ultracode {
+                settings["ultracode"] = true.into();
+            }
             let servers = serde_json::json!({"mcpServers":{"neptune":{"command":helper,"args":["--agent-mcp"]}}});
             // --mcp-config takes several values; --settings ends its list
             // before the user's own arguments.
@@ -1028,6 +2341,12 @@ fn run_agent(
                     ),
                     "-c",
                     "mcp_servers.neptune.args=[\"--agent-mcp\"]",
+                    // Waiting for a started agent outlasts Codex's minute.
+                    "-c",
+                    &format!(
+                        "mcp_servers.neptune.tool_timeout_sec={}",
+                        super::agent_mcp::MAX_WAIT.as_secs() + 30
+                    ),
                 ]);
                 // Codex excludes *TOKEN* from the default tool/hook environment.
                 // Supply only this pane's bridge metadata as invocation-scoped overrides;
@@ -1037,7 +2356,10 @@ fn run_agent(
                     (ENDPOINT, std::env::var(ENDPOINT).unwrap_or_default()),
                     (RUN, run.clone()),
                     (HELPER, helper.clone()),
-                ] {
+                ]
+                .into_iter()
+                .chain(spawned.then(|| (SPAWNED, "1".to_owned())))
+                {
                     let value = toml::Value::String(value);
                     command.args([
                         "-c",
@@ -1060,6 +2382,11 @@ fn run_agent(
         supervisor.args(["-c", "helper=$1; resumed=$2; shift 2; trap ':' INT QUIT; \"$@\"; result=$?; \"$helper\" --agent-close \"$result\" \"$resumed\"; exit \"$result\"", "neptune-agent"])
             .arg(std::env::current_exe()?).arg(if resumed.is_some() { "1" } else { "0" })
             .arg(command.get_program()).args(command.get_args()).env(RUN, &run).env(HELPER, &helper);
+        if spawned {
+            supervisor.env(SPAWNED, "1");
+        } else {
+            supervisor.env_remove(SPAWNED);
+        }
         if let Some(agent) = resumed {
             supervisor.current_dir(&agent.cwd);
         }
@@ -1069,6 +2396,9 @@ fn run_agent(
     {
         if let Some(agent) = resumed {
             command.current_dir(&agent.cwd);
+        }
+        if spawned {
+            command.env(SPAWNED, "1");
         }
         let result = command.env(RUN, &run).env(HELPER, &helper).status();
         let _ = send(Event::Close, &run);
@@ -1351,7 +2681,10 @@ mod tests {
                 generation: 7,
                 token: "one".into(),
                 run: None,
+                kind: None,
                 activity: None,
+                shown: None,
+                since: Instant::now(),
                 wake: Arc::new(move || {
                     wake.fetch_add(1, Ordering::Relaxed);
                 }),
@@ -1485,7 +2818,10 @@ mod tests {
                 generation: 7,
                 token: "one".into(),
                 run: None,
+                kind: None,
                 activity: None,
+                shown: None,
+                since: Instant::now(),
                 wake: Arc::new(|| {}),
                 _startup: None,
             },
@@ -1535,7 +2871,10 @@ mod tests {
                     generation: 7,
                     token: token.into(),
                     run: None,
+                    kind: None,
                     activity: None,
+                    shown: None,
+                    since: Instant::now(),
                     wake: Arc::new(|| {}),
                     _startup: None,
                 },
@@ -1609,6 +2948,567 @@ mod tests {
         );
         assert!(bridge.drain().is_empty());
     }
+    /// A bridge with an unopened terminal for each token, at generation 7.
+    fn bridge_with(tokens: &[&str]) -> (AgentBridge, Arc<std::sync::atomic::AtomicUsize>) {
+        let bridge = AgentBridge::default();
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (index, token) in tokens.iter().enumerate() {
+            let wake = woken.clone();
+            bridge.shared.lock().unwrap().slots.insert(
+                PaneId::new(index as u64 + 1),
+                Slot {
+                    generation: 7,
+                    token: (*token).into(),
+                    run: None,
+                    kind: None,
+                    activity: None,
+                    shown: None,
+                    since: Instant::now(),
+                    wake: Arc::new(move || {
+                        wake.fetch_add(1, Ordering::Relaxed);
+                    }),
+                    _startup: None,
+                },
+            );
+        }
+        (bridge, woken)
+    }
+    fn message(token: &str, run: &str, event: Event) -> Message {
+        Message {
+            token: token.into(),
+            run: run.into(),
+            event,
+        }
+    }
+    fn codex() -> AgentSession {
+        AgentSession {
+            kind: AgentKind::Codex,
+            ..agent(SECOND)
+        }
+    }
+    #[test]
+    fn an_agent_starts_another_and_hears_only_from_the_agents_it_started() {
+        let ask_signal = ask;
+        let (bridge, woken) = bridge_with(&["one", "two", "three"]);
+        let (parent, child) = (PaneId::new(1), PaneId::new(2));
+        let emit = |token: &str, run: &str, event| {
+            apply_message(&bridge.shared, message(token, run, event))
+        };
+        let ask =
+            |token: &str, run: &str, event| answer(&bridge.shared, message(token, run, event));
+        let refused = |answer: Answer| matches!(answer, Answer::Refused { .. });
+        let spawn = || Event::Spawn {
+            kind: AgentKind::Codex,
+            prompt: "Build the API".into(),
+            cwd: std::env::temp_dir(),
+            model: Some("gpt-5.1-codex".into()),
+            effort: Some("High".into()),
+            ultra: false,
+        };
+        let collect = |token: &str, run: &str, take| match ask(
+            token,
+            run,
+            Event::Collect { agent: None, take },
+        ) {
+            Answer::Agents { agents } => agents,
+            other => panic!("{other:?}"),
+        };
+        let one = |take| collect("one", "a", take).remove(0);
+        // What the hooks and the title last said is older than any wait.
+        let age = |pane: PaneId| {
+            let mut shared = bridge.shared.lock().unwrap();
+            let past = Instant::now() - Duration::from_secs(30);
+            shared.slots.get_mut(&pane).unwrap().since = past;
+            shared.children.get_mut(&pane).unwrap().marked = past;
+        };
+
+        // Only an open agent starts another, with a task and a directory.
+        assert!(refused(ask("one", "a", spawn())));
+        assert!(emit(
+            "one",
+            "a",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+        assert!(refused(ask("one", "b", spawn())));
+        assert!(refused(ask(
+            "one",
+            "a",
+            Event::Spawn {
+                kind: AgentKind::Codex,
+                prompt: " ".into(),
+                cwd: std::env::temp_dir(),
+                model: None,
+                effort: None,
+                ultra: false,
+            }
+        )));
+        // A model is a name, never an option for the CLI.
+        assert!(refused(ask(
+            "one",
+            "a",
+            Event::Spawn {
+                kind: AgentKind::Codex,
+                prompt: "x".into(),
+                cwd: std::env::temp_dir(),
+                model: Some("--dangerously-bypass-approvals-and-sandbox".into()),
+                effort: None,
+                ultra: false,
+            }
+        )));
+        // Each CLI has its own effort levels; "ultra" is ultracode for one
+        // and the highest effort for the other.
+        let level = |kind, effort, ultra| effort_level(kind, effort, ultra);
+        assert_eq!(
+            level(AgentKind::Claude, Some("xhigh"), true),
+            Ok((Some("xhigh".into()), true))
+        );
+        assert_eq!(level(AgentKind::Claude, None, true), Ok((None, true)));
+        assert_eq!(
+            level(AgentKind::Codex, None, true),
+            Ok((Some("ultra".into()), false))
+        );
+        assert_eq!(
+            level(AgentKind::Codex, Some("ultra"), false),
+            Ok((Some("ultra".into()), false))
+        );
+        assert_eq!(level(AgentKind::Codex, Some(" "), false), Ok((None, false)));
+        for (kind, effort, ultra) in [
+            (AgentKind::Claude, "ultra", false),
+            (AgentKind::Claude, "minimal", false),
+            (AgentKind::Claude, "--max", false),
+            (AgentKind::Codex, "low", true),
+            (AgentKind::Codex, "\"; rm", false),
+        ] {
+            assert!(level(kind, Some(effort), ultra).is_err());
+        }
+        woken.store(0, Ordering::Relaxed);
+        let Answer::Queued { request } = ask("one", "a", spawn()) else {
+            panic!("the spawn was not queued");
+        };
+        assert_eq!(woken.swap(0, Ordering::Relaxed), 1);
+        assert_eq!(
+            ask("one", "a", Event::SpawnResult { request }),
+            Answer::Pending
+        );
+        let mut requests = bridge.drain_requests();
+        let Some(AgentRequest::Spawn {
+            parent: asked,
+            generation: 7,
+            task,
+            ..
+        }) = requests.pop()
+        else {
+            panic!("the application was not asked");
+        };
+        assert_eq!(asked, parent);
+        assert_eq!(
+            (task.kind, task.model.as_deref(), &task.resume),
+            (AgentKind::Codex, Some("gpt-5.1-codex"), &None)
+        );
+        assert_eq!(
+            (task.effort.as_deref(), task.ultracode),
+            (Some("high"), false)
+        );
+        let prompt = task.prompt.clone();
+        // The task says who handed it over and how the answer returns.
+        assert!(prompt.starts_with("[Claude Code in another Neptune terminal started you"));
+        assert!(prompt.ends_with("\n\nBuild the API"));
+        bridge.register_spawn(child, parent, task);
+        bridge.spawn_result(request, Ok(child));
+        assert_eq!(
+            ask("one", "a", Event::SpawnResult { request }),
+            Answer::Spawned { agent: 2 }
+        );
+        assert!(refused(ask("one", "a", Event::SpawnResult { request })));
+
+        // Until its CLI takes the task it is starting, and takes no message.
+        // One that stays that way is news once: a person has to look.
+        assert!(one(false).status == Status::Starting && !one(false).news);
+        age(child);
+        let stalled = one(true);
+        assert!(stalled.news && stalled.status == Status::Starting);
+        assert!(!one(false).news);
+        let tell = |text: &str| {
+            ask(
+                "one",
+                "a",
+                Event::Tell {
+                    agent: 2,
+                    text: text.into(),
+                },
+            )
+        };
+        assert!(refused(tell("hello")));
+        assert!(!bridge.takes_prompt(child, 7));
+        // What its terminal shows once it stands still is news, and only
+        // then are keys pressed for it: a few named ones.
+        let press = |keys: &[&str]| {
+            ask(
+                "one",
+                "a",
+                Event::Press {
+                    agent: 2,
+                    keys: keys.iter().map(|key| (*key).to_owned()).collect(),
+                },
+            )
+        };
+        assert!(refused(press(&["enter"])));
+        bridge.asking(child, 6, Some("stale".into()));
+        assert_eq!(one(false).status, Status::Starting);
+        bridge.asking(child, 7, Some("Trust this folder?".into()));
+        let asking = Status::Asking {
+            screen: "Trust this folder?".into(),
+        };
+        assert!(one(false).news && one(true).status == asking);
+        assert!(!one(false).news);
+        assert!(refused(tell("hello")));
+        assert!(refused(press(&[])));
+        assert!(refused(press(&["rm -rf"])));
+        assert!(refused(press(&["ctrl+c"])));
+        assert_eq!(press(&["1", "Enter"]), Answer::Done);
+        assert_eq!(
+            bridge.drain_requests(),
+            [AgentRequest::Press {
+                pane: child,
+                generation: 7,
+                keys: vec![Press::Char('1'), Press::Enter],
+            }]
+        );
+        assert_eq!(one(false).status, Status::Starting);
+        assert_eq!(bridge.starting(), [(child, 7)]);
+        // Its terminal takes the task once; a file sourced again finds none.
+        assert_eq!(
+            ask("two", "", Event::Launch),
+            Answer::Launch {
+                kind: AgentKind::Codex,
+                prompt,
+                model: Some("gpt-5.1-codex".into()),
+                effort: Some("high".into()),
+                ultracode: false,
+                resume: None,
+            }
+        );
+        assert!(refused(ask("two", "", Event::Launch)));
+        assert!(refused(ask("three", "", Event::Launch)));
+        assert!(emit("two", "c", Event::Open { agent: codex() }));
+        assert_eq!(one(false).status, Status::Starting);
+        let signal = |signal| Event::Activity { signal };
+        assert!(emit("two", "c", signal(Signal::Prompt)));
+        assert_eq!(one(false).status, Status::Working);
+        assert!(bridge.takes_prompt(child, 7) && !bridge.takes_prompt(child, 6));
+
+        // A message for a working agent is typed for it all the same.
+        assert_eq!(tell("Also add tests"), Answer::Told { working: true });
+        assert_eq!(
+            bridge.drain_requests(),
+            [AgentRequest::Tell {
+                pane: child,
+                generation: 7,
+                text: "Also add tests".into()
+            }]
+        );
+        // Words before the end of its turn are news while it works on.
+        let report = |text: &str, done| {
+            emit(
+                "two",
+                "c",
+                Event::Report {
+                    text: text.into(),
+                    done,
+                },
+            )
+        };
+        assert!(report("Which port?", false));
+        let peek = one(false);
+        assert!(peek.news && peek.replies.is_empty() && peek.status == Status::Working);
+        assert_eq!(one(true).replies, ["Which port?"]);
+        assert!(!one(false).news);
+        // The end of a turn brings its last message. The turn of the message
+        // handed over meanwhile is still owed, so the agent is not at rest.
+        assert!(report("Built 3 endpoints.", true));
+        assert_eq!(one(false).status, Status::Working);
+        assert!(emit("two", "c", signal(Signal::Prompt)));
+        assert!(report("Tests added.", true));
+        let done = one(true);
+        assert_eq!(done.status, Status::Idle);
+        assert_eq!(done.replies, ["Built 3 endpoints.", "Tests added."]);
+        assert!(done.news && !one(false).news);
+        // A message folded into the turn before it is not waited for forever.
+        assert_eq!(tell("One more thing"), Answer::Told { working: false });
+        assert_eq!(bridge.drain_requests().len(), 1);
+        assert_eq!(one(false).status, Status::Working);
+        age(child);
+        let rested = one(true);
+        assert!(rested.news && rested.status == Status::Idle);
+
+        // A request to a person is one once it has stood a moment; nothing
+        // is typed over it.
+        assert!(emit("two", "c", signal(Signal::Prompt)));
+        assert!(emit(
+            "two",
+            "c",
+            signal(ask_signal(Attention::Permission, Some("Bash"), false))
+        ));
+        assert_eq!(one(false).status, Status::Working);
+        assert!(refused(tell("hello")) && !bridge.takes_prompt(child, 7));
+        age(child);
+        assert_eq!(
+            one(false).status,
+            Status::Waiting {
+                attention: Attention::Permission
+            }
+        );
+        assert!(refused(tell("hello")));
+        // Where no hook says a wait or a turn ended, the title does.
+        bridge.observe(child, 6, Activity::Idle);
+        assert!(matches!(one(false).status, Status::Waiting { .. }));
+        bridge.observe(child, 7, Activity::Idle);
+        assert_eq!(one(false).status, Status::Idle);
+        assert!(emit("two", "c", signal(Signal::Prompt)));
+        assert_eq!(one(false).status, Status::Working);
+
+        // Another agent neither sees nor reaches it, and it has no agents.
+        assert!(emit(
+            "three",
+            "x",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+        assert!(collect("three", "x", false).is_empty());
+        assert!(collect("two", "c", false).is_empty());
+        for event in [
+            Event::Collect {
+                agent: Some(2),
+                take: true,
+            },
+            Event::Tell {
+                agent: 2,
+                text: "hello".into(),
+            },
+            Event::Dismiss { agent: 2 },
+        ] {
+            assert!(refused(ask("three", "x", event)));
+        }
+        // Nor does an agent nobody started reply to anyone.
+        assert!(!emit(
+            "three",
+            "x",
+            Event::Report {
+                text: "hello".into(),
+                done: true
+            }
+        ));
+
+        // Its exit is news with what it last said; it is forgotten once told
+        // and the model has dropped the link.
+        assert!(report("Leaving.", false));
+        assert!(emit("two", "c", Event::Close));
+        assert!(!bridge.takes_prompt(child, 7));
+        bridge.sync_spawned(&[]);
+        let ended = one(true);
+        assert_eq!(ended.replies, ["Leaving."]);
+        assert_eq!(
+            ended.status,
+            Status::Ended {
+                reason: "its agent exited".into()
+            }
+        );
+        assert!(refused(tell("hello")));
+        // It is kept while its conversation can be opened again, and opens
+        // where it worked, on the model it had.
+        bridge.sync_spawned(&[]);
+        assert!(ended.reopens && one(false).reopens && !one(false).news);
+        assert!(bridge.starting().is_empty());
+        let reopen = |agent| {
+            ask(
+                "one",
+                "a",
+                Event::Reopen {
+                    agent,
+                    text: "One more thing".into(),
+                },
+            )
+        };
+        assert!(refused(reopen(3)));
+        assert!(refused(ask(
+            "three",
+            "x",
+            Event::Reopen {
+                agent: 2,
+                text: "hello".into()
+            }
+        )));
+        let Answer::Queued { request } = reopen(2) else {
+            panic!("the reopening was not queued");
+        };
+        let Some(AgentRequest::Spawn { task, cwd, .. }) = bridge.drain_requests().pop() else {
+            panic!("the application was not asked");
+        };
+        assert_eq!(cwd, codex().cwd);
+        assert_eq!(
+            (task.kind, task.model.as_deref(), task.resume.clone()),
+            (
+                AgentKind::Codex,
+                Some("gpt-5.1-codex"),
+                Some((child, codex().session_id.unwrap()))
+            )
+        );
+        assert_eq!(task.effort.as_deref(), Some("high"));
+        assert!(task.prompt.ends_with("\n\nOne more thing"));
+        let again = PaneId::new(3);
+        // The third terminal's agent gives way to the one opened again.
+        assert!(emit("three", "x", Event::Close));
+        bridge.register_spawn(again, parent, task);
+        bridge.spawn_result(request, Ok(again));
+        assert_eq!(collect("one", "a", false).len(), 1);
+        assert!(matches!(
+            ask("three", "", Event::Launch),
+            Answer::Launch { resume: Some(session), model: Some(_), .. }
+                if Some(&session) == codex().session_id.as_ref()
+        ));
+        assert!(refused(reopen(2)) && refused(reopen(3)));
+        bridge.sync_spawned(&[]);
+        one(true);
+        bridge.sync_spawned(&[]);
+        assert!(collect("one", "a", false).is_empty());
+        assert!(emit(
+            "three",
+            "x",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+
+        // The agent that started it closes one; the application is asked once.
+        bridge.register_spawn(child, parent, Task::new(AgentKind::Codex, "again"));
+        bridge.sync_spawned(&[(child, parent)]);
+        assert_eq!(ask("one", "a", Event::Dismiss { agent: 2 }), Answer::Done);
+        assert!(refused(ask("one", "a", Event::Dismiss { agent: 2 })));
+        assert_eq!(
+            bridge.drain_requests(),
+            [AgentRequest::Close {
+                pane: child,
+                generation: 7,
+                parent
+            }]
+        );
+        assert!(!one(false).news);
+        bridge.sync_spawned(&[]);
+        assert!(collect("one", "a", false).is_empty());
+
+        // One that cannot start says why, and the model is told it left.
+        bridge.register_spawn(child, parent, Task::new(AgentKind::Codex, "again"));
+        bridge.drain();
+        assert_eq!(
+            ask(
+                "two",
+                "",
+                Event::LaunchFailed {
+                    reason: "codex is not installed".into()
+                }
+            ),
+            Answer::Done
+        );
+        assert_eq!(bridge.drain(), [(child, 7, None)]);
+        assert!(matches!(
+            one(true).status,
+            Status::Ended { reason } if reason.contains("codex is not installed")
+        ));
+        bridge.sync_spawned(&[]);
+
+        // No more agents are open at once than the model keeps.
+        for pane in 10..10 + AgentSession::MAX_SPAWNED as u64 {
+            bridge.register_spawn(PaneId::new(pane), parent, Task::new(AgentKind::Codex, "x"));
+        }
+        assert!(refused(ask("one", "a", spawn())));
+        // When the agent that started them leaves, they answer to no one, and
+        // a new agent in its terminal does not inherit them.
+        assert!(matches!(ask("three", "x", spawn()), Answer::Queued { .. }));
+        assert!(emit("one", "a", Event::Close));
+        assert!(emit(
+            "one",
+            "b",
+            Event::Open {
+                agent: agent(FIRST)
+            }
+        ));
+        assert!(collect("one", "b", false).is_empty());
+        assert_eq!(
+            bridge.drain(),
+            [(parent, 7, None), (parent, 7, Some(agent(FIRST)))]
+        );
+        // A terminal that closes takes its pending requests with it.
+        bridge.close(PaneId::new(3));
+        assert!(bridge.drain_requests().is_empty());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_restored_link_is_known_before_its_agent_resumes_and_ends_with_a_restart() {
+        let bridge = AgentBridge::default();
+        let (parent, child) = (PaneId::new(1), PaneId::new(2));
+        let prepare = |pane, generation, resume: Option<&AgentSession>, spawned_by| {
+            let mut options = SessionOptions {
+                shell: Some("/bin/sh".into()),
+                ..Default::default()
+            };
+            bridge
+                .prepare(
+                    pane,
+                    generation,
+                    &mut options,
+                    resume,
+                    spawned_by,
+                    Arc::new(|| {}),
+                )
+                .unwrap();
+            options.args
+        };
+        prepare(parent, 1, Some(&agent(FIRST)), None);
+        let args = prepare(child, 1, Some(&codex()), Some(parent));
+        assert_eq!(
+            (args[4].as_str(), args[6].as_str()),
+            ("--agent-restore", "spawned")
+        );
+        let status = |bridge: &AgentBridge| {
+            let shared = bridge.shared.lock().unwrap();
+            let record = shared.children.get(&child).unwrap();
+            assert_eq!((record.parent, record.kind), (parent, AgentKind::Codex));
+            record.status(shared.slots.get(&child), Instant::now())
+        };
+        assert_eq!(status(&bridge), Status::Starting);
+        // A task handed over opens the terminal with its CLI instead.
+        bridge.register_spawn(PaneId::new(3), parent, Task::new(AgentKind::Claude, "task"));
+        let args = prepare(PaneId::new(3), 1, None, Some(parent));
+        assert_eq!(args[4..7], ["--agent-spawn", "", ""]);
+        // A link without a saved agent or a task opens a plain shell.
+        assert!(prepare(PaneId::new(4), 1, None, Some(parent)).is_empty());
+        // Restarting the started terminal ends its agent for its starter.
+        assert!(prepare(child, 2, None, None).is_empty());
+        assert!(matches!(status(&bridge), Status::Ended { .. }));
+    }
+    #[test]
+    fn only_a_started_agents_last_message_is_read_from_its_hook() {
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop", "session_id": FIRST, "cwd": "/tmp",
+            "last_assistant_message": "Done: 3 endpoints.", "transcript_path": "/tmp/t.jsonl",
+        });
+        let parsed: Hook = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            parsed.last_assistant_message.as_deref(),
+            Some("Done: 3 endpoints.")
+        );
+        // The signal every agent sends still names the moment alone.
+        let sent = serde_json::to_string(&signal(AgentKind::Codex, &parsed).unwrap()).unwrap();
+        assert_eq!(sent, r#"{"signal":"done"}"#);
+        // A reply longer than agents exchange is cut at a character.
+        let long = "é".repeat(MAX_TEXT);
+        let cut = clip(&long);
+        assert!(cut.len() < MAX_TEXT + 100 && cut.contains("Neptune cut this short"));
+        assert_eq!(clip("short"), "short");
+    }
     #[test]
     fn batch_and_administrative_invocations_are_not_restored() {
         for args in [vec!["auth"], vec!["mcp"], vec!["--print"], vec!["--help"]] {
@@ -1657,7 +3557,7 @@ mod tests {
                 ..Default::default()
             };
             bridge
-                .prepare(PaneId::new(1), 1, &mut options, None, Arc::new(|| {}))
+                .prepare(PaneId::new(1), 1, &mut options, None, None, Arc::new(|| {}))
                 .unwrap();
             let session = TerminalSession::spawn(options, Arc::new(|| {})).unwrap();
             session.write(b"printf 'CONFIG=%s ADAPTER=%s\\n' \"$NEPTUNE_USER_CONFIG\" \"$(command -v claude)\"\r").unwrap();
@@ -1707,7 +3607,7 @@ mod tests {
             ..Default::default()
         };
         bridge
-            .prepare(PaneId::new(1), 1, &mut options, None, Arc::new(|| {}))
+            .prepare(PaneId::new(1), 1, &mut options, None, None, Arc::new(|| {}))
             .unwrap();
         let startup = option_env(&options, "ZDOTDIR").unwrap();
         options.env.push(("FIXTURE_STARTUP_DIR".into(), startup));
@@ -1769,7 +3669,13 @@ mod tests {
                 ],
                 ..Default::default()
             };
-            configure_shell(&mut options, root.path(), &helper, Some(&agent(FIRST))).unwrap();
+            configure_shell(
+                &mut options,
+                root.path(),
+                &helper,
+                Start::Resume(&agent(FIRST), false),
+            )
+            .unwrap();
             let session = TerminalSession::spawn(options, Arc::new(|| {})).unwrap();
             let output = home.join("restore");
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1796,7 +3702,7 @@ mod tests {
             ..Default::default()
         };
         bridge
-            .prepare(PaneId::new(1), 1, &mut options, None, Arc::new(|| {}))
+            .prepare(PaneId::new(1), 1, &mut options, None, None, Arc::new(|| {}))
             .unwrap();
         assert_eq!(options.shell.as_deref(), Some("/bin/bash"));
         assert_eq!(options.args, ["--norc", "-i"]);
@@ -1812,11 +3718,13 @@ mod tests {
                 1,
                 &mut options,
                 Some(&agent(FIRST)),
+                None,
                 Arc::new(|| {}),
             )
             .unwrap();
         assert_eq!(options.shell.as_deref(), Some("/bin/sh"));
-        // `shift 2` leaves the shell and its own arguments for `exec "$@"`.
-        assert_eq!(options.args[5..], ["/bin/zsh", "-l"]);
+        // `shift 4` leaves the shell and its own arguments for `exec "$@"`.
+        assert_eq!(options.args[4], "--agent-restore");
+        assert_eq!(options.args[6..], ["", "/bin/zsh", "-l"]);
     }
 }

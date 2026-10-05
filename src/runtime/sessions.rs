@@ -48,6 +48,8 @@ pub enum AgentLaunch {
     Disabled,
     Local {
         resume: Option<neptune_model::AgentSession>,
+        /// The terminal whose agent started the one this terminal opens.
+        spawned_by: Option<PaneId>,
     },
 }
 impl From<SessionOptions> for SessionLaunch {
@@ -151,13 +153,15 @@ impl SessionManager {
                         };
                         let tick = Instant::now();
                         let result = (|| {
-                            if let AgentLaunch::Local { resume } = &request.launch.agent {
+                            if let AgentLaunch::Local { resume, spawned_by } = &request.launch.agent
+                            {
                                 agents
                                     .prepare(
                                         request.pane,
                                         request.generation,
                                         &mut request.launch.terminal,
                                         resume.as_ref(),
+                                        *spawned_by,
                                         request.wake.clone(),
                                     )
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
@@ -326,6 +330,11 @@ impl SessionManager {
     }
     pub fn pull_request_links(&self) -> Vec<(PaneId, u64, neptune_model::PullRequest)> {
         self.agents.drain_links()
+    }
+    /// The bridge agents reach the application through: what they asked for,
+    /// and what the application tells it about the agents they started.
+    pub fn agents(&self) -> &super::agents::AgentBridge {
+        &self.agents
     }
     pub fn close(&mut self, pane: PaneId) {
         self.agents.close(pane);

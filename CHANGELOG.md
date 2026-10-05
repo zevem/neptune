@@ -17,6 +17,22 @@ their preparation records remain in Git history.
   Click an agent to go to its terminal. The toolbar's panel button, which now
   opens the file explorer and the agents as tabs, carries a dot while an agent
   waits out of view. Codex asks once to trust the hooks that report this.
+- Let Claude Code and Codex work together. Ask one for the other, such as
+  "build the backend and let Claude Code handle the frontend", and it starts
+  that agent out of view, hands it the task, reads its answer and can keep
+  talking to it. The tab of an agent that started others shows how many;
+  click the count to list them and open one's terminal in a tab. A started
+  agent can be given its own directory, such as a git worktree, a model, an
+  effort level and its CLI's ultra mode (ultracode or Ultra).
+  One you closed can be opened again with its conversation, and a question a
+  started agent's CLI asks before it begins is passed on to you at once.
+
+### Acceptance notes and known limitations
+
+- Saved workspaces now use schema version 9, which records which terminal's
+  agent started another's and which of those terminals have no tab. Older
+  workspace files still load, but RC3 and
+  earlier cannot save over layouts written by this version.
 
 ### Fixes
 

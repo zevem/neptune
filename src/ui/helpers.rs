@@ -315,6 +315,146 @@ impl<'a> PullRequestChips<'a> {
     }
 }
 
+/// How many agents the terminal's agent started, as a chip that lists them
+/// and opens the terminal of the one chosen, which has no tab until then. Laid out and painted like
+/// `PullRequestChips`, before which it sits.
+pub struct SpawnedChip<'a> {
+    chip: Option<(Rect, std::sync::Arc<egui::Galley>, egui::Response)>,
+    agents: &'a [super::agents::Spawned],
+    /// Leading edge of the chip; the trailing edge given when there is none.
+    pub left: f32,
+}
+impl<'a> SpawnedChip<'a> {
+    pub fn layout(
+        ui: &egui::Ui,
+        id: egui::Id,
+        agents: &'a [super::agents::Spawned],
+        (limit, right, middle): (f32, f32, f32),
+        p: crate::theme::Palette,
+    ) -> Self {
+        let mut chip = None;
+        let mut left = right;
+        if !agents.is_empty() {
+            let count = ui.painter().layout_no_wrap(
+                agents.len().to_string(),
+                crate::theme::medium(11.5),
+                Self::ink(agents, p),
+            );
+            let width = count.size().x + 41.0;
+            if right - width >= limit {
+                let rect = Rect::from_min_max(
+                    egui::pos2(right - width, middle - 9.0),
+                    egui::pos2(right, middle + 9.0),
+                );
+                left = rect.left() - 1.0;
+                let response = ui.interact(rect, id, Sense::click());
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Started agents")
+                });
+                chip = Some((rect, count, response));
+            }
+        }
+        Self { chip, agents, left }
+    }
+    /// The attention colour while a started agent waits for a person.
+    fn ink(agents: &[super::agents::Spawned], p: crate::theme::Palette) -> egui::Color32 {
+        if agents.iter().any(super::agents::Spawned::waits) {
+            p.attention
+        } else {
+            p.accent
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.chip.is_none()
+    }
+    pub fn hovered(&self) -> bool {
+        self.chip.as_ref().is_some_and(|chip| chip.2.hovered())
+    }
+    pub fn paint(
+        self,
+        painter: &egui::Painter,
+        p: crate::theme::Palette,
+        actions: &mut Vec<super::Action>,
+    ) {
+        use crate::icons::{self, Icon};
+        let Some((chip, count, response)) = self.chip else {
+            return;
+        };
+        let ink = Self::ink(self.agents, p);
+        let listing =
+            egui::Popup::is_id_open(&response.ctx, egui::Popup::default_response_id(&response));
+        if response.hovered() || listing {
+            painter.rect_filled(chip, 5, crate::theme::tint(ink, 0.14));
+        }
+        icons::paint(
+            painter,
+            Rect::from_center_size(
+                egui::pos2(chip.left() + 11.5, chip.center().y),
+                Vec2::splat(13.0),
+            ),
+            Icon::Agents,
+            ink,
+        );
+        galley_at(
+            painter,
+            egui::pos2(chip.left() + 22.0, chip.center().y + 1.0),
+            count,
+        );
+        icons::paint(
+            painter,
+            Rect::from_center_size(
+                egui::pos2(chip.right() - 10.0, chip.center().y + 0.5),
+                Vec2::splat(10.0),
+            ),
+            Icon::ChevronDown,
+            ink,
+        );
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        egui::Popup::menu(&response).show(|ui| {
+            // As wide as its longest entry and that entry's state.
+            let widest = self
+                .agents
+                .iter()
+                .map(|agent| {
+                    let width = |text: &str, font| {
+                        ui.painter()
+                            .layout_no_wrap(text.to_owned(), font, p.fg)
+                            .size()
+                            .x
+                    };
+                    width(&ellipsize(&agent.title, 40), crate::theme::regular(13.0))
+                        + width(agent.state(), crate::theme::regular(12.0))
+                })
+                .fold(0.0, f32::max);
+            menu_layout(ui, (widest + 74.0).clamp(160.0, 420.0));
+            for agent in self.agents {
+                let chosen = ui
+                    .push_id(agent.pane, |ui| {
+                        menu_item(
+                            ui,
+                            p,
+                            Icon::Terminal,
+                            &ellipsize(&agent.title, 40),
+                            agent.state(),
+                            false,
+                        )
+                    })
+                    .inner;
+                if chosen {
+                    actions.push(super::Action::Focus(agent.pane));
+                    ui.close();
+                }
+            }
+        });
+        if !listing {
+            response.on_hover_text(match self.agents.len() {
+                1 => "1 agent started from this terminal".to_owned(),
+                count => format!("{count} agents started from this terminal"),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -52,6 +52,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         link_opener: Default::default(),
         notifications: Default::default(),
         agents: Default::default(),
+        delegation: Default::default(),
         desktop_notifier: Default::default(),
         updates: Default::default(),
         attachments: attachments::Attachments::new(root.join("pasted-images")),

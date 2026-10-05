@@ -30,6 +30,8 @@ pub struct ChromeView<'a> {
     /// The focused terminal's linked pull requests, while it has no tab to
     /// carry them.
     pub pull_requests: &'a [neptune_model::PullRequest],
+    /// The agents the focused terminal's agent started, likewise.
+    pub spawned: &'a [super::agents::Spawned],
     pub zoomed: bool,
     /// The whole window. The window controls keep their place in it.
     pub window: Rect,
@@ -515,10 +517,18 @@ pub fn toolbar(
         (left + 96.0, right - 2.0, middle),
         p.accent,
     );
-    if !chips.is_empty() {
-        right = chips.left - 6.0;
+    let spawned = helpers::SpawnedChip::layout(
+        ui,
+        ui.id().with("toolbar-spawned"),
+        view.spawned,
+        (left + 96.0, chips.left, middle),
+        p,
+    );
+    if !chips.is_empty() || !spawned.is_empty() {
+        right = spawned.left - 6.0;
     }
     chips.paint(ui.painter(), p, actions);
+    spawned.paint(ui.painter(), p, actions);
     let budget = right - left - 6.0;
     if budget < 36.0 {
         return;
@@ -2071,6 +2081,7 @@ mod tests {
                 pane: None,
                 subtitle: "",
                 pull_requests: &[],
+                spawned: &[],
                 zoomed: false,
                 window: Rect::from_min_size(Pos2::ZERO, vec2(900.0, self.height)),
                 sidebar: 1.0,
@@ -2154,6 +2165,7 @@ mod tests {
                         remote_cwd: None,
                         agent: None,
                         pull_requests: Vec::new(),
+                        spawned_by: None,
                     }],
                     layout: neptune_model::Layout::pane(PaneId::new(*id)),
                     active: PaneId::new(*id),
@@ -2725,6 +2737,7 @@ mod tests {
                             pane: Some(pane),
                             subtitle: "",
                             pull_requests: &[],
+                            spawned: &[],
                             zoomed: false,
                             window: Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0)),
                             sidebar: 1.0,

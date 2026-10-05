@@ -20,6 +20,8 @@ pub struct PanePresentation {
     pub agent: Option<AgentKind>,
     /// Pull requests the agent linked to the terminal, oldest first.
     pub pull_requests: Vec<neptune_model::PullRequest>,
+    /// The agents this terminal's agent started, oldest first.
+    pub spawned: Vec<super::agents::Spawned>,
     pub unread: usize,
     pub metadata: SessionMetadata,
     /// The terminal's content; absent for a tab that is not in view.
@@ -374,11 +376,20 @@ fn tab(
         (rect.left() + 72.0, close.left() - 2.0, rect.center().y),
         p.accent,
     );
+    // The agents this one started are listed before them.
+    let spawned = helpers::SpawnedChip::layout(
+        ui,
+        ui.id().with(("tab-spawned", id)),
+        if closable { &presentation.spawned } else { &[] },
+        (rect.left() + 72.0, chips.left, rect.center().y),
+        p,
+    );
     let hovered = response.hovered()
         || close_response
             .as_ref()
             .is_some_and(|response| response.hovered())
-        || chips.hovered();
+        || chips.hovered()
+        || spawned.hovered();
 
     // A place with one terminal reads as a plain title, as it always has.
     let fill = if shown && !alone {
@@ -403,8 +414,8 @@ fn tab(
     } else {
         0.0
     };
-    let right = if !chips.is_empty() {
-        chips.left - 5.0
+    let right = if !chips.is_empty() || !spawned.is_empty() {
+        spawned.left - 5.0
     } else if closable && close_alpha > 0.0 {
         close.left() - 3.0
     } else {
@@ -441,6 +452,7 @@ fn tab(
         );
     }
     chips.paint(&painter, p, actions);
+    spawned.paint(&painter, p, actions);
     if let Some(close_response) = close_response {
         if close_alpha > 0.0 {
             if close_response.hovered() {
@@ -1341,6 +1353,7 @@ mod tests {
                             PanePresentation {
                                 agent: None,
                                 pull_requests: Vec::new(),
+                                spawned: Vec::new(),
                                 unread: 0,
                                 metadata: metadata(""),
                                 snapshot: Some(ViewportSnapshot::blank(80, 24)),
@@ -1492,6 +1505,7 @@ mod tests {
         let presentation = PanePresentation {
             agent: None,
             pull_requests: Vec::new(),
+            spawned: Vec::new(),
             unread: 1,
             metadata: metadata(""),
             snapshot: None,
@@ -1693,6 +1707,7 @@ mod tests {
                 let presentation = PanePresentation {
                     agent: None,
                     pull_requests: Vec::new(),
+                    spawned: Vec::new(),
                     unread: 0,
                     metadata: metadata("zsh"),
                     snapshot: Some(ViewportSnapshot::blank(80, 24)),

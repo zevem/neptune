@@ -86,6 +86,21 @@ can report IDs and what it is doing. Exiting the CLI or restarting its terminal 
 reference; closing Neptune retains it. See [agent sessions](agent-sessions.md)
 for setup, exact-session requirements and platform limitations.
 
+The two can work together. Ask one for the other ("build the backend and let
+Claude Code handle the frontend", or "start Codex on gpt-5.1-codex at high
+effort for this", or "start Claude Code with ultracode")
+and it starts the other agent, hands it the task, reads its answer and can
+keep talking to it. The started agent runs out of view, without a tab. The tab
+of the agent that started others shows how many it started; click the count
+for the list and an agent in it to open its terminal, which is a tab from then
+on. If a started agent's CLI asks something before it begins, such as whether
+to trust a folder, the agent that started it tells you what it asks, and the
+count changes colour: answer in its terminal, or tell the first agent your answer.
+An agent you closed can be opened again by the agent that started it, with its
+conversation. See
+[agents that start agents](agent-sessions.md#agents-that-start-agents) for
+models, effort levels, worktrees, permissions and limits.
+
 ## Notifications
 
 Processes can request attention through BEL, OSC 9, OSC 99 and OSC 777. BEL produces a generic **Terminal bell** alert. Pane rings, sidebar unread badges and the toolbar notification popover keep track of alerts, with optional native desktop banners. See [notifications and agent setup](notifications.md) for Claude Code, Codex, OpenCode, pi and shell examples.

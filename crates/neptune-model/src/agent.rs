@@ -26,6 +26,12 @@ pub struct AgentSession {
     pub cwd: PathBuf,
 }
 impl AgentSession {
+    /// The most agents one agent can have started and still have open.
+    pub const MAX_SPAWNED: usize = 8;
+    /// An agent a person started can start agents, and those can start
+    /// agents; these last cannot.
+    pub const MAX_SPAWN_DEPTH: usize = 2;
+
     pub fn is_valid(&self) -> bool {
         self.cwd.is_absolute()
             && self.cwd.as_os_str().len() <= 32768
@@ -241,6 +247,253 @@ mod tests {
         link(&mut controller, generation, 1);
         controller.dispatch(Command::RestartPane(pane)).unwrap();
         assert!(numbers(&controller).is_empty());
+    }
+    #[test]
+    fn spawned_agents_open_out_of_view_and_leave_with_either_agent() {
+        let mut controller = Controller::new(Model::default());
+        controller
+            .dispatch(Command::AddWorkspace {
+                cwd: std::env::temp_dir(),
+                name: "a".into(),
+                remote: None,
+                group: None,
+            })
+            .unwrap();
+        let parent = controller.model().active_pane().unwrap();
+        let generation = controller.model().pane(parent).unwrap().generation();
+        let spawn = |controller: &mut Controller, parent, generation| {
+            controller
+                .dispatch(Command::SpawnAgent {
+                    parent,
+                    generation,
+                    cwd: std::env::temp_dir(),
+                })
+                .map(|effects| {
+                    effects
+                        .iter()
+                        .find_map(|effect| match effect {
+                            crate::Effect::StartSession { pane, .. } => Some(*pane),
+                            _ => None,
+                        })
+                        .unwrap()
+                })
+        };
+        let open = |controller: &mut Controller, pane, agent| {
+            let generation = controller.model().pane(pane).unwrap().generation();
+            controller
+                .dispatch(Command::PaneAgentChanged {
+                    pane,
+                    generation,
+                    agent,
+                })
+                .unwrap();
+        };
+        let spawned = |controller: &Controller, parent| -> Vec<crate::PaneId> {
+            controller
+                .model()
+                .spawned(parent)
+                .map(|pane| pane.id())
+                .collect()
+        };
+        // A terminal without an agent, or a stale one, starts nothing.
+        assert!(spawn(&mut controller, parent, generation).is_err());
+        open(&mut controller, parent, Some(agent()));
+        assert!(spawn(&mut controller, parent, generation + 1).is_err());
+        assert_eq!(controller.model().pane_count(), 1);
+
+        let child = spawn(&mut controller, parent, generation).unwrap();
+        let workspace = controller.model().workspace(WorkspaceId::new(1)).unwrap();
+        assert_eq!(workspace.active(), parent);
+        assert_eq!(workspace.layout().panes(), [parent]);
+        assert!(workspace.is_background(child));
+        assert_eq!(spawned(&controller, parent), [child]);
+        // The link survives a restore only once the started agent can be resumed.
+        let restore = |controller: &Controller| {
+            Model::restore(
+                controller.model().specs(),
+                Some(WorkspaceId::new(1)),
+                true,
+                Default::default(),
+            )
+        };
+        assert!(restore(&controller).is_err());
+        open(&mut controller, child, Some(agent()));
+        let restored = restore(&controller).unwrap();
+        assert_eq!(restored.pane(child).unwrap().spawned_by(), Some(parent));
+        assert!(restored.workspaces()[0].is_background(child));
+
+        // Its agents may start agents; theirs may not.
+        let grandchild = spawn(&mut controller, child, 1).unwrap();
+        open(&mut controller, grandchild, Some(agent()));
+        assert_eq!(
+            spawn(&mut controller, grandchild, 1),
+            Err(crate::Error::SpawnDepth)
+        );
+        // The started agent leaving ends its link, and its own agents' links.
+        open(&mut controller, child, None);
+        assert!(spawned(&controller, parent).is_empty());
+        assert!(spawned(&controller, child).is_empty());
+
+        // One that never opened leaves when its launch reports failure.
+        let failed = spawn(&mut controller, parent, generation).unwrap();
+        open(&mut controller, failed, None);
+        assert!(spawned(&controller, parent).is_empty());
+
+        for _ in 0..AgentSession::MAX_SPAWNED {
+            spawn(&mut controller, parent, generation).unwrap();
+        }
+        assert_eq!(
+            spawn(&mut controller, parent, generation),
+            Err(crate::Error::SpawnLimit)
+        );
+        let all = spawned(&controller, parent);
+        controller.dispatch(Command::RestartPane(all[0])).unwrap();
+        controller.dispatch(Command::ClosePane(all[1])).unwrap();
+        assert_eq!(
+            spawned(&controller, parent).len(),
+            AgentSession::MAX_SPAWNED - 2
+        );
+        controller
+            .dispatch(Command::SessionFailed {
+                pane: all[2],
+                generation: 1,
+                error: "no shell".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            spawned(&controller, parent).len(),
+            AgentSession::MAX_SPAWNED - 3
+        );
+        // The agent that started them leaving ends every link at once.
+        open(&mut controller, parent, None);
+        assert!(spawned(&controller, parent).is_empty());
+        assert!(controller.is_dirty());
+        // A loop or a link to a terminal without an agent is not restored.
+        let mut specs = controller.model().specs();
+        specs[0].panes[0].spawned_by = Some(specs[0].panes[0].id);
+        specs[0].panes[0].agent = Some(agent());
+        assert!(Model::restore(specs, None, true, Default::default()).is_err());
+    }
+    #[test]
+    fn a_background_terminal_gets_a_tab_when_opened_or_left_alone() {
+        let mut controller = Controller::new(Model::default());
+        controller
+            .dispatch(Command::AddWorkspace {
+                cwd: std::env::temp_dir(),
+                name: "a".into(),
+                remote: None,
+                group: None,
+            })
+            .unwrap();
+        let workspace = WorkspaceId::new(1);
+        let parent = controller.model().active_pane().unwrap();
+        let open = |controller: &mut Controller, pane, agent| {
+            controller
+                .dispatch(Command::PaneAgentChanged {
+                    pane,
+                    generation: 1,
+                    agent,
+                })
+                .unwrap();
+        };
+        let spawn = |controller: &mut Controller, parent| {
+            let before = controller.model().pane_count();
+            controller
+                .dispatch(Command::SpawnAgent {
+                    parent,
+                    generation: 1,
+                    cwd: std::env::temp_dir(),
+                })
+                .unwrap();
+            let pane = controller.model().workspaces()[0].panes()[before].id();
+            open(controller, pane, Some(agent()));
+            pane
+        };
+        let tabs = |controller: &Controller| {
+            let layout = controller.model().workspace(workspace).unwrap().layout();
+            (layout.panes(), layout.shown())
+        };
+        open(&mut controller, parent, Some(agent()));
+        let first = spawn(&mut controller, parent);
+        let second = spawn(&mut controller, parent);
+        assert_eq!(tabs(&controller), (vec![parent], vec![parent]));
+
+        // Opening one gives it the tab after its starter and the focus.
+        controller
+            .dispatch(Command::FocusPane {
+                workspace,
+                pane: first,
+            })
+            .unwrap();
+        assert_eq!(tabs(&controller), (vec![parent, first], vec![first]));
+        assert_eq!(controller.model().active_pane(), Some(first));
+        assert_eq!(controller.model().spawned(parent).count(), 2);
+        // Nothing is placed against a terminal that has no place.
+        assert!(
+            controller
+                .dispatch(Command::MovePane {
+                    pane: first,
+                    destination: crate::Destination::Tab {
+                        pane: second,
+                        index: 0,
+                    },
+                })
+                .is_err()
+        );
+
+        // One that never had a tab closes with its agent: nobody saw its shell.
+        let unseen = spawn(&mut controller, parent);
+        let effects = controller
+            .dispatch(Command::PaneAgentChanged {
+                pane: unseen,
+                generation: 1,
+                agent: None,
+            })
+            .unwrap();
+        assert!(effects.contains(&crate::Effect::StopSession {
+            pane: unseen,
+            generation: 1
+        }));
+        assert!(controller.model().pane(unseen).is_none());
+        assert_eq!(tabs(&controller), (vec![parent, first], vec![first]));
+        // Its starter's agent leaving gives the other a tab, out of view.
+        open(&mut controller, parent, None);
+        assert_eq!(
+            tabs(&controller),
+            (vec![parent, first, second], vec![first])
+        );
+        assert_eq!(controller.model().active_pane(), Some(first));
+
+        // The last terminal in view closing leaves its place to the rest.
+        open(&mut controller, first, Some(agent()));
+        let third = spawn(&mut controller, first);
+        controller.dispatch(Command::ClosePane(parent)).unwrap();
+        controller.dispatch(Command::ClosePane(second)).unwrap();
+        assert_eq!(tabs(&controller), (vec![first], vec![first]));
+        controller.dispatch(Command::ClosePane(first)).unwrap();
+        assert_eq!(tabs(&controller), (vec![third], vec![third]));
+        assert_eq!(controller.model().active_pane(), Some(third));
+        assert!(
+            Model::restore(
+                controller.model().specs(),
+                Some(workspace),
+                true,
+                Default::default()
+            )
+            .is_ok()
+        );
+
+        // A terminal no agent answers for is never restored without a tab.
+        let mut specs = controller.model().specs();
+        specs[0].panes.push(crate::PaneSpec {
+            id: crate::PaneId::new(90),
+            cwd: std::env::temp_dir(),
+            remote_cwd: None,
+            agent: None,
+            pull_requests: Vec::new(),
+            spawned_by: None,
+        });
+        assert!(Model::restore(specs, None, true, Default::default()).is_err());
     }
     #[test]
     fn agent_metadata_is_targeted_durable_and_cleared_by_reverse_actions() {
