@@ -322,7 +322,11 @@ mod tests {
     fn hint_keys_copy_and_cancel_without_reaching_the_shell_and_release_is_consumed() {
         let root = tempfile::tempdir().unwrap();
         let (mut app, ctx, pane) = opened(root.path());
-        let chord = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        let chord = if cfg!(target_os = "macos") {
+            egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND | egui::Modifiers::SHIFT
+        } else {
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT
+        };
         frame(
             &mut app,
             &ctx,
