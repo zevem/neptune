@@ -11,6 +11,53 @@ their preparation records remain in Git history.
 
 ### What's New
 
+## [0.1.0-rc.5] - 2026-10-05
+
+### What's New
+
+- Correct release notes on the download page and in the desktop update sheet
+  to describe the public preview and its availability through the Beta channel.
+
+### Acceptance notes and known limitations
+
+- Full native acceptance on every platform remains pending; this is a release
+  candidate, not a production-stable release.
+- In-place updates are verified on Linux only by replacing and restarting a
+  test AppImage; the macOS bundle replacement has not yet run on a Mac.
+- Saved workspaces now use schema version 11, which records which terminal's
+  agent started another's, which of those terminals have no tab, the git
+  worktree made for a terminal's agent, attached files, and sessions of OpenCode,
+  Gemini CLI, pi and Oh My Pi. Older workspace files still load, but RC3 and
+  earlier cannot save over layouts written by this version. Back up workspace
+  state before testing if you need to return to an earlier candidate. Older
+  builds also reject workspaces containing more than 12 terminals.
+- Agents in worktrees are for local terminals with `git` on `PATH`. Neptune
+  does not fetch, so a pull request merged on a server shows as merged after
+  your checkout fetches or pulls it. On Windows the tab opens in the worktree
+  without starting a CLI.
+- Port discovery requires the host's process/socket tools. Windows SSH port
+  discovery and forwarding need noninteractive key or SSH-agent authentication;
+  remote discovery requires a Linux or Unix host. Port chips identify TCP
+  listeners, which may not be HTTP services.
+- The reported intermittent native Wayland freeze still needs a capture of the
+  blocking state. Earlier XWayland fixes do not establish native Wayland acceptance.
+- Windows installers remain unsigned and may show an unverified-publisher or
+  SmartScreen warning. Both macOS installers require signing and notarization;
+  all installers are covered by signed update metadata and build attestations.
+- Linux x64 packages require glibc 2.35 or newer and working host graphics
+  drivers. Browser-downloaded AppImages need execute permission before launch;
+  enable it in file Properties or run `chmod u+x` on the downloaded file.
+- Workspace restoration starts fresh shells and SSH connections; arbitrary
+  running commands and process memory are not restored. Coding-agent features
+  remain limited to the supported providers and platform paths.
+- SSH requires an installed OpenSSH client and a POSIX remote shell. Remote
+  directory tracking is integrated for zsh; other shells need OSC 7 integration.
+- Kitty graphics and comprehensive complex-script shaping remain unsupported.
+  Keypad identity and some keyboard-layout information depend on the window
+  toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
+- This release candidate is available through the Beta channel. Automatic
+  updates never downgrade; select Beta in Preferences → Updates to receive previews.
+
 ## [0.1.0-rc.4] - 2026-10-05
 
 ### What's New
@@ -89,8 +136,8 @@ their preparation records remain in Git history.
 
 ### Acceptance notes and known limitations
 
-- This candidate is a private draft for acceptance testing. Full native acceptance
-  on every platform remains pending; it is not a production-stable release.
+- Full native acceptance on every platform remains pending; this is a release
+  candidate, not a production-stable release.
 - In-place updates are verified on Linux only by replacing and restarting a
   test AppImage; the macOS bundle replacement has not yet run on a Mac.
 - Saved workspaces now use schema version 11, which records which terminal's
@@ -124,8 +171,8 @@ their preparation records remain in Git history.
 - Kitty graphics and comprehensive complex-script shaping remain unsupported.
   Keypad identity and some keyboard-layout information depend on the window
   toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
-- Private drafts are excluded from website downloads and automatic updates.
-  Automatic updates never downgrade; install this candidate manually for testing.
+- This release candidate is available through the Beta channel. Automatic
+  updates never downgrade; select Beta in Preferences → Updates to receive previews.
 
 ### Fixes
 
@@ -172,8 +219,8 @@ their preparation records remain in Git history.
 
 ### Acceptance notes and known limitations
 
-- This candidate is a private draft for acceptance testing. Full native acceptance
-  on every platform remains pending; it is not a production-stable release.
+- Full native acceptance on every platform remains pending; this is a release
+  candidate, not a production-stable release.
 - Saved workspaces now use schema version 8. Older workspace files still load,
   but RC1 and RC2 cannot save over layouts written by RC3. Back up workspace state
   before testing if you need to return to an earlier candidate.
@@ -194,8 +241,8 @@ their preparation records remain in Git history.
 - Kitty graphics and comprehensive complex-script shaping remain unsupported.
   Keypad identity and some keyboard-layout information depend on the window
   toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
-- Private drafts are excluded from website downloads and automatic updates.
-  Automatic updates never downgrade; install this candidate manually for testing.
+- This release candidate is available through the Beta channel. Automatic
+  updates never downgrade; select Beta in Preferences → Updates to receive previews.
 
 ## [0.1.0-rc.2] - 2026-10-03
 
@@ -217,8 +264,8 @@ their preparation records remain in Git history.
 
 ### Acceptance notes and known limitations
 
-- This candidate is a private draft for acceptance testing. Full native acceptance
-  on every platform remains pending; it is not a production-stable release.
+- Full native acceptance on every platform remains pending; this is a release
+  candidate, not a production-stable release.
 - Saved workspaces now use schema version 7. Older workspace files still load,
   but RC1 cannot save over layouts written by RC2. Back up workspace state before
   testing if you need to return to RC1.
@@ -238,8 +285,8 @@ their preparation records remain in Git history.
 - Kitty graphics and comprehensive complex-script shaping remain unsupported.
   Keypad identity and some keyboard-layout information depend on the window
   toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
-- Private drafts are excluded from website downloads and automatic updates.
-  Automatic updates never downgrade; install this candidate manually for testing.
+- This release candidate is available through the Beta channel. Automatic
+  updates never downgrade; select Beta in Preferences → Updates to receive previews.
 
 ## [0.1.0-rc.1] - 2026-10-02
 
