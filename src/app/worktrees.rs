@@ -544,8 +544,10 @@ mod tests {
             Action::Worktree(Event::ConfirmRemove { discard: false }),
         );
         assert_eq!(app.ui.overlay, OverlayState::None);
+        // Where the terminals close first, git is still at work after them.
         settle(&mut app, &ctx, "the removal", |app| {
             app.controller.model().pane(opened).is_none()
+                && (!tree.path.exists() || app.ui.error.is_some())
         });
         assert!(app.ui.error.is_none(), "{:?}", app.ui.error);
         assert!(!tree.path.exists());
