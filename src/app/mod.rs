@@ -417,6 +417,11 @@ impl App {
                     terminal_core::TerminalEvent::ClipboardStore {
                         selection: true, ..
                     } => {}
+                    // What an agent on an SSH host is doing. The bridge
+                    // holds the credential that tells it from other output.
+                    terminal_core::TerminalEvent::Report(line) => {
+                        self.sessions.agents().report(pane, generation, &line);
+                    }
                 }
             }
         }

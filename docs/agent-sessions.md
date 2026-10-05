@@ -1,7 +1,8 @@
 # Resuming coding agents
 
-On Unix desktops, local terminals started by Neptune add temporary `claude` and
-`codex` adapters to their command search path. Launch either CLI normally. When
+On Unix desktops, local terminals started by Neptune add temporary `claude`,
+`codex`, `opencode`, `gemini`, `pi` and `omp` adapters to their command search path.
+Launch any of them normally. When
 workspace restoration is enabled, closing and reopening Neptune opens each
 remembered agent in its original pane and asks it to resume its recorded session
 ID. Several panes can use the same directory without selecting each other's
@@ -20,7 +21,27 @@ this terminal, independently of a shared server's environment. Older versions
 still open normally, but automatic exact-session capture is unavailable.
 
 Claude Code receives invocation-scoped hooks through `--settings`: SessionStart
-and the ones that report its activity. Neither integration rewrites shell dotfiles or the providers'
+and the ones that report its activity.
+
+OpenCode, pi, Oh My Pi and Gemini CLI have no command hooks that can be added
+for one launch, so each is reached its own way:
+
+| CLI | What Neptune adds to the launch | Resumed with |
+| --- | --- | --- |
+| OpenCode | A plugin of Neptune's, named in `OPENCODE_CONFIG_CONTENT` beside the plugins of your own configuration | `opencode --session ses_…` |
+| pi | An extension of Neptune's, as `pi -e`, when the `pi` on the search path resolves into a `pi-coding-agent` package | `pi --session <id>` |
+| Oh My Pi | The same extension, as `omp -e` | `omp --resume <id>` |
+| Gemini CLI | Nothing: its hooks come only from its settings files, which are yours | Not resumed: the CLI is reopened in its directory |
+
+The plugin and the extension say when a turn begins and ends and when a person
+is asked something, and name the session once it has had a turn; a session
+without one has nothing to reopen. `opencode --pure`, `OPENCODE_PURE`, or an
+`OPENCODE_CONFIG_CONTENT` of your own that is not a JSON object with a list of
+plugins, leaves OpenCode without Neptune's plugin: it is listed, but stays
+"Idle". On an SSH host any `OPENCODE_CONFIG_CONTENT` of your own does. OpenCode and pi need no trust review for either. Gemini CLI is
+followed by its terminal title alone, as [below](#agent-activity).
+
+No integration rewrites shell dotfiles or the providers'
 global settings. Bash and Zsh startup adapters load the user's configuration
 before adding the command adapters; other Unix shells, and a shell configured
 with its own arguments, use the inherited PATH.
@@ -50,17 +71,21 @@ saved reference is kept.
 Neptune restores new processes, not unfinished tool execution or process memory.
 Only provider, session ID, directory, the addresses of
 [linked pull requests](#linked-pull-requests) and the terminal whose agent
-[started an agent](#agents-that-start-agents) are saved in workspace schema 9,
-which reads versions 1–8. Invalid references receive the same recovery-copy protection
+[started an agent](#agents-that-start-agents) are saved in workspace schema 10,
+which reads versions 1–9. Version 10 differs from 9 only in the CLIs a
+reference can name. Invalid references receive the same recovery-copy protection
 as other damaged workspace state. Prompts, transcripts, arbitrary commands,
 credentials and permission-bypass flags are not saved or replayed. Transcripts
 remain owned by the CLI. Launch-only options and temporary environment changes
 (such as a different `CODEX_HOME`) must be reapplied by the user's configuration.
 
-This integration is for local interactive CLIs. Batch/print commands, SSH
-sessions and Windows shells do not participate, and neither does a CLI that one
+This integration is for local interactive CLIs. Batch/print commands and
+Windows shells do not participate, and neither does a CLI that one
 agent runs from its own shell, as opposed to an agent it
-[starts through Neptune](#agents-that-start-agents). An application update
+[starts through Neptune](#agents-that-start-agents). An agent in an SSH
+workspace is [listed with what it is doing](#agents-on-ssh-hosts) and nothing
+more: it is not saved, reopened, given Neptune's tools or started by another
+agent. Only Claude Code and Codex can be started by another agent. An application update
 cannot discover agents launched before its adapters were installed. macOS uses
 the Unix adapter but still needs native verification; Linux/X11 is the verified
 host for this change.
@@ -250,6 +275,8 @@ send what they did before.
 The right panel's **Agents** tab lists each agent the adapters started and says
 whether it is working, idle or waiting for a person. The state comes from the
 agent's own hooks, corrected by its terminal title where no hook exists.
+OpenCode and pi report through Neptune's plugin and extension instead of
+hooks, and Gemini CLI through its title alone.
 
 Hooks. For the launch only, Neptune adds a hook for each of these events;
 your own hooks for the same events keep running:
@@ -258,6 +285,19 @@ your own hooks for the same events keep running:
 | --- | --- |
 | Claude Code | UserPromptSubmit, PreToolUse, PermissionRequest, PostToolUse, PostToolUseFailure, Notification, Elicitation, ElicitationResult, Stop, StopFailure, PostCompact |
 | Codex | UserPromptSubmit, PreToolUse, PermissionRequest, PostToolUse, Stop, Interrupt |
+
+| Agent | What its plugin reports |
+| --- | --- |
+| OpenCode | A session turning busy or idle; a permission or a question asked, and answered or dismissed |
+| pi | A turn starting and ending; a dialog an extension opens, and its closing |
+| Oh My Pi | A turn starting and ending, but for a loop it continues by itself; a tool approval asked and resolved; its `ask` tool starting and finishing |
+
+OpenCode's subagents run in sessions of their own: their turns do not change
+the state, their permission requests do. pi asks no permission before a tool
+and has no question tool, so it waits for a person only where an extension of
+yours opens a dialog (pi 1.0 and later). Oh My Pi's subagents run the
+extension in sessions without the terminal: their turns do not change the
+state, their approval requests do.
 
 A submitted prompt or a starting tool means working. A permission request, the
 question tools (`AskUserQuestion`, `request_user_input`), plan approval
@@ -292,6 +332,27 @@ shows the same `✳` as an idle one, so there the keys you type decide: Escape
 in that terminal ends the wait after two seconds without a hook, and Enter or
 a digit does so for a permission request or a plan when the title stays calm.
 
+Oh My Pi's title is `π`, a state and the session: `>` at rest, a spinner at
+work, `!` when it asks, which correct its reports as Claude Code's and
+Codex's titles do.
+
+Gemini CLI's title leads with `◇` when ready, `✦` while working (`⏲` while a
+shell command of its own is silent) and `✋` when it needs an action, and
+Neptune reads nothing else of it: working shows after two seconds, the other
+two at once. With `ui.dynamicWindowTitle` or the title turned off in its
+settings, it is listed and stays "Idle". OpenCode's and pi's titles name the
+session and carry no state, so nothing corrects their reports: an OpenCode
+whose plugin is off, or a pi turn that ends without its end being reported,
+keeps the state last reported.
+
+Alerts. Claude Code and Codex ask for attention themselves, through the
+terminal, and so does Oh My Pi by default. OpenCode, Gemini CLI and pi do not unless their own notification
+settings are turned on, so Neptune raises a
+[terminal alert](notifications.md#coding-agents) for them from the state
+above: when one comes to rest after working, or starts to wait for a person,
+in a terminal that is not the focused one of a focused window. A request that
+is dismissed, and an agent that exits, raise nothing.
+
 Limits. With Codex's hooks untrusted, or a Codex without `--no-daemon`, the
 title alone is used and states lag by about two seconds. An agent whose title
 is disabled or replaced (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, a Codex
@@ -299,8 +360,59 @@ is disabled or replaced (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, a Codex
 waiting after a refusal, until its next prompt. Answering one part of a
 several-part question does not change the state. Background shells and
 subagents that outlive a turn are not shown as work unless the title says so.
-The limits in the first section (SSH, Windows, batch commands, bypassed
+The limits in the first section (Windows, batch commands, bypassed
 adapters) apply here too: those agents are not listed.
+
+### Agents on SSH hosts
+
+An agent you start in a terminal of an SSH workspace is listed like a local
+one, under its workspace, with the host and directory in its tooltip. This
+needs nothing of Neptune's on the host, and no port or connection besides the
+terminal's own.
+
+When the terminal connects, its bootstrap writes the adapters to
+`${XDG_CACHE_HOME:-~/.cache}/neptune/agents` on the host, readable by you
+alone: a launcher, a hook script, the settings file with Claude Code's hooks,
+the plugin and the extension, and one `claude`, `codex`, `opencode`, `gemini`,
+`pi` and `omp` command that runs the launcher. They are a few kilobytes of POSIX
+shell and JavaScript, written once and replaced when a newer Neptune connects.
+Zsh and Bash on the host put that directory first on the search path after
+your own startup files have run; Bash is started with a startup file that
+reads `/etc/profile` and the first of `~/.bash_profile`, `~/.bash_login` and
+`~/.profile`, as a login shell does, though it is not one (`shopt login_shell`
+is off and `~/.bash_logout` is not read). Other shells get the directory on
+the path they inherit, which their login files may replace. A host where the
+directory cannot be written gets its shell without adapters.
+
+The launcher starts the real CLI with the same hooks, plugin or extension as
+a local launch, and each reports by writing one line to the terminal:
+`OSC 7717 ; neptune ; credential ; run ; …`. It says that a CLI opened or
+closed, or names a hook's event with at most its tool name, notification
+type, permission mode, source and trigger, and whether a subagent made it.
+The hook script takes those words from the first 64 KB of the hook's input
+and sends nothing else of it; the same rules as for a local hook then decide
+the state. Titles travel the connection as they are, so they correct the
+state as they do locally.
+
+The credential is random per connection and is given to the host as an
+argument of the bootstrap, so the host's process list shows it to the host's
+other users while the shell starts. It keeps output from being taken for a
+report: a file you print or a log you replay does not carry this connection's
+credential. Someone who can read it and also put text on your terminal could
+make a row show a wrong state; a report can do nothing else. Only an SSH
+terminal accepts reports, and only for itself.
+
+Limits. Tracking starts with terminals opened after this version: a
+connection made before it has no adapters. Inside `tmux` or `screen` on the
+host, reports and titles stop at the multiplexer unless it passes them
+through, and a session started under an earlier connection has that
+connection's credential, so its agents are not listed. Codex asks once per
+host to trust the hooks, whose commands differ from the local ones. A report
+is written to the terminal between the CLI's own writes; a CLI that was in
+the middle of an escape sequence would show a few stray characters, which was
+not seen with these CLIs. An SSH session you start yourself by typing `ssh`
+in a local terminal is not an SSH workspace and gets no adapters. The host's
+CLIs are found on its search path only, as locally.
 
 ## Implementation and source review
 
@@ -315,6 +427,14 @@ in its pane, and reaches the model as a generation-tagged
 `PanePullRequestLinked` command. Pending updates coalesce per pane; hooks wake the application on change,
 so idle integrations do not poll or repaint. Socket reads have byte and total-time
 limits. Startup-file creation and cleanup stay on workers.
+
+An SSH terminal has a credential and no channel: terminal-core passes a line
+of `OSC 7717 ; neptune` on as an event without reading it, and the bridge
+takes it only from the SSH terminal whose credential it carries, for the run
+it opened. The listener never answers for such a terminal. The host's
+adapters are one script, made from the same hook and batch-argument tables as
+the local ones and evaluated by the bootstrap. An agent on a host is held
+beside the model with its activity, so nothing about it is saved.
 
 Activity uses the same channel and credentials. The hook process reduces an
 event to one of a closed set of signals; the bridge accepts it only from the
@@ -373,7 +493,13 @@ cargo test -p neptune-terminal --test agent_restore --locked
 `python3 scripts/verify-agent-activity.py` does the same for the Agents tab:
 its fixtures read the hooks injected for them, fire them with realistic input
 (including a 6 MB tool result) and set terminal titles, and the rows are read
-back through inspection. `NEPTUNE_EXPLORER_STATE=agents`, `agents-empty` and
+back through inspection. Its `opencode` and `pi` fixtures need `node`: they
+load the plugin and the extension named for the launch and hand them events.
+A second instance opens an SSH workspace through a stand-in `ssh` that runs
+the host's command on this machine with another home, so the bootstrap, the
+installed adapters and the reports through the terminal are the real ones and
+the network and a second machine are not. `app::ssh::tests` runs the host's
+side on a PTY under Bash and Zsh without the application. `NEPTUNE_EXPLORER_STATE=agents`, `agents-empty` and
 `agents-closed` of `app::tests::capture_explorer_native` capture the tab.
 
 `python3 scripts/verify-agent-delegation.py` covers agents that start agents.
@@ -469,3 +595,20 @@ wait, a 90-second wait without a tool timeout, and Claude Code asking before
 CLIs: restore, a started agent's permission request, Codex as the starting
 agent in this version, Codex asking before a tool, and Codex with Neptune's
 hooks untrusted; fixtures and unit tests cover the first two. macOS, Windows and native Wayland are unverified.
+
+More agents and SSH workspaces were checked on 2026-10-05 in the Linux
+development build with `inspection` (Wayland session, XWayland window), with
+captures reviewed at 1100×700 and 640×440. The deterministic native
+regression passed: OpenCode through its plugin (turns, a subagent's session,
+a permission, a question, the session ID in the saved state), pi through its
+extension, Gemini CLI through its title, and Claude Code, Codex, pi and
+Gemini CLI in an SSH workspace whose host was this machine behind a stand-in
+client. With the installed **OpenCode 1.18.34** in a throwaway home, the
+plugin loaded from `OPENCODE_CONFIG_CONTENT` and ran its hook command from
+inside OpenCode for events handed to it; **pi 1.0.2**, installed to a scratch
+directory, listed the extension as loaded. Neither was signed in, so no turn
+of either ran, and Gemini CLI was not run with Neptune at all: its titles are
+taken from the source of 0.62.0, where the working and action-required ones
+were read and the ready one was seen. Not exercised: a real SSH connection to
+another machine, any of the three CLIs through a real turn, `tmux` on a host,
+other login shells than Bash and Zsh, macOS and Windows.

@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 const MAX_SEQUENCE: usize = 8192;
 const MAX_TEXT: usize = 4096;
 const MAX_PENDING: usize = 16;
+const MAX_REPORT: usize = 512;
 
 pub(super) enum Command {
     Event(TerminalEvent),
@@ -109,7 +110,15 @@ impl Scanner {
     }
 
     fn decode(&mut self, text: &str, emit: &mut impl FnMut(Command)) {
-        if let Some(title) = text.strip_prefix("9;") {
+        if let Some(line) = text.strip_prefix("7717;neptune;") {
+            // Passed on as it came: the application holds what it expects.
+            if !line.is_empty()
+                && line.len() <= MAX_REPORT
+                && line.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                emit(Command::Event(TerminalEvent::Report(line.to_owned())));
+            }
+        } else if let Some(title) = text.strip_prefix("9;") {
             // ConEmu uses numeric OSC 9 subcommands (notably 9;4 progress).
             if title
                 .split_once(';')
@@ -333,6 +342,25 @@ mod tests {
         assert_eq!(decode_base64("SGVsbG8"), Some("Hello".into()));
     }
 
+    #[test]
+    fn application_reports_are_short_printable_lines() {
+        let bytes = b"\x1b]7717;neptune;abc;run;hook;Stop\x07\x1b]7717;neptune;second\x1b\\";
+        for chunk in 1..=bytes.len() {
+            assert_eq!(
+                events(bytes, chunk),
+                [
+                    TerminalEvent::Report("abc;run;hook;Stop".into()),
+                    TerminalEvent::Report("second".into())
+                ]
+            );
+        }
+        let mut long = b"\x1b]7717;neptune;".to_vec();
+        long.extend(vec![b'x'; MAX_REPORT + 1]);
+        long.extend(b"\x07\x1b]7717;neptune;with space\x07\x1b]7717;neptune;\x07");
+        // Another vendor's line, and one inside another control string.
+        long.extend(b"\x1b]7717;other;line\x07\x1bP\x1b]7717;neptune;fake\x07\x1b\\");
+        assert!(events(&long, 7).is_empty());
+    }
     #[test]
     fn oversized_sequences_are_discarded_and_parser_recovers() {
         let mut bytes = b"\x1b]9;".to_vec();

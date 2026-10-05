@@ -14,8 +14,8 @@ shell sessions, GPU rendering, and a quiet workspace interface, with no webview.
 - Scrollback, terminal search, selection/clipboard, and a command palette.
 - 715 built-in themes and custom themes shared by the window and terminal.
 - Terminal notifications with optional native desktop banners.
-- Saved workspace layouts and directories, plus optional Claude Code/Codex
-  session resumption on local Unix terminals, where an agent's pull requests
+- Saved workspace layouts and directories, plus optional Claude Code, Codex,
+  OpenCode, pi and Oh My Pi session resumption on local Unix terminals, where an agent's pull requests
   appear on its tab and a panel lists which agents are working, idle or
   waiting for you. Either agent can start the other out of view and
   work with it.
@@ -57,7 +57,7 @@ Build job limits, optional compiler caching, and scoped verification are in the
 | [User guide](docs/usage.md) | Workspaces, SSH, shortcuts, preferences, and restoration |
 | [Configuration example](config.example.toml) | Supported settings and defaults |
 | [Notifications](docs/notifications.md) | Terminal alerts and coding-agent setup |
-| [Agent sessions](docs/agent-sessions.md) | Claude Code and Codex session resumption |
+| [Agent sessions](docs/agent-sessions.md) | Coding-agent session resumption and activity, locally and on SSH hosts |
 | [Development](docs/development.md) | Build tooling, native inspection, CI, and artifacts |
 | [Architecture](docs/architecture.md) · [Interface design](docs/design.md) | Ownership, terminal engine, renderer, and UI direction |
 | [Verification](docs/verification.md) · [Performance](docs/performance.md) | Native evidence, release gates, and reproducible measurements |

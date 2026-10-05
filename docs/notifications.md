@@ -57,6 +57,18 @@ No agent-name detection is required. Any tool that emits these OSCs can use the
 same path. Neptune does not edit agent configuration or install hooks for you.
 The examples below are integration recipes, not evidence of live agent runs.
 
+OpenCode, Gemini CLI and pi are the exception: out of the box none of them
+asks for attention (OpenCode's `attention` and Gemini CLI's
+`enableNotifications` settings are off, and pi has neither), so for an agent
+[Neptune tracks](agent-sessions.md#agent-activity) it raises the alert itself.
+When such an agent finishes a turn it was working on, or starts waiting for a
+permission, an answer or other input, its terminal gets an alert named after
+the CLI, reading "Finished" or what it waits for, with a desktop banner when
+those are on. Nothing is raised for the terminal you are looking at in a
+focused window. If you turn the CLI's own notifications on, or use one of the
+recipes below, you get both alerts. Claude Code, Codex and Oh My Pi are left
+to their own notifications.
+
 ### Codex
 
 Codex's interactive CLI enables notifications by default, but emits them only

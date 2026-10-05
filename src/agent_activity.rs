@@ -1,9 +1,10 @@
 //! What each running CLI agent is doing. Ephemeral and bounded by the panes
 //! that run one: nothing here is saved, logged or sent to diagnostics.
 //!
-//! The agent's hooks say what it is doing. Neither CLI has a hook for every
-//! way a turn or a question can end, so the terminal title, which both keep
-//! current, corrects a report that it has contradicted for a while.
+//! The agent's hooks say what it is doing. No CLI has a hook for every way a
+//! turn or a question can end, so the terminal title, where the CLI keeps its
+//! state there, corrects a report that it has contradicted for a while.
+//! Gemini CLI has no hooks Neptune can add for one launch: its title is all.
 use neptune_model::{AgentKind, Lifecycle, Model, PaneId};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,6 +17,8 @@ use std::{
 const HOLD: Duration = Duration::from_secs(2);
 /// A request the agent's own reviewer answers at once is not shown.
 const DEBOUNCE: Duration = Duration::from_millis(400);
+/// Changes kept for whoever takes them.
+const MAX_TURNS: usize = 64;
 
 /// What an agent is waiting on a person for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,12 +89,50 @@ fn classify(kind: AgentKind, title: &str) -> Option<Title> {
         AgentKind::Codex if title.contains("Action Required") => Some(Title::Blocked),
         AgentKind::Codex if spinner => Some(Title::Busy),
         AgentKind::Codex => Some(Title::Calm),
+        // A mark, two spaces, the state and the folder.
+        AgentKind::Gemini => match first {
+            '\u{25c7}' => Some(Title::Calm),
+            '\u{2726}' | '\u{23f2}' => Some(Title::Busy),
+            '\u{270b}' => Some(Title::Blocked),
+            _ => None,
+        },
+        // `π`, the state and the session: `>` at rest, a spinner at work,
+        // `!` when it asks. With the state turned off it is `π: session`.
+        AgentKind::Omp => match title.strip_prefix("\u{3c0} ")?.chars().next()? {
+            '>' => Some(Title::Calm),
+            '!' => Some(Title::Blocked),
+            '\u{2800}'..='\u{28ff}' => Some(Title::Busy),
+            _ => None,
+        },
+        // Their titles name the session and say nothing of its state.
+        AgentKind::Opencode | AgentKind::Pi => None,
     }
+}
+
+fn named(name: &str) -> Option<&str> {
+    Some(name.trim()).filter(|name| !name.is_empty())
 }
 
 /// What the agent calls its conversation: its title without the activity
 /// mark. `None` for a title that is not the agent's or names nothing.
 pub fn conversation(kind: AgentKind, title: &str) -> Option<&str> {
+    match kind {
+        // `OC | title`, or the application's name before a session has one.
+        AgentKind::Opencode => return named(title.strip_prefix("OC | ")?),
+        // `π - name - folder`, without the name until the session has one.
+        AgentKind::Pi => {
+            let rest = title.strip_prefix("\u{3c0} - ")?;
+            return named(rest.rsplit_once(" - ")?.0);
+        }
+        AgentKind::Omp => {
+            classify(kind, title)?;
+            let rest = title.strip_prefix("\u{3c0} ")?;
+            return named(rest.strip_prefix(|_: char| true)?);
+        }
+        // The folder, which the row shows already.
+        AgentKind::Gemini => return None,
+        AgentKind::Claude | AgentKind::Codex => {}
+    }
     let class = classify(kind, title)?;
     let name = match (kind, class) {
         (_, Title::Blocked) => return None,
@@ -105,6 +146,9 @@ pub fn conversation(kind: AgentKind, title: &str) -> Option<&str> {
 #[derive(Clone, Debug)]
 struct Entry {
     generation: u64,
+    /// The CLI of an agent on an SSH host. The model holds no reference for
+    /// one: it is not saved and not reopened.
+    host: Option<AgentKind>,
     /// As the agent's hooks last reported it.
     reported: Activity,
     reported_at: Instant,
@@ -174,6 +218,28 @@ impl Entry {
 #[derive(Default)]
 pub struct AgentActivities {
     entries: BTreeMap<PaneId, Entry>,
+    /// What was shown turning into something else, until it is taken.
+    turns: Vec<Turn>,
+}
+
+/// An agent's shown activity changing while it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Turn {
+    pub pane: PaneId,
+    pub generation: u64,
+    pub from: Activity,
+    pub to: Activity,
+}
+impl Turn {
+    /// What a person away from the terminal would want to hear of: the agent
+    /// came to rest after working, or began to wait for them.
+    pub fn news(&self) -> bool {
+        match self.to {
+            Activity::Idle => self.from == Activity::Working,
+            Activity::NeedsInput(_) => true,
+            Activity::Working => false,
+        }
+    }
 }
 
 impl AgentActivities {
@@ -201,6 +267,7 @@ impl AgentActivities {
                     pane,
                     Entry {
                         generation,
+                        host: None,
                         reported: activity,
                         reported_at: now,
                         previous: activity,
@@ -215,6 +282,18 @@ impl AgentActivities {
                 );
             }
         }
+    }
+
+    /// The agent just reported runs on the SSH host of `pane`.
+    pub fn on_host(&mut self, pane: PaneId, kind: AgentKind) {
+        if let Some(entry) = self.entries.get_mut(&pane) {
+            entry.host = Some(kind);
+        }
+    }
+
+    /// The CLI of the agent on the SSH host of `pane`.
+    pub fn host(&self, pane: PaneId) -> Option<AgentKind> {
+        self.entries.get(&pane).and_then(|entry| entry.host)
     }
 
     /// The title of a terminal, as often as it is read.
@@ -278,9 +357,19 @@ impl AgentActivities {
     pub fn settle(&mut self, now: Instant) -> (bool, Option<Duration>) {
         let mut changed = false;
         let mut next: Option<Instant> = None;
-        for entry in self.entries.values_mut() {
+        for (pane, entry) in &mut self.entries {
             let (shown, deadline) = entry.resolve(now);
             if shown != entry.shown {
+                // Bounded by the panes: one that is never taken gives way.
+                if self.turns.len() == MAX_TURNS {
+                    self.turns.remove(0);
+                }
+                self.turns.push(Turn {
+                    pane: *pane,
+                    generation: entry.generation,
+                    from: entry.shown,
+                    to: shown,
+                });
                 entry.shown = shown;
                 entry.since = now;
                 changed = true;
@@ -291,6 +380,11 @@ impl AgentActivities {
             };
         }
         (changed, next.map(|at| at.saturating_duration_since(now)))
+    }
+
+    /// The changes `settle` made since they were last taken, oldest first.
+    pub fn take_turns(&mut self) -> Vec<Turn> {
+        std::mem::take(&mut self.turns)
     }
 
     /// Whether the terminal's title is the agent's own by now.
@@ -379,6 +473,160 @@ mod tests {
         assert_eq!(conversation(CODEX, "\u{280b} neptune"), Some("neptune"));
         assert_eq!(conversation(CODEX, "neptune"), Some("neptune"));
         assert_eq!(conversation(CODEX, "[ ! ] Action Required"), None);
+    }
+
+    #[test]
+    fn gemini_is_followed_by_its_title_alone_and_others_name_their_session() {
+        const GEMINI: AgentKind = AgentKind::Gemini;
+        // Gemini CLI pads its title to eighty columns.
+        let title = |text: &str| format!("{text:<80}");
+        assert_eq!(
+            classify(GEMINI, &title("\u{25c7}  Ready (api)")),
+            Some(Title::Calm)
+        );
+        assert_eq!(
+            classify(GEMINI, &title("\u{2726}  Working\u{2026} (api)")),
+            Some(Title::Busy)
+        );
+        assert_eq!(
+            classify(GEMINI, &title("\u{23f2}  Working\u{2026} (api)")),
+            Some(Title::Busy)
+        );
+        assert_eq!(
+            classify(GEMINI, &title("\u{270b}  Action Required (api)")),
+            Some(Title::Blocked)
+        );
+        assert_eq!(classify(GEMINI, &title("Gemini CLI (api)")), None);
+        assert_eq!(conversation(GEMINI, &title("\u{25c7}  Ready (api)")), None);
+        // No hook reports for it: it opens at rest and its title leads.
+        let start = Instant::now();
+        let mut agents = opened(GEMINI, Activity::Idle, start);
+        agents.title(pane(), GEMINI, &title("\u{25c7}  Ready (api)"), start);
+        assert_eq!(shown(&mut agents, start + secs(5.0)), Activity::Idle);
+        agents.title(
+            pane(),
+            GEMINI,
+            &title("\u{2726}  Working\u{2026} (api)"),
+            start + secs(5.0),
+        );
+        assert_eq!(shown(&mut agents, start + secs(6.0)), Activity::Idle);
+        assert_eq!(shown(&mut agents, start + secs(7.0)), Activity::Working);
+        agents.title(
+            pane(),
+            GEMINI,
+            &title("\u{270b}  Action Required (api)"),
+            start + secs(9.0),
+        );
+        assert_eq!(
+            shown(&mut agents, start + secs(9.0)),
+            Activity::NeedsInput(Attention::Input)
+        );
+        agents.title(
+            pane(),
+            GEMINI,
+            &title("\u{2726}  Working\u{2026} (api)"),
+            start + secs(12.0),
+        );
+        assert_eq!(shown(&mut agents, start + secs(12.0)), Activity::Working);
+        agents.title(
+            pane(),
+            GEMINI,
+            &title("\u{25c7}  Ready (api)"),
+            start + secs(20.0),
+        );
+        assert_eq!(shown(&mut agents, start + secs(20.0)), Activity::Idle);
+
+        let omp = AgentKind::Omp;
+        assert_eq!(classify(omp, "\u{3c0} > Fix the build"), Some(Title::Calm));
+        assert_eq!(
+            classify(omp, "\u{3c0} \u{280b} Fix the build"),
+            Some(Title::Busy)
+        );
+        assert_eq!(
+            classify(omp, "\u{3c0} ! Fix the build"),
+            Some(Title::Blocked)
+        );
+        assert_eq!(classify(omp, "\u{3c0} >"), Some(Title::Calm));
+        assert_eq!(classify(omp, "\u{3c0}: Fix the build"), None);
+        assert_eq!(classify(omp, "\u{3c0} - api"), None);
+        assert_eq!(
+            conversation(omp, "\u{3c0} \u{280b} Fix the build"),
+            Some("Fix the build")
+        );
+        assert_eq!(conversation(omp, "\u{3c0} >"), None);
+        let opencode = AgentKind::Opencode;
+        assert_eq!(classify(opencode, "OC | Fix the build"), None);
+        assert_eq!(
+            conversation(opencode, "OC | Fix the build"),
+            Some("Fix the build")
+        );
+        assert_eq!(conversation(opencode, "OpenCode"), None);
+        let pi = AgentKind::Pi;
+        assert_eq!(
+            conversation(pi, "\u{3c0} - Fix - the build - api"),
+            Some("Fix - the build")
+        );
+        assert_eq!(conversation(pi, "\u{3c0} - api"), None);
+        assert_eq!(conversation(pi, "zsh"), None);
+        // A title without a state leaves the hooks' report alone.
+        let mut agents = opened(opencode, Activity::Working, start);
+        agents.title(pane(), opencode, "OC | Fix the build", start + secs(1.0));
+        assert!(agents.titled(pane()));
+        assert_eq!(shown(&mut agents, start + secs(60.0)), Activity::Working);
+    }
+
+    #[test]
+    fn a_turn_ending_and_a_wait_beginning_are_news_once() {
+        let mut agents = AgentActivities::default();
+        let start = Instant::now();
+        agents.report(pane(), 1, Some(Activity::Idle), start);
+        agents.settle(start);
+        // Opening is not a change.
+        assert!(agents.take_turns().is_empty());
+        agents.report(pane(), 1, Some(Activity::Working), start + secs(1.0));
+        agents.settle(start + secs(1.0));
+        agents.report(pane(), 1, Some(ASK), start + secs(2.0));
+        agents.settle(start + secs(2.1));
+        agents.settle(start + secs(3.0));
+        agents.report(pane(), 1, Some(Activity::Working), start + secs(4.0));
+        agents.settle(start + secs(4.0));
+        agents.report(pane(), 1, Some(Activity::Idle), start + secs(5.0));
+        agents.settle(start + secs(5.0));
+        agents.settle(start + secs(6.0));
+        let turns = agents.take_turns();
+        let news: Vec<_> = turns.iter().filter(|turn| turn.news()).collect();
+        assert_eq!(turns.len(), 4);
+        assert_eq!(
+            news.iter().map(|turn| turn.to).collect::<Vec<_>>(),
+            [ASK, Activity::Idle]
+        );
+        assert!(
+            news.iter()
+                .all(|turn| turn.pane == pane() && turn.generation == 1)
+        );
+        assert!(agents.take_turns().is_empty());
+        // A request left without an answer comes to rest, which is not an end.
+        let turn = |from, to| Turn {
+            pane: pane(),
+            generation: 1,
+            from,
+            to,
+        };
+        assert!(!turn(ASK, Activity::Idle).news());
+        assert!(!turn(Activity::Idle, Activity::Working).news());
+    }
+
+    #[test]
+    fn an_agent_on_an_ssh_host_is_known_by_its_report() {
+        let mut agents = AgentActivities::default();
+        let now = Instant::now();
+        agents.on_host(pane(), AgentKind::Codex);
+        assert_eq!(agents.host(pane()), None);
+        agents.report(pane(), 1, Some(Activity::Idle), now);
+        agents.on_host(pane(), AgentKind::Codex);
+        assert_eq!(agents.host(pane()), Some(AgentKind::Codex));
+        agents.report(pane(), 1, None, now);
+        assert_eq!(agents.host(pane()), None);
     }
 
     #[test]

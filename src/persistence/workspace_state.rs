@@ -9,10 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Version 9 adds the pane whose agent started a pane's agent. Version 8 added
+/// Version 10 adds OpenCode, Gemini CLI, pi and Oh My Pi to the agents a pane's resume
+/// reference can name, which an earlier build would take for damage. Version 9
+/// added the pane whose agent started a pane's agent. Version 8 added
 /// workspace group default directories and the pull requests an agent linked
-/// to its pane. Versions 1–8 remain readable.
-pub const SCHEMA_VERSION: u32 = 9;
+/// to its pane. Versions 1–9 remain readable.
+pub const SCHEMA_VERSION: u32 = 10;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -1183,7 +1185,7 @@ mod tests {
     fn earlier_schema_versions_are_read_without_loss_and_saved_as_the_current_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspaces.json");
-        for version in [1, 2, 3, 4, 5, 6, 7, 8] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
             let mut saved = serde_json::to_value(sample(directory.path())).unwrap();
             saved["version"] = version.into();
             saved.as_object_mut().unwrap().remove("groups");

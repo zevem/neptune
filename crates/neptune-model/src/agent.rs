@@ -7,12 +7,58 @@ use std::path::PathBuf;
 pub enum AgentKind {
     Claude,
     Codex,
+    Opencode,
+    Gemini,
+    Pi,
+    Omp,
 }
 impl AgentKind {
+    pub const ALL: [Self; 6] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Opencode,
+        Self::Gemini,
+        Self::Pi,
+        Self::Omp,
+    ];
+
     pub fn executable(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Opencode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+        }
+    }
+
+    /// Whether `id` is a session ID as this CLI writes one. Never an option,
+    /// a name or a command.
+    fn names_session(self, id: &str) -> bool {
+        match self {
+            // `ses_`, twelve hex digits of time, fourteen random letters and digits.
+            Self::Opencode => id.strip_prefix("ses_").is_some_and(|rest| {
+                rest.len() == 26
+                    && rest.bytes().enumerate().all(|(i, b)| {
+                        if i < 12 {
+                            b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+                        } else {
+                            b.is_ascii_alphanumeric()
+                        }
+                    })
+            }),
+            // The others use UUIDs.
+            _ => {
+                id.len() == 36
+                    && id.bytes().enumerate().all(|(i, b)| {
+                        if matches!(i, 8 | 13 | 18 | 23) {
+                            b == b'-'
+                        } else {
+                            b.is_ascii_hexdigit()
+                        }
+                    })
+            }
         }
     }
 }
@@ -35,17 +81,10 @@ impl AgentSession {
     pub fn is_valid(&self) -> bool {
         self.cwd.is_absolute()
             && self.cwd.as_os_str().len() <= 32768
-            && self.session_id.as_ref().is_none_or(|id| {
-                // Both providers use UUIDs. Do not accept options, names or commands.
-                id.len() == 36
-                    && id.bytes().enumerate().all(|(i, b)| {
-                        if matches!(i, 8 | 13 | 18 | 23) {
-                            b == b'-'
-                        } else {
-                            b.is_ascii_hexdigit()
-                        }
-                    })
-            })
+            && self
+                .session_id
+                .as_ref()
+                .is_none_or(|id| self.kind.names_session(id))
     }
 }
 
@@ -141,6 +180,27 @@ mod tests {
             "019a1234-5678-7000-8000-123456789abz",
         ] {
             value.session_id = Some(id.into());
+            assert!(!value.is_valid());
+        }
+        // Each CLI's own form of ID, and no other's.
+        value.kind = AgentKind::Opencode;
+        value.session_id = Some("ses_ef579273dffe5vpZTGF29Kt3yQ".into());
+        assert!(value.is_valid());
+        for id in [
+            "019a1234-5678-7000-8000-123456789abc",
+            "ses_ef579273dffe5vpZTGF29Kt3y",
+            "ses_EF579273dffe5vpZTGF29Kt3yQ",
+            "ses_ef579273dffe5vpZTGF29Kt3-Q",
+            "-s_ef579273dffe5vpZTGF29Kt3yQx",
+        ] {
+            value.session_id = Some(id.into());
+            assert!(!value.is_valid(), "{id}");
+        }
+        for kind in [AgentKind::Gemini, AgentKind::Pi, AgentKind::Omp] {
+            value.kind = kind;
+            value.session_id = Some("01a10a88-4d43-71a3-8741-4822706a387c".into());
+            assert!(value.is_valid());
+            value.session_id = Some("ses_ef579273dffe5vpZTGF29Kt3yQ".into());
             assert!(!value.is_valid());
         }
         value.session_id = None;
