@@ -111,6 +111,8 @@ pub struct App {
     delegation: delegation::Delegation,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
     updates: crate::runtime::updates::Updates,
+    /// The live state of the pull requests linked in the workspace in view.
+    pull_requests: crate::runtime::pull_requests::Watcher,
     attachments: attachments::Attachments,
     image_preview: image_preview::ImagePreview,
     explorer: explorer::Explorer,
@@ -228,6 +230,7 @@ impl App {
             delegation: Default::default(),
             desktop_notifier: Default::default(),
             updates: Default::default(),
+            pull_requests: Default::default(),
             attachments: attachments::Attachments::new(data.join("pasted-images")),
             image_preview: Default::default(),
             explorer: Default::default(),
@@ -345,6 +348,17 @@ impl App {
                 },
             );
         }
+        // The workspace in view is the one whose pull requests have chips.
+        let model = self.controller.model();
+        self.pull_requests.watch(
+            model
+                .active_workspace()
+                .and_then(|id| model.workspace(id))
+                .into_iter()
+                .flat_map(|workspace| workspace.panes())
+                .flat_map(|pane| pane.pull_requests().iter().cloned()),
+            ctx,
+        );
         let metadata: Vec<_> = self
             .sessions
             .iter()
@@ -559,7 +573,14 @@ impl App {
                     }
                     PanePresentation {
                         agent: pane.agent().map(|agent| agent.kind),
-                        pull_requests: pane.pull_requests().to_vec(),
+                        pull_requests: pane
+                            .pull_requests()
+                            .iter()
+                            .map(|link| ui::helpers::LinkedPullRequest {
+                                link: link.clone(),
+                                lookup: self.pull_requests.lookup(link),
+                            })
+                            .collect(),
                         spawned: self.spawned_agents(pane.id()),
                         unread: self.notifications.unread(Some(pane.id())),
                         metadata: session.metadata(),

@@ -73,6 +73,8 @@ pub struct Palette {
     /// Unread terminal alerts (the pane ring, the bell dot and unread counts)
     /// and agents waiting for a person.
     pub attention: Color32,
+    /// A merged pull request.
+    pub merged: Color32,
     pub scrim: Color32,
     pub shadow: Color32,
     pub dark: bool,
@@ -247,6 +249,7 @@ impl Palette {
         if p.attention == p.accent {
             p.attention = readable(amber, &surfaces, 3.0);
         }
+        p.merged = readable(p.ansi[5], &surfaces, 3.0);
         p
     }
 
@@ -293,6 +296,7 @@ impl Palette {
             yellow: color(0xffd60a),
             red: color(0xff5a52),
             attention,
+            merged: color(0xc792f6),
             scrim: black(120),
             shadow: black(110),
             dark,
@@ -329,6 +333,7 @@ impl Palette {
                 p.green = color(0x28a745);
                 p.yellow = color(0xe0a800);
                 p.red = color(0xe5372d);
+                p.merged = color(0x9340c8);
                 p.scrim = black(70);
                 p.shadow = black(46);
                 p.ansi = [
@@ -513,6 +518,11 @@ mod tests {
                 assert!(
                     contrast(p.attention, surface) >= 3.0,
                     "{} attention contrast",
+                    theme.name
+                );
+                assert!(
+                    contrast(p.merged, surface) >= 3.0,
+                    "{} merged contrast",
                     theme.name
                 );
             }

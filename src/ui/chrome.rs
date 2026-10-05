@@ -29,7 +29,7 @@ pub struct ChromeView<'a> {
     pub subtitle: &'a str,
     /// The focused terminal's linked pull requests, while it has no tab to
     /// carry them.
-    pub pull_requests: &'a [neptune_model::PullRequest],
+    pub pull_requests: &'a [helpers::LinkedPullRequest],
     /// The agents the focused terminal's agent started, likewise.
     pub spawned: &'a [super::agents::Spawned],
     pub zoomed: bool,
@@ -515,7 +515,7 @@ pub fn toolbar(
         ui.id().with("toolbar-pull-request"),
         view.pull_requests,
         (left + 96.0, right - 2.0, middle),
-        p.accent,
+        p,
     );
     let spawned = helpers::SpawnedChip::layout(
         ui,

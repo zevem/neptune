@@ -69,10 +69,17 @@ and stopped terminals; a destructive control's label is white unless an
 imported red is too light to carry it. Amber (`attention`) is reserved for what
 waits for the person: unread terminal alerts (the pane ring, the bell's dot and
 unread counts) and agents waiting for input (their row's mark and state, their
-count on the Agents tab and the dot on the panel toggle). In the three
+count on the Agents tab, the dot on the panel toggle, and the count of
+unresolved review comments beside a linked pull request). In the three
 original themes it turns yellow when the accent itself is orange, so an alert
 never reads as focus; an imported or custom palette supplies its ANSI yellow,
 held to 3:1 against the main surfaces.
+
+A linked pull request's number says where it stands: the accent while open,
+`secondary` as a draft, `muted` once closed and purple (`merged`, the palette's
+ANSI magenta held to 3:1) once merged, which also changes its icon. Its checks
+are a green check, a red cross or a yellow ring, so no state rests on colour
+alone, and the tooltip says each in words.
 
 Notification rows mark their workspace with a tile in a stable identity colour
 taken from the workspace id. The identity colour is decoration only; state is

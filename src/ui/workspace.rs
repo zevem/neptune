@@ -19,7 +19,7 @@ pub struct PanePresentation {
     /// The CLI agent the terminal is running, which takes dropped files.
     pub agent: Option<AgentKind>,
     /// Pull requests the agent linked to the terminal, oldest first.
-    pub pull_requests: Vec<neptune_model::PullRequest>,
+    pub pull_requests: Vec<helpers::LinkedPullRequest>,
     /// The agents this terminal's agent started, oldest first.
     pub spawned: Vec<super::agents::Spawned>,
     pub unread: usize,
@@ -374,7 +374,7 @@ fn tab(
             &[]
         },
         (rect.left() + 72.0, close.left() - 2.0, rect.center().y),
-        p.accent,
+        p,
     );
     // The agents this one started are listed before them.
     let spawned = helpers::SpawnedChip::layout(

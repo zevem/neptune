@@ -74,6 +74,8 @@ def main():
     # Stands in for the desktop's browser launcher and records what it is asked to open.
     opener = fixtures/'xdg-open'
     opener.write_text(f'#!/bin/sh\necho "$1" >> {shlex.quote(str(output/"opened.log"))}\n'); opener.chmod(0o700)
+    # Pull request status is another script's subject; this one stays off the network.
+    gh = fixtures/'gh'; gh.write_text('#!/bin/sh\nexit 1\n'); gh.chmod(0o700)
     (data/'config.toml').write_text('shell = "/bin/bash"\nconfirm_close = false\nwarn_running_processes = false\n')
     (home/'.bashrc').write_text(f'export PATH={shlex.quote(str(fixtures))}:"$PATH"\nPS1="test $ "\n')
     endpoint = H['free_endpoint']()
