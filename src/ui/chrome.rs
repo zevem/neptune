@@ -32,6 +32,8 @@ pub struct ChromeView<'a> {
     pub pull_requests: &'a [helpers::LinkedPullRequest],
     /// The agents the focused terminal's agent started, likewise.
     pub spawned: &'a [super::agents::Spawned],
+    /// The worktree of a terminal alone in view, which has no tab to name.
+    pub worktree: Option<(neptune_model::PaneId, &'a super::worktrees::Tab)>,
     pub zoomed: bool,
     /// The whole window. The window controls keep their place in it.
     pub window: Rect,
@@ -524,11 +526,22 @@ pub fn toolbar(
         (left + 96.0, chips.left, middle),
         p,
     );
-    if !chips.is_empty() || !spawned.is_empty() {
-        right = spawned.left - 6.0;
+    let merged = super::worktrees::MergedChip::layout(
+        ui,
+        ui.id().with("toolbar-merged"),
+        match view.worktree {
+            Some((pane, tab)) => (pane, Some(tab)),
+            None => (neptune_model::PaneId::new(0), None),
+        },
+        (left + 96.0, spawned.left, middle),
+        p,
+    );
+    if !chips.is_empty() || !spawned.is_empty() || !merged.is_empty() {
+        right = merged.left - 6.0;
     }
     chips.paint(ui.painter(), p, actions);
     spawned.paint(ui.painter(), p, actions);
+    merged.paint(ui.painter(), p, actions);
     let budget = right - left - 6.0;
     if budget < 36.0 {
         return;
@@ -2116,6 +2129,7 @@ mod tests {
                 subtitle: "",
                 pull_requests: &[],
                 spawned: &[],
+                worktree: None,
                 zoomed: false,
                 window: Rect::from_min_size(Pos2::ZERO, vec2(900.0, self.height)),
                 sidebar: 1.0,
@@ -2200,6 +2214,7 @@ mod tests {
                         agent: None,
                         pull_requests: Vec::new(),
                         spawned_by: None,
+                        worktree: None,
                     }],
                     layout: neptune_model::Layout::pane(PaneId::new(*id)),
                     active: PaneId::new(*id),
@@ -2773,6 +2788,7 @@ mod tests {
                             subtitle: "",
                             pull_requests: &[],
                             spawned: &[],
+                            worktree: None,
                             zoomed: false,
                             window: Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0)),
                             sidebar: 1.0,

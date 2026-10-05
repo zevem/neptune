@@ -494,6 +494,7 @@ mod tests {
             agent: None,
             pull_requests: Vec::new(),
             spawned_by: None,
+            worktree: None,
         });
         assert!(Model::restore(specs, None, true, Default::default()).is_err());
     }
