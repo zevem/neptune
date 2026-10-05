@@ -261,7 +261,9 @@ fn list(directory: &Path) -> Result<Vec<(PathBuf, Option<String>)>, String> {
     let mut entries: Vec<(PathBuf, Option<String>)> = Vec::new();
     for line in listed.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            entries.push((path.into(), None));
+            // git writes `/` on every system; the rest of Neptune compares
+            // paths as the system writes them.
+            entries.push((Path::new(path).components().collect(), None));
         } else if let (Some(branch), Some(entry)) =
             (line.strip_prefix("branch refs/heads/"), entries.last_mut())
         {
@@ -634,6 +636,8 @@ mod tests {
             run(&root, &["config", key, value]);
         }
         commit(&root, "README.md", "one");
+        // As git names it, which is how every worktree's path is reported.
+        let root = list(&root).unwrap()[0].0.clone();
         (directory, root)
     }
     fn commit(directory: &Path, file: &str, contents: &str) {

@@ -361,6 +361,10 @@ mod tests {
             git(&root, &["config", key, value]);
         }
         commit(&root, "README.md");
+        // As git names it, which is how every worktree's path is reported.
+        let root: PathBuf = std::path::Path::new(&git(&root, &["rev-parse", "--show-toplevel"]))
+            .components()
+            .collect();
         let (mut app, _sender) = super::super::tests::fixture(directory.path());
         let ctx = egui::Context::default();
         app.startup = None;
