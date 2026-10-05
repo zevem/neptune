@@ -11,6 +11,26 @@ their preparation records remain in Git history.
 
 ### What's New
 
+## [0.1.0-rc.4] - 2026-10-05
+
+### What's New
+
+- Customize shortcuts in the config file. Preferences → General → Keyboard
+  opens the active config and includes an expandable reference with action
+  names, default shortcuts and examples. Menus, buttons and the command palette
+  show your configured shortcuts. Restart Neptune after editing the file.
+- Open a dev server from its terminal's port chip. Local listeners appear on
+  the tab or toolbar; clicking one in an SSH workspace forwards the remote
+  port to your computer. A menu lets you stop forwarding or retry a failure.
+- Ctrl-click a filename or diagnostic location in a terminal (Command-click
+  on macOS) to open it in Neptune's file explorer or your preferred editor.
+  Choose the editor in Preferences → General. Use Ctrl+Shift+H
+  (Command+Shift+H on macOS) to label visible paths, hashes and URLs, then type
+  a label to copy its target without selecting it.
+- Keep a row or column of terminals evenly sized as you split, close or move
+  them. Double-click a divider to even its row or column, or use **Even terminal
+  sizes** in the command palette for the whole workspace. Each workspace now
+  holds up to 16 terminals, including tabs and agents without a tab.
 - Review what changed without leaving the terminal. The new Changes tab of
   the right panel shows the branch of the focused terminal's folder and the
   files that differ, with a diff of the one you click. Choose **Working tree**
@@ -25,8 +45,9 @@ their preparation records remain in Git history.
   opens the file explorer and the agents as tabs, carries a dot while an agent
   waits out of view. Codex asks once to trust the hooks that report this.
 - The Agents tab also lists OpenCode, Gemini CLI, pi and Oh My Pi, and agents
-  you start in SSH workspaces. OpenCode, pi and Oh My Pi sessions reopen with their conversations
-  like Claude Code's and Codex's. On an SSH host Neptune keeps a few small
+  you start in SSH workspaces. OpenCode, pi and Oh My Pi sessions reopen with
+  their conversations like Claude Code's and Codex's. On an SSH host Neptune
+  keeps a few small
   adapter scripts in your cache directory and reports through the terminal
   itself, so the host needs nothing installed and no extra connection.
   OpenCode, Gemini CLI and pi do not ask for attention on their own, so
@@ -51,7 +72,6 @@ their preparation records remain in Git history.
   comments are unresolved, and changes colour and icon once the pull request is
   merged. It updates on its own, through the GitHub CLI (`gh`) you are signed
   in to; without it the number looks as before.
-
 - Give an agent a git worktree of its own with **New agent in worktree**, in
   the command palette, a terminal's menu or on Ctrl+Shift+G (Command+G on
   macOS). Name a branch and press Enter: Neptune creates the branch, checks it
@@ -69,20 +89,43 @@ their preparation records remain in Git history.
 
 ### Acceptance notes and known limitations
 
+- This candidate is a private draft for acceptance testing. Full native acceptance
+  on every platform remains pending; it is not a production-stable release.
 - In-place updates are verified on Linux only by replacing and restarting a
   test AppImage; the macOS bundle replacement has not yet run on a Mac.
-
 - Saved workspaces now use schema version 11, which records which terminal's
   agent started another's, which of those terminals have no tab, the git
-  worktree made for a terminal's agent, where the files an agent attached
-  are, and sessions of OpenCode, Gemini CLI,
-  pi and Oh My Pi. Older
-  workspace files still load, but RC3 and
-  earlier cannot save over layouts written by this version.
+  worktree made for a terminal's agent, attached files, and sessions of OpenCode,
+  Gemini CLI, pi and Oh My Pi. Older workspace files still load, but RC3 and
+  earlier cannot save over layouts written by this version. Back up workspace
+  state before testing if you need to return to an earlier candidate. Older
+  builds also reject workspaces containing more than 12 terminals.
 - Agents in worktrees are for local terminals with `git` on `PATH`. Neptune
   does not fetch, so a pull request merged on a server shows as merged after
   your checkout fetches or pulls it. On Windows the tab opens in the worktree
   without starting a CLI.
+- Port discovery requires the host's process/socket tools. Windows SSH port
+  discovery and forwarding need noninteractive key or SSH-agent authentication;
+  remote discovery requires a Linux or Unix host. Port chips identify TCP
+  listeners, which may not be HTTP services.
+- The reported intermittent native Wayland freeze still needs a capture of the
+  blocking state. Earlier XWayland fixes do not establish native Wayland acceptance.
+- Windows installers remain unsigned and may show an unverified-publisher or
+  SmartScreen warning. Both macOS installers require signing and notarization;
+  all installers are covered by signed update metadata and build attestations.
+- Linux x64 packages require glibc 2.35 or newer and working host graphics
+  drivers. Browser-downloaded AppImages need execute permission before launch;
+  enable it in file Properties or run `chmod u+x` on the downloaded file.
+- Workspace restoration starts fresh shells and SSH connections; arbitrary
+  running commands and process memory are not restored. Coding-agent features
+  remain limited to the supported providers and platform paths.
+- SSH requires an installed OpenSSH client and a POSIX remote shell. Remote
+  directory tracking is integrated for zsh; other shells need OSC 7 integration.
+- Kitty graphics and comprehensive complex-script shaping remain unsupported.
+  Keypad identity and some keyboard-layout information depend on the window
+  toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
+- Private drafts are excluded from website downloads and automatic updates.
+  Automatic updates never downgrade; install this candidate manually for testing.
 
 ### Fixes
 
