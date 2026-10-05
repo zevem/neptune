@@ -1,5 +1,6 @@
 //! Scoped CLI adapters and a bounded, metadata-only local hook bridge.
 //! All setup and socket/file I/O runs on startup workers or the bridge worker.
+use super::agent_remote as remote;
 use crate::agent_activity::{Activity, Attention};
 use neptune_model::{AgentKind, AgentSession, PaneId, PullRequest};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,12 @@ const RUN: &str = "NEPTUNE_AGENT_RUN";
 const HELPER: &str = "NEPTUNE_AGENT_HELPER";
 /// Set for a CLI another agent started: its replies go to that agent.
 const SPAWNED: &str = "NEPTUNE_AGENT_SPAWNED";
+/// What Neptune's plugin for a CLI runs at each moment, followed by its name.
+const HOOK: &str = "NEPTUNE_AGENT_HOOK";
+/// Where the plugins are, under the adapters' directory.
+const PLUGINS: &str = "plugins";
+pub(super) const OPENCODE_PLUGIN: &str = include_str!("agent-opencode.js");
+pub(super) const PI_EXTENSION: &str = include_str!("agent-pi.js");
 const NOT_TRACKED: &str = "Neptune is not tracking an agent in this terminal.";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -422,6 +429,10 @@ pub(super) fn label(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Claude => "Claude Code",
         AgentKind::Codex => "Codex",
+        AgentKind::Opencode => "OpenCode",
+        AgentKind::Gemini => "Gemini CLI",
+        AgentKind::Pi => "pi",
+        AgentKind::Omp => "Oh My Pi",
     }
 }
 /// A model name as a CLI takes one: a short word, never an option.
@@ -445,6 +456,13 @@ fn effort_level(
     let levels: &[&str] = match kind {
         AgentKind::Claude => &["low", "medium", "high", "xhigh", "max"],
         AgentKind::Codex => &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+        // Neptune has no way to hand these a task and read their answer.
+        AgentKind::Opencode | AgentKind::Gemini | AgentKind::Pi | AgentKind::Omp => {
+            return Err(format!(
+                "Neptune starts Claude Code and Codex for another agent, not {}.",
+                label(kind)
+            ));
+        }
     };
     let effort = effort
         .map(|effort| effort.trim().to_ascii_lowercase())
@@ -474,7 +492,7 @@ fn effort_level(
             }
             (Some("ultra".into()), false)
         }
-        AgentKind::Codex => (effort, false),
+        _ => (effort, false),
     })
 }
 /// Keeps the start of text longer than one agent hands another.
@@ -598,6 +616,9 @@ struct Slot {
     generation: u64,
     token: String,
     run: Option<String>,
+    /// The terminal is an SSH connection: its agents run on the host and
+    /// report through the terminal itself, never through the listener.
+    remote: bool,
     /// The CLI of the open invocation.
     kind: Option<AgentKind>,
     /// Set while an invocation is open.
@@ -691,7 +712,11 @@ impl AgentBridge {
                     .prefix("neptune-agents-")
                     .tempdir()?;
                 let executable = std::env::current_exe()?;
-                for kind in [AgentKind::Claude, AgentKind::Codex] {
+                let plugins = directory.path().join(PLUGINS);
+                std::fs::create_dir(&plugins)?;
+                std::fs::write(plugins.join("opencode.js"), OPENCODE_PLUGIN)?;
+                std::fs::write(plugins.join("pi.js"), PI_EXTENSION)?;
+                for kind in AgentKind::ALL {
                     let path = directory.path().join(kind.executable());
                     std::fs::write(
                         &path,
@@ -831,6 +856,7 @@ impl AgentBridge {
                         generation,
                         token,
                         run: None,
+                        remote: false,
                         kind: None,
                         activity: None,
                         shown: None,
@@ -844,6 +870,149 @@ impl AgentBridge {
             drop((old, retired));
             Ok(())
         }
+    }
+    /// Called only by a startup worker, for a terminal that is an SSH
+    /// connection. The host is handed this terminal's report credential and
+    /// the script that installs the adapters there, as the second and third
+    /// arguments of the bootstrap that ends the client's command line.
+    pub fn prepare_remote(
+        &self,
+        pane: PaneId,
+        generation: u64,
+        options: &mut SessionOptions,
+        wake: Wake,
+    ) -> std::io::Result<()> {
+        let nonce = tempfile::Builder::new()
+            .prefix("")
+            .rand_bytes(32)
+            .tempfile()?;
+        let token = nonce
+            .path()
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        drop(nonce);
+        let Some(command) = options.args.last_mut() else {
+            return Ok(());
+        };
+        command.push_str(&format!(
+            " {} {}",
+            quote(&token),
+            quote(remote::installer())
+        ));
+        let (old, retired) = {
+            let mut shared = self
+                .shared
+                .lock()
+                .map_err(|_| std::io::Error::other("Agent bridge unavailable"))?;
+            if let Some(child) = shared.children.get_mut(&pane) {
+                child.end("its terminal was restarted");
+            }
+            shared.changes.remove(&pane);
+            shared.activity.remove(&pane);
+            shared.links.retain(|link| link.0 != pane);
+            shared.requests.retain(|request| !request.targets(pane));
+            let old = shared.slots.insert(
+                pane,
+                Slot {
+                    generation,
+                    token,
+                    run: None,
+                    remote: true,
+                    kind: None,
+                    activity: None,
+                    shown: None,
+                    since: Instant::now(),
+                    wake,
+                    _startup: None,
+                },
+            );
+            (old, std::mem::take(&mut shared.retired))
+        };
+        drop((old, retired));
+        Ok(())
+    }
+    /// A line the terminal in `pane` addressed to the application. It counts
+    /// only from an SSH terminal and with that terminal's credential, which
+    /// output shown there by accident or by design does not have. Reports
+    /// whether it was taken.
+    pub fn report(&self, pane: PaneId, generation: u64, line: &str) -> bool {
+        let mut fields = line.split(';');
+        let (Some(token), Some(run), Some(verb)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        let Ok(mut guard) = self.shared.lock() else {
+            return false;
+        };
+        let shared = &mut *guard;
+        let Some(slot) = shared
+            .slots
+            .get_mut(&pane)
+            .filter(|slot| slot.remote && slot.generation == generation && slot.token == token)
+        else {
+            return false;
+        };
+        if run.is_empty() || run.len() > 64 {
+            return false;
+        }
+        let now = Instant::now();
+        let open = slot.run.as_deref() == Some(run);
+        match verb {
+            "open" => {
+                let Some(kind) = fields.next().and_then(|name| kind(name).ok()) else {
+                    return false;
+                };
+                slot.run = Some(run.into());
+                slot.kind = Some(kind);
+                slot.activity = Some(Tracked::idle());
+                slot.shown = None;
+                slot.since = now;
+                shared
+                    .activity
+                    .insert(pane, (generation, Some(Activity::Idle)));
+            }
+            "close" if open => {
+                slot.run = None;
+                slot.kind = None;
+                slot.activity = None;
+                slot.shown = None;
+                shared.activity.insert(pane, (generation, None));
+            }
+            // The same fields a local hook reads from its input, and nothing
+            // else of it: the host's hook sent only these.
+            "hook" if open => {
+                let (Some(provider), Some(event)) = (slot.kind, fields.next()) else {
+                    return false;
+                };
+                let mut hook = Hook {
+                    hook_event_name: event.into(),
+                    ..Hook::default()
+                };
+                for field in fields {
+                    let Some((name, value)) = field.split_once('=') else {
+                        continue;
+                    };
+                    let value = Some(value.to_owned()).filter(|value| value.len() <= MAX_TOOL);
+                    match name {
+                        "tool_name" => hook.tool_name = value,
+                        "agent_id" => hook.agent_id = value,
+                        "notification_type" => hook.notification_type = value,
+                        "permission_mode" => hook.permission_mode = value,
+                        "source" => hook.source = value,
+                        "trigger" => hook.trigger = value,
+                        // A newer adapter on the host may say more.
+                        _ => {}
+                    }
+                }
+                if let Some(signal) = signal(provider, &hook) {
+                    shared.signal(pane, signal, now);
+                }
+            }
+            _ => return false,
+        }
+        true
     }
     pub fn close(&self, pane: PaneId) {
         if let Ok(mut shared) = self.shared.lock() {
@@ -1040,13 +1209,23 @@ impl AgentBridge {
         })
     }
     /// What each agent turned to since the last call; `None` when it left.
-    pub fn drain_activity(&self) -> Vec<(PaneId, u64, Option<Activity>)> {
+    /// An agent on an SSH host comes with its CLI, which the model does not
+    /// hold for it.
+    pub fn drain_activity(&self) -> Vec<(PaneId, u64, Option<Activity>, Option<AgentKind>)> {
         self.shared
             .lock()
             .map(|mut shared| {
+                let shared = &mut *shared;
                 std::mem::take(&mut shared.activity)
                     .into_iter()
-                    .map(|(pane, (generation, activity))| (pane, generation, activity))
+                    .map(|(pane, (generation, activity))| {
+                        let remote = shared
+                            .slots
+                            .get(&pane)
+                            .filter(|slot| slot.remote)
+                            .and_then(|slot| slot.kind);
+                        (pane, generation, activity, remote)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1070,6 +1249,28 @@ impl AgentRequest {
     }
 }
 impl Shared {
+    /// Takes a hook's signal for the agent open in `pane`. `None` without
+    /// one; otherwise whether it is news for the application.
+    fn signal(&mut self, pane: PaneId, signal: Signal, now: Instant) -> Option<bool> {
+        let slot = self.slots.get_mut(&pane)?;
+        let before = slot.state();
+        let prompt = signal == Signal::Prompt;
+        let tracked = slot.activity.as_mut()?;
+        let news = tracked.apply(signal);
+        let state = tracked.state;
+        if news {
+            // A hook is newer than what the title last corrected.
+            slot.shown = None;
+            if slot.state() != before {
+                slot.since = now;
+            }
+            self.activity.insert(pane, (slot.generation, Some(state)));
+        }
+        if prompt && let Some(child) = self.children.get_mut(&pane) {
+            child.start();
+        }
+        Some(news)
+    }
     /// Queues the opening of a terminal for an agent `parent` starts, and
     /// names the request its answer is asked for by.
     fn queue_spawn(
@@ -1299,7 +1500,7 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
     let Some((&pane, slot)) = shared
         .slots
         .iter_mut()
-        .find(|(_, slot)| slot.token == message.token)
+        .find(|(_, slot)| !slot.remote && slot.token == message.token)
     else {
         return false;
     };
@@ -1338,23 +1539,10 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
         if !open {
             return false;
         }
-        let before = slot.state();
-        let prompt = signal == Signal::Prompt;
-        let Some(tracked) = slot.activity.as_mut() else {
+        let Some(news) = shared.signal(pane, signal, now) else {
             return false;
         };
-        let news = tracked.apply(signal);
-        let state = tracked.state;
-        if prompt && let Some(child) = shared.children.get_mut(&pane) {
-            child.start();
-        }
         if news {
-            // A hook is newer than what the title last corrected.
-            slot.shown = None;
-            if slot.state() != before {
-                slot.since = now;
-            }
-            shared.activity.insert(pane, (generation, Some(state)));
             drop(guard);
             wake();
         }
@@ -1482,7 +1670,7 @@ fn respond(shared: &Mutex<Shared>, message: Message) -> (Answer, Option<Wake>) {
     let Some((&pane, slot)) = shared
         .slots
         .iter()
-        .find(|(_, slot)| slot.token == message.token)
+        .find(|(_, slot)| !slot.remote && slot.token == message.token)
     else {
         return refused(NOT_TRACKED.into());
     };
@@ -1801,15 +1989,14 @@ fn respond(shared: &Mutex<Shared>, message: Message) -> (Answer, Option<Wake>) {
         _ => refused("Neptune does not answer that.".into()),
     }
 }
-fn quote(value: &str) -> String {
+pub(super) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 fn kind(value: &str) -> anyhow::Result<AgentKind> {
-    match value {
-        "claude" => Ok(AgentKind::Claude),
-        "codex" => Ok(AgentKind::Codex),
-        _ => anyhow::bail!("Unknown agent"),
-    }
+    AgentKind::ALL
+        .into_iter()
+        .find(|kind| kind.executable() == value)
+        .ok_or_else(|| anyhow::anyhow!("Unknown agent"))
 }
 /// Delivers one event and reports whether the bridge took it for this pane.
 fn send(event: Event, run: &str) -> anyhow::Result<bool> {
@@ -1967,7 +2154,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
                 arguments.extend([
                     match kind {
                         AgentKind::Claude => "--model",
-                        AgentKind::Codex => "-m",
+                        _ => "-m",
                     }
                     .to_owned(),
                     model,
@@ -1976,7 +2163,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
             if let Some(effort) = effort {
                 arguments.extend(match kind {
                     AgentKind::Claude => ["--effort".to_owned(), effort],
-                    AgentKind::Codex => [
+                    _ => [
                         "-c".to_owned(),
                         format!("model_reasoning_effort={}", toml::Value::String(effort)),
                     ],
@@ -2017,8 +2204,9 @@ fn resume_arguments(agent: &AgentSession) -> Vec<String> {
     match &agent.session_id {
         Some(id) => vec![
             match agent.kind {
-                AgentKind::Claude => "--resume",
+                AgentKind::Claude | AgentKind::Gemini | AgentKind::Omp => "--resume",
                 AgentKind::Codex => "resume",
+                AgentKind::Opencode | AgentKind::Pi => "--session",
             }
             .into(),
             id.clone(),
@@ -2056,6 +2244,8 @@ fn signal(provider: AgentKind, hook: &Hook) -> Option<Signal> {
         (AgentKind::Claude, Some("AskUserQuestion")) => Some(Attention::Question),
         (AgentKind::Claude, Some("ExitPlanMode")) => Some(Attention::Plan),
         (AgentKind::Codex, Some("request_user_input")) => Some(Attention::Question),
+        (AgentKind::Opencode, Some("question")) => Some(Attention::Question),
+        (AgentKind::Omp, Some("ask")) => Some(Attention::Question),
         _ => None,
     };
     let ask = |attention| {
@@ -2073,6 +2263,15 @@ fn signal(provider: AgentKind, hook: &Hook) -> Option<Signal> {
         })
     };
     match hook.hook_event_name.as_str() {
+        // Neptune's own plugins name a session when its first turn begins.
+        "SessionStart"
+            if matches!(
+                provider,
+                AgentKind::Opencode | AgentKind::Pi | AgentKind::Omp
+            ) =>
+        {
+            None
+        }
         // Compaction restarts the session in the middle of a turn.
         "SessionStart" if hook.source.as_deref() != Some("compact") => lead(Signal::Done),
         "UserPromptSubmit" => lead(Signal::Prompt),
@@ -2104,8 +2303,11 @@ fn signal(provider: AgentKind, hook: &Hook) -> Option<Signal> {
     }
 }
 /// Hook events that say what the agent is doing, beyond `SessionStart`.
+/// OpenCode and pi report through a plugin of Neptune's instead, and Gemini
+/// CLI through its title alone.
 fn activity_hooks(provider: AgentKind) -> &'static [&'static str] {
     match provider {
+        AgentKind::Opencode | AgentKind::Gemini | AgentKind::Pi | AgentKind::Omp => &[],
         AgentKind::Claude => &[
             "UserPromptSubmit",
             "PreToolUse",
@@ -2128,6 +2330,65 @@ fn activity_hooks(provider: AgentKind) -> &'static [&'static str] {
             "Interrupt",
         ],
     }
+}
+/// Claude Code's `hooks` setting: `command` for the session's start, and
+/// `command EVENT` for each event that says what the agent is doing.
+pub(super) fn claude_hooks(command: &str) -> serde_json::Value {
+    let mut hooks = serde_json::Map::new();
+    hooks.insert(
+        "SessionStart".into(),
+        serde_json::json!([{"hooks":[{"type":"command","command":command}]}]),
+    );
+    // In order, so states follow each other as the agent reached them; the
+    // command answers in milliseconds and never blocks a tool.
+    for event in activity_hooks(AgentKind::Claude) {
+        hooks.insert(
+            (*event).into(),
+            serde_json::json!([{"hooks":[{
+                "type":"command","command":format!("{command} {event}"),"timeout":5
+            }]}]),
+        );
+    }
+    hooks.into()
+}
+/// Codex's `-c` overrides for the same hooks.
+pub(super) fn codex_hooks(command: &str) -> Vec<String> {
+    let start = format!(
+        "hooks.SessionStart=[{{hooks=[{{type=\"command\",command={}}}]}}]",
+        toml::Value::String(command.into())
+    );
+    let activity = activity_hooks(AgentKind::Codex).iter().map(|event| {
+        // Codex allows an interrupt hook three seconds and says so at every
+        // start when asked for more.
+        let timeout = if *event == "Interrupt" { 3 } else { 5 };
+        format!(
+            "hooks.{event}=[{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
+            toml::Value::String(format!("{command} {event}"))
+        )
+    });
+    std::iter::once(start).chain(activity).collect()
+}
+/// Whether the program found under a CLI's name is that CLI. `pi` is a name
+/// other programs have, and one of those is not given an extension.
+fn is_agent(provider: AgentKind, executable: &std::path::Path) -> bool {
+    provider != AgentKind::Pi
+        || executable
+            .canonicalize()
+            .is_ok_and(|path| path.to_string_lossy().contains("pi-coding-agent"))
+}
+/// OpenCode's configuration for one launch with Neptune's plugin added to
+/// the plugins it names. `None` when what the user set cannot be added to.
+fn opencode_config(existing: Option<&str>, plugin: &str) -> Option<String> {
+    let mut config = match existing.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => serde_json::from_str(text).ok()?,
+        None => serde_json::json!({}),
+    };
+    let plugins = config
+        .as_object_mut()?
+        .entry("plugin")
+        .or_insert_with(|| serde_json::json!([]));
+    plugins.as_array_mut()?.push(plugin.into());
+    Some(config.to_string())
 }
 fn resolve(provider: AgentKind) -> anyhow::Result<PathBuf> {
     let shims = std::env::var_os(SHIMS).map(PathBuf::from);
@@ -2152,18 +2413,25 @@ fn resolve(provider: AgentKind) -> anyhow::Result<PathBuf> {
         provider.executable()
     )
 }
-fn interactive(provider: AgentKind, args: &[String]) -> bool {
-    if args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--help" | "-h" | "--version" | "-V" | "--remote" | "--remote-control"
-        )
-    }) {
-        return false;
-    }
-    if provider == AgentKind::Claude && args.iter().any(|arg| arg == "-p" || arg == "--print") {
-        return false;
-    }
+/// Arguments that make an invocation something other than an interactive
+/// session: it is passed through untouched, here and on an SSH host.
+pub(super) fn batch_arguments(provider: AgentKind) -> impl Iterator<Item = &'static str> {
+    let options: &[&str] = match provider {
+        AgentKind::Claude => &["-p", "--print"],
+        AgentKind::Codex | AgentKind::Opencode => &[],
+        AgentKind::Gemini => &[
+            "-p",
+            "--prompt",
+            "--acp",
+            "--experimental-acp",
+            "-l",
+            "--list-extensions",
+            "--list-sessions",
+            "--delete-session",
+        ],
+        AgentKind::Pi => &["-p", "--print", "--mode", "--export", "--list-models"],
+        AgentKind::Omp => &["-p", "--print", "--mode", "--export", "--alias"],
+    };
     let commands: &[&str] = match provider {
         AgentKind::Claude => &[
             "auth",
@@ -2203,9 +2471,107 @@ fn interactive(provider: AgentKind, args: &[String]) -> bool {
             "help",
             "agents",
         ],
+        AgentKind::Opencode => &[
+            "run",
+            "serve",
+            "web",
+            "acp",
+            "mcp",
+            "completion",
+            "debug",
+            "providers",
+            "auth",
+            "agent",
+            "upgrade",
+            "uninstall",
+            "models",
+            "stats",
+            "export",
+            "import",
+            "github",
+            "session",
+            "plugin",
+            "plug",
+            "db",
+            // Their terminals are another server's or a pull request's.
+            "attach",
+            "pr",
+        ],
+        AgentKind::Gemini => &[
+            "mcp",
+            "extensions",
+            "extension",
+            "skills",
+            "skill",
+            "hooks",
+            "hook",
+            "gemma",
+        ],
+        AgentKind::Pi => &[
+            "install",
+            "remove",
+            "uninstall",
+            "update",
+            "list",
+            "config",
+            "auth",
+            "mcp",
+        ],
+        AgentKind::Omp => &[
+            "acp",
+            "agents",
+            "auth-broker",
+            "auth-gateway",
+            "bench",
+            "browser-relay",
+            "cleanse",
+            "commit",
+            "completions",
+            "compress",
+            "config",
+            "dry-balance",
+            "gallery",
+            "gc",
+            "grep",
+            "grievances",
+            "install",
+            "join",
+            "models",
+            "plugin",
+            "read",
+            "say",
+            "search",
+            "setup",
+            "share",
+            "shell",
+            "ssh",
+            "stats",
+            "tiny-models",
+            "token",
+            "ttsr",
+            "update",
+            "usage",
+            "worktree",
+        ],
     };
-    // Conservative around option-led subcommands too: never relaunch a batch job.
-    !args.iter().any(|arg| commands.contains(&arg.as_str()))
+    [
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+        "-v",
+        "--remote",
+        "--remote-control",
+    ]
+    .into_iter()
+    .chain(options.iter().copied())
+    .chain(commands.iter().copied())
+}
+/// Conservative around option-led subcommands too: never relaunch a batch job.
+fn interactive(provider: AgentKind, args: &[String]) -> bool {
+    !args
+        .iter()
+        .any(|arg| batch_arguments(provider).any(|word| word == arg))
 }
 /// `spawned` marks a CLI another agent started, whose replies return to it;
 /// `ultracode` starts Claude Code with ultracode on.
@@ -2217,15 +2583,17 @@ fn run_agent(
     ultracode: bool,
 ) -> anyhow::Result<i32> {
     let executable = resolve(provider)?;
-    let mut command = std::process::Command::new(executable);
+    let mut command = std::process::Command::new(&executable);
     let nested = std::env::var(RUN).is_ok_and(|value| !value.is_empty());
     if nested
+        || !is_agent(provider, &executable)
         || !interactive(provider, args)
         || !std::io::stdin().is_terminal()
         || !std::io::stdout().is_terminal()
         || std::env::var(ENDPOINT).is_err()
     {
-        command.args(args);
+        // A CLI inside another does not speak for the one that is tracked.
+        command.args(args).env_remove(HOOK);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -2261,25 +2629,38 @@ fn run_agent(
         provider.executable()
     );
     let helper = std::env::current_exe()?.to_string_lossy().into_owned();
+    let plugin = |name: &str| {
+        PathBuf::from(std::env::var_os(SHIMS).unwrap_or_default())
+            .join(PLUGINS)
+            .join(name)
+    };
+    // Set for the CLI alone; the supervisor that runs it passes them on.
+    let mut environment: Vec<(&str, String)> = Vec::new();
     match provider {
-        AgentKind::Claude => {
-            let mut hooks = serde_json::Map::new();
-            hooks.insert(
-                "SessionStart".into(),
-                serde_json::json!([{"hooks":[{"type":"command","command":hook}]}]),
+        AgentKind::Opencode => {
+            // --pure and its variable turn every plugin off, this one too.
+            let pure = args.iter().any(|arg| arg == "--pure")
+                || std::env::var_os("OPENCODE_PURE").is_some();
+            let config = opencode_config(
+                std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
+                &plugin("opencode.js").to_string_lossy(),
             );
-            // In order, so states follow each other as the agent reached them;
-            // the helper answers in milliseconds and never blocks a tool.
-            for event in activity_hooks(provider) {
-                hooks.insert(
-                    (*event).into(),
-                    serde_json::json!([{"hooks":[{
-                        "type":"command","command":format!("{hook} {event}"),"timeout":5
-                    }]}]),
-                );
+            if let Some(config) = config.filter(|_| !pure) {
+                environment.push(("OPENCODE_CONFIG_CONTENT", config));
+                environment.push((HOOK, hook.clone()));
             }
+        }
+        // Oh My Pi grew from pi and takes the same extension.
+        AgentKind::Pi | AgentKind::Omp => {
+            command.arg("-e").arg(plugin("pi.js"));
+            environment.push((HOOK, hook.clone()));
+        }
+        // Gemini CLI takes hooks only from its settings files, which are the
+        // user's. Its title says what it is doing.
+        AgentKind::Gemini => {}
+        AgentKind::Claude => {
             let mut settings = serde_json::json!({
-                "hooks":hooks,
+                "hooks":claude_hooks(&hook),
                 "permissions":{"allow":super::agent_mcp::allowed_tools()
                     .map(|tool| format!("mcp__neptune__{tool}"))
                     .collect::<Vec<_>>()},
@@ -2300,19 +2681,6 @@ fn run_agent(
             // the commands stay the same when this executable moves, as a
             // mounted image does at every launch.
             let hook = format!("\"${HELPER}\" --agent-hook {}", provider.executable());
-            let activity: Vec<String> = activity_hooks(provider)
-                .iter()
-                .map(|event| {
-                    // Codex allows an interrupt hook three seconds and says so
-                    // at every start when asked for more.
-                    let timeout = if *event == "Interrupt" { 3 } else { 5 };
-                    format!(
-                        "hooks.{event}=[{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
-                        toml::Value::String(format!("{hook} {event}"))
-                    )
-                })
-                .collect();
-            let hook = toml::Value::String(hook).to_string();
             // Hook processes need this terminal's environment, not a shared daemon's.
             // Older Codex versions still open normally; they can restore the CLI only.
             let supports_local = std::process::Command::new(resolve(provider)?)
@@ -2323,15 +2691,9 @@ fn run_agent(
                         && String::from_utf8_lossy(&output.stdout).contains("--no-daemon")
                 });
             if supports_local {
-                command.args([
-                    "--no-daemon",
-                    "-c",
-                    &format!(
-                        "hooks.SessionStart=[{{hooks=[{{type=\"command\",command={hook}}}]}}]"
-                    ),
-                ]);
-                for hook in &activity {
-                    command.args(["-c", hook]);
+                command.arg("--no-daemon");
+                for hook in codex_hooks(&hook) {
+                    command.args(["-c", &hook]);
                 }
                 command.args([
                     "-c",
@@ -2381,7 +2743,8 @@ fn run_agent(
         let mut supervisor = std::process::Command::new("/bin/sh");
         supervisor.args(["-c", "helper=$1; resumed=$2; shift 2; trap ':' INT QUIT; \"$@\"; result=$?; \"$helper\" --agent-close \"$result\" \"$resumed\"; exit \"$result\"", "neptune-agent"])
             .arg(std::env::current_exe()?).arg(if resumed.is_some() { "1" } else { "0" })
-            .arg(command.get_program()).args(command.get_args()).env(RUN, &run).env(HELPER, &helper);
+            .arg(command.get_program()).args(command.get_args()).env(RUN, &run).env(HELPER, &helper)
+            .envs(environment);
         if spawned {
             supervisor.env(SPAWNED, "1");
         } else {
@@ -2400,7 +2763,11 @@ fn run_agent(
         if spawned {
             command.env(SPAWNED, "1");
         }
-        let result = command.env(RUN, &run).env(HELPER, &helper).status();
+        let result = command
+            .env(RUN, &run)
+            .env(HELPER, &helper)
+            .envs(environment)
+            .status();
         let _ = send(Event::Close, &run);
         Ok(result?.code().unwrap_or(1))
     }
@@ -2681,6 +3048,7 @@ mod tests {
                 generation: 7,
                 token: "one".into(),
                 run: None,
+                remote: false,
                 kind: None,
                 activity: None,
                 shown: None,
@@ -2715,7 +3083,7 @@ mod tests {
         ));
         assert_eq!(
             bridge.drain_activity(),
-            [(PaneId::new(1), 7, Some(Activity::Idle))]
+            [(PaneId::new(1), 7, Some(Activity::Idle), None)]
         );
         woke();
         // A stranger and another invocation do not describe this pane.
@@ -2736,7 +3104,8 @@ mod tests {
             [(
                 PaneId::new(1),
                 7,
-                Some(Activity::NeedsInput(Attention::Question))
+                Some(Activity::NeedsInput(Attention::Question)),
+                None
             )]
         );
         assert!(bridge.drain_activity().is_empty());
@@ -2750,7 +3119,7 @@ mod tests {
         ));
         assert!(bridge.drain_activity().is_empty());
         assert!(emit("one", "a", Event::Close));
-        assert_eq!(bridge.drain_activity(), [(PaneId::new(1), 7, None)]);
+        assert_eq!(bridge.drain_activity(), [(PaneId::new(1), 7, None, None)]);
         assert!(!emit("one", "a", activity(Signal::Done)), "a late hook");
         // Leaving and returning within a frame is a fresh agent at rest.
         assert!(!emit("one", "a", activity(Signal::Prompt)));
@@ -2772,13 +3141,13 @@ mod tests {
         ));
         assert_eq!(
             bridge.drain_activity(),
-            [(PaneId::new(1), 7, Some(Activity::Idle))]
+            [(PaneId::new(1), 7, Some(Activity::Idle), None)]
         );
         // A resume that failed keeps the reference but is no running agent.
         bridge.drain();
         assert!(!emit("one", "c", Event::Stopped), "an earlier invocation");
         assert!(emit("one", "d", Event::Stopped));
-        assert_eq!(bridge.drain_activity(), [(PaneId::new(1), 7, None)]);
+        assert_eq!(bridge.drain_activity(), [(PaneId::new(1), 7, None, None)]);
         assert!(bridge.drain().is_empty(), "the reference is untouched");
         assert!(!emit("one", "d", activity(Signal::Prompt)));
         assert!(emit(
@@ -2818,6 +3187,7 @@ mod tests {
                 generation: 7,
                 token: "one".into(),
                 run: None,
+                remote: false,
                 kind: None,
                 activity: None,
                 shown: None,
@@ -2871,6 +3241,7 @@ mod tests {
                     generation: 7,
                     token: token.into(),
                     run: None,
+                    remote: false,
                     kind: None,
                     activity: None,
                     shown: None,
@@ -2960,6 +3331,7 @@ mod tests {
                     generation: 7,
                     token: (*token).into(),
                     run: None,
+                    remote: false,
                     kind: None,
                     activity: None,
                     shown: None,
@@ -3508,6 +3880,223 @@ mod tests {
         let cut = clip(&long);
         assert!(cut.len() < MAX_TEXT + 100 && cut.contains("Neptune cut this short"));
         assert_eq!(clip("short"), "short");
+    }
+    fn remote(bridge: &AgentBridge, pane: u64) -> String {
+        let mut options = SessionOptions {
+            args: vec![
+                "-t".into(),
+                "--".into(),
+                "devbox".into(),
+                "sh -c 'x' neptune ''".into(),
+            ],
+            ..Default::default()
+        };
+        bridge
+            .prepare_remote(PaneId::new(pane), 7, &mut options, Arc::new(|| {}))
+            .unwrap();
+        let command = options.args.pop().unwrap();
+        // The credential and the installer follow the directory as data.
+        let rest = command.strip_prefix("sh -c 'x' neptune '' '").unwrap();
+        let (token, installer) = rest.split_once("' '").unwrap();
+        assert!(token.len() == 32 && token.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert!(installer.contains("_neptune_install_agents"));
+        token.to_owned()
+    }
+    #[test]
+    fn an_ssh_terminal_reports_its_agents_through_its_own_credential() {
+        let bridge = AgentBridge::default();
+        let pane = PaneId::new(1);
+        let token = remote(&bridge, 1);
+        let other = remote(&bridge, 2);
+        assert_ne!(token, other);
+        let report = |line: &str| bridge.report(pane, 7, line);
+        let drained = || bridge.drain_activity();
+        // Output cannot open an agent without this terminal's credential,
+        // with another terminal's, or for a generation that is gone.
+        assert!(!report("guess;run1;open;claude"));
+        assert!(!report(&format!("{other};run1;open;claude")));
+        assert!(!bridge.report(pane, 6, &format!("{token};run1;open;claude")));
+        assert!(!report(&format!("{token};run1;open;emacs")));
+        assert!(!report(&format!("{token};run1;hook;UserPromptSubmit")));
+        assert!(drained().is_empty());
+
+        assert!(report(&format!("{token};run1;open;claude")));
+        assert_eq!(
+            drained(),
+            [(pane, 7, Some(Activity::Idle), Some(AgentKind::Claude))]
+        );
+        // The model is told nothing: the agent is not saved or reopened.
+        assert!(bridge.drain().is_empty());
+        assert!(report(&format!("{token};run1;hook;UserPromptSubmit")));
+        assert_eq!(drained()[0].2, Some(Activity::Working));
+        assert!(report(&format!(
+            "{token};run1;hook;PermissionRequest;tool_name=Bash;permission_mode=default;later=word"
+        )));
+        assert_eq!(
+            drained()[0].2,
+            Some(Activity::NeedsInput(Attention::Permission))
+        );
+        // The same rules as a local hook: another tool leaves the request,
+        // a subagent's tool says nothing, bypassed permissions ask no one.
+        assert!(report(&format!(
+            "{token};run1;hook;PostToolUse;tool_name=Read"
+        )));
+        assert!(report(&format!(
+            "{token};run1;hook;PostToolUse;tool_name=Bash;agent_id=1"
+        )));
+        assert!(drained().is_empty());
+        assert!(report(&format!(
+            "{token};run1;hook;PostToolUse;tool_name=Bash"
+        )));
+        assert_eq!(drained()[0].2, Some(Activity::Working));
+        assert!(report(&format!(
+            "{token};run1;hook;PermissionRequest;tool_name=Bash;permission_mode=bypassPermissions"
+        )));
+        assert!(drained().is_empty());
+        assert!(report(&format!(
+            "{token};run1;hook;PreToolUse;tool_name=AskUserQuestion"
+        )));
+        assert_eq!(
+            drained()[0].2,
+            Some(Activity::NeedsInput(Attention::Question))
+        );
+        // A run that is not the open one describes nothing and closes nothing.
+        assert!(!report(&format!("{token};run0;hook;Stop")));
+        assert!(!report(&format!("{token};run0;close")));
+        assert!(drained().is_empty());
+        assert!(report(&format!("{token};run1;hook;Stop")));
+        assert_eq!(drained()[0].2, Some(Activity::Idle));
+        assert!(report(&format!("{token};run1;close")));
+        assert_eq!(drained(), [(pane, 7, None, None)]);
+        assert!(!report(&format!("{token};run1;hook;UserPromptSubmit")));
+
+        // The listener never answers for an SSH terminal, whoever knows its
+        // credential, and a local terminal takes no report from its output.
+        assert!(!apply_message(
+            &bridge.shared,
+            message(
+                &token,
+                "run2",
+                Event::Open {
+                    agent: agent(FIRST)
+                }
+            )
+        ));
+        assert!(matches!(
+            answer(&bridge.shared, message(&token, "", Event::Launch)),
+            Answer::Refused { .. }
+        ));
+        let (local, _) = bridge_with(&["local"]);
+        assert!(!local.report(PaneId::new(1), 7, "local;run1;open;claude"));
+        // A restarted connection has a new credential.
+        let again = remote(&bridge, 1);
+        assert_ne!(again, token);
+        assert!(!report(&format!("{token};run3;open;claude")));
+    }
+    #[test]
+    fn opencode_and_pi_report_through_neptunes_plugins_and_gemini_by_title() {
+        // The plugins send only these moments, in the hooks' own form.
+        let session = "ses_ef579273dffe5vpZTGF29Kt3yQ";
+        assert_eq!(
+            signal(AgentKind::Omp, &tool("PermissionRequest", "bash")),
+            Some(ask(Attention::Permission, Some("bash"), false))
+        );
+        assert_eq!(
+            signal(AgentKind::Omp, &tool("PreToolUse", "ask")),
+            Some(ask(Attention::Question, Some("ask"), false))
+        );
+        assert_eq!(
+            resume_arguments(&AgentSession {
+                kind: AgentKind::Omp,
+                session_id: Some(FIRST.into()),
+                cwd: std::env::temp_dir(),
+            }),
+            ["--resume", FIRST]
+        );
+        assert!(!interactive(AgentKind::Omp, &["commit".to_owned()]));
+        assert!(interactive(AgentKind::Omp, &["fix it".to_owned()]));
+        for provider in [AgentKind::Opencode, AgentKind::Pi, AgentKind::Omp] {
+            assert_eq!(signal(provider, &hook("SessionStart")), None);
+            assert_eq!(
+                signal(provider, &hook("UserPromptSubmit")),
+                Some(Signal::Prompt)
+            );
+            assert_eq!(signal(provider, &hook("Stop")), Some(Signal::Done));
+            assert_eq!(
+                signal(provider, &hook("Elicitation")),
+                Some(ask(Attention::Input, None, false))
+            );
+            assert_eq!(
+                signal(provider, &hook("ElicitationResult")),
+                Some(Signal::Answered)
+            );
+            assert!(activity_hooks(provider).is_empty());
+        }
+        assert_eq!(
+            signal(AgentKind::Opencode, &hook("PermissionRequest")),
+            Some(ask(Attention::Permission, None, false))
+        );
+        assert_eq!(
+            signal(AgentKind::Opencode, &tool("PreToolUse", "question")),
+            Some(ask(Attention::Question, Some("question"), false))
+        );
+        assert!(OPENCODE_PLUGIN.contains("NEPTUNE_AGENT_HOOK") && PI_EXTENSION.contains(HOOK));
+        // Each CLI is asked for a conversation in its own words.
+        let resume = |kind, id: &str| {
+            resume_arguments(&AgentSession {
+                kind,
+                session_id: Some(id.into()),
+                cwd: std::env::temp_dir(),
+            })
+        };
+        assert_eq!(resume(AgentKind::Opencode, session), ["--session", session]);
+        assert_eq!(resume(AgentKind::Pi, FIRST), ["--session", FIRST]);
+        assert_eq!(resume(AgentKind::Gemini, FIRST), ["--resume", FIRST]);
+        // The plugin joins the user's own; what cannot be added to is left.
+        assert_eq!(
+            opencode_config(None, "/n/opencode.js").unwrap(),
+            r#"{"plugin":["/n/opencode.js"]}"#
+        );
+        let merged: serde_json::Value = serde_json::from_str(
+            &opencode_config(Some(r#"{"theme":"x","plugin":["mine"]}"#), "/n/opencode.js").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(merged["theme"], "x");
+        assert_eq!(
+            merged["plugin"],
+            serde_json::json!(["mine", "/n/opencode.js"])
+        );
+        assert_eq!(opencode_config(Some("not json"), "/n/o.js"), None);
+        assert_eq!(
+            opencode_config(Some(r#"{"plugin":"mine"}"#), "/n/o.js"),
+            None
+        );
+        // Batch jobs and administration are passed through untouched.
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for (kind, batch, session) in [
+            (AgentKind::Opencode, vec!["run", "x"], vec!["-s", session]),
+            (AgentKind::Gemini, vec!["-p", "x"], vec!["-i", "fix it"]),
+            (AgentKind::Pi, vec!["--mode", "rpc"], vec!["-c"]),
+        ] {
+            assert!(!interactive(kind, &args(&batch)), "{kind:?}");
+            assert!(interactive(kind, &args(&session)), "{kind:?}");
+            assert!(interactive(kind, &[]));
+        }
+        // Another program named `pi` is not the agent.
+        let package = std::env::temp_dir().join("node_modules/pi-coding-agent/dist/cli.js");
+        assert!(!is_agent(AgentKind::Pi, std::path::Path::new("/bin/sh")));
+        assert!(is_agent(AgentKind::Gemini, std::path::Path::new("/bin/sh")));
+        assert!(
+            !is_agent(AgentKind::Pi, &package),
+            "a missing file is no one's"
+        );
+        // Only Claude Code and Codex can be started for another agent.
+        assert!(effort_level(AgentKind::Gemini, None, false).is_err());
     }
     #[test]
     fn batch_and_administrative_invocations_are_not_restored() {

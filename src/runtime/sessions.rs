@@ -46,6 +46,9 @@ pub struct SessionLaunch {
 }
 pub enum AgentLaunch {
     Disabled,
+    /// An SSH connection: adapters are installed on the host, and its agents
+    /// report through the terminal.
+    Remote,
     Local {
         resume: Option<neptune_model::AgentSession>,
         /// The terminal whose agent started the one this terminal opens.
@@ -162,6 +165,16 @@ impl SessionManager {
                                         &mut request.launch.terminal,
                                         resume.as_ref(),
                                         *spawned_by,
+                                        request.wake.clone(),
+                                    )
+                                    .map_err(|_| "Agent integration could not start".to_owned())?;
+                            }
+                            if matches!(request.launch.agent, AgentLaunch::Remote) {
+                                agents
+                                    .prepare_remote(
+                                        request.pane,
+                                        request.generation,
+                                        &mut request.launch.terminal,
                                         request.wake.clone(),
                                     )
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
@@ -325,7 +338,15 @@ impl SessionManager {
         self.agents.drain()
     }
     /// What agents turned to since the last call; `None` for one that left.
-    pub fn agent_activity(&self) -> Vec<(PaneId, u64, Option<crate::agent_activity::Activity>)> {
+    /// An agent on an SSH host comes with its CLI.
+    pub fn agent_activity(
+        &self,
+    ) -> Vec<(
+        PaneId,
+        u64,
+        Option<crate::agent_activity::Activity>,
+        Option<neptune_model::AgentKind>,
+    )> {
         self.agents.drain_activity()
     }
     pub fn pull_request_links(&self) -> Vec<(PaneId, u64, neptune_model::PullRequest)> {

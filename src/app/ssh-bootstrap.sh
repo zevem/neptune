@@ -5,6 +5,13 @@ if [ -n "$1" ]; then
     CDPATH= cd -- "$1" || exit
 fi
 
+# $2 and $3, when given, are this terminal's report credential and the script
+# that installs the agent adapters for the shell below. A host where they
+# cannot be installed gets its shell all the same.
+if [ -n "$3" ]; then
+    eval "$3"
+fi
+
 case "${SHELL##*/}" in
 zsh)
     # A private, temporary startup directory adds hooks after the user's config.
@@ -66,6 +73,10 @@ if [[ -n $_neptune_start_cwd ]]; then
     builtin cd -- "$_neptune_start_cwd" || exit
 fi
 unset _neptune_start_cwd
+# The user's files have set the search path; the agent adapters lead it.
+if [[ -n $NEPTUNE_AGENT_DIR ]]; then
+    path=("$NEPTUNE_AGENT_DIR/bin" "${(@)path:#$NEPTUNE_AGENT_DIR/bin}")
+fi
 
 _neptune_report_cwd() {
     # Encode bytes so Unicode, percent signs and control characters round trip.
@@ -84,6 +95,14 @@ add-zsh-hook chpwd _neptune_report_cwd
 NEPTUNE_ZLOGIN
     ZDOTDIR=$_neptune_dir
     export ZDOTDIR
+    exec "$SHELL" -il
+    ;;
+bash)
+    # Bash reads its login files from a startup file of the adapters', which
+    # then puts them first on the search path.
+    if [ -n "$NEPTUNE_AGENT_DIR" ]; then
+        exec "$SHELL" --rcfile "$NEPTUNE_AGENT_DIR/bashrc" -i
+    fi
     exec "$SHELL" -il
     ;;
 *)

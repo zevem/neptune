@@ -79,9 +79,10 @@ Closing hangs up the terminal; detached or signal-ignoring jobs may survive.
 
 ## Coding agent sessions
 
-Local Unix terminals can reopen Claude Code and Codex in their original panes
-when Neptune restarts, using each CLI's own saved session ID. Start `claude` or
-`codex` normally. Codex asks you to review Neptune's hooks before it
+Local Unix terminals can reopen Claude Code, Codex, OpenCode, pi and Oh My Pi
+in their original panes when Neptune restarts, using each CLI's own saved session ID;
+Gemini CLI is reopened without its conversation. Start `claude`, `codex`,
+`opencode`, `pi`, `omp` or `gemini` normally. Codex asks you to review Neptune's hooks before it
 can report IDs and what it is doing. Exiting the CLI or restarting its terminal clears the resume
 reference; closing Neptune retains it. See [agent sessions](agent-sessions.md)
 for setup, exact-session requirements and platform limitations.
@@ -193,9 +194,9 @@ The **Toggle right panel** button at the trailing end of the toolbar, Ctrl+Shift
 
 ## Agents
 
-The **Agents** tab lists every Claude Code and Codex agent running in a local terminal of any workspace, including workspaces and tabs out of view. Agents are grouped by what they are doing: **Needs input** first (an agent asking to allow a tool, asking a question, waiting for a plan to be approved, or otherwise blocked on you), then **Working**, then **Idle**. Each row shows the agent's name for its conversation, its state, which agent it is, its workspace and how long it has been in that state. Click a row to go to its terminal. While an agent waits for input and the list is not in view, the panel's toolbar button carries a dot, and the Agents tab shows how many are waiting.
+The **Agents** tab lists every Claude Code, Codex, OpenCode, Gemini CLI, pi and Oh My Pi agent running in a terminal of any workspace, local or SSH, including workspaces and tabs out of view. Agents are grouped by what they are doing: **Needs input** first (an agent asking to allow a tool, asking a question, waiting for a plan to be approved, or otherwise blocked on you), then **Working**, then **Idle**. Each row shows the agent's name for its conversation, its state, which agent it is, its workspace and how long it has been in that state. Click a row to go to its terminal. While an agent waits for input and the list is not in view, the panel's toolbar button carries a dot, and the Agents tab shows how many are waiting.
 
-An agent is listed while its CLI runs: it appears when `claude` or `codex` starts and leaves when the CLI exits or its terminal is restarted or closed. Agents started inside SSH sessions, on Windows, as batch commands (`claude -p`, `codex exec`) or through an alias or absolute path that bypasses Neptune's adapters are not listed. Codex asks once to trust the hooks that report its activity; until it does, its state is read from its terminal title alone, about two seconds behind. See [agent sessions](agent-sessions.md#agent-activity) for how states are detected and where they can lag.
+An agent is listed while its CLI runs: it appears when its CLI starts and leaves when the CLI exits or its terminal is restarted or closed. In an SSH workspace Neptune installs small adapters in your cache directory on the host to report this through the terminal; see [agents on SSH hosts](agent-sessions.md#agents-on-ssh-hosts). Agents started inside `tmux` on a host, in an `ssh` you typed yourself, on Windows, as batch commands (`claude -p`, `codex exec`) or through an alias or absolute path that bypasses Neptune's adapters are not listed. Codex asks once to trust the hooks that report its activity; until it does, its state is read from its terminal title alone, about two seconds behind. Gemini CLI is always read from its title. See [agent sessions](agent-sessions.md#agent-activity) for how states are detected and where they can lag.
 
 ## Changes
 

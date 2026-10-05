@@ -72,6 +72,10 @@ pub fn kind_name(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Claude => "Claude Code",
         AgentKind::Codex => "Codex",
+        AgentKind::Opencode => "OpenCode",
+        AgentKind::Gemini => "Gemini CLI",
+        AgentKind::Pi => "pi",
+        AgentKind::Omp => "Oh My Pi",
     }
 }
 
@@ -217,7 +221,7 @@ pub fn show(ui: &mut Ui, rect: Rect, p: Palette, view: &View, actions: &mut Vec<
     );
     if view.rows.is_empty() {
         let galley = child.painter().layout(
-            "No agents are running.\nStart claude or codex in a terminal and it is listed here."
+            "No agents are running.\nStart a coding agent such as claude, codex or opencode in a terminal and it is listed here."
                 .to_owned(),
             theme::regular(12.0),
             p.muted,

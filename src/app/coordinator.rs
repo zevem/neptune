@@ -155,7 +155,7 @@ impl App {
                                 spawned_by,
                             }
                         } else {
-                            crate::runtime::sessions::AgentLaunch::Disabled
+                            crate::runtime::sessions::AgentLaunch::Remote
                         },
                     };
                     if let Err(error) = self.sessions.start(

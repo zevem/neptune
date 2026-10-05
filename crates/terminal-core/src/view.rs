@@ -271,9 +271,18 @@ impl ViewportSnapshot {
 /// reads remain disabled; the desktop runtime explicitly owns copy delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalEvent {
-    ClipboardStore { selection: bool, text: String },
+    ClipboardStore {
+        selection: bool,
+        text: String,
+    },
     Notification(Notification),
-    CloseNotification { id: String },
+    CloseNotification {
+        id: String,
+    },
+    /// A line addressed to the hosting application by an integration it
+    /// installed (`OSC 7717 ; neptune ; line`): at most 512 printable ASCII
+    /// bytes. What it means, and whether to believe it, is the application's.
+    Report(String),
 }
 
 /// An explicit terminal attention request. BEL uses a generic title; OSC text
@@ -303,6 +312,7 @@ impl TerminalEvent {
                 n.title.len() + n.body.len() + n.id.as_ref().map_or(0, String::len)
             }
             Self::CloseNotification { id } => id.len(),
+            Self::Report(line) => line.len(),
         }
     }
 }

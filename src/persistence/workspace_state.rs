@@ -9,9 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Version 9 adds the pane whose agent started a pane's agent. Version 8 added
+/// Version 10 adds the git worktree made for a pane's agent, and OpenCode,
+/// Gemini CLI, pi and Oh My Pi to the agents a pane's resume reference can
+/// name, which an earlier build would take for damage. Version 9
+/// added the pane whose agent started a pane's agent. Version 8 added
 /// workspace group default directories and the pull requests an agent linked
-/// to its pane. Versions 1–8 remain readable.
+/// to its pane. Versions 1–9 remain readable.
 pub const SCHEMA_VERSION: u32 = 10;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 

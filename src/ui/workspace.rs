@@ -1294,6 +1294,10 @@ pub fn file_drop(
     let text = match stage.presentations.get(&pane).and_then(|pane| pane.agent) {
         Some(AgentKind::Claude) => "Drop to attach to Claude",
         Some(AgentKind::Codex) => "Drop to attach to Codex",
+        Some(AgentKind::Opencode) => "Drop to attach to OpenCode",
+        Some(AgentKind::Gemini) => "Drop to attach to Gemini",
+        Some(AgentKind::Pi) => "Drop to attach to pi",
+        Some(AgentKind::Omp) => "Drop to attach to Oh My Pi",
         None => "Drop to insert path",
     };
     let label = elided(&painter, text, theme::medium(12.0), p.fg, 220.0);

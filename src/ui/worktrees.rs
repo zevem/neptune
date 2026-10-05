@@ -82,10 +82,7 @@ impl Default for State {
 }
 
 pub fn agent_name(kind: AgentKind) -> &'static str {
-    match kind {
-        AgentKind::Claude => "Claude Code",
-        AgentKind::Codex => "Codex",
-    }
+    super::agents::kind_name(kind)
 }
 
 fn note(ui: &mut Ui, text: impl Into<String>, ink: egui::Color32) {
