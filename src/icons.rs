@@ -46,6 +46,7 @@ pub enum Icon {
     Star,
     Image,
     PullRequest,
+    Branch,
     Agents,
     File,
     Files,
@@ -352,6 +353,14 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[[6.0, 9.0], [6.0, 21.0]]);
             circle(18.0, 18.0, 3.0);
             line(&[[13.0, 6.0], [16.0, 6.0], [18.0, 8.0], [18.0, 15.0]]);
+        }
+        Icon::Branch => {
+            // A trunk, and the branch that left it.
+            circle(6.0, 5.5, 2.5);
+            line(&[[6.0, 8.0], [6.0, 16.0]]);
+            circle(6.0, 18.5, 2.5);
+            circle(18.0, 7.5, 2.5);
+            line(&[[18.0, 10.0], [18.0, 11.0], [15.0, 14.0], [6.0, 14.0]]);
         }
         Icon::Agents => {
             // One agent, and the two it started.

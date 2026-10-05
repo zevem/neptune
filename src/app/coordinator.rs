@@ -609,6 +609,7 @@ impl App {
             }
             Action::Panel(event) => self.panel_event(ctx, event),
             Action::Explorer(event) => self.explorer_event(ctx, event),
+            Action::Changes(event) => self.changes_event(ctx, event),
             Action::SidebarWidth(width) => {
                 let config = Config {
                     sidebar_width: width.clamp(170.0, 360.0),

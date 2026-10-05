@@ -99,6 +99,10 @@ icon buttons keep a 28-point target around a 16-point glyph.
   every terminal in it has stopped), a
   path that keeps its final directory, and either the pane count or, on hover,
   a "more" button with the same menu as a secondary click. A workspace
+  folder inside a Git repository is followed by a branch icon and the
+  branch's name in the same muted text, then a 5-point dot in the palette's
+  yellow while the repository has uncommitted changes; the branch may take up
+  to six tenths of the line and the path gives way to it. A workspace
   connected over SSH shows a globe and its host in place of the path, and its
   menu offers "Disconnect from SSH" where a local one offers "Connect over
   SSH…". Double-click renames.
@@ -154,8 +158,9 @@ icon buttons keep a 28-point target around a 16-point glyph.
   is resized once to the size it will rest at, and a toggle reversed midway
   turns around from where it is. Its leading edge resizes it (220–560 points;
   double-click restores 300) and it always leaves the terminals 240 points. A
-  34-point strip at its top holds two tabs of equal width, "Files" and
-  "Agents", drawn like terminal tabs: the one in view takes a faint fill. They
+  34-point strip at its top holds three tabs, "Files", "Agents" and "Changes",
+  of equal width unless the panel is too narrow for a name, where each takes
+  what its name needs. They are drawn like terminal tabs: the one in view takes a faint fill. They
   are chosen with the pointer or the command palette, never with Tab or the
   arrow keys. The Agents tab counts the agents waiting for input in a pill in
   the attention colour. The panel opens on the tab last shown.
@@ -193,6 +198,23 @@ icon buttons keep a 28-point target around a 16-point glyph.
   empty list says how an agent comes to be listed. Rows change when an agent
   reports or its title changes; nothing animates, and a list in view is drawn
   again every 30 seconds only so that its ages stay true.
+- **Changes.** The Changes tab shows what Git says about the focused
+  terminal's folder. The 30-point header carries a branch icon, the branch's
+  name and, in muted text, the commits to push and to pull beside up and down
+  arrows; "Refresh changes" sits at its trailing edge. Under it a segmented
+  control chooses "Working tree" or "Branch", and a line counts the files
+  ("3 files changed since origin/main") with the lines added in green and
+  removed in red at its trailing edge. Rows are 26 points: a status letter in
+  its colour (M yellow, A and U green, D and ! red, R accent), the file's name,
+  its folder in muted text, and its own added and removed counts. The selected
+  row takes the accent tint and its diff opens in a content surface at the
+  bottom of the panel, resized by the divider above it: the terminal face,
+  one line number, a sign, and a faint green or red fill across added and
+  removed lines; hunk headings are muted on a faint fill. Colour never stands
+  alone: every line carries its sign and every row its letter. A folder that
+  is not a repository, an SSH workspace, a missing Git and a branch with
+  nothing to compare with each say so in muted text. Git runs off the UI
+  thread; a frame is drawn only when what it reported changed.
 - **Window controls.** Close, minimize and maximize are three lights at the
   leading edge. Glyphs appear as the pointer approaches, and the lights turn
   neutral in an inactive window. Their accessible names are "Close window",

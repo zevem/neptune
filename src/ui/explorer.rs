@@ -249,7 +249,7 @@ fn keep_focus_on_enter(ui: &Ui, response: &egui::Response) {
     }
 }
 
-fn centered_note(ui: &Ui, rect: Rect, p: Palette, text: &str) {
+pub(super) fn centered_note(ui: &Ui, rect: Rect, p: Palette, text: &str) {
     let galley = ui.painter().layout(
         text.to_owned(),
         theme::regular(12.0),
@@ -361,7 +361,13 @@ fn root_menu(ui: &mut Ui, p: Palette, root: &Path, events: &mut Vec<Event>) {
 
 /// The surface of a row that can be clicked: selected, under the pointer or
 /// under its own menu.
-fn row_surface(ui: &Ui, rect: Rect, p: Palette, response: &egui::Response, selected: bool) {
+pub(super) fn row_surface(
+    ui: &Ui,
+    rect: Rect,
+    p: Palette,
+    response: &egui::Response,
+    selected: bool,
+) {
     let menu = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(response));
     let fill = if selected {
         theme::tint(p.accent, 0.18)
