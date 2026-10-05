@@ -267,6 +267,14 @@ pub(super) fn engine_loop(
                         shared.force_repaint();
                     }
                 }
+                if let Some(pid) = cwd_tracker.remote_pid.take() {
+                    let mut metadata = shared.metadata.lock();
+                    if metadata.remote_process_id != Some(pid) {
+                        metadata.remote_process_id = Some(pid);
+                        drop(metadata);
+                        shared.force_repaint();
+                    }
+                }
                 shared.bytes_parsed.fetch_add(len as u64, Ordering::Relaxed);
                 let _ = pool.try_send(buffer);
                 // Follow Alacritty's wakeup policy: a synchronized application

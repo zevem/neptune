@@ -144,6 +144,7 @@ impl App {
                     }
                     let launch = crate::runtime::sessions::SessionLaunch {
                         terminal: options,
+                        ssh_control: remote.is_some(),
                         agent: if remote.is_none() {
                             crate::runtime::sessions::AgentLaunch::Local {
                                 resume: self
@@ -801,6 +802,12 @@ impl App {
             Action::ClearAttachments(pane) => {
                 self.dispatch(ctx, Command::ClearAttachments { pane });
             }
+            Action::Port {
+                pane,
+                generation,
+                listener,
+                stop,
+            } => self.port_action(ctx, pane, generation, listener, stop),
             Action::ScrollBottom(pane) => {
                 if let Some(session) = self.sessions.get(pane) {
                     session.scroll_to_bottom();

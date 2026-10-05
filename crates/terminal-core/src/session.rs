@@ -121,6 +121,8 @@ pub struct SessionMetadata {
     /// `cwd`, this never comes from polling the local child process.
     pub reported_cwd: Option<PathBuf>,
     pub process_id: Option<u32>,
+    /// Shell PID reported by Neptune's remote bootstrap; never a local PID.
+    pub remote_process_id: Option<u32>,
     pub status: SessionStatus,
     pub bell_count: u64,
 }
@@ -267,6 +269,7 @@ impl TerminalSession {
                 cwd: options.cwd,
                 reported_cwd: None,
                 process_id: child.process_id(),
+                remote_process_id: None,
                 status: SessionStatus::Running,
                 bell_count: 0,
             },

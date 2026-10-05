@@ -97,11 +97,16 @@ mod tests {
         .unwrap();
         std::fs::write(
             dotdir.join(".zlogin"),
-            "printf '%slogin' \"$NEPTUNE_STARTUP\" > \"$HOME/startup\"\nprintf '%s' \"$HISTFILE\" > \"$HOME/histfile\"\ncd \"$HOME\"\n",
+            "printf '%slogin' \"$NEPTUNE_STARTUP\" > \"$HOME/startup\"\nprintf '%s' \"$HISTFILE\" > \"$HOME/histfile\"\nprintf '%s' \"$$\" > \"$HOME/shell-pid\"\ncd \"$HOME\"\n",
         )
         .unwrap();
         let session = bootstrap(root.path(), Some(&dotdir), Some(&project));
         wait_for(|| session.metadata().reported_cwd.as_deref() == Some(project.as_path()));
+        let shell_pid = std::fs::read_to_string(root.path().join("shell-pid"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(session.metadata().remote_process_id, Some(shell_pid));
         assert_eq!(
             std::fs::read_to_string(root.path().join("startup")).unwrap(),
             "env profile rc login"
