@@ -12,6 +12,7 @@ pub mod image_preview;
 pub mod notifications;
 pub mod palette;
 pub mod panel;
+pub(crate) mod ports;
 pub mod preferences;
 pub mod search;
 pub mod theme_browser;
@@ -215,6 +216,12 @@ pub enum Action {
     /// Take one attached file, or all of them, off a terminal's list.
     RemoveAttachment(PaneId, PathBuf),
     ClearAttachments(PaneId),
+    Port {
+        pane: PaneId,
+        generation: u64,
+        listener: crate::platform::ports::Listener,
+        stop: bool,
+    },
     ScrollBottom(PaneId),
     OpenNotification(PaneId, u64),
     /// Reveal the terminal an agent runs in, if it is still that terminal.

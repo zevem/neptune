@@ -43,6 +43,8 @@ pub struct ResourceUsage {
 pub struct SessionLaunch {
     pub terminal: SessionOptions,
     pub agent: AgentLaunch,
+    /// Give this SSH pane its own private connection-sharing socket.
+    pub ssh_control: bool,
 }
 pub enum AgentLaunch {
     Disabled,
@@ -60,6 +62,7 @@ impl From<SessionOptions> for SessionLaunch {
         Self {
             terminal,
             agent: AgentLaunch::Disabled,
+            ssh_control: false,
         }
     }
 }
@@ -72,7 +75,7 @@ struct Request {
 struct Completion {
     pane: PaneId,
     generation: u64,
-    result: Result<TerminalSession, String>,
+    result: Result<Entry, String>,
     elapsed: Duration,
 }
 struct Jobs {
@@ -84,6 +87,7 @@ struct Closing {
     generation: u64,
     session: TerminalSession,
     since: Instant,
+    _control: Option<Arc<tempfile::TempDir>>,
 }
 pub enum SessionCompletion {
     Started {
@@ -100,6 +104,7 @@ pub enum SessionCompletion {
 struct Entry {
     generation: u64,
     session: TerminalSession,
+    control: Option<Arc<tempfile::TempDir>>,
 }
 
 pub struct SessionManager {
@@ -156,6 +161,28 @@ impl SessionManager {
                         };
                         let tick = Instant::now();
                         let result = (|| {
+                            let mut control = None;
+                            if request.launch.ssh_control && cfg!(unix) {
+                                let directory = tempfile::Builder::new()
+                                    .prefix("neptune-ssh-")
+                                    .tempdir()
+                                    .map_err(|_| {
+                                        "Could not prepare SSH connection sharing".to_owned()
+                                    })?;
+                                let path = directory.path().join("control");
+                                request.launch.terminal.args.splice(
+                                    0..0,
+                                    [
+                                        "-o".into(),
+                                        "ControlMaster=auto".into(),
+                                        "-o".into(),
+                                        "ControlPersist=no".into(),
+                                        "-o".into(),
+                                        format!("ControlPath={}", path.display()),
+                                    ],
+                                );
+                                control = Some(Arc::new(directory));
+                            }
                             if let AgentLaunch::Local { resume, spawned_by } = &request.launch.agent
                             {
                                 agents
@@ -180,6 +207,11 @@ impl SessionManager {
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
                             }
                             TerminalSession::spawn(request.launch.terminal, request.wake.clone())
+                                .map(|session| Entry {
+                                    generation: request.generation,
+                                    session,
+                                    control,
+                                })
                                 .map_err(|error| format!("{error:#}"))
                         })();
                         if sender
@@ -219,6 +251,9 @@ impl SessionManager {
     }
     pub fn get(&self, pane: PaneId) -> Option<&TerminalSession> {
         self.live.get(&pane).map(|entry| &entry.session)
+    }
+    pub fn ssh_control(&self, pane: PaneId) -> Option<Arc<tempfile::TempDir>> {
+        self.live.get(&pane).and_then(|entry| entry.control.clone())
     }
     pub fn generation(&self, pane: PaneId) -> Option<u64> {
         self.desired
@@ -292,6 +327,7 @@ impl SessionManager {
                 generation: old.generation,
                 session: old.session,
                 since: Instant::now(),
+                _control: old.control,
             });
         }
         let request = Request {
@@ -371,6 +407,7 @@ impl SessionManager {
                 generation: entry.generation,
                 session: entry.session,
                 since: Instant::now(),
+                _control: entry.control,
             });
         }
     }
@@ -390,26 +427,21 @@ impl SessionManager {
             if self.desired.get(&completion.pane) != Some(&completion.generation) {
                 self.agents
                     .close_generation(completion.pane, completion.generation);
-                if let Ok(session) = completion.result {
-                    session.shutdown();
+                if let Ok(entry) = completion.result {
+                    entry.session.shutdown();
                     self.closing.push(Closing {
                         pane: completion.pane,
                         generation: completion.generation,
-                        session,
+                        session: entry.session,
                         since: Instant::now(),
+                        _control: entry.control,
                     });
                 }
                 continue;
             }
             match completion.result {
-                Ok(session) => {
-                    self.live.insert(
-                        completion.pane,
-                        Entry {
-                            generation: completion.generation,
-                            session,
-                        },
-                    );
+                Ok(entry) => {
+                    self.live.insert(completion.pane, entry);
                     events.push(SessionCompletion::Started {
                         pane: completion.pane,
                         generation: completion.generation,

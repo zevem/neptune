@@ -19,6 +19,8 @@ pub struct PaletteView<'a> {
     pub local: bool,
     /// The branch of the worktree the focused terminal is in.
     pub worktree: Option<&'a str>,
+    pub pane_generation: u64,
+    pub ports: &'a [crate::runtime::ports::Port],
     pub layout: Option<&'a neptune_model::Layout>,
     pub workspaces: &'a [WorkspaceView],
     pub groups: &'a [neptune_model::WorkspaceGroup],
@@ -62,6 +64,49 @@ fn command(
 fn commands(view: &PaletteView) -> Vec<Command> {
     let mut list = Vec::new();
     if let Some(pane) = view.pane {
+        for port in view.ports {
+            if matches!(
+                port.forward,
+                crate::runtime::ports::Forward::Starting | crate::runtime::ports::Forward::Stopping
+            ) {
+                continue;
+            }
+            let label = if port.remote && port.url().is_none() {
+                format!("Forward {}", port.listener.label())
+            } else {
+                format!("Open {}", port.label())
+            };
+            list.push(command(
+                "Ports",
+                Icon::Globe,
+                label,
+                "",
+                [Action::Port {
+                    pane,
+                    generation: view.pane_generation,
+                    listener: port.listener,
+                    stop: false,
+                }],
+            ));
+            if matches!(
+                port.forward,
+                crate::runtime::ports::Forward::On(_)
+                    | crate::runtime::ports::Forward::Failed { local: Some(_), .. }
+            ) {
+                list.push(command(
+                    "Ports",
+                    Icon::Close,
+                    format!("Stop forwarding {}", port.label()),
+                    "",
+                    [Action::Port {
+                        pane,
+                        generation: view.pane_generation,
+                        listener: port.listener,
+                        stop: true,
+                    }],
+                ));
+            }
+        }
         list.extend([
             command(
                 "Terminal",
@@ -819,6 +864,8 @@ mod tests {
             pane: None,
             local: true,
             worktree: None,
+            pane_generation: 1,
+            ports: &[],
             layout: None,
             workspaces,
             groups: &[],
@@ -827,6 +874,45 @@ mod tests {
             zoomed: false,
             message: false,
         }
+    }
+
+    #[test]
+    fn ports_commands_capture_pane_generation_and_use_the_forwarded_address() {
+        use crate::{
+            platform::ports::Listener,
+            runtime::ports::{Forward, Port},
+        };
+        let config = Config::default();
+        let listener = Listener {
+            address: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 3000,
+        };
+        let ports = [Port {
+            listener,
+            remote: true,
+            forward: Forward::On(4100),
+        }];
+        let pane = PaneId::new(19);
+        let list = commands(&PaletteView {
+            pane: Some(pane),
+            pane_generation: 7,
+            ports: &ports,
+            ..view(&config, &[])
+        });
+        let commands: Vec<_> = list.iter().filter(|c| c.group == "Ports").collect();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|c| c.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Open localhost:4100", "Stop forwarding localhost:4100"]
+        );
+        assert!(
+            matches!(commands[0].actions.as_slice(), [Action::Port { pane: target, generation: 7, listener: server, stop: false }] if *target == pane && *server == listener)
+        );
+        assert!(
+            matches!(commands[1].actions.as_slice(), [Action::Port { pane: target, generation: 7, listener: server, stop: true }] if *target == pane && *server == listener)
+        );
     }
 
     #[test]

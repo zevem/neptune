@@ -37,6 +37,8 @@ pub struct ChromeView<'a> {
     pub spawned: &'a [super::agents::Spawned],
     /// The worktree of a terminal alone in view, which has no tab to name.
     pub worktree: Option<(neptune_model::PaneId, &'a super::worktrees::Tab)>,
+    pub ports: &'a [crate::runtime::ports::Port],
+    pub pane_generation: u64,
     pub zoomed: bool,
     /// The whole window. The window controls keep their place in it.
     pub window: Rect,
@@ -577,8 +579,16 @@ pub fn toolbar(
         )
     });
     let leading = attached.as_ref().map_or(merged.left, |chip| chip.left);
-    if leading < right - 2.0 {
-        right = leading - 6.0;
+    let ports = super::ports::Chips::layout(
+        ui,
+        ui.id().with("toolbar-ports"),
+        view.ports,
+        view.pane.map(|pane| (pane, view.pane_generation)),
+        (left + 42.0, leading, middle),
+        p,
+    );
+    if ports.left < right - 2.0 {
+        right = ports.left - 6.0;
     }
     chips.paint(ui.painter(), p, actions);
     spawned.paint(ui.painter(), p, actions);
@@ -586,6 +596,7 @@ pub fn toolbar(
     if let Some(attached) = attached {
         attached.paint(ui.painter(), p, actions);
     }
+    ports.paint(ui.painter(), p, actions);
     let budget = right - left - 6.0;
     if budget < 36.0 {
         return;
@@ -2171,6 +2182,8 @@ mod tests {
                 attached: &[],
                 spawned: &[],
                 worktree: None,
+                ports: &[],
+                pane_generation: 1,
                 zoomed: false,
                 window: Rect::from_min_size(Pos2::ZERO, vec2(900.0, self.height)),
                 sidebar: 1.0,
@@ -2833,6 +2846,8 @@ mod tests {
                             attached: &[],
                             spawned: &[],
                             worktree: None,
+                            ports: &[],
+                            pane_generation: 1,
                             zoomed: false,
                             window: Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0)),
                             sidebar: 1.0,

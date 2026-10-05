@@ -7,6 +7,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 - [Workspaces and terminals](#workspaces-and-terminals)
 - [Workspace groups](#workspace-groups)
 - [SSH workspaces](#ssh-workspaces)
+- [Dev servers and ports](#dev-servers-and-ports)
 - [Closing terminals safely](#closing-terminals-safely)
 - [Coding agent sessions](#coding-agent-sessions)
 - [Notifications](#notifications)
@@ -50,9 +51,40 @@ before creating another local workspace there.
 
 A workspace can be connected to another machine over SSH. Every terminal in it, including new splits and restarted terminals, then opens on that host instead of in a local shell. Secondary-click a workspace and choose **Connect over SSH…** to move all of its terminals to a host, or run **New SSH workspace** from the command palette. **Disconnect from SSH** returns the workspace to local shells. Connecting or disconnecting replaces the workspace's terminals, so processes running in them stop. A terminal keeps its session when it is moved, so it can be moved only between workspaces on the same machine.
 
-The host is an OpenSSH destination: `host`, `user@host`, an alias from `~/.ssh/config`, or `ssh://user@host:port`. Neptune runs the system `ssh` client (which must be on your `PATH`) once per terminal, so your SSH configuration, keys and agent apply, and password, passphrase and host-key prompts appear in the terminal. Neptune stores the destination and each terminal's last reported remote directory, never a credential. Each terminal is its own connection; enable `ControlMaster` in your SSH configuration to share one. The remote host needs a POSIX `sh` to launch its login shell; the `shell` setting applies to local terminals only. A terminal whose connection ends offers **Reconnect**.
+The host is an OpenSSH destination: `host`, `user@host`, an alias from `~/.ssh/config`, or `ssh://user@host:port`. Neptune runs the system `ssh` client (which must be on your `PATH`) once per terminal, so your SSH configuration, keys and agent apply, and password, passphrase and host-key prompts appear in the terminal. Neptune stores the destination and each terminal's last reported remote directory, never a credential. Each terminal is its own connection. On Unix, Neptune gives each connection a private control socket for port discovery and forwarding; it does not change your SSH configuration. The remote host needs a POSIX `sh` to launch its login shell; the `shell` setting applies to local terminals only. A terminal whose connection ends offers **Reconnect**.
 
 The first terminal starts in the host's login directory; splitting inherits the source terminal's current remote directory. Reconnecting or reopening the app with workspace restoration enabled opens a fresh SSH shell in each terminal's last reported remote directory. Neptune adds temporary OSC 7 directory reporting to Zsh after loading your normal login configuration, without editing your dotfiles. Other shells need their own OSC 7 integration; until a shell reports a directory, splits and reconnects start in the login directory. If a remembered remote directory no longer exists, the terminal shows the failure instead of silently opening elsewhere. Disconnecting or changing hosts clears the remembered remote directories.
+
+## Dev servers and ports
+
+TCP listeners owned by a terminal's shell or its child processes appear as
+chips such as **localhost:3000** on its tab. A single terminal shows them in
+the toolbar. Click a local chip to open its HTTP address in your default
+browser. Several ports, or a narrow tab, share a **ports** menu.
+IPv4 and IPv6 localhost listeners, including wildcard bindings, open as
+`http://localhost:<port>/`. Listeners bound to another specific address open
+that address.
+
+In an SSH workspace, click a chip to forward that remote listener to your
+computer. The chip then opens the forwarded address; secondary-click it for
+**Stop forwarding**. Forwards bind only to `127.0.0.1`. If the same local port
+is busy, Neptune chooses a free port and shows that number on the chip.
+Failures appear on the chip with a retry action. Closing, restarting or
+disconnecting a terminal releases its forwards; forwards are not restored
+across launches.
+
+Discovery runs on a background worker, including for hidden terminals, and
+normally refreshes every two seconds. It reads process ancestry and TCP socket
+metadata, never command lines, input or output. Linux uses `/proc`; other Unix
+hosts need `ps` and `lsof`. Windows local discovery uses PowerShell networking
+and process queries. Windows OpenSSH lacks connection sharing, so remote
+discovery and forwarding need noninteractive key or SSH-agent authentication.
+Remote discovery currently requires a Linux or Unix host. Fully detached
+processes whose ancestry no longer leads to the pane are not attributed to it.
+Each pane shows up to 16 distinct ports, with up to 64 active forwards across
+the application. Process, descriptor, helper-output and
+query-time limits bound discovery work. Chips identify TCP listeners, so an
+HTTP browser may not be suitable for every service.
 
 ## Closing terminals safely
 
@@ -70,8 +102,8 @@ uses OS metadata rather than terminal titles or output, detects foreground,
 background and stopped child jobs, and recognizes programs that replace the
 shell with `exec`. An idle recognized shell can close immediately with the first
 switch off. Starting sessions, failed checks and checks taking longer than two
-seconds ask before closing. SSH connections always count as active: Neptune
-cannot inspect jobs on the remote host. Shell helper processes and unrecognized
+seconds ask before closing. SSH connections always count as active: the close check does not
+classify remote shell jobs. Shell helper processes and unrecognized
 shell executables may also trigger a warning. Shell builtins with no child
 process and fully detached/reparented jobs cannot reliably be distinguished
 from an idle shell; use the always-confirm switch if you need that protection.

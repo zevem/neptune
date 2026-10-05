@@ -43,6 +43,7 @@ pub(super) fn report_cwd(command: &mut CommandBuilder, shell: &str) {
 pub(super) struct CwdTracker {
     state: u8,
     pub(super) bytes: Vec<u8>,
+    pub(super) remote_pid: Option<u32>,
 }
 
 impl CwdTracker {
@@ -71,6 +72,7 @@ impl CwdTracker {
                     }
                 }
                 2 if byte == 7 => {
+                    self.observe_pid();
                     path = decode_report(&self.bytes).or(path);
                     self.state = 0;
                 }
@@ -86,6 +88,7 @@ impl CwdTracker {
                 }
                 3 => {
                     if byte == b'\\' {
+                        self.observe_pid();
                         path = decode_report(&self.bytes).or(path);
                     }
                     self.state = 0;
@@ -105,9 +108,19 @@ impl CwdTracker {
         }
         path
     }
+
+    fn observe_pid(&mut self) {
+        if let Some(bytes) = self.bytes.strip_prefix(REPORTS[2]) {
+            self.remote_pid = std::str::from_utf8(bytes)
+                .ok()
+                .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|text| text.parse::<u32>().ok())
+                .filter(|pid| *pid > 1);
+        }
+    }
 }
 
-const REPORTS: [&[u8]; 2] = [b"7;", b"9;9;"];
+const REPORTS: [&[u8]; 3] = [b"7;", b"9;9;", b"777;neptune;pid;"];
 
 fn is_report_prefix(bytes: &[u8]) -> bool {
     REPORTS

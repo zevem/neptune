@@ -376,6 +376,19 @@ fn oversized_osc7_has_bounded_storage_and_recovers() {
 }
 
 #[test]
+fn remote_shell_pid_survives_fragmentation_without_becoming_a_directory() {
+    let mut tracker = CwdTracker::default();
+    for byte in b"\x1b]777;neptune;pid;12345\x1b\\" {
+        assert!(tracker.advance(&[*byte]).is_none());
+    }
+    assert_eq!(tracker.remote_pid.take(), Some(12345));
+    for invalid in ["0", "1", "-2", "12;other", "4294967296"] {
+        tracker.advance(format!("\x1b]777;neptune;pid;{invalid}\x07").as_bytes());
+        assert_eq!(tracker.remote_pid.take(), None);
+    }
+}
+
+#[test]
 fn osc9_9_reports_native_paths_and_ignores_other_osc9() {
     let dir = if cfg!(windows) {
         r"C:\Work dir"
@@ -435,6 +448,7 @@ fn fixture(cols: u16, rows: u16, history: usize) -> TerminalSession {
             cwd: PathBuf::from("."),
             reported_cwd: None,
             process_id: None,
+            remote_process_id: None,
             status: SessionStatus::Running,
             bell_count: 0,
         },

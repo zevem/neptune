@@ -56,6 +56,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         hint_keys: Vec::new(),
         file_location: None,
         file_opener: Default::default(),
+        ports: Default::default(),
         notifications: Default::default(),
         agents: Default::default(),
         delegation: Default::default(),
@@ -2141,7 +2142,7 @@ fn a_remote_split_inherits_the_reported_host_directory_and_keeps_its_local_direc
     let client = root.path().join("fake-ssh");
     std::fs::write(
         &client,
-        "#!/bin/sh\nprintf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> \"$0.args\"\n\
+        "#!/bin/sh\nwhile [ \"$1\" = -o ]; do shift 2; done\n[ \"$1\" = -t ] || exit 1\nprintf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> \"$0.args\"\n\
          printf '%s\\0' \"$4\" >> \"$0.commands\"\npwd >> \"$0.cwd\"\n\
          printf '\\033]7;file://devbox/srv/on-the-host\\007'\nexec sleep 30\n",
     )
@@ -2242,7 +2243,7 @@ fn remote_directories_survive_shutdown_and_restoration_per_terminal() {
     std::fs::write(home.join(".zshrc"), "PROMPT='NEPTUNE> '\n").unwrap();
     // Keep the real remote bootstrap and PTY, with a test-owned SSH stand-in.
     let client = root.path().join("fake-ssh");
-    std::fs::write(&client, "#!/bin/sh\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
+    std::fs::write(&client, "#!/bin/sh\nwhile [ \"$1\" = -o ]; do shift 2; done\n[ \"$1\" = -t ] || exit 1\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
     std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
     let ctx = egui::Context::default();
     let wait_for_directory = |app: &mut App, pane, directory: &std::path::Path| {
@@ -2345,7 +2346,7 @@ fn remote_splits_follow_their_source_pane_after_focus_and_directory_changes() {
     .unwrap();
     std::fs::write(home.join(".zshrc"), "PROMPT='NEPTUNE> '\n").unwrap();
     let client = root.path().join("fake-ssh");
-    std::fs::write(&client, "#!/bin/sh\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
+    std::fs::write(&client, "#!/bin/sh\nwhile [ \"$1\" = -o ]; do shift 2; done\n[ \"$1\" = -t ] || exit 1\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
     std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (mut app, _sender) = fixture(root.path());
     let ctx = egui::Context::default();
