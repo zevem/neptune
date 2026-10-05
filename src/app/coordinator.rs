@@ -791,6 +791,16 @@ impl App {
                     }
                 }
             },
+            Action::OpenAttachment(pane, path) => self.open_attachment(ctx, pane, path),
+            Action::RevealAttachment(path) => {
+                self.explorer_event(ctx, ui::explorer::Event::Reveal(path));
+            }
+            Action::RemoveAttachment(pane, path) => {
+                self.dispatch(ctx, Command::RemoveAttachment { pane, path });
+            }
+            Action::ClearAttachments(pane) => {
+                self.dispatch(ctx, Command::ClearAttachments { pane });
+            }
             Action::ScrollBottom(pane) => {
                 if let Some(session) = self.sessions.get(pane) {
                     session.scroll_to_bottom();

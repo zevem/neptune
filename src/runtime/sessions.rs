@@ -352,6 +352,9 @@ impl SessionManager {
     pub fn pull_request_links(&self) -> Vec<(PaneId, u64, neptune_model::PullRequest)> {
         self.agents.drain_links()
     }
+    pub fn attached_files(&self) -> Vec<(PaneId, u64, neptune_model::Attachment)> {
+        self.agents.drain_attachments()
+    }
     /// The bridge agents reach the application through: what they asked for,
     /// and what the application tells it about the agents they started.
     pub fn agents(&self) -> &super::agents::AgentBridge {

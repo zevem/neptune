@@ -55,6 +55,7 @@ pub enum Icon {
     FilePlus,
     FolderPlus,
     Trash,
+    Paperclip,
 }
 
 /// Paint an icon into its visual bounds. The caller controls the hit area.
@@ -386,6 +387,22 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             circle(6.0, 18.5, 2.5);
             circle(18.0, 7.5, 2.5);
             line(&[[18.0, 10.0], [18.0, 11.0], [15.0, 14.0], [6.0, 14.0]]);
+        }
+        Icon::Paperclip => {
+            // One wire: down the long side, round the foot, up over the
+            // head and back down into the loop it holds.
+            let arc = |x: f32, y: f32, radius: f32, from: f32, to: f32| {
+                (0..=8).map(move |step| {
+                    let angle = (from + (to - from) * step as f32 / 8.0).to_radians();
+                    [x + radius * angle.cos(), y + radius * angle.sin()]
+                })
+            };
+            let mut wire = vec![[18.0, 8.0]];
+            wire.extend(arc(12.0, 15.0, 6.0, 0.0, 180.0));
+            wire.extend(arc(10.25, 7.25, 4.25, 180.0, 360.0));
+            wire.extend(arc(12.25, 14.5, 2.25, 0.0, 180.0));
+            wire.push([10.0, 9.0]);
+            line(&wire);
         }
         Icon::Agents => {
             // One agent, and the two it started.

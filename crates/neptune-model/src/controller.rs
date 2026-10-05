@@ -160,6 +160,21 @@ pub enum Command {
         generation: u64,
         pull_request: crate::PullRequest,
     },
+    /// An agent attached a file to this terminal for the user to look at.
+    PaneFileAttached {
+        pane: PaneId,
+        generation: u64,
+        attachment: crate::Attachment,
+    },
+    /// The user takes one attached file off a terminal's list.
+    RemoveAttachment {
+        pane: PaneId,
+        path: PathBuf,
+    },
+    /// The user empties a terminal's list of attached files.
+    ClearAttachments {
+        pane: PaneId,
+    },
     PaneCwdChanged {
         pane: PaneId,
         generation: u64,
@@ -344,6 +359,7 @@ impl Controller {
                         remote_cwd: None,
                         agent: None,
                         pull_requests: Vec::new(),
+                        attachments: Vec::new(),
                         spawned_by: None,
                         worktree: None,
                         generation: 1,
@@ -636,6 +652,7 @@ impl Controller {
                         pane.remote_cwd = None;
                         pane.agent = None;
                         pane.pull_requests.clear();
+                        pane.attachments.clear();
                         pane.spawned_by = None;
                         pane.worktree = None;
                         effects.push(Effect::StopSession {
@@ -695,6 +712,7 @@ impl Controller {
                 dirty |= item.agent.take().is_some();
                 dirty |= item.spawned_by.take().is_some();
                 item.pull_requests.clear();
+                item.attachments.clear();
                 effects.push(Effect::StopSession {
                     pane,
                     generation: previous,
@@ -747,6 +765,7 @@ impl Controller {
                     dirty |= item.agent.take().is_some();
                     dirty |= item.spawned_by.take().is_some();
                     item.pull_requests.clear();
+                    item.attachments.clear();
                     self.close_background(pane, &mut effects);
                 }
             }
@@ -770,6 +789,7 @@ impl Controller {
                     // agent that never opened leaves the one that started it too.
                     if agent.is_none() {
                         item.pull_requests.clear();
+                        item.attachments.clear();
                         dirty |= item.spawned_by.take().is_some();
                     }
                     let left = agent.is_none();
@@ -825,6 +845,7 @@ impl Controller {
                     remote_cwd: None,
                     agent: None,
                     pull_requests: Vec::new(),
+                    attachments: Vec::new(),
                     spawned_by: Some(parent),
                     worktree: None,
                     generation: 1,
@@ -858,6 +879,42 @@ impl Controller {
                         item.pull_requests.remove(0);
                     }
                     item.pull_requests.push(pull_request);
+                    dirty = true;
+                }
+            }
+            Command::PaneFileAttached {
+                pane,
+                generation,
+                attachment,
+            } => {
+                if let Ok(item) = self.model.pane_mut(pane)
+                    && item.generation == generation
+                    && matches!(item.lifecycle, Lifecycle::Starting | Lifecycle::Running)
+                    && item.agent.is_some()
+                    && item.attachments.last() != Some(&attachment)
+                {
+                    // The same file again is the newest, under its new title.
+                    item.attachments
+                        .retain(|kept| kept.path() != attachment.path());
+                    if item.attachments.len() >= crate::Attachment::MAX_PER_PANE {
+                        item.attachments.remove(0);
+                    }
+                    item.attachments.push(attachment);
+                    dirty = true;
+                }
+            }
+            Command::RemoveAttachment { pane, path } => {
+                if let Ok(item) = self.model.pane_mut(pane) {
+                    let kept = item.attachments.len();
+                    item.attachments.retain(|kept| kept.path() != path);
+                    dirty |= item.attachments.len() != kept;
+                }
+            }
+            Command::ClearAttachments { pane } => {
+                if let Ok(item) = self.model.pane_mut(pane)
+                    && !item.attachments.is_empty()
+                {
+                    item.attachments.clear();
                     dirty = true;
                 }
             }
@@ -981,6 +1038,7 @@ impl Controller {
             remote_cwd: remote_cwd.clone(),
             agent: None,
             pull_requests: Vec::new(),
+            attachments: Vec::new(),
             spawned_by: None,
             worktree: None,
             generation: 1,
@@ -2840,6 +2898,7 @@ mod tests {
                     remote_cwd: None,
                     agent: None,
                     pull_requests: Vec::new(),
+                    attachments: Vec::new(),
                     spawned_by: None,
                     worktree: None,
                 },
@@ -2849,6 +2908,7 @@ mod tests {
                     remote_cwd: None,
                     agent: None,
                     pull_requests: Vec::new(),
+                    attachments: Vec::new(),
                     spawned_by: None,
                     worktree: None,
                 },

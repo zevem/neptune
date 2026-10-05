@@ -60,15 +60,22 @@ their preparation records remain in Git history.
   its work is in the default branch; click it to remove the folder and the
   local branch. **Remove worktree** says what would be lost before it removes
   anything, and keeps a branch that has unmerged commits.
+- Ask Claude Code or Codex to attach its screenshots, or any file it wants
+  you to look at, and they appear on its tab. Click the paperclip for the
+  list: each file with its picture, where it has one. Click a picture to see
+  it at full size and step through the others with the arrow keys; click any
+  other file to open it. Each row also shows the file in your file manager or
+  dismisses it from the list, leaving the file where it is.
 
 ### Acceptance notes and known limitations
 
 - In-place updates are verified on Linux only by replacing and restarting a
   test AppImage; the macOS bundle replacement has not yet run on a Mac.
 
-- Saved workspaces now use schema version 10, which records which terminal's
+- Saved workspaces now use schema version 11, which records which terminal's
   agent started another's, which of those terminals have no tab, the git
-  worktree made for a terminal's agent, and sessions of OpenCode, Gemini CLI,
+  worktree made for a terminal's agent, where the files an agent attached
+  are, and sessions of OpenCode, Gemini CLI,
   pi and Oh My Pi. Older
   workspace files still load, but RC3 and
   earlier cannot save over layouts written by this version.

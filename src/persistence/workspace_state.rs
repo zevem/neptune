@@ -9,13 +9,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Version 10 adds the git worktree made for a pane's agent, and OpenCode,
-/// Gemini CLI, pi and Oh My Pi to the agents a pane's resume reference can
-/// name, which an earlier build would take for damage. Version 9
-/// added the pane whose agent started a pane's agent. Version 8 added
-/// workspace group default directories and the pull requests an agent linked
-/// to its pane. Versions 1–9 remain readable.
-pub const SCHEMA_VERSION: u32 = 10;
+/// Version 11 adds the files an agent attached to its pane. Version 10 added
+/// the git worktree made for a pane's agent, and OpenCode, Gemini CLI, pi and
+/// Oh My Pi to the agents a pane's resume reference can name, which an
+/// earlier build would take for damage. Version 9 added the pane whose agent
+/// started a pane's agent. Version 8 added workspace group default
+/// directories and the pull requests an agent linked to its pane. Versions
+/// 1–10 remain readable.
+pub const SCHEMA_VERSION: u32 = 11;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -111,6 +112,23 @@ pub struct SavedPane {
     /// The git worktree made for the pane's agent, from schema version 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<neptune_model::Worktree>,
+    /// The files the agent attached, from schema version 11.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<SavedAttachment>,
+}
+
+/// Where an attached file is and what the agent called it; never its contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedAttachment {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+impl SavedAttachment {
+    fn restore(&self) -> Option<neptune_model::Attachment> {
+        neptune_model::Attachment::new(self.path.clone(), self.title.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +190,14 @@ impl StateSnapshot {
                             // resumed, so neither can its link.
                             spawned_by: pane.spawned_by().filter(|_| pane.agent().is_some()),
                             worktree: pane.worktree().cloned(),
+                            attachments: pane
+                                .attachments()
+                                .iter()
+                                .map(|file| SavedAttachment {
+                                    path: file.path().into(),
+                                    title: file.title().map(str::to_owned),
+                                })
+                                .collect(),
                         })
                         .collect(),
                     layout: SavedLayout::from_layout(workspace.layout()),
@@ -244,6 +270,11 @@ impl SavedWorkspace {
                         .collect(),
                     spawned_by: pane.spawned_by,
                     worktree: pane.worktree,
+                    attachments: pane
+                        .attachments
+                        .iter()
+                        .filter_map(SavedAttachment::restore)
+                        .collect(),
                     agent: pane.agent,
                 })
                 .collect(),
@@ -533,6 +564,22 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                 ));
                 pane.worktree = None;
             }
+            // A file that has since been moved or deleted stays listed: the
+            // list says so when it is opened, and reading it here would not
+            // keep it true.
+            let files = pane.attachments.len();
+            pane.attachments.retain(|file| file.restore().is_some());
+            pane.attachments
+                .truncate(neptune_model::Attachment::MAX_PER_PANE);
+            if pane.agent.is_none() {
+                pane.attachments.clear();
+            }
+            if pane.attachments.len() != files {
+                report.diagnostics.push(format!(
+                    "Pane {}: left out attached files that could not be restored",
+                    pane.id
+                ));
+            }
             if !pane.cwd.is_dir() {
                 report.diagnostics.push(format!(
                     "Pane {} in {:?}: missing directory {}; using {}",
@@ -752,6 +799,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 remote_cwd: None,
                 agent: None,
                 pull_requests: Vec::new(),
+                attachments: Vec::new(),
                 spawned_by: None,
                 worktree: None,
             });
@@ -770,6 +818,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 remote_cwd: None,
                 agent: None,
                 pull_requests: Vec::new(),
+                attachments: Vec::new(),
                 spawned_by: None,
                 worktree: None,
             });
@@ -939,12 +988,22 @@ mod tests {
         snapshot.workspaces[0].panes[0].agent = Some(reference.clone());
         snapshot.workspaces[0].panes[0].pull_requests =
             vec!["https://github.com/zevem/neptune/pull/83".into()];
+        // A file that is gone by now is still listed where it was.
+        let attached = SavedAttachment {
+            path: root.path().join("after.png"),
+            title: Some("After".into()),
+        };
+        snapshot.workspaces[0].panes[0].attachments = vec![attached.clone()];
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
         let report = load_state(&path, Limits::default());
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
         let model = report.model.unwrap();
         let panes = model.workspaces()[0].panes();
         assert_eq!(panes[0].agent(), Some(&reference));
+        assert_eq!(
+            StateSnapshot::from_model(&model).workspaces[0].panes[0].attachments,
+            std::slice::from_ref(&attached)
+        );
         assert_eq!(
             StateSnapshot::from_model(&model).workspaces[0].panes[0].pull_requests,
             ["https://github.com/zevem/neptune/pull/83"]
@@ -955,14 +1014,24 @@ mod tests {
             .push("javascript:alert(1)".into());
         snapshot.workspaces[0].panes[1].pull_requests =
             vec!["https://github.com/zevem/neptune/pull/84".into()];
+        // So are files that are not absolute paths, or without their agent.
+        snapshot.workspaces[0].panes[0]
+            .attachments
+            .push(SavedAttachment {
+                path: "relative.png".into(),
+                title: None,
+            });
+        snapshot.workspaces[0].panes[1].attachments = vec![attached.clone()];
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
         let report = load_state(&path, Limits::default());
-        // One note for each pane, and one for the recovery copy.
-        assert_eq!(report.diagnostics.len(), 3, "{:?}", report.diagnostics);
+        // Two notes for each pane, and one for the recovery copy.
+        assert_eq!(report.diagnostics.len(), 5, "{:?}", report.diagnostics);
         let model = report.model.unwrap();
         let panes = model.workspaces()[0].panes();
         assert_eq!(panes[0].pull_requests().len(), 1);
         assert!(panes[1].pull_requests().is_empty());
+        assert_eq!(panes[0].attachments().len(), 1);
+        assert!(panes[1].attachments().is_empty());
         // A link between two resumable agents returns; one to a terminal
         // without an agent, to itself or to a missing terminal does not.
         let (first, second) = (
@@ -972,6 +1041,8 @@ mod tests {
         let mut linked = snapshot.clone();
         linked.workspaces[0].panes[0].pull_requests.pop();
         linked.workspaces[0].panes[1].pull_requests.clear();
+        linked.workspaces[0].panes[0].attachments.pop();
+        linked.workspaces[0].panes[1].attachments.clear();
         linked.workspaces[0].panes[1].agent = Some(reference.clone());
         linked.workspaces[0].panes[1].spawned_by = Some(first);
         std::fs::write(&path, serde_json::to_vec(&linked).unwrap()).unwrap();
@@ -1239,7 +1310,7 @@ mod tests {
     fn earlier_schema_versions_are_read_without_loss_and_saved_as_the_current_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspaces.json");
-        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
             let mut saved = serde_json::to_value(sample(directory.path())).unwrap();
             saved["version"] = version.into();
             saved.as_object_mut().unwrap().remove("groups");
@@ -1395,6 +1466,7 @@ mod tests {
             remote_cwd: None,
             agent: None,
             pull_requests: Vec::new(),
+            attachments: Vec::new(),
             spawned_by: None,
             worktree: None,
         }];

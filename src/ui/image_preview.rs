@@ -1,7 +1,10 @@
 //! The picture a terminal path names, floated beside the path while the
 //! pointer rests on it.
 use super::helpers::{animate, capsule, elided, galley_at};
-use crate::theme::{self, Palette};
+use crate::{
+    icons::{self, Icon},
+    theme::{self, Palette},
+};
 use eframe::egui::{
     self, Color32, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType,
     vec2,
@@ -159,6 +162,21 @@ pub struct View<'a> {
     pub texture: &'a egui::TextureHandle,
     pub name: &'a str,
     pub pixels: [u32; 2],
+    /// Which of several pictures this is, counted from one, and of how many.
+    pub position: Option<(usize, usize)>,
+}
+
+/// What the person asked of a full view this frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Verdict {
+    #[default]
+    Stay,
+    Close,
+    /// Show the picture before or after this one.
+    Previous,
+    Next,
+    /// Show the file in the file manager.
+    Reveal,
 }
 
 /// How far a full view is magnified past fitting the window, and where the
@@ -226,35 +244,59 @@ fn fit(pixels: Vec2, bounds: Rect) -> Rect {
 }
 
 /// The picture over the dimmed window. The wheel, a pinch and the plus and
-/// minus keys zoom, a drag moves a zoomed picture and 0 fits it again. A
-/// click anywhere closes it, as Escape does; returns true for that click.
-pub fn view(ui: &Ui, p: Palette, bounds: Rect, view: View<'_>, zoom: &mut Zoom) -> bool {
+/// minus keys zoom, a drag moves a zoomed picture and 0 fits it again. One of
+/// several is left for its neighbours with the arrow keys or the controls at
+/// the window's sides. A click anywhere else closes it, as Escape does.
+pub fn view(ui: &Ui, p: Palette, bounds: Rect, view: View<'_>, zoom: &mut Zoom) -> Verdict {
     let ctx = ui.ctx();
-    let area = egui::Area::new(Id::new("image-view"))
+    egui::Area::new(Id::new("image-view"))
         .order(egui::Order::Foreground)
         .fixed_pos(bounds.min)
         .constrain(false)
         .fade_in(false)
-        .show(ctx, |ui| {
-            let response = ui.allocate_rect(bounds, Sense::click_and_drag());
-            response.widget_info(|| {
-                WidgetInfo::labeled(
-                    WidgetType::Window,
-                    true,
-                    format!(
-                        "{}. Scroll to zoom, click or press Escape to close",
-                        view.name
-                    ),
-                )
-            });
-            response
-        });
-    let response = area.inner;
+        .show(ctx, |ui| view_contents(ui, p, bounds, view, zoom))
+        .inner
+}
+
+/// A round control over a full view; painted once the picture is.
+fn view_control(ui: &Ui, rect: Rect, label: &str) -> egui::Response {
+    let response = ui
+        .interact(rect, Id::new(("image-view", label)), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    response
+}
+
+fn view_contents(
+    ui: &mut Ui,
+    p: Palette,
+    bounds: Rect,
+    view: View<'_>,
+    zoom: &mut Zoom,
+) -> Verdict {
+    let ctx = ui.ctx().clone();
+    let several = view.position.is_some_and(|(_, count)| count > 1);
+    let response = ui.allocate_rect(bounds, Sense::click_and_drag());
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Window,
+            true,
+            format!(
+                "{}. Scroll to zoom, {}click or press Escape to close",
+                view.name,
+                if several {
+                    "use the arrow keys for the other pictures, "
+                } else {
+                    ""
+                }
+            ),
+        )
+    });
     let scale = ctx.pixels_per_point();
     let size = vec2(view.pixels[0] as f32, view.pixels[1] as f32) / scale;
     let fitted = fit(size, bounds);
     let most = VIEW_PIXEL * size.x / fitted.width();
-    let (by, reset) = ctx.input(|input| {
+    let (by, reset, step) = ctx.input(|input| {
         let keys = |keys: &[egui::Key]| keys.iter().any(|key| input.key_pressed(*key));
         let mut by = input.zoom_delta() * (input.smooth_scroll_delta.y * 0.004).exp();
         if keys(&[egui::Key::Plus, egui::Key::Equals]) {
@@ -263,7 +305,16 @@ pub fn view(ui: &Ui, p: Palette, bounds: Rect, view: View<'_>, zoom: &mut Zoom) 
         if keys(&[egui::Key::Minus]) {
             by /= VIEW_STEP;
         }
-        (by, keys(&[egui::Key::Num0]))
+        let step = if !several {
+            Verdict::Stay
+        } else if keys(&[egui::Key::ArrowLeft]) {
+            Verdict::Previous
+        } else if keys(&[egui::Key::ArrowRight]) {
+            Verdict::Next
+        } else {
+            Verdict::Stay
+        };
+        (by, keys(&[egui::Key::Num0]), step)
     });
     if reset {
         *zoom = Zoom::default();
@@ -285,22 +336,29 @@ pub fn view(ui: &Ui, p: Palette, bounds: Rect, view: View<'_>, zoom: &mut Zoom) 
         zoom.offset = Vec2::ZERO;
     }
     let picture = zoom.place(fitted, room(bounds));
-    let painter = ctx.layer_painter(response.layer_id);
+    let painter = ui.painter();
     // A zoomed picture stops short of the window's edge and rounded corners.
     let framed = painter.with_clip_rect(bounds.shrink(VIEW_MARGIN * 0.5));
     framed.add(p.sheet_shadow().as_shape(picture, 8));
     framed.rect_filled(picture, 8, p.elevated);
     framed.add(textured(picture, 8, view.texture));
     let percent = (picture.width() / size.x * 100.0).round();
+    let place = view
+        .position
+        .filter(|_| several)
+        .map(|(index, count)| format!("{index} of {count}   "))
+        .unwrap_or_default();
+    // The control that shows the file in its folder ends the caption.
+    const REVEAL: f32 = 26.0;
     let label = elided(
-        &painter,
+        painter,
         &format!(
-            "{}   {} × {}   {percent}%",
+            "{place}{}   {} × {}   {percent}%",
             view.name, view.pixels[0], view.pixels[1]
         ),
         theme::medium(12.0),
         p.fg,
-        bounds.width() - VIEW_MARGIN * 2.0 - 28.0,
+        bounds.width() - VIEW_MARGIN * 2.0 - 28.0 - REVEAL,
     );
     // Under a fitted picture; over a zoomed one, at the foot of the window.
     let foot = bounds.bottom() - VIEW_MARGIN - VIEW_CAPTION * 0.5 + 4.0;
@@ -309,15 +367,77 @@ pub fn view(ui: &Ui, p: Palette, bounds: Rect, view: View<'_>, zoom: &mut Zoom) 
             bounds.center().x,
             (picture.bottom() + VIEW_CAPTION * 0.5 + 4.0).min(foot),
         ),
-        vec2(label.size().x + 28.0, 28.0),
+        vec2(label.size().x + 24.0 + REVEAL, 28.0),
     );
-    capsule(&painter, chip, p);
+    // The caption is not the picture: a click on it does not close the view.
+    ui.interact(chip, Id::new("image-view-caption"), Sense::click());
+    capsule(painter, chip, p);
     galley_at(
-        &painter,
+        painter,
         Pos2::new(chip.left() + 14.0, chip.center().y),
         label,
     );
-    response.clicked()
+    let reveal = view_control(
+        ui,
+        Rect::from_center_size(
+            Pos2::new(chip.right() - 15.0, chip.center().y),
+            Vec2::splat(22.0),
+        ),
+        crate::platform::files::REVEAL_LABEL,
+    );
+    if reveal.hovered() {
+        painter.rect_filled(reveal.rect, 11, theme::tint(p.fg, 0.12));
+    }
+    icons::paint(
+        painter,
+        Rect::from_center_size(reveal.rect.center(), Vec2::splat(13.0)),
+        Icon::Folder,
+        if reveal.hovered() { p.fg } else { p.secondary },
+    );
+    let mut verdict = step;
+    if reveal
+        .on_hover_text(crate::platform::files::REVEAL_LABEL)
+        .clicked()
+    {
+        verdict = Verdict::Reveal;
+    }
+    if several {
+        let middle = room(bounds).center().y;
+        for (x, icon, label, to) in [
+            (
+                bounds.left() + VIEW_MARGIN + 8.0,
+                Icon::ChevronLeft,
+                "Previous picture",
+                Verdict::Previous,
+            ),
+            (
+                bounds.right() - VIEW_MARGIN - 8.0,
+                Icon::ChevronRight,
+                "Next picture",
+                Verdict::Next,
+            ),
+        ] {
+            let rect = Rect::from_center_size(Pos2::new(x, middle), Vec2::splat(34.0));
+            let control = view_control(ui, rect, label);
+            capsule(painter, rect, p);
+            if control.hovered() {
+                painter.rect_filled(rect, 17, theme::tint(p.fg, 0.12));
+            }
+            icons::paint(
+                painter,
+                Rect::from_center_size(rect.center(), Vec2::splat(14.0)),
+                icon,
+                if control.hovered() { p.fg } else { p.secondary },
+            );
+            if control.on_hover_text(label).clicked() {
+                verdict = to;
+            }
+        }
+    }
+    if verdict == Verdict::Stay && response.clicked() {
+        verdict = Verdict::Close;
+    }
+    verdict
 }
 
 #[cfg(test)]
@@ -426,8 +546,9 @@ mod tests {
                             texture,
                             name: "a.png",
                             pixels: [300, 200],
+                            position: None,
                         };
-                        view(ui, p, BOUNDS, full, &mut Zoom::default())
+                        view(ui, p, BOUNDS, full, &mut Zoom::default()) == Verdict::Close
                     } else {
                         let preview = Preview {
                             texture,
@@ -457,5 +578,83 @@ mod tests {
             assert!(!frame(vec![button(true)], full));
             assert!(frame(vec![button(false)], full), "full view: {full}");
         }
+    }
+
+    #[test]
+    fn one_of_several_pictures_steps_by_key_and_by_its_controls() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let p = Palette::for_config(&crate::config::Config::default());
+        let mut texture = None;
+        let mut frame = |events: Vec<egui::Event>, position| {
+            let mut verdict = Verdict::Stay;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(BOUNDS),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let texture = texture.get_or_insert_with(|| {
+                        ui.ctx().load_texture(
+                            "test",
+                            egui::ColorImage::filled([300, 200], Color32::RED),
+                            Default::default(),
+                        )
+                    });
+                    let full = View {
+                        texture,
+                        name: "a.png",
+                        pixels: [300, 200],
+                        position,
+                    };
+                    verdict = view(ui, p, BOUNDS, full, &mut Zoom::default());
+                },
+            );
+            output.textures_delta.clear();
+            verdict
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let several = Some((2, 3));
+        assert_eq!(
+            frame(vec![key(egui::Key::ArrowRight)], several),
+            Verdict::Next
+        );
+        assert_eq!(
+            frame(vec![key(egui::Key::ArrowLeft)], several),
+            Verdict::Previous
+        );
+        // A picture on its own, or the only one of its list, has no neighbour.
+        assert_eq!(frame(vec![key(egui::Key::ArrowRight)], None), Verdict::Stay);
+        assert_eq!(
+            frame(vec![key(egui::Key::ArrowRight)], Some((1, 1))),
+            Verdict::Stay
+        );
+        // The controls at the sides step; they do not close the view.
+        let mut click = |pos: Pos2, position| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(vec![egui::Event::PointerMoved(pos)], position);
+            frame(Vec::new(), position);
+            frame(vec![button(true)], position);
+            frame(vec![button(false)], position)
+        };
+        let middle = room(BOUNDS).center().y;
+        let left = Pos2::new(BOUNDS.left() + VIEW_MARGIN + 8.0, middle);
+        let right = Pos2::new(BOUNDS.right() - VIEW_MARGIN - 8.0, middle);
+        assert_eq!(click(left, several), Verdict::Previous);
+        assert_eq!(click(right, several), Verdict::Next);
+        // Without neighbours the same place is the dimmed window: it closes.
+        assert_eq!(click(left, None), Verdict::Close);
     }
 }

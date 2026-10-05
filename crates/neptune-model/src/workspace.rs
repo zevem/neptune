@@ -111,6 +111,7 @@ pub struct Pane {
     pub(crate) remote_cwd: Option<PathBuf>,
     pub(crate) agent: Option<crate::AgentSession>,
     pub(crate) pull_requests: Vec<crate::PullRequest>,
+    pub(crate) attachments: Vec<crate::Attachment>,
     pub(crate) spawned_by: Option<PaneId>,
     pub(crate) worktree: Option<crate::Worktree>,
     pub(crate) generation: u64,
@@ -123,6 +124,10 @@ impl Pane {
     /// Pull requests the agent linked to this terminal, oldest first.
     pub fn pull_requests(&self) -> &[crate::PullRequest] {
         &self.pull_requests
+    }
+    /// Files the agent attached to this terminal, oldest first.
+    pub fn attachments(&self) -> &[crate::Attachment] {
+        &self.attachments
     }
     /// The terminal whose agent started this one's, while both agents last.
     pub fn spawned_by(&self) -> Option<PaneId> {
@@ -158,6 +163,7 @@ pub struct PaneSpec {
     pub remote_cwd: Option<PathBuf>,
     pub agent: Option<crate::AgentSession>,
     pub pull_requests: Vec<crate::PullRequest>,
+    pub attachments: Vec<crate::Attachment>,
     /// The terminal whose agent started this one's.
     pub spawned_by: Option<PaneId>,
     /// The git worktree Neptune made for this terminal's agent.
@@ -549,6 +555,11 @@ impl Model {
                 {
                     return Err(Error::InvalidWorktree);
                 }
+                if pane.attachments.len() > crate::Attachment::MAX_PER_PANE
+                    || (pane.agent.is_none() && !pane.attachments.is_empty())
+                {
+                    return Err(Error::InvalidLayout("invalid attachments"));
+                }
                 if remote.is_none() && pane.remote_cwd.is_some() {
                     return Err(Error::InvalidLayout("local pane has a remote directory"));
                 }
@@ -604,6 +615,7 @@ impl Model {
                         remote_cwd: pane.remote_cwd,
                         agent: pane.agent,
                         pull_requests: pane.pull_requests,
+                        attachments: pane.attachments,
                         spawned_by: pane.spawned_by,
                         worktree: pane.worktree,
                         generation: 1,
@@ -669,6 +681,7 @@ impl Model {
                         remote_cwd: pane.remote_cwd.clone(),
                         agent: pane.agent.clone(),
                         pull_requests: pane.pull_requests.clone(),
+                        attachments: pane.attachments.clone(),
                         spawned_by: pane.spawned_by,
                         worktree: pane.worktree.clone(),
                     })

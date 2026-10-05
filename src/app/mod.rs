@@ -1,5 +1,6 @@
 //! Thin eframe composition: widgets emit actions, the controller owns transitions,
 //! workers own processes/storage, and caches consume immutable terminal snapshots.
+mod attached;
 mod attachments;
 mod changes;
 mod closing;
@@ -125,6 +126,8 @@ pub struct App {
     /// The live state of the pull requests linked in the workspace in view.
     pull_requests: crate::runtime::pull_requests::Watcher,
     attachments: attachments::Attachments,
+    /// What is known of the files agents attached to their terminals.
+    attached: attached::Attached,
     image_preview: image_preview::ImagePreview,
     explorer: explorer::Explorer,
     /// What git says about the folders in view.
@@ -254,6 +257,7 @@ impl App {
             pull_requests: Default::default(),
             attachments: attachments::Attachments::new(data.join("pasted-images")),
             image_preview: Default::default(),
+            attached: Default::default(),
             explorer: Default::default(),
             changes: Default::default(),
             file_drag: Default::default(),
@@ -388,6 +392,17 @@ impl App {
                 .flat_map(|pane| pane.pull_requests().iter().cloned()),
             ctx,
         );
+        for (pane, generation, attachment) in self.sessions.attached_files() {
+            self.attached.forget(attachment.path());
+            self.dispatch(
+                ctx,
+                Command::PaneFileAttached {
+                    pane,
+                    generation,
+                    attachment,
+                },
+            );
+        }
         let metadata: Vec<_> = self
             .sessions
             .iter()
@@ -471,6 +486,7 @@ impl App {
         self.poll_agents(ctx);
         self.serve_agents(ctx);
         self.poll_attachments();
+        self.poll_attached(ctx);
         self.poll_explorer(ctx);
         self.poll_changes(ctx);
         self.poll_saves(ctx);
@@ -621,6 +637,7 @@ impl App {
                                 lookup: self.pull_requests.lookup(link),
                             })
                             .collect(),
+                        attached: self.attached_files(pane),
                         spawned: self.spawned_agents(pane.id()),
                         worktree: self.worktree_tab(pane),
                         unread: self.notifications.unread(Some(pane.id())),
@@ -637,6 +654,7 @@ impl App {
                     PanePresentation {
                         agent: None,
                         pull_requests: Vec::new(),
+                        attached: Vec::new(),
                         spawned: Vec::new(),
                         worktree: self.worktree_tab(pane),
                         unread: self.notifications.unread(Some(pane.id())),
@@ -903,6 +921,10 @@ impl eframe::App for App {
         let worktree = active_pane
             .filter(|_| tabs <= 1)
             .and_then(|pane| Some((pane, presentations.get(&pane)?.worktree.as_ref()?)));
+        let attached = active_pane
+            .and_then(|pane| presentations.get(&pane))
+            .filter(|_| tabs <= 1)
+            .map_or(&[][..], |presentation| &presentation.attached);
         let sidebar_available = bounds.width() >= metrics::SIDEBAR_MIN_WINDOW;
         let sidebar_open = self.controller.model().sidebar() && sidebar_available;
         // Only a toggle slides. A window too narrow for the sidebar, like
@@ -969,6 +991,7 @@ impl eframe::App for App {
             pane: active_pane,
             subtitle: &subtitle,
             pull_requests,
+            attached,
             spawned,
             worktree,
             zoomed: self.ui.zoomed,
@@ -1343,6 +1366,17 @@ impl eframe::App for App {
                     pane,
                     generation,
                     pull_request,
+                },
+            );
+        }
+        for (pane, generation, attachment) in self.sessions.attached_files() {
+            self.attached.forget(attachment.path());
+            self.dispatch(
+                &ctx,
+                Command::PaneFileAttached {
+                    pane,
+                    generation,
+                    attachment,
                 },
             );
         }

@@ -2,7 +2,7 @@
 //! All setup and socket/file I/O runs on startup workers or the bridge worker.
 use super::agent_remote as remote;
 use crate::agent_activity::{Activity, Attention};
-use neptune_model::{AgentKind, AgentSession, PaneId, PullRequest};
+use neptune_model::{AgentKind, AgentSession, Attachment, PaneId, PullRequest};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -74,6 +74,12 @@ pub(super) enum Event {
     Close,
     PullRequest {
         url: String,
+    },
+    /// A file for the user to look at, by its absolute path.
+    Attachment {
+        path: PathBuf,
+        #[serde(default)]
+        title: Option<String>,
     },
     Activity {
         signal: Signal,
@@ -662,6 +668,7 @@ struct Shared {
     /// The latest activity per pane since the last frame; `None` once closed.
     activity: BTreeMap<PaneId, (u64, Option<Activity>)>,
     links: Vec<(PaneId, u64, PullRequest)>,
+    attachments: Vec<(PaneId, u64, Attachment)>,
     retired: Vec<tempfile::TempDir>,
 }
 struct Listener {
@@ -849,6 +856,7 @@ impl AgentBridge {
                 shared.changes.remove(&pane);
                 shared.activity.remove(&pane);
                 shared.links.retain(|link| link.0 != pane);
+                shared.attachments.retain(|file| file.0 != pane);
                 shared.requests.retain(|request| !request.targets(pane));
                 let old = shared.slots.insert(
                     pane,
@@ -1237,6 +1245,13 @@ impl AgentBridge {
             .map(|mut shared| std::mem::take(&mut shared.links))
             .unwrap_or_default()
     }
+    /// Files agents attached since the last call, in arrival order.
+    pub fn drain_attachments(&self) -> Vec<(PaneId, u64, Attachment)> {
+        self.shared
+            .lock()
+            .map(|mut shared| std::mem::take(&mut shared.attachments))
+            .unwrap_or_default()
+    }
 }
 impl AgentRequest {
     fn targets(&self, pane: PaneId) -> bool {
@@ -1315,6 +1330,7 @@ impl Shared {
         self.changes.remove(&pane);
         self.activity.remove(&pane);
         self.links.retain(|link| link.0 != pane);
+        self.attachments.retain(|file| file.0 != pane);
         self.requests.retain(|request| !request.targets(pane));
         self.spawns.retain(|_, spawn| spawn.0 != pane);
         if let Some(child) = self.children.get_mut(&pane) {
@@ -1514,6 +1530,17 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
             return false;
         };
         shared.links.push((pane, generation, link));
+        drop(guard);
+        wake();
+        return true;
+    }
+    if let Event::Attachment { path, title } = &message.event {
+        // As for a link: only the invocation that opened in this pane.
+        let file = Attachment::new(path.clone(), title.as_deref()).filter(|_| open);
+        let Some(file) = file.filter(|_| shared.attachments.len() < MAX_LINKS) else {
+            return false;
+        };
+        shared.attachments.push((pane, generation, file));
         drop(guard);
         wake();
         return true;
@@ -3226,10 +3253,29 @@ mod tests {
         assert_eq!((links[0].0, links[0].1), (PaneId::new(1), 7));
         assert_eq!(links[0].2.url(), url);
         assert!(bridge.drain_links().is_empty());
-        // A link that has not reached a frame leaves with its pane.
+        // A file is attached under the same rule, by an absolute path.
+        let file = |path: &std::path::Path| Event::Attachment {
+            path: path.into(),
+            title: Some("After".into()),
+        };
+        let shot = std::env::temp_dir().join("after.png");
+        assert!(!emit("two", "a", file(&shot)));
+        assert!(!emit("one", "b", file(&shot)));
+        assert!(!emit("one", "a", file(std::path::Path::new("after.png"))));
+        assert!(emit("one", "a", file(&shot)));
+        let files = bridge.drain_attachments();
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].0, files[0].1), (PaneId::new(1), 7));
+        assert_eq!(
+            (files[0].2.path(), files[0].2.title()),
+            (&*shot, Some("After"))
+        );
+        // What has not reached a frame leaves with its pane.
         assert!(emit("one", "a", link(url)));
+        assert!(emit("one", "a", file(&shot)));
         bridge.close(PaneId::new(1));
         assert!(bridge.drain_links().is_empty());
+        assert!(bridge.drain_attachments().is_empty());
     }
     #[test]
     fn hooks_are_bound_to_pane_generation_and_invocation_and_coalesced() {

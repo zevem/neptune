@@ -17,7 +17,8 @@ shell sessions, GPU rendering, and a quiet workspace interface, with no webview.
 - Saved workspace layouts and directories, plus optional Claude Code, Codex,
   OpenCode, pi and Oh My Pi session resumption on local Unix terminals, where
   an agent's pull requests appear on its tab with their checks, unresolved
-  review comments and merged state, and a panel lists which agents are working, idle or
+  review comments and merged state beside the screenshots and files it
+  attaches, and a panel lists which agents are working, idle or
   waiting for you. Either agent can start the other out of view and
   work with it.
 
