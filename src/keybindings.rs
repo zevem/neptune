@@ -659,7 +659,7 @@ mod tests {
             [keybindings]
             split-right = ["alt+h", "ctrl+shift+F10"]
             split-below = []
-            increase-font-size = ["primary+PageUp"]
+            increase-font-size = ["primary+F8"]
         "#,
         )
         .unwrap();
