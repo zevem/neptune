@@ -269,6 +269,14 @@ fn pane_menu(
         chosen.push(Action::Paste(id));
     }
     helpers::menu_separator(ui, p);
+    let hints_shortcut = if cfg!(target_os = "macos") {
+        "⌘⇧H".to_owned()
+    } else {
+        shortcut("H")
+    };
+    if menu_item(ui, p, Icon::Copy, "Copy with hints", &hints_shortcut, false) {
+        chosen.push(Action::CopyHints(id));
+    }
     if menu_item(ui, p, Icon::Search, "Find…", &shortcut("F"), false) {
         chosen.extend([Action::Focus(id), Action::Find]);
     }
@@ -783,7 +791,7 @@ fn draw_pane(
             actions.push(Action::Selection(id, interaction));
         }
         if let Some(link) = painted.open_link {
-            actions.push(Action::OpenLink(link));
+            actions.push(Action::OpenTerminalLink(id, link));
         }
         // A remote terminal names files on another machine.
         if !painted.image_paths.is_empty() && !remote {

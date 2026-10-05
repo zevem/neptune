@@ -655,6 +655,7 @@ impl App {
                     );
                 }
             }
+            Action::CopyHints(pane) => self.start_hints(ctx, pane),
             Action::Find => {
                 let editing = ctx.memory(|memory| memory.has_focus(ui::search::input_id()));
                 if self.ui.search_open && !editing {
@@ -770,6 +771,26 @@ impl App {
                     self.ui.error = Some(error.into());
                 }
             }
+            Action::OpenTerminalLink(pane, target) => match target {
+                crate::terminal_view::LinkTarget::Web(link) => {
+                    if let Err(error) = self.link_opener.open(link, ctx.clone()) {
+                        self.ui.error = Some(error.into());
+                    }
+                }
+                crate::terminal_view::LinkTarget::File(location) => {
+                    if self
+                        .controller
+                        .model()
+                        .workspace_for_pane(pane)
+                        .and_then(|id| self.controller.model().workspace(id))
+                        .is_some_and(|w| w.remote().is_some())
+                    {
+                        self.ui.error = Some("This file belongs to a remote terminal. Copy its path with hints instead.".into());
+                    } else {
+                        self.open_file_location(ctx, pane, location);
+                    }
+                }
+            },
             Action::OpenAttachment(pane, path) => self.open_attachment(ctx, pane, path),
             Action::RevealAttachment(path) => {
                 self.explorer_event(ctx, ui::explorer::Event::Reveal(path));

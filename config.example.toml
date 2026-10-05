@@ -51,6 +51,14 @@ scrollback = 10000
 # shell = 'C:\Windows\System32\wsl.exe'
 # shell_args = ["-d", "Ubuntu"]
 
+# Ctrl-click filenames or path:line[:column] to open Neptune’s file explorer.
+# Preferences → General detects installed external editors. Set a custom editor
+# executable plus arguments here; placeholders are passed without a shell.
+# editor = ["code", "--goto", "{file}:{line}:{column}"]
+# editor = ["cursor", "--goto", "{file}:{line}:{column}"]
+# editor = ["subl", "{file}:{line}:{column}"]
+# An empty array uses Neptune’s explorer.
+
 # block, beam, or underline
 cursor = "block"
 cursor_blink = false

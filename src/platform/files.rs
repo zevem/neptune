@@ -4,7 +4,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -26,16 +26,27 @@ pub enum Handoff {
     Reveal(PathBuf),
     /// Open with the default application.
     Open(PathBuf),
+    Edit {
+        location: super::editor::FileLocation,
+        directories: Vec<PathBuf>,
+        command: Vec<String>,
+    },
 }
 
 #[derive(Default)]
 pub struct FileOpener {
-    pending: Option<mpsc::Receiver<Result<(), &'static str>>>,
+    pending: Option<mpsc::Receiver<Result<Option<Child>, &'static str>>>,
+    editors: Vec<Child>,
 }
 
 impl FileOpener {
     /// Only one launcher can be in flight.
     pub fn start(&mut self, handoff: Handoff, ctx: egui::Context) -> Result<(), &'static str> {
+        self.editors
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        if self.editors.len() >= 8 {
+            return Err("Several editor launchers are still running. Try again after one closes.");
+        }
         if self.pending.is_some() {
             return Err("A file is already opening. Try again in a moment.");
         }
@@ -43,7 +54,15 @@ impl FileOpener {
         std::thread::Builder::new()
             .name("neptune-open-file".into())
             .spawn(move || {
-                let _ = sender.send(launch(&handoff));
+                let result = match &handoff {
+                    Handoff::Edit {
+                        location,
+                        directories,
+                        command,
+                    } => launch_editor(location, directories, command),
+                    _ => launch(&handoff).map(|()| None),
+                };
+                let _ = sender.send(result);
                 ctx.request_repaint();
             })
             .map_err(|_| "Could not start the file launcher.")?;
@@ -52,13 +71,19 @@ impl FileOpener {
     }
 
     pub fn poll(&mut self) -> Option<Result<(), &'static str>> {
+        self.editors
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         let result = match self.pending.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => Err("The file launcher stopped unexpectedly."),
         };
         self.pending = None;
-        Some(result)
+        Some(result.map(|child| {
+            if let Some(child) = child {
+                self.editors.push(child);
+            }
+        }))
     }
 }
 
@@ -105,6 +130,7 @@ fn commands(handoff: &Handoff) -> Vec<Command> {
     };
     match handoff {
         Handoff::Open(path) => vec![open(path)],
+        Handoff::Edit { .. } => unreachable!("editor resolution runs on the worker"),
         Handoff::Reveal(path) => {
             #[cfg(target_os = "macos")]
             {
@@ -147,6 +173,32 @@ fn commands(handoff: &Handoff) -> Vec<Command> {
     }
 }
 
+/// A GUI editor can remain running for hours. Keep its handle for nonblocking
+/// reaping; never kill it because the handoff has taken longer than a browser.
+fn launch_editor(
+    location: &super::editor::FileLocation,
+    directories: &[PathBuf],
+    args: &[String],
+) -> Result<Option<Child>, &'static str> {
+    let mut child = quiet(super::editor::command(location, directories, args)?)
+        .spawn()
+        .map_err(|_| "Could not start the editor. Choose an installed editor in Preferences.")?;
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(None),
+            Ok(Some(_)) => {
+                return Err(
+                    "The editor could not open the file. Check its command in config.toml.",
+                );
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => return Ok(Some(child)),
+            Err(_) => return Err("Could not check the editor launcher."),
+        }
+    }
+}
+
 fn launch(handoff: &Handoff) -> Result<(), &'static str> {
     let commands = commands(handoff);
     let last = commands.len().saturating_sub(1);
@@ -177,6 +229,9 @@ fn launch(handoff: &Handoff) -> Result<(), &'static str> {
     Err(match handoff {
         Handoff::Reveal(_) => "Could not show the file. Check that a file manager is installed.",
         Handoff::Open(_) => "Could not open the file. No application is set to open it.",
+        Handoff::Edit { .. } => {
+            "Could not open the editor. Set editor in config.toml to an installed editor command."
+        }
     })
 }
 
@@ -218,6 +273,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         let mut opener = FileOpener {
             pending: Some(receiver),
+            editors: Vec::new(),
         };
         assert!(
             opener
@@ -228,5 +284,48 @@ mod tests {
         sender.send(Err("failed")).unwrap();
         assert_eq!(opener.poll(), Some(Err("failed")));
         assert!(opener.pending.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_handoff_preserves_arguments_and_retains_a_running_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a {line} $(echo) é.rs");
+        std::fs::write(&file, "").unwrap();
+        let record = root.path().join("arguments");
+        let launcher = root.path().join("editor");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\nrecord=$1\nshift\nprintf '%s\\n' \"$@\" > \"$record\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = launch_editor(
+            &super::super::editor::FileLocation {
+                path: file.file_name().unwrap().to_str().unwrap().into(),
+                line: 42,
+                column: 7,
+            },
+            &[root.path().into()],
+            &[
+                launcher.to_str().unwrap().into(),
+                record.to_str().unwrap().into(),
+                "--goto".into(),
+                "{file}:{line}:{column}".into(),
+            ],
+        )
+        .unwrap()
+        .expect("A persistent editor launcher must survive the handoff");
+        let running = child.try_wait();
+        let arguments = std::fs::read_to_string(&record);
+        // This is the fixture's process, not an installed editor.
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(matches!(running, Ok(None)));
+        assert_eq!(
+            arguments.unwrap(),
+            format!("--goto\n{}:42:7\n", file.canonicalize().unwrap().display())
+        );
     }
 }

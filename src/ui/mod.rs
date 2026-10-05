@@ -165,6 +165,7 @@ pub enum Action {
     Changes(changes::Event),
     Worktree(worktrees::Event),
     Find,
+    CopyHints(PaneId),
     SearchChanged,
     FindNext {
         reverse: bool,
@@ -201,6 +202,7 @@ pub enum Action {
     Resize(PaneId, crate::terminal_view::geometry::ResizeRequest),
     Selection(PaneId, crate::terminal_view::SelectionInteraction),
     OpenLink(crate::platform::links::WebLink),
+    OpenTerminalLink(PaneId, crate::terminal_view::LinkTarget),
     /// Show an attached picture at full size, or open another kind of file
     /// with its application.
     OpenAttachment(PaneId, PathBuf),

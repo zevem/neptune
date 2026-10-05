@@ -1,6 +1,7 @@
 //! Desktop side effects with deterministic substitutes for headless tests.
 
 pub mod clipboard;
+pub mod editor;
 pub mod file_drag;
 pub mod files;
 pub(crate) mod folders;

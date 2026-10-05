@@ -77,6 +77,8 @@ pub struct State {
     pub delete: Option<PathBuf>,
     /// The preview's share of the panel's height below the fields.
     pub preview_share: f32,
+    pub preview_location: Option<(u32, u32)>,
+    pub preview_jump: bool,
 }
 
 impl Default for State {
@@ -91,6 +93,8 @@ impl Default for State {
             scroll_jump: false,
             delete: None,
             preview_share: 0.45,
+            preview_location: None,
+            preview_jump: false,
         }
     }
 }
@@ -691,7 +695,14 @@ fn list(
     });
 }
 
-fn preview(ui: &mut Ui, rect: Rect, p: Palette, view: &PreviewView, events: &mut Vec<Event>) {
+fn preview(
+    ui: &mut Ui,
+    rect: Rect,
+    p: Palette,
+    view: &PreviewView,
+    state: &mut State,
+    events: &mut Vec<Event>,
+) {
     ui.painter().rect_filled(rect, metrics::PANE_RADIUS, p.bg);
     let header = Rect::from_min_size(rect.min, vec2(rect.width(), 32.0));
     let middle = header.center().y;
@@ -760,6 +771,18 @@ fn preview(ui: &mut Ui, rect: Rect, p: Palette, view: &PreviewView, events: &mut
             widest,
             truncated,
         } => {
+            if state
+                .preview_location
+                .is_some_and(|(line, _)| line as usize > lines.len())
+            {
+                let message = if *truncated {
+                    "This line is beyond the preview. Choose an external editor in Preferences to open it."
+                } else {
+                    "This line is beyond the end of the file."
+                };
+                centered_note(ui, body, p, message);
+                return;
+            }
             let font = egui::FontId::monospace(11.5);
             let column = painter
                 .layout_no_wrap("0".into(), font.clone(), p.fg)
@@ -775,8 +798,22 @@ fn preview(ui: &mut Ui, rect: Rect, p: Palette, view: &PreviewView, events: &mut
             );
             ui.set_clip_rect(body.intersect(ui.clip_rect()));
             ui.spacing_mut().item_spacing = Vec2::ZERO;
-            egui::ScrollArea::both()
-                .id_salt("explorer-preview-lines")
+            let location = state.preview_location;
+            let mut scroll = egui::ScrollArea::both();
+            if state.preview_jump
+                && let Some((line, col)) = location
+            {
+                scroll = scroll
+                    .vertical_scroll_offset(
+                        (line.saturating_sub(1) as usize).min(lines.len().saturating_sub(1)) as f32
+                            * height,
+                    )
+                    .horizontal_scroll_offset(
+                        (col.saturating_sub(1) as f32 * column - body.width() / 2.0).max(0.0),
+                    );
+            }
+            let scrolled = scroll
+                .id_salt(("explorer-preview-lines", view.path))
                 .auto_shrink([false, false])
                 .show_rows(
                     &mut ui,
@@ -788,6 +825,21 @@ fn preview(ui: &mut Ui, rect: Rect, p: Palette, view: &PreviewView, events: &mut
                             let (_, line) =
                                 ui.allocate_space(vec2(width.max(ui.available_width()), height));
                             let painter = ui.painter();
+                            if let Some((target, col)) = location
+                                && index + 1 == target as usize
+                            {
+                                painter.rect_filled(line, 0, p.accent.gamma_multiply(0.15));
+                                let x = line.left()
+                                    + gutter
+                                    + (col.saturating_sub(1) as usize)
+                                        .min(lines[index].chars().count())
+                                        as f32
+                                        * column;
+                                painter.line_segment(
+                                    [egui::pos2(x, line.top()), egui::pos2(x, line.bottom())],
+                                    egui::Stroke::new(1.5, p.accent),
+                                );
+                            }
                             let Some(text) = lines.get(index) else {
                                 painter.text(
                                     Pos2::new(line.left() + gutter, line.center().y),
@@ -815,6 +867,19 @@ fn preview(ui: &mut Ui, rect: Rect, p: Palette, view: &PreviewView, events: &mut
                         }
                     },
                 );
+            if state.preview_jump && !ui.is_sizing_pass() && !ui.ctx().will_discard() {
+                let desired = location.map_or(0.0, |(line, _)| {
+                    (line.saturating_sub(1) as usize).min(lines.len().saturating_sub(1)) as f32
+                        * height
+                });
+                let expected =
+                    desired.min((scrolled.content_size.y - scrolled.inner_rect.height()).max(0.0));
+                if (scrolled.state.offset.y - expected).abs() < 1.0 {
+                    state.preview_jump = false;
+                } else {
+                    ui.ctx().request_repaint();
+                }
+            }
         }
         PreviewBody::Image { texture, pixels } => {
             let room = body.shrink(8.0);
@@ -1136,7 +1201,9 @@ fn contents(
     if height > 0.0 {
         let surface = Rect::from_min_max(Pos2::new(body.left(), split), body.max);
         match &view.preview {
-            Some(preview) if previewing >= 1.0 => self::preview(ui, surface, p, preview, events),
+            Some(preview) if previewing >= 1.0 => {
+                self::preview(ui, surface, p, preview, state, events)
+            }
             // Opening or closing: the surface alone, without content to reflow.
             _ => {
                 ui.painter()
@@ -1428,5 +1495,66 @@ mod tests {
         assert_eq!(file_size(1536), "1.5 KB");
         assert_eq!(file_size(20 * 1024 * 1024), "20 MB");
         assert_eq!(file_size(u64::MAX), "16777216 TB");
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_location_scrolls_the_visible_preview_to_its_highlighted_line() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let lines: Vec<_> = (1..=100).map(|i| format!("source line {i}")).collect();
+        let view = PreviewView {
+            path: Path::new("/tmp/location.rs"),
+            name: "location.rs",
+            size: Some(1024),
+            body: PreviewBody::Text {
+                lines: &lines,
+                widest: 20,
+                truncated: false,
+            },
+        };
+        let mut state = State {
+            preview_location: Some((42, 3)),
+            preview_jump: true,
+            ..Default::default()
+        };
+        let mut painted = Vec::new();
+        for _ in 0..4 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    preview(
+                        ui,
+                        Rect::from_min_size(Pos2::ZERO, vec2(300.0, 240.0)),
+                        Palette::new(crate::config::Theme::Graphite),
+                        &view,
+                        &mut state,
+                        &mut Vec::new(),
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            painted = output
+                .shapes
+                .into_iter()
+                .filter_map(|s| match s.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect();
+        }
+        assert!(!state.preview_jump);
+        assert!(
+            painted.iter().any(|t| t == "source line 42"),
+            "painted: {painted:?}"
+        );
+        assert!(!painted.iter().any(|t| t == "source line 1"));
     }
 }

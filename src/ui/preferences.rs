@@ -81,6 +81,7 @@ pub struct View {
     pub pane: Pane,
     query: String,
     font: FontPicker,
+    editors: crate::platform::editor::Detection,
     /// The search field takes the keyboard when the sheet appears.
     focus_search: bool,
 }
@@ -91,6 +92,7 @@ impl View {
         self.query.clear();
         self.focus_search = true;
         self.font.cancel();
+        self.editors.refresh();
     }
 
     /// The sheet with a search under way.
@@ -149,6 +151,7 @@ impl FontPicker {
 /// One thing a search can find: a row, or the rows that belong together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Setting {
+    FileEditor,
     RestoreWorkspaces,
     ConfirmClose,
     WarnProcesses,
@@ -170,7 +173,13 @@ enum Setting {
 
 /// Each setting with its pane, its label and the other words people use for
 /// it. A search reads the pane's name and the label as well as these.
-const INDEX: [(Setting, Pane, &str, &str); 17] = [
+const INDEX: [(Setting, Pane, &str, &str); 18] = [
+    (
+        Setting::FileEditor,
+        Pane::General,
+        "Open file locations in",
+        "editor files paths click line vscode visual studio code cursor android studio explorer",
+    ),
     (
         Setting::RestoreWorkspaces,
         Pane::General,
@@ -546,7 +555,7 @@ pub fn show(
                         .show(ui, |ui| {
                             padded(ui, 20.0, |ui| {
                                 if listed(Pane::General) {
-                                    general(ui, p, &shown, &mut config);
+                                    general(ui, p, &shown, &mut config, &mut view.editors);
                                 }
                                 if listed(Pane::Appearance) {
                                     appearance(ui, p, &shown, &mut config, state);
@@ -690,7 +699,13 @@ fn sidebar(ui: &mut Ui, p: Palette, view: &mut View, found: Option<&[Setting]>, 
         });
 }
 
-fn general(ui: &mut Ui, p: Palette, shown: &Shown, config: &mut Config) {
+fn general(
+    ui: &mut Ui,
+    p: Palette,
+    shown: &Shown,
+    config: &mut Config,
+    editors: &mut crate::platform::editor::Detection,
+) {
     use Setting::{ConfirmClose, Reset, RestoreWorkspaces, WarnProcesses};
     let pane = Pane::General;
     card(
@@ -742,6 +757,64 @@ fn general(ui: &mut Ui, p: Palette, shown: &Shown, config: &mut Config) {
                 rows.note(
                     ui,
                     "Process warnings also apply when quitting, even with close confirmation off.",
+                );
+            }
+        },
+    );
+    card(
+        ui,
+        p,
+        shown,
+        pane,
+        "File locations",
+        &[Setting::FileEditor],
+        |ui, rows| {
+            let detected = editors.poll(ui.ctx());
+            let label = if config.editor.is_empty() {
+                "Neptune file explorer"
+            } else {
+                detected
+                    .and_then(|list| list.iter().find(|e| e.command == config.editor))
+                    .map(|e| e.name.as_str())
+                    .unwrap_or("Custom editor")
+            };
+            rows.row(ui, "Open file locations in", |ui| {
+                let width = (ui.available_width() - 150.0).clamp(120.0, 240.0);
+                let response = select(
+                    ui,
+                    p,
+                    Id::new("preferences-file-editor"),
+                    label,
+                    "Open file locations in",
+                    width,
+                );
+                egui::Popup::menu(&response).show(|ui| {
+                    menu_layout(ui, width.max(240.0));
+                    if menu_item(ui, p, Icon::Folder, "Neptune file explorer", "", false) {
+                        config.editor.clear();
+                        ui.close();
+                    }
+                    if let Some(list) = detected {
+                        for editor in list {
+                            if menu_item(ui, p, Icon::Terminal, &editor.name, "", false) {
+                                config.editor.clone_from(&editor.command);
+                                ui.close();
+                            }
+                        }
+                        if list.is_empty() {
+                            ui.label("No external editors found.");
+                        }
+                    } else {
+                        ui.label("Finding installed editors…");
+                    }
+                });
+            });
+            if !config.editor.is_empty()
+                && detected.is_some_and(|list| !list.iter().any(|e| e.command == config.editor))
+            {
+                rows.note(
+                    ui,
+                    "Custom or unavailable editor. Check its command in config.toml.",
                 );
             }
         },
