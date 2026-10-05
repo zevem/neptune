@@ -228,7 +228,9 @@ icon buttons keep a 28-point target around a 16-point glyph.
   "Minimize" and "Maximize".
 - **Panes.** Rounded surfaces in the chrome, separated by a 6-point gutter that
   is also the split handle (a grip appears on hover; double-click evens the
-  split). The surface takes the terminal's resolved background, so a program
+  whole row or column it divides). A new split takes an equal share of its
+  row or column and a closed one returns its share, the others keeping their
+  proportions, so equal terminals stay equal. The surface takes the terminal's resolved background, so a program
   that changes it stays seamless. Each place in the layout holds one or more
   terminals as tabs, with one in view. With several terminals, each place has
   a header with a tab per terminal, naming the program and directory (the

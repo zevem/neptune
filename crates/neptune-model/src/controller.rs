@@ -117,6 +117,10 @@ pub enum Command {
         split: SplitId,
         ratio: f32,
     },
+    /// Give the places in the line this split divides the same share of it.
+    EvenSplit(SplitId),
+    /// Give the places of every line in a workspace the same share of it.
+    EvenSplits(WorkspaceId),
     RestartPane(PaneId),
     SetSidebar(bool),
     /// The composition layer owns the typed configuration and supplies its
@@ -663,6 +667,17 @@ impl Controller {
                     .iter_mut()
                     .find_map(|workspace| workspace.layout.set_ratio(split, ratio))
                     .ok_or(Error::UnknownSplit(split))?;
+            }
+            Command::EvenSplit(split) => {
+                dirty = self
+                    .model
+                    .workspaces
+                    .iter_mut()
+                    .find_map(|workspace| workspace.layout.even_line(split))
+                    .ok_or(Error::UnknownSplit(split))?;
+            }
+            Command::EvenSplits(workspace) => {
+                dirty = self.model.workspace_mut(workspace)?.layout.even(true);
             }
             Command::RestartPane(pane) => {
                 let remote = self
@@ -2118,6 +2133,112 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(controller.generation(), generation);
+    }
+
+    #[test]
+    fn splits_share_their_line_and_evening_reports_only_real_changes() {
+        fn ratios(layout: &Layout) -> Vec<f32> {
+            match layout {
+                Layout::Tabs { .. } => Vec::new(),
+                Layout::Split {
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => [vec![*ratio], ratios(first), ratios(second)].concat(),
+            }
+        }
+        let (mut controller, workspace, first) = setup();
+        let second = split(&mut controller, first, Axis::Vertical);
+        let third = split(&mut controller, second, Axis::Vertical);
+        let layout = |controller: &Controller| {
+            controller
+                .model()
+                .workspace(workspace)
+                .unwrap()
+                .layout()
+                .clone()
+        };
+        // Three columns of one width: a third, then half of the rest.
+        assert_eq!(ratios(&layout(&controller)), [1.0 / 3.0, 0.5]);
+        controller.dispatch(Command::ClosePane(third)).unwrap();
+        assert_eq!(ratios(&layout(&controller)), [0.5]);
+        let third = split(&mut controller, first, Axis::Vertical);
+        assert_eq!(ratios(&layout(&controller)), [2.0 / 3.0, 0.5]);
+        // Moving a terminal along the line keeps the columns even.
+        controller
+            .dispatch(Command::MovePane {
+                pane: first,
+                destination: Destination::Beside {
+                    pane: second,
+                    edge: Edge::Right,
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            controller
+                .model()
+                .workspace(workspace)
+                .unwrap()
+                .layout()
+                .shown(),
+            [third, second, first]
+        );
+        assert_eq!(ratios(&layout(&controller)), [1.0 / 3.0, 0.5]);
+
+        let ids = split_ids(&layout(&controller));
+        let generation = controller.generation();
+        // Dropped where it stands, a terminal leaves the line as it is.
+        let unmoved = Command::MovePane {
+            pane: first,
+            destination: Destination::Beside {
+                pane: second,
+                edge: Edge::Right,
+            },
+        };
+        for command in [
+            unmoved,
+            Command::EvenSplit(ids[1]),
+            Command::EvenSplits(workspace),
+        ] {
+            assert!(controller.dispatch(command).unwrap().is_empty());
+        }
+        assert_eq!(controller.generation(), generation);
+        controller
+            .dispatch(Command::SetSplitRatio {
+                split: ids[0],
+                ratio: 0.7,
+            })
+            .unwrap();
+        // Either divider evens the whole line.
+        assert!(
+            !controller
+                .dispatch(Command::EvenSplit(ids[1]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(ratios(&layout(&controller)), [1.0 / 3.0, 0.5]);
+        controller
+            .dispatch(Command::SetSplitRatio {
+                split: ids[1],
+                ratio: 0.2,
+            })
+            .unwrap();
+        assert!(
+            !controller
+                .dispatch(Command::EvenSplits(workspace))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(ratios(&layout(&controller)), [1.0 / 3.0, 0.5]);
+        assert_eq!(
+            controller.dispatch(Command::EvenSplit(SplitId::new(99))),
+            Err(Error::UnknownSplit(SplitId::new(99)))
+        );
+        assert_eq!(
+            controller.dispatch(Command::EvenSplits(WorkspaceId::new(99))),
+            Err(Error::UnknownWorkspace(WorkspaceId::new(99)))
+        );
     }
 
     #[test]
