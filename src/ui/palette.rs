@@ -167,6 +167,15 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             ));
         }
         if let Some(layout) = view.layout {
+            if let (neptune_model::Layout::Split { .. }, Some(workspace)) = (layout, view.active) {
+                list.push(command(
+                    "Terminal",
+                    Icon::Grid,
+                    "Even terminal sizes",
+                    "",
+                    [Action::EvenSplits(workspace)],
+                ));
+            }
             for (forward, title, key) in
                 [(true, "Next tab", "PgDn"), (false, "Previous tab", "PgUp")]
             {
@@ -994,9 +1003,30 @@ mod tests {
         let list = commands(&PaletteView {
             pane: Some(PaneId::new(1)),
             layout: Some(&layout),
+            active: Some(WorkspaceId::new(4)),
             zoomed: true,
             ..view(&config, &[])
         });
+        let even = list
+            .iter()
+            .find(|command| command.title == "Even terminal sizes")
+            .expect("even command");
+        assert!(matches!(
+            even.actions[..],
+            [Action::EvenSplits(workspace)] if workspace == WorkspaceId::new(4)
+        ));
+        // One place has nothing to even.
+        let alone = neptune_model::Layout::pane(PaneId::new(1));
+        assert!(
+            commands(&PaletteView {
+                pane: Some(PaneId::new(1)),
+                layout: Some(&alone),
+                active: Some(WorkspaceId::new(4)),
+                ..view(&config, &[])
+            })
+            .iter()
+            .all(|command| command.title != "Even terminal sizes")
+        );
         let navigation: Vec<_> = list
             .iter()
             .filter(|command| command.title.starts_with("Focus pane"))

@@ -1002,16 +1002,19 @@ fn draw_pane(
     }
 }
 
-/// The two sides of a split and the gutter between them.
-fn divide(rect: Rect, vertical: bool, ratio: f32) -> (Rect, Rect, Rect) {
+/// The two sides of a split and the gutter between them. Each side keeps a
+/// minimum for every place it holds along the split, `places` of them before
+/// and after the gutter; with too little room, the places share the shortfall.
+fn divide(rect: Rect, vertical: bool, ratio: f32, places: (usize, usize)) -> (Rect, Rect, Rect) {
     let length = if vertical {
         rect.width()
     } else {
         rect.height()
     };
     let min = if vertical { 200.0 } else { 130.0 };
-    let low = (min / length).min(0.45);
-    let cut = length * ratio.clamp(low, 1.0 - low);
+    let (before, after) = (places.0 as f32, places.1 as f32);
+    let min = (min / length).min(0.9 / (before + after));
+    let cut = length * ratio.clamp(min * before, 1.0 - min * after);
     let half = metrics::GUTTER * 0.5;
     if vertical {
         (
@@ -1063,15 +1066,16 @@ pub fn draw_node(
             } else {
                 rect.height()
             };
-            let (a, b, gap) = divide(rect, vertical, *ratio);
-            let (settled_a, settled_b, _) = divide(place.settled, vertical, *ratio);
+            let places = (first.places(*axis), second.places(*axis));
+            let (a, b, gap) = divide(rect, vertical, *ratio, places);
+            let (settled_a, settled_b, _) = divide(place.settled, vertical, *ratio, places);
             // A slightly wider grab area than the visible gutter.
             let grab = if vertical {
                 gap.expand2(vec2(2.0, 0.0))
             } else {
                 gap.expand2(vec2(0.0, 2.0))
             };
-            // Click sensing is what reports the double-click that evens a split.
+            // Click sensing is what reports the double-click that evens a line.
             let response = ui
                 .interact(
                     grab,
@@ -1094,7 +1098,7 @@ pub fn draw_node(
                 actions.push(Action::Ratio(*split, ratio.clamp(0.1, 0.9)));
             }
             if response.double_clicked() || response.triple_clicked() {
-                actions.push(Action::Ratio(*split, 0.5));
+                actions.push(Action::EvenSplit(*split));
             }
             let grip = animate(
                 ui.ctx(),
@@ -1397,6 +1401,30 @@ mod tests {
             status: SessionStatus::Running,
             bell_count: 0,
         }
+    }
+
+    #[test]
+    fn minimum_sizes_count_every_place_on_each_side_of_a_split() {
+        let rect = |width| Rect::from_min_size(Pos2::ZERO, vec2(width, 400.0));
+        // One column beside four: an even line stays even however narrow.
+        for width in [1500.0, 640.0, 300.0] {
+            let (a, b, gap) = divide(rect(width), true, 0.2, (1, 4));
+            let inner = width - gap.width();
+            assert!((a.width() - inner / 5.0).abs() < 2.0, "{width}: {a:?}");
+            assert!((b.width() - inner * 0.8).abs() < 2.0, "{width}: {b:?}");
+        }
+        // With room, a side keeps 200 points for each column it holds.
+        let (a, b, _) = divide(rect(1500.0), true, 0.9, (1, 4));
+        assert!((b.width() - 800.0).abs() < 4.0 && a.width() > 690.0);
+        let (a, _, _) = divide(rect(1500.0), true, 0.1, (1, 4));
+        assert!((a.width() - 200.0).abs() < 4.0);
+        // Two places alone keep the limits they had.
+        let (a, b, _) = divide(rect(1000.0), true, 0.1, (1, 1));
+        assert!((a.width() - 200.0).abs() < 4.0 && b.width() > 790.0);
+        let (a, b, _) = divide(rect(300.0), true, 0.1, (1, 1));
+        assert!((a.width() - 135.0).abs() < 4.0 && (b.width() - 165.0).abs() < 4.0);
+        let (a, _, _) = divide(rect(1000.0).with_max_y(600.0), false, 0.1, (1, 1));
+        assert!((a.height() - 130.0).abs() < 4.0);
     }
 
     /// Two terminals side by side, drawn headlessly the way the app draws them.
@@ -1840,7 +1868,7 @@ mod tests {
                 _ => None,
             }));
         }
-        let (_, _, gap) = divide(settled, true, 0.5);
+        let (_, _, gap) = divide(settled, true, 0.5, (1, 1));
         assert_eq!(
             resizes.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             [left, right]

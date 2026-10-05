@@ -127,6 +127,8 @@ pub enum Action {
     MoveWorkspace(WorkspaceId, usize),
     Focus(PaneId),
     Ratio(SplitId, f32),
+    EvenSplit(SplitId),
+    EvenSplits(WorkspaceId),
     Rename(WorkspaceId),
     New,
     NewInGroup(WorkspaceGroupId),

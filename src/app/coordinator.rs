@@ -510,6 +510,8 @@ impl App {
             Action::Ratio(split, ratio) => {
                 self.dispatch(ctx, Command::SetSplitRatio { split, ratio })
             }
+            Action::EvenSplit(split) => self.dispatch(ctx, Command::EvenSplit(split)),
+            Action::EvenSplits(workspace) => self.dispatch(ctx, Command::EvenSplits(workspace)),
             Action::MovePane(pane, destination) => {
                 self.dispatch(ctx, Command::MovePane { pane, destination })
             }
