@@ -1,8 +1,8 @@
-//! The panel at the window's trailing edge. It holds the file explorer and
-//! the running agents as tabs, and owns what they share: the toolbar control,
+//! The panel at the window's trailing edge. It holds the file explorer, the
+//! running agents and git's changes as tabs, and owns what they share: the toolbar control,
 //! the slide, the width and the edge that resizes it.
 use super::helpers::{animate, elided, galley_at};
-use super::{Action, agents, chrome::SidebarSlide, explorer};
+use super::{Action, agents, changes, chrome::SidebarSlide, explorer};
 use crate::{
     icons::{self, Icon},
     theme::{self, Palette},
@@ -22,6 +22,7 @@ pub enum Tab {
     #[default]
     Files,
     Agents,
+    Changes,
 }
 
 impl Tab {
@@ -29,6 +30,7 @@ impl Tab {
         match self {
             Self::Files => "Files",
             Self::Agents => "Agents",
+            Self::Changes => "Changes",
         }
     }
 }
@@ -98,12 +100,19 @@ pub fn toggle(ui: &mut Ui, p: Palette, open: bool, waiting: bool, hint: &str) ->
 pub struct View<'a> {
     pub files: &'a explorer::View<'a>,
     pub agents: &'a agents::View<'a>,
+    pub changes: &'a changes::View<'a>,
     /// Agents waiting for input, whichever tab is in view.
     pub waiting: usize,
     /// The window, which clips the panel while it slides.
     pub window: Rect,
     /// How far the panel has slid in, 0 to 1.
     pub reveal: f32,
+}
+
+/// What the tabs keep between frames.
+pub struct Contents<'a> {
+    pub files: &'a mut explorer::State,
+    pub changes: &'a mut changes::State,
 }
 
 /// One tab of the strip. Returns whether it was chosen.
@@ -166,7 +175,7 @@ pub fn show(
     p: Palette,
     view: &View,
     state: &mut State,
-    files: &mut explorer::State,
+    contents: Contents,
     actions: &mut Vec<Action>,
 ) {
     let strip = Rect::from_min_max(
@@ -176,24 +185,46 @@ pub fn show(
     let mut child = ui.new_child(UiBuilder::new().id_salt("right-panel").max_rect(rect));
     child.set_clip_rect(rect.expand2(vec2(4.0, 0.0)).intersect(view.window));
     child.multiply_opacity(view.reveal);
-    let tabs = [Tab::Files, Tab::Agents];
+    let tabs = [Tab::Files, Tab::Agents, Tab::Changes];
+    let waiting = |item| if item == Tab::Agents { view.waiting } else { 0 };
     let gap = 4.0;
-    let each = (strip.width() - gap * (tabs.len() - 1) as f32) / tabs.len() as f32;
-    for (index, item) in tabs.into_iter().enumerate() {
-        let left = strip.left() + index as f32 * (each + gap);
+    let room = strip.width() - gap * (tabs.len() - 1) as f32;
+    let each = room / tabs.len() as f32;
+    // Tabs are of equal width while every name fits one. In a panel too
+    // narrow for that, each takes what its name needs and a share of the rest.
+    let needed = tabs.map(|item| {
+        let width = |text: String, size| {
+            child
+                .painter()
+                .layout_no_wrap(text, theme::medium(size), p.fg)
+                .size()
+                .x
+        };
+        let badge = match waiting(item) {
+            0 => 0.0,
+            count => width(count.to_string(), 10.5) + 12.0,
+        };
+        width(item.label().to_owned(), 12.0) + badge + 16.0
+    });
+    let spare = (room - needed.iter().sum::<f32>()) / tabs.len() as f32;
+    let fitted = needed.iter().all(|needed| *needed <= each) || spare < 0.0;
+    let mut left = strip.left();
+    for (item, needed) in tabs.into_iter().zip(needed) {
+        let width = if fitted { each } else { needed + spare };
         let cell = Rect::from_min_max(
             Pos2::new(left, strip.top() + 3.0),
-            Pos2::new(left + each, strip.bottom() - 3.0),
+            Pos2::new(left + width, strip.bottom() - 3.0),
         );
-        let waiting = if item == Tab::Agents { view.waiting } else { 0 };
-        if tab(&mut child, cell, p, item, state.tab == item, waiting) && state.tab != item {
+        left += width + gap;
+        if tab(&mut child, cell, p, item, state.tab == item, waiting(item)) && state.tab != item {
             actions.push(Action::Panel(Event::Show(item)));
         }
     }
     let body = Rect::from_min_max(Pos2::new(rect.left(), strip.bottom()), rect.max);
     match state.tab {
-        Tab::Files => explorer::show(ui, body, p, view.files, files, actions),
+        Tab::Files => explorer::show(ui, body, p, view.files, contents.files, actions),
         Tab::Agents => agents::show(ui, body, p, view.agents, actions),
+        Tab::Changes => changes::show(ui, body, p, view.changes, contents.changes, actions),
     }
     // The leading edge resizes the panel once it rests there.
     if view.reveal >= 1.0 {
@@ -264,6 +295,7 @@ mod tests {
     ) -> (Vec<Action>, egui::FullOutput) {
         let mut actions = Vec::new();
         let mut files = explorer::State::default();
+        let mut changed = changes::State::default();
         let mut output = ctx.run_ui(
             RawInput {
                 screen_rect: Some(WINDOW),
@@ -288,6 +320,12 @@ mod tests {
                         window: WINDOW,
                         reveal: 1.0,
                     },
+                    changes: &changes::View {
+                        repository: None,
+                        notice: "This folder is not in a Git repository.",
+                        reveal: 1.0,
+                        window: WINDOW,
+                    },
                     waiting: rows
                         .iter()
                         .filter(|row| matches!(row.activity, Activity::NeedsInput(_)))
@@ -301,7 +339,10 @@ mod tests {
                     p,
                     &view,
                     state,
-                    &mut files,
+                    Contents {
+                        files: &mut files,
+                        changes: &mut changed,
+                    },
                     &mut actions,
                 );
             },
@@ -348,8 +389,9 @@ mod tests {
         };
         let rows = rows();
         let strip = panel(state.width);
-        let agents_tab = Pos2::new(strip.right() - 60.0, strip.top() + TABS * 0.5);
-        let files_tab = Pos2::new(strip.left() + 60.0, strip.top() + TABS * 0.5);
+        let agents_tab = Pos2::new(strip.center().x, strip.top() + TABS * 0.5);
+        let changes_tab = Pos2::new(strip.right() - 50.0, strip.top() + TABS * 0.5);
+        let files_tab = Pos2::new(strip.left() + 50.0, strip.top() + TABS * 0.5);
         let mut actions = Vec::new();
         for events in click(agents_tab) {
             actions.extend(run(&ctx, events, &rows, &mut state).0);
@@ -357,6 +399,14 @@ mod tests {
         assert!(matches!(
             actions.as_slice(),
             [Action::Panel(Event::Show(Tab::Agents))]
+        ));
+        let mut actions = Vec::new();
+        for events in click(changes_tab) {
+            actions.extend(run(&ctx, events, &rows, &mut state).0);
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Panel(Event::Show(Tab::Changes))]
         ));
         // The files tab is the one in view: clicking it asks for nothing.
         let mut actions = Vec::new();
@@ -380,6 +430,7 @@ mod tests {
         for expected in [
             "Files",
             "Agents",
+            "Changes",
             "Needs input",
             "Asked a question",
             "Needs permission",
@@ -413,6 +464,24 @@ mod tests {
             texts_contain(&output, "No agents are running"),
             "an empty list says so"
         );
+    }
+
+    #[test]
+    fn the_narrowest_panel_names_every_tab_in_full_beside_a_count() {
+        let ctx = context();
+        let mut state = State {
+            open: true,
+            width: *WIDTH.start(),
+            ..State::default()
+        };
+        let (_, output) = run(&ctx, Vec::new(), &rows(), &mut state);
+        let texts = texts(&output);
+        for expected in ["Files", "Agents", "2", "Changes"] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "{expected} in {texts:?}"
+            );
+        }
     }
 
     fn texts_contain(output: &egui::FullOutput, part: &str) -> bool {

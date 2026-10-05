@@ -515,6 +515,15 @@ pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut 
         OverlayState::ConfirmClose(close) => {
             confirm_close(ctx, p, close, state.close_status, actions)
         }
+        OverlayState::NewWorktree(_) => {
+            let enter = confirmed_by_enter(ctx, state);
+            super::worktrees::new_agent(ctx, p, state, enter, accepts_focus, actions)
+        }
+        OverlayState::RemoveWorktree => match &state.worktree.removal {
+            Some(removal) => super::worktrees::remove(ctx, p, removal, actions),
+            // Nothing to confirm: the sheet has no reason to hold the window.
+            None => actions.push(Action::CloseOverlay),
+        },
         _ => {}
     }
     if let Some(error) = &state.error

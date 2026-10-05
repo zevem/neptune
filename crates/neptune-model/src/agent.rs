@@ -141,15 +141,16 @@ impl PullRequest {
     pub fn number(&self) -> u64 {
         self.number
     }
+    /// Its host, owner and repository.
+    pub fn location(&self) -> (&str, &str, &str) {
+        let mut parts = self.url[8..].split('/');
+        let mut part = || parts.next().unwrap_or_default();
+        (part(), part(), part())
+    }
     /// `owner/repo#N`.
     pub fn label(&self) -> String {
-        let mut parts = self.url[8..].split('/').skip(1);
-        format!(
-            "{}/{}#{}",
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-            self.number
-        )
+        let (_, owner, repository) = self.location();
+        format!("{owner}/{repository}#{}", self.number)
     }
     /// Hosts treat owner and repository names without regard to case.
     pub fn same(&self, other: &Self) -> bool {
@@ -216,6 +217,7 @@ mod tests {
             (link.number(), link.label()),
             (83, "zevem/neptune#83".into())
         );
+        assert_eq!(link.location(), ("github.com", "zevem", "neptune"));
         assert!(
             link.same(&PullRequest::parse("https://github.com/Zevem/Neptune/pull/83").unwrap())
         );
@@ -552,6 +554,7 @@ mod tests {
             agent: None,
             pull_requests: Vec::new(),
             spawned_by: None,
+            worktree: None,
         });
         assert!(Model::restore(specs, None, true, Default::default()).is_err());
     }

@@ -1,6 +1,7 @@
 //! Widgets consume presentation data and emit targeted actions. Only the controller
 //! may change durable workspace state; renderer caches remain desktop-owned.
 pub mod agents;
+pub mod changes;
 pub mod chrome;
 pub mod controls;
 pub mod dialogs;
@@ -16,6 +17,7 @@ pub mod theme_browser;
 mod theme_editor;
 pub mod updates;
 pub mod workspace;
+pub mod worktrees;
 use crate::{config::Config, terminal::Cache};
 use neptune_model::{
     Axis, Destination, PaneId, SidebarItem, SplitId, WorkspaceGroupId, WorkspaceId,
@@ -50,6 +52,10 @@ pub enum OverlayState {
     Image,
     /// Confirm deleting the file or folder the explorer holds for it.
     DeleteFile,
+    /// Name the branch of a new agent's worktree; its tab follows this terminal.
+    NewWorktree(PaneId),
+    /// Confirm removing the worktree the sheet's state holds.
+    RemoveWorktree,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CloseStatus {
@@ -104,6 +110,10 @@ pub struct UiState {
     pub panel: panel::State,
     /// The file explorer tab and what is typed in it.
     pub explorer: explorer::State,
+    /// The changes tab: what it compares and the file whose diff it shows.
+    pub changes: changes::State,
+    /// The sheets that make and remove an agent's git worktree.
+    pub worktree: worktrees::State,
 }
 #[derive(Clone)]
 pub enum Action {
@@ -149,6 +159,8 @@ pub enum Action {
     SidebarWidth(f32),
     Panel(panel::Event),
     Explorer(explorer::Event),
+    Changes(changes::Event),
+    Worktree(worktrees::Event),
     Find,
     SearchChanged,
     FindNext {
@@ -199,11 +211,21 @@ pub struct WorkspaceView {
     pub cwd: PathBuf,
     /// SSH destination of a remote workspace.
     pub remote: Option<String>,
+    /// The branch of the repository that folder is in.
+    pub branch: Option<Branch>,
     pub panes: usize,
     pub unread: usize,
     /// The newest unread alert, shown in place of the path.
     pub alert: Option<String>,
     pub running: bool,
+}
+/// A folder's branch as the sidebar shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    /// The branch, or the short name of a commit checked out without one.
+    pub name: String,
+    /// The folder has changes that are not committed.
+    pub dirty: bool,
 }
 pub struct PaneRender {
     pub preedit: String,

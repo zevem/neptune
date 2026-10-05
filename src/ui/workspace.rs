@@ -19,9 +19,11 @@ pub struct PanePresentation {
     /// The CLI agent the terminal is running, which takes dropped files.
     pub agent: Option<AgentKind>,
     /// Pull requests the agent linked to the terminal, oldest first.
-    pub pull_requests: Vec<neptune_model::PullRequest>,
+    pub pull_requests: Vec<helpers::LinkedPullRequest>,
     /// The agents this terminal's agent started, oldest first.
     pub spawned: Vec<super::agents::Spawned>,
+    /// The git worktree made for the terminal's agent, which names its tab.
+    pub worktree: Option<super::worktrees::Tab>,
     pub unread: usize,
     pub metadata: SessionMetadata,
     /// The terminal's content; absent for a tab that is not in view.
@@ -248,7 +250,14 @@ fn status_capsule(
     }
 }
 
-fn pane_menu(ui: &mut Ui, p: Palette, id: PaneId, zoomed: bool, actions: &mut Vec<Action>) {
+fn pane_menu(
+    ui: &mut Ui,
+    p: Palette,
+    id: PaneId,
+    // Zoomed, on this machine, and in a worktree made for its agent.
+    (zoomed, local, worktree): (bool, bool, bool),
+    actions: &mut Vec<Action>,
+) {
     helpers::menu_layout(ui, 240.0);
     let mut chosen: Vec<Action> = Vec::new();
     if menu_item(ui, p, Icon::Copy, "Copy", &shortcut("C"), false) {
@@ -264,6 +273,18 @@ fn pane_menu(ui: &mut Ui, p: Palette, id: PaneId, zoomed: bool, actions: &mut Ve
     helpers::menu_separator(ui, p);
     if menu_item(ui, p, Icon::Plus, "New tab", &shortcut("T"), false) {
         chosen.push(Action::NewTab(id));
+    }
+    if local
+        && menu_item(
+            ui,
+            p,
+            Icon::Branch,
+            "New agent in worktree…",
+            &shortcut("G"),
+            false,
+        )
+    {
+        chosen.push(Action::Worktree(super::worktrees::Event::New(id)));
     }
     if menu_item(
         ui,
@@ -311,6 +332,9 @@ fn pane_menu(ui: &mut Ui, p: Palette, id: PaneId, zoomed: bool, actions: &mut Ve
         chosen.push(Action::Restart(id));
     }
     helpers::menu_separator(ui, p);
+    if worktree && menu_item(ui, p, Icon::Trash, "Remove worktree…", "", true) {
+        chosen.push(Action::Worktree(super::worktrees::Event::RemoveOf(id)));
+    }
     if menu_item(ui, p, Icon::Close, "Close terminal", &shortcut("W"), true) {
         chosen.push(Action::ClosePane(id));
     }
@@ -374,7 +398,7 @@ fn tab(
             &[]
         },
         (rect.left() + 72.0, close.left() - 2.0, rect.center().y),
-        p.accent,
+        p,
     );
     // The agents this one started are listed before them.
     let spawned = helpers::SpawnedChip::layout(
@@ -384,12 +408,21 @@ fn tab(
         (rect.left() + 72.0, chips.left, rect.center().y),
         p,
     );
+    // A merged worktree offers its cleanup before either.
+    let merged = super::worktrees::MergedChip::layout(
+        ui,
+        ui.id().with(("tab-merged", id)),
+        (id, presentation.worktree.as_ref().filter(|_| closable)),
+        (rect.left() + 72.0, spawned.left, rect.center().y),
+        p,
+    );
     let hovered = response.hovered()
         || close_response
             .as_ref()
             .is_some_and(|response| response.hovered())
         || chips.hovered()
-        || spawned.hovered();
+        || spawned.hovered()
+        || merged.hovered();
 
     // A place with one terminal reads as a plain title, as it always has.
     let fill = if shown && !alone {
@@ -414,17 +447,29 @@ fn tab(
     } else {
         0.0
     };
-    let right = if !chips.is_empty() || !spawned.is_empty() {
-        spawned.left - 5.0
+    let right = if !chips.is_empty() || !spawned.is_empty() || !merged.is_empty() {
+        merged.left - 5.0
     } else if closable && close_alpha > 0.0 {
         close.left() - 3.0
     } else {
         rect.right() - 7.0
     };
+    // A worktree's tab is named by its branch, and says what runs there
+    // where another tab names its folder.
+    let branch = presentation.worktree.as_ref().map(|tab| &tab.branch);
+    if branch.is_some() && right - left > 40.0 {
+        icons::paint(
+            &painter,
+            Rect::from_center_size(Pos2::new(left + 6.0, rect.center().y), Vec2::splat(12.0)),
+            Icon::Branch,
+            if shown { p.secondary } else { p.muted },
+        );
+        left += 17.0;
+    }
     let room = (right - left).max(0.0);
     let title = elided(
         &painter,
-        &pane_label(metadata),
+        branch.map_or(&pane_label(metadata), |branch| branch),
         theme::medium(12.0),
         if shown && id == stage.active {
             p.fg
@@ -438,6 +483,7 @@ fn tab(
     let remaining = room - title_width - 9.0;
     if remaining > 36.0 {
         let folder = match &presentation.remote {
+            _ if branch.is_some() => pane_label(metadata),
             Some(destination) => destination.clone(),
             None => metadata
                 .cwd
@@ -453,6 +499,7 @@ fn tab(
     }
     chips.paint(&painter, p, actions);
     spawned.paint(&painter, p, actions);
+    merged.paint(&painter, p, actions);
     if let Some(close_response) = close_response {
         if close_alpha > 0.0 {
             if close_response.hovered() {
@@ -491,9 +538,26 @@ fn tab(
         actions.push(Action::ClosePane(id));
     }
     let carried = response.dragged();
-    response.context_menu(|ui| pane_menu(ui, p, id, stage.zoomed, actions));
+    response.context_menu(|ui| {
+        pane_menu(
+            ui,
+            p,
+            id,
+            (
+                stage.zoomed,
+                presentation.remote.is_none(),
+                presentation.worktree.is_some(),
+            ),
+            actions,
+        )
+    });
     response.on_hover_text(format!(
-        "{}\n{}",
+        "{}{}\n{}",
+        presentation
+            .worktree
+            .as_ref()
+            .map(|worktree| format!("{}\n", worktree.branch))
+            .unwrap_or_default(),
         if metadata.title.is_empty() {
             pane_label(metadata)
         } else {
@@ -745,7 +809,19 @@ fn draw_pane(
             ui.ctx().request_repaint();
         }
         if !pane.cache.mode.intersects(TermMode::MOUSE_MODE) || ui.input(|i| i.modifiers.shift) {
-            response.context_menu(|ui| pane_menu(ui, p, id, stage.zoomed, actions));
+            response.context_menu(|ui| {
+                pane_menu(
+                    ui,
+                    p,
+                    id,
+                    (
+                        stage.zoomed,
+                        presentation.remote.is_none(),
+                        presentation.worktree.is_some(),
+                    ),
+                    actions,
+                )
+            });
         }
     });
 
@@ -1358,6 +1434,7 @@ mod tests {
                                 agent: None,
                                 pull_requests: Vec::new(),
                                 spawned: Vec::new(),
+                                worktree: None,
                                 unread: 0,
                                 metadata: metadata(""),
                                 snapshot: Some(ViewportSnapshot::blank(80, 24)),
@@ -1510,6 +1587,7 @@ mod tests {
             agent: None,
             pull_requests: Vec::new(),
             spawned: Vec::new(),
+            worktree: None,
             unread: 1,
             metadata: metadata(""),
             snapshot: None,
@@ -1712,6 +1790,7 @@ mod tests {
                     agent: None,
                     pull_requests: Vec::new(),
                     spawned: Vec::new(),
+                    worktree: None,
                     unread: 0,
                     metadata: metadata("zsh"),
                     snapshot: Some(ViewportSnapshot::blank(80, 24)),

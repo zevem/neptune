@@ -11,6 +11,13 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Review what changed without leaving the terminal. The new Changes tab of
+  the right panel shows the branch of the focused terminal's folder and the
+  files that differ, with a diff of the one you click. Choose **Working tree**
+  for work that is not committed yet, or **Branch** for everything the branch
+  holds since it left the main one. Each workspace's row in the sidebar now
+  shows its branch, with a dot while it has uncommitted changes. Needs Git
+  installed.
 - See every Claude Code and Codex agent running in any workspace in the new
   Agents tab of the right panel: which are working, which are idle and which
   are waiting for you to allow a tool, answer a question or approve a plan.
@@ -34,14 +41,33 @@ their preparation records remain in Git history.
   effort level and its CLI's ultra mode (ultracode or Ultra).
   One you closed can be opened again with its conversation, and a question a
   started agent's CLI asks before it begins is passed on to you at once.
+- See where an agent's pull request stands on its tab. The linked number now
+  shows whether its checks pass, fail or are still running and how many review
+  comments are unresolved, and changes colour and icon once the pull request is
+  merged. It updates on its own, through the GitHub CLI (`gh`) you are signed
+  in to; without it the number looks as before.
+
+- Give an agent a git worktree of its own with **New agent in worktree**, in
+  the command palette, a terminal's menu or on Ctrl+Shift+G (Command+G on
+  macOS). Name a branch and press Enter: Neptune creates the branch, checks it
+  out in a folder beside the repository and opens a tab there with Claude Code
+  or Codex started. The tab is named by the branch and shows **Merged** once
+  its work is in the default branch; click it to remove the folder and the
+  local branch. **Remove worktree** says what would be lost before it removes
+  anything, and keeps a branch that has unmerged commits.
 
 ### Acceptance notes and known limitations
 
 - Saved workspaces now use schema version 10, which records which terminal's
-  agent started another's, which of those terminals have no tab, and sessions
-  of OpenCode, Gemini CLI, pi and Oh My Pi. Older
+  agent started another's, which of those terminals have no tab, the git
+  worktree made for a terminal's agent, and sessions of OpenCode, Gemini CLI,
+  pi and Oh My Pi. Older
   workspace files still load, but RC3 and
   earlier cannot save over layouts written by this version.
+- Agents in worktrees are for local terminals with `git` on `PATH`. Neptune
+  does not fetch, so a pull request merged on a server shows as merged after
+  your checkout fetches or pulls it. On Windows the tab opens in the worktree
+  without starting a CLI.
 
 ### Fixes
 

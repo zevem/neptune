@@ -29,9 +29,11 @@ pub struct ChromeView<'a> {
     pub subtitle: &'a str,
     /// The focused terminal's linked pull requests, while it has no tab to
     /// carry them.
-    pub pull_requests: &'a [neptune_model::PullRequest],
+    pub pull_requests: &'a [helpers::LinkedPullRequest],
     /// The agents the focused terminal's agent started, likewise.
     pub spawned: &'a [super::agents::Spawned],
+    /// The worktree of a terminal alone in view, which has no tab to name.
+    pub worktree: Option<(neptune_model::PaneId, &'a super::worktrees::Tab)>,
     pub zoomed: bool,
     /// The whole window. The window controls keep their place in it.
     pub window: Rect,
@@ -515,7 +517,7 @@ pub fn toolbar(
         ui.id().with("toolbar-pull-request"),
         view.pull_requests,
         (left + 96.0, right - 2.0, middle),
-        p.accent,
+        p,
     );
     let spawned = helpers::SpawnedChip::layout(
         ui,
@@ -524,11 +526,22 @@ pub fn toolbar(
         (left + 96.0, chips.left, middle),
         p,
     );
-    if !chips.is_empty() || !spawned.is_empty() {
-        right = spawned.left - 6.0;
+    let merged = super::worktrees::MergedChip::layout(
+        ui,
+        ui.id().with("toolbar-merged"),
+        match view.worktree {
+            Some((pane, tab)) => (pane, Some(tab)),
+            None => (neptune_model::PaneId::new(0), None),
+        },
+        (left + 96.0, spawned.left, middle),
+        p,
+    );
+    if !chips.is_empty() || !spawned.is_empty() || !merged.is_empty() {
+        right = merged.left - 6.0;
     }
     chips.paint(ui.painter(), p, actions);
     spawned.paint(ui.painter(), p, actions);
+    merged.paint(ui.painter(), p, actions);
     let budget = right - left - 6.0;
     if budget < 36.0 {
         return;
@@ -861,13 +874,46 @@ fn workspace_row(
             ),
         );
     } else {
-        painter.text(
+        // The branch trails the folder and may take most of the line: the
+        // name above usually says which folder this is.
+        let branch = workspace.branch.as_ref().map(|branch| {
+            let dot = if branch.dirty { 9.0 } else { 0.0 };
+            let name = elided(
+                &painter,
+                &branch.name,
+                theme::regular(11.0),
+                p.muted,
+                (text_width * 0.6 - 14.0 - dot).max(0.0),
+            );
+            (name, branch.dirty, dot)
+        });
+        let branch_width = branch
+            .as_ref()
+            .map_or(0.0, |(name, _, dot)| 8.0 + 14.0 + name.size().x + dot);
+        let path = painter.text(
             detail,
             Align2::LEFT_CENTER,
-            helpers::path_label(&workspace.cwd, (text_width / 5.9).max(4.0) as usize),
+            helpers::path_label(
+                &workspace.cwd,
+                ((text_width - branch_width) / 5.9).max(4.0) as usize,
+            ),
             theme::regular(11.0),
             p.muted,
         );
+        if let Some((name, dirty, _)) = branch {
+            let left = path.right() + 8.0;
+            icons::paint(
+                &painter,
+                Rect::from_center_size(Pos2::new(left + 5.5, detail.y), Vec2::splat(11.0)),
+                Icon::Branch,
+                p.muted,
+            );
+            let named = galley_at(&painter, Pos2::new(left + 14.0, detail.y), name);
+            // Work that is not committed yet marks the branch.
+            if dirty {
+                painter.circle_filled(Pos2::new(named.right() + 6.0, detail.y), 2.5, p.yellow);
+            }
+        }
     }
 
     response.widget_info(|| {
@@ -1999,6 +2045,7 @@ mod tests {
                 name: format!("workspace {id}"),
                 cwd: "/srv/app".into(),
                 remote: None,
+                branch: None,
                 panes: 1,
                 running: true,
             })
@@ -2082,6 +2129,7 @@ mod tests {
                 subtitle: "",
                 pull_requests: &[],
                 spawned: &[],
+                worktree: None,
                 zoomed: false,
                 window: Rect::from_min_size(Pos2::ZERO, vec2(900.0, self.height)),
                 sidebar: 1.0,
@@ -2166,6 +2214,7 @@ mod tests {
                         agent: None,
                         pull_requests: Vec::new(),
                         spawned_by: None,
+                        worktree: None,
                     }],
                     layout: neptune_model::Layout::pane(PaneId::new(*id)),
                     active: PaneId::new(*id),
@@ -2707,6 +2756,7 @@ mod tests {
                 name: format!("workspace {id}"),
                 cwd: "/srv/app".into(),
                 remote: remote.map(str::to_owned),
+                branch: None,
                 panes: 2,
                 running: true,
             })
@@ -2738,6 +2788,7 @@ mod tests {
                             subtitle: "",
                             pull_requests: &[],
                             spawned: &[],
+                            worktree: None,
                             zoomed: false,
                             window: Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0)),
                             sidebar: 1.0,

@@ -70,10 +70,11 @@ saved reference is kept.
 `--no-restore` and `restore_workspaces = false` retain their existing meaning.
 Neptune restores new processes, not unfinished tool execution or process memory.
 Only provider, session ID, directory, the addresses of
-[linked pull requests](#linked-pull-requests) and the terminal whose agent
-[started an agent](#agents-that-start-agents) are saved in workspace schema 10,
-which reads versions 1–9. Version 10 differs from 9 only in the CLIs a
-reference can name. Invalid references receive the same recovery-copy protection
+[linked pull requests](#linked-pull-requests), the terminal whose agent
+[started an agent](#agents-that-start-agents) and the
+[worktree made for an agent](#agents-in-worktrees) are saved in workspace schema 10,
+which reads versions 1–9; version 10 also widens the CLIs a reference can
+name. Invalid references receive the same recovery-copy protection
 as other damaged workspace state. Prompts, transcripts, arbitrary commands,
 credentials and permission-bypass flags are not saved or replayed. Transcripts
 remain owned by the CLI. Launch-only options and temporary environment changes
@@ -101,20 +102,63 @@ request's number beside its close control; clicking the number opens the pull
 request in the default browser. A terminal alone in view has no tab, so the
 toolbar shows its numbers after the title. One or two pull requests are shown
 side by side, the newest nearest the close control. With more, or where two do
-not fit beside the title, the newest number carries a chevron and opens a list
+not fit beside the title, one number carries a chevron and opens a list
 of them all. A terminal keeps its eight most recent links, and linking the same
 pull request again changes nothing.
 
 The link depends on the agent following those instructions: a pull request
 created through `gh` or an API is not discovered on its own, and Neptune does
-not look up branches or pull request status. Ask the agent to link a pull
-request if its number is missing.
+not look up branches. Ask the agent to link a pull request if its number is
+missing.
+
+### Pull request status
+
+A linked number also shows where its pull request stands, so that one needing
+you can be seen without opening the browser:
+
+| The pull request | Its number |
+| --- | --- |
+| Open | The accent colour |
+| Draft | Grey |
+| Merged | Purple, with the merge icon in place of the pull request icon |
+| Closed without merging | Dimmed |
+
+While a pull request is open or a draft, two marks follow its number. The
+first is for the checks of its last commit taken together: a green check when
+they pass, a red cross when one fails and a yellow ring while any is running or
+expected; a commit without checks has no mark. The second is a comment icon
+with a count, in the attention colour, of the review conversations that are not
+resolved; "99+" stands for a hundred or more. A merged or closed pull request
+carries neither. Resting the pointer on a number says the same in words, for
+example "Open · Checks failing · 2 unresolved comments". The number that
+stands for several pull requests is the newest still open or a draft, or the
+newest of all once none is; it carries the worst state of their checks and
+the sum of their unresolved conversations, and its list says each one's state.
+Where a tab is short of room the marks are given up before the number is.
+
+Neptune reads this through the [GitHub CLI](https://cli.github.com) (`gh`), as
+the account signed in to it: one request for each host names the linked pull
+requests of the workspace in view and asks for their state, the combined state
+of their checks and whether each review conversation is resolved. Neptune
+holds no token of its own, and nothing it reads is saved. Without `gh`, without
+a sign-in for the pull request's host (`gh auth login`, with `--hostname` for
+GitHub Enterprise), without a network or for a host that is not GitHub, the
+number looks as it did before and its tooltip says the status is unavailable.
+Titles, comments and other contents of a pull request are not requested.
+
+A state is read when its link first comes into view and again every 15 seconds
+while checks are running, every minute while the pull request is otherwise in
+review, every ten minutes once it is merged or closed, and every minute after a
+lookup that failed. One worker makes one request at a time, for at most 32 pull
+requests, with a 20-second limit and a bounded response; the window is drawn
+again only when a state changed. Only the workspace in view is read; the last
+state of another is kept for an hour, shown again on return and read afresh.
 
 Links belong to the agent's run in that terminal. They return with the agent
 when workspaces are restored, and leave when the agent exits, the terminal is
 restarted or closed, or the workspace changes SSH hosts. Only an address that
 names a pull request over HTTPS is accepted; it is saved without credentials,
-query or fragment, and nothing else about the pull request is read or stored.
+query or fragment, and nothing else about the pull request is stored.
 
 Claude Code receives Neptune's tools as an invocation-scoped server through
 `--mcp-config`, and permission for the ones that read, link or answer through
@@ -123,6 +167,82 @@ Claude Code receives Neptune's tools as an invocation-scoped server through
 may ask before the first call according to its approval settings. The server is
 the Neptune executable followed by `--agent-mcp`. A server of your own named
 `neptune` is replaced for that launch.
+
+## Agents in worktrees
+
+Several agents in one checkout edit the same files. **New agent in worktree**
+gives an agent a git worktree of its own: a second checkout of the repository,
+on its own branch, in its own folder. It is in the command palette, in a
+terminal's menu and on Ctrl+Shift+G (Command+G on macOS), for a terminal on
+this machine whose directory is in a git repository.
+
+It asks for one thing, the branch. Type a name, choose Claude Code or Codex,
+and press Enter. A few words are a name: `fix login` becomes `fix-login`. The
+sheet says beneath the field what Create will do before you press it. Neptune
+then
+
+- creates the branch from the repository's default branch (the one
+  `origin/HEAD` names, as your checkout has it, else `main` or `master`; the
+  current commit if there is none), or checks out the branch as it is when it
+  already exists;
+- adds its worktree beside the repository, in `<repository>.worktrees/<branch>`
+  with `/` written as `-`, so the repository's own status and ignore rules do
+  not see it;
+- opens a tab after the terminal you started from, in that folder, and starts
+  the CLI there as if you had typed `claude` or `codex`.
+
+The tab is named by the branch, with the program it runs beside the name; a
+terminal alone in view has no tab, so the toolbar names the branch. Tabs and
+splits opened from it are ordinary terminals in the same folder. The
+repository's own checkout is not touched: its branch, index and files stay as
+they were. The sheet opens the CLI the focused terminal runs, or the one you
+chose last.
+
+Cleaning up. While a worktree is open in a tab, Neptune looks at its branch
+every ten seconds, with git commands that change no branch, index or working
+file and take none of the repository's optional locks. Once the branch's work is in the default branch, here or as
+`origin/` has it after a fetch, and nothing in the worktree is uncommitted,
+the tab shows **Merged**. A merge commit, a fast-forward, a squash and a
+rebase all count: the branch's commits are in the default branch, or merging
+it there would change nothing. Click **Merged** and confirm: the terminals in
+the worktree close, its folder is removed and its local branch is deleted.
+Neptune does not fetch, so a pull request merged on a server shows once your
+checkout has fetched or pulled it.
+
+**Remove worktree** in the terminal's menu and the command palette does the
+same at any time, and says first what would go:
+
+| The worktree has | Removing it |
+| --- | --- |
+| A merged branch, or no commits the default branch lacks | Removes the folder and deletes the local branch |
+| Commits that are not in the default branch | Removes the folder and keeps the branch with its commits |
+| Changes that were never committed | Asks to **Discard and remove**; those changes are deleted with the folder |
+
+A branch on a remote is never deleted, and nothing is pushed or fetched.
+If git refuses, nothing is closed and the message says why.
+
+The sheet also lists the worktrees Neptune made for this repository, with
+**Merged into …** on the finished ones. Click one to start the chosen CLI in it in a new tab, or its bin to remove
+it. A worktree can hold several agents, of the same CLI or both: each click
+adds a tab beside any that already work there, and a worktree whose tabs you
+closed is found here too. Typing the name of a branch that has a worktree
+opens another tab in that worktree.
+
+A worktree stays with its terminal when the agent exits or the terminal is
+restarted, and returns with it when workspaces are restored, where its agent
+is resumed like any other. Connecting the workspace over SSH ends it, since
+its terminal then runs elsewhere. A worktree whose folder was deleted outside
+Neptune is restored as an ordinary terminal in the workspace's directory.
+
+Limits. Local terminals only: no SSH workspaces. On Windows the tab opens in
+the worktree without starting a CLI, because the adapters that start one are
+Unix-only. `git` must be on `PATH`. A branch checked out in the repository
+itself cannot also have a worktree. Squash and rebase detection needs git
+2.38 or later; older versions notice only branches whose commits are in the
+default branch. Submodules, and files git ignores such as dependencies or
+`.env`, are not copied into a new worktree. An
+[agent that another agent starts](#agents-that-start-agents) is still given
+its directory by that agent.
 
 ## Agents that start agents
 
@@ -191,9 +311,11 @@ restored uses the CLI's defaults again.
 
 Directories and worktrees. A started agent works in the directory of the
 agent that started it unless `cwd` names another, which must exist. Neptune
-creates no worktree: the tools' instructions tell the starting agent to make
-one with `git worktree add` and pass its path when both agents would edit the
-same files. The started agent's row and tab show the directory it was given.
+creates no worktree for a started agent: the tools' instructions tell the
+starting agent to make one with `git worktree add` and pass its path when both
+agents would edit the same files. The started agent's row and tab show the
+directory it was given. For an agent you start yourself, Neptune makes and
+removes the worktree: see [agents in worktrees](#agents-in-worktrees).
 
 Questions before the task. A CLI can open on a question of its own before it
 takes anything: whether to trust a new folder, to review hooks that changed,
@@ -424,7 +546,9 @@ callback credential, and each CLI invocation has its own identity. Closed or
 replaced panes and late hooks from exited invocations cannot overwrite a newer
 session. A linked pull request is accepted only from the invocation that is open
 in its pane, and reaches the model as a generation-tagged
-`PanePullRequestLinked` command. Pending updates coalesce per pane; hooks wake the application on change,
+`PanePullRequestLinked` command. The state of a linked pull request stays out
+of the model: `runtime/pull_requests.rs` owns one worker that runs `gh api
+graphql` off the frame and wakes the application when a state changed. Pending updates coalesce per pane; hooks wake the application on change,
 so idle integrations do not poll or repaint. Socket reads have byte and total-time
 limits. Startup-file creation and cleanup stay on workers.
 
@@ -465,6 +589,19 @@ a conversation for as long as the agent that started it runs.
 A wait polls the bridge from the tool server's own process and reads its input
 on a second thread, so a cancelled call stops and nothing it had not yet
 collected is lost.
+
+A worktree is a field of its pane in the model: the repository, the folder,
+the branch and the commit the branch stood at, validated like a resume
+reference and opened by an `OpenWorktree` command that adds an ordinary tab
+whose saved agent has no conversation yet, so the shell's startup opens the
+CLI the way it reopens one without a session ID. One worker thread in
+`runtime/worktrees.rs` runs every git command, so no frame waits for a
+repository: the sheet's probe, `git worktree add`, the look at open worktrees
+and removal. It sleeps while no worktree is open, compares each branch and its
+targets with one `git for-each-ref` per look, works out a merge only when one
+of them moved, and wakes the application only when an answer changes. Branch
+names are checked before git sees them and never begin with a dash; paths and
+branch names are not logged or sent to diagnostics.
 
 A small POSIX supervisor preserves foreground signal handling and reports normal
 CLI exit. Resumption runs as part of shell startup with quoted arguments, never
@@ -514,12 +651,30 @@ shows by the call that started it and answered with the keys given; links
 return after a close and reopen, out of view where they were, and no task or
 reply is in the saved state.
 
+`python3 scripts/verify-agent-worktree.py` covers agents in worktrees, in a
+repository it makes: a branch named in the sheet becomes a tab in its own
+worktree with the fixture CLI started there; a second agent gets another; a
+merge is noticed and offered on the tab; removal deletes the folder and the
+local branch of the merged one only; uncommitted work is named and cancelling
+keeps it; and the worktree returns with its agent after a close and reopen.
+`cargo test -p neptune-terminal --lib worktree --locked` runs the git
+operations (merge, squash, removal) and the application flow against
+temporary repositories.
+
 `python3 scripts/verify-agent-restore.py` runs deterministic CLI fixtures in an
 isolated native app, with fresh storage and a unique inspection endpoint. It
 checks independent IDs in one directory, graceful close/reopen, normal exit,
 Ctrl+C and narrow-window presentation. Fixtures prove Neptune's contracts without
 sending model requests; they do not stand in for installed-provider validation.
 Build the inspection targets described in [native verification](verification.md#native-application-verification) first.
+
+`python3 scripts/verify-pull-request-status.py` links pull requests through the
+same fixtures, with a stand-in `gh` that answers from a file the script
+rewrites. It checks that the real worker asks once per round for the pull
+requests in view, reads a change of state without input, and leaves captures of
+each state alone in view, on tabs, in the list, in the Light theme and in a
+narrow window for review. The stand-in proves Neptune's request and its reading
+of the answer, not GitHub's API or an installed `gh`.
 
 The implementation was also checked in the running Linux/X11 app with the two
 installed CLIs above. Each received a no-tools request to reply with `OK`; both
@@ -596,19 +751,43 @@ CLIs: restore, a started agent's permission request, Codex as the starting
 agent in this version, Codex asking before a tool, and Codex with Neptune's
 hooks untrusted; fixtures and unit tests cover the first two. macOS, Windows and native Wayland are unverified.
 
+Agents in worktrees were checked on 2026-10-05 in the Linux development build
+with `inspection` (Wayland session, XWayland window) and git 2.53.0.
+The deterministic native regression passed, with captures reviewed at
+1100×700 and 640×440: the palette command, the sheet empty, with a typed name
+and with its list of worktrees, tabs named by their branches, **Merged** on a
+tab and on the toolbar of a terminal alone in view, both removal sheets, the
+restored workspace and the workspace closing with its last worktree. The CLIs
+were fixtures: the installed Claude Code and Codex were not started in a
+worktree, though a worktree's CLI is opened by the same shell startup path
+that reopens an agent without a session ID. Squash and rebase detection, a
+branch that already existed and removal after a folder was deleted by hand
+were exercised in unit tests against temporary repositories, not natively.
+macOS, Windows and native Wayland are unverified, as is Command+G on macOS.
+
 More agents and SSH workspaces were checked on 2026-10-05 in the Linux
 development build with `inspection` (Wayland session, XWayland window), with
 captures reviewed at 1100×700 and 640×440. The deterministic native
 regression passed: OpenCode through its plugin (turns, a subagent's session,
-a permission, a question, the session ID in the saved state), pi through its
-extension, Gemini CLI through its title, and Claude Code, Codex, pi and
+a permission, a question, "busy" repeated up to the instant of "idle", the
+session ID in the saved state), pi and Oh My Pi through the extension
+(for Oh My Pi its approvals, `ask` tool, a subagent, a loop it continues and
+its title), Gemini CLI through its title, and Claude Code, Codex, pi and
 Gemini CLI in an SSH workspace whose host was this machine behind a stand-in
-client. With the installed **OpenCode 1.18.34** in a throwaway home, the
-plugin loaded from `OPENCODE_CONFIG_CONTENT` and ran its hook command from
-inside OpenCode for events handed to it; **pi 1.0.2**, installed to a scratch
-directory, listed the extension as loaded. Neither was signed in, so no turn
-of either ran, and Gemini CLI was not run with Neptune at all: its titles are
-taken from the source of 0.62.0, where the working and action-required ones
-were read and the ready one was seen. Not exercised: a real SSH connection to
-another machine, any of the three CLIs through a real turn, `tmux` on a host,
-other login shells than Bash and Zsh, macOS and Windows.
+client. In one run the window was not the focused one and the alert Neptune
+raises for Gemini CLI showed on its workspace row and the toolbar bell.
+
+With the installed CLIs in an isolated instance at 1500×900, **Gemini CLI
+0.62.0**, **pi 1.0.2**, **Oh My Pi 17.3.5** and **OpenCode 1.18.34** were
+each listed when started, Gemini CLI at its folder trust question and pi and
+Oh My Pi with the extension loaded. OpenCode, the one signed in, ran a turn:
+its row went from idle to working and back, took the session's name, and its
+session ID was saved. Before the plugin reported changes in order, the same
+turn had left the row on "Working": OpenCode says "busy" again 2 ms before
+"idle". In a terminal about ten columns wide OpenCode crashed inside Bun and
+its row left the list; whether it does so without Neptune's plugin was not
+checked. Not exercised: a turn of Gemini CLI, pi or Oh My Pi (none was
+signed in; Gemini CLI's working and action-required titles and Oh My Pi's
+working and asking titles are read from their sources), a real SSH
+connection to another machine, `tmux` on a host, other login shells than
+Bash and Zsh, the desktop banner of an alert, macOS and Windows.

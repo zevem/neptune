@@ -609,6 +609,8 @@ impl App {
             }
             Action::Panel(event) => self.panel_event(ctx, event),
             Action::Explorer(event) => self.explorer_event(ctx, event),
+            Action::Changes(event) => self.changes_event(ctx, event),
+            Action::Worktree(event) => self.worktree_event(ctx, event),
             Action::SidebarWidth(width) => {
                 let config = Config {
                     sidebar_width: width.clamp(170.0, 360.0),
@@ -666,6 +668,7 @@ impl App {
                     self.updates.dismiss();
                 }
                 self.ui.explorer.delete = None;
+                self.close_worktree_sheet();
                 self.ui.overlay = OverlayState::None;
             }
             Action::DismissError => self.ui.error = None,

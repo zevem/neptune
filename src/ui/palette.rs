@@ -17,6 +17,10 @@ use neptune_model::{Axis, Destination, FocusDirection, PaneId, WorkspaceId};
 
 pub struct PaletteView<'a> {
     pub pane: Option<PaneId>,
+    /// The focused terminal runs on this machine, where git can be run.
+    pub local: bool,
+    /// The branch of the worktree the focused terminal is in.
+    pub worktree: Option<&'a str>,
     pub layout: Option<&'a neptune_model::Layout>,
     pub workspaces: &'a [WorkspaceView],
     pub groups: &'a [neptune_model::WorkspaceGroup],
@@ -140,6 +144,28 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 [Action::ClosePane(pane)],
             ),
         ]);
+        if view.local {
+            // Beside "New tab": it opens one, in a worktree of its own.
+            list.insert(
+                1,
+                command(
+                    "Terminal",
+                    Icon::Branch,
+                    "New agent in worktree",
+                    shortcut("G"),
+                    [Action::Worktree(super::worktrees::Event::New(pane))],
+                ),
+            );
+        }
+        if let Some(branch) = view.worktree {
+            list.push(command(
+                "Terminal",
+                Icon::Trash,
+                format!("Remove worktree {branch}"),
+                "",
+                [Action::Worktree(super::worktrees::Event::RemoveOf(pane))],
+            ));
+        }
         if let Some(layout) = view.layout {
             for (forward, title, key) in
                 [(true, "Next tab", "PgDn"), (false, "Previous tab", "PgUp")]
@@ -419,6 +445,15 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             "",
             [Action::Panel(super::panel::Event::Show(
                 super::panel::Tab::Agents,
+            ))],
+        ),
+        command(
+            "View",
+            Icon::Branch,
+            "Show changes",
+            "",
+            [Action::Panel(super::panel::Event::Show(
+                super::panel::Tab::Changes,
             ))],
         ),
         command(
@@ -732,6 +767,8 @@ mod tests {
     fn view<'a>(config: &'a Config, workspaces: &'a [WorkspaceView]) -> PaletteView<'a> {
         PaletteView {
             pane: None,
+            local: true,
+            worktree: None,
             layout: None,
             workspaces,
             groups: &[],
@@ -755,6 +792,7 @@ mod tests {
                 name: "app".into(),
                 cwd: "/srv/app".into(),
                 remote: None,
+                branch: None,
                 panes: 1,
                 running: true,
             })
@@ -793,6 +831,7 @@ mod tests {
                 name: "app".into(),
                 cwd: "/srv/app".into(),
                 remote: None,
+                branch: None,
                 panes: 1,
                 running: true,
             })
@@ -835,6 +874,7 @@ mod tests {
                 name: "app".into(),
                 cwd: "/srv/app".into(),
                 remote: remote.map(str::to_owned),
+                branch: None,
                 panes: 1,
                 running: true,
             })
@@ -883,6 +923,7 @@ mod tests {
                     name: "app".into(),
                     cwd: "/srv/app".into(),
                     remote: remote.map(str::to_owned),
+                    branch: None,
                     panes: 1,
                     running: true,
                 })
@@ -973,6 +1014,47 @@ mod tests {
                 matches!(command.actions[..], [Action::Focus(target)] if target == PaneId::new(3))
             );
         }
+    }
+
+    #[test]
+    fn a_local_terminal_offers_an_agent_in_a_worktree_and_removal_of_its_own() {
+        let config = Config::default();
+        let pane = PaneId::new(7);
+        let titles = |view: PaletteView| -> Vec<String> {
+            commands(&view)
+                .into_iter()
+                .filter(|command| command.title.contains("worktree"))
+                .map(|command| command.title)
+                .collect()
+        };
+        let local = PaletteView {
+            pane: Some(pane),
+            ..view(&config, &[])
+        };
+        let list = commands(&local);
+        assert_eq!(list[1].title, "New agent in worktree");
+        assert!(matches!(
+            list[1].actions[..],
+            [Action::Worktree(crate::ui::worktrees::Event::New(target))] if target == pane
+        ));
+        assert_eq!(
+            titles(PaletteView {
+                worktree: Some("fix-login"),
+                ..local
+            }),
+            ["New agent in worktree", "Remove worktree fix-login"]
+        );
+        // git runs on this machine: an SSH terminal is not offered one, and
+        // neither is a window without a terminal.
+        assert!(
+            titles(PaletteView {
+                pane: Some(pane),
+                local: false,
+                ..view(&config, &[])
+            })
+            .is_empty()
+        );
+        assert!(titles(view(&config, &[])).is_empty());
     }
 
     #[test]

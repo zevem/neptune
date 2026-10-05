@@ -441,6 +441,37 @@ fn read_preview(path: &Path) -> (Option<u64>, Loaded) {
     (size, text_preview(&bytes))
 }
 
+/// A line of a file as it is painted: tabs become spaces, control characters
+/// blanks, and what is beyond the widest line shown an ellipsis. Returns the
+/// columns it takes as well.
+pub(super) fn display_line(line: &str) -> (String, usize) {
+    let mut shown = String::with_capacity(line.len());
+    let mut columns = 0;
+    for character in line.trim_end_matches('\r').chars() {
+        if columns >= PREVIEW_COLUMNS {
+            shown.push('…');
+            columns += 1;
+            break;
+        }
+        match character {
+            '\t' => {
+                let stop = 4 - columns % 4;
+                shown.extend(std::iter::repeat_n(' ', stop));
+                columns += stop;
+            }
+            character if character.is_control() => {
+                shown.push(' ');
+                columns += 1;
+            }
+            character => {
+                shown.push(character);
+                columns += 1;
+            }
+        }
+    }
+    (shown, columns)
+}
+
 /// Text as lines ready to paint, or `Binary` for anything else.
 fn text_preview(bytes: &[u8]) -> Loaded {
     if bytes.iter().take(8 * 1024).any(|byte| *byte == 0) {
@@ -466,30 +497,7 @@ fn text_preview(bytes: &[u8]) -> Loaded {
     let lines = lines
         .into_iter()
         .map(|line| {
-            let mut shown = String::with_capacity(line.len());
-            let mut columns = 0;
-            for character in line.trim_end_matches('\r').chars() {
-                if columns >= PREVIEW_COLUMNS {
-                    shown.push('…');
-                    columns += 1;
-                    break;
-                }
-                match character {
-                    '\t' => {
-                        let stop = 4 - columns % 4;
-                        shown.extend(std::iter::repeat_n(' ', stop));
-                        columns += stop;
-                    }
-                    character if character.is_control() => {
-                        shown.push(' ');
-                        columns += 1;
-                    }
-                    character => {
-                        shown.push(character);
-                        columns += 1;
-                    }
-                }
-            }
+            let (shown, columns) = display_line(line);
             widest = widest.max(columns);
             shown
         })
