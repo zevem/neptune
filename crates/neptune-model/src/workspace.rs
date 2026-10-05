@@ -89,7 +89,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             workspaces: 24,
-            panes_per_workspace: 12,
+            panes_per_workspace: 16,
             total_panes: 64,
         }
     }
