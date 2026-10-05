@@ -58,6 +58,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         attachments: attachments::Attachments::new(root.join("pasted-images")),
         image_preview: Default::default(),
         explorer: Default::default(),
+        changes: Default::default(),
         file_drag: Default::default(),
         paste_chord: Default::default(),
         swallowed_paste: None,

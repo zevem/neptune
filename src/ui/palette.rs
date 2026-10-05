@@ -423,6 +423,15 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         ),
         command(
             "View",
+            Icon::Branch,
+            "Show changes",
+            "",
+            [Action::Panel(super::panel::Event::Show(
+                super::panel::Tab::Changes,
+            ))],
+        ),
+        command(
+            "View",
             Icon::Bell,
             "Notifications",
             "",
@@ -755,6 +764,7 @@ mod tests {
                 name: "app".into(),
                 cwd: "/srv/app".into(),
                 remote: None,
+                branch: None,
                 panes: 1,
                 running: true,
             })
@@ -793,6 +803,7 @@ mod tests {
                 name: "app".into(),
                 cwd: "/srv/app".into(),
                 remote: None,
+                branch: None,
                 panes: 1,
                 running: true,
             })
@@ -835,6 +846,7 @@ mod tests {
                 name: "app".into(),
                 cwd: "/srv/app".into(),
                 remote: remote.map(str::to_owned),
+                branch: None,
                 panes: 1,
                 running: true,
             })
@@ -883,6 +895,7 @@ mod tests {
                     name: "app".into(),
                     cwd: "/srv/app".into(),
                     remote: remote.map(str::to_owned),
+                    branch: None,
                     panes: 1,
                     running: true,
                 })

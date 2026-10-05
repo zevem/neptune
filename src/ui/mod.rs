@@ -1,6 +1,7 @@
 //! Widgets consume presentation data and emit targeted actions. Only the controller
 //! may change durable workspace state; renderer caches remain desktop-owned.
 pub mod agents;
+pub mod changes;
 pub mod chrome;
 pub mod controls;
 pub mod dialogs;
@@ -104,6 +105,8 @@ pub struct UiState {
     pub panel: panel::State,
     /// The file explorer tab and what is typed in it.
     pub explorer: explorer::State,
+    /// The changes tab: what it compares and the file whose diff it shows.
+    pub changes: changes::State,
 }
 #[derive(Clone)]
 pub enum Action {
@@ -149,6 +152,7 @@ pub enum Action {
     SidebarWidth(f32),
     Panel(panel::Event),
     Explorer(explorer::Event),
+    Changes(changes::Event),
     Find,
     SearchChanged,
     FindNext {
@@ -199,11 +203,21 @@ pub struct WorkspaceView {
     pub cwd: PathBuf,
     /// SSH destination of a remote workspace.
     pub remote: Option<String>,
+    /// The branch of the repository that folder is in.
+    pub branch: Option<Branch>,
     pub panes: usize,
     pub unread: usize,
     /// The newest unread alert, shown in place of the path.
     pub alert: Option<String>,
     pub running: bool,
+}
+/// A folder's branch as the sidebar shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    /// The branch, or the short name of a commit checked out without one.
+    pub name: String,
+    /// The folder has changes that are not committed.
+    pub dirty: bool,
 }
 pub struct PaneRender {
     pub preedit: String,
