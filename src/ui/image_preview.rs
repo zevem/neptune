@@ -164,6 +164,14 @@ pub struct View<'a> {
     pub pixels: [u32; 2],
     /// Which of several pictures this is, counted from one, and of how many.
     pub position: Option<(usize, usize)>,
+    /// Small copies of all of them, in order; empty for a picture on its own.
+    pub strip: &'a [Thumb<'a>],
+}
+
+/// A small copy of one of the pictures a full view steps through.
+pub struct Thumb<'a> {
+    pub name: &'a str,
+    pub texture: &'a egui::TextureHandle,
 }
 
 /// What the person asked of a full view this frame.
@@ -175,6 +183,8 @@ pub enum Verdict {
     /// Show the picture before or after this one.
     Previous,
     Next,
+    /// Show the picture at this place of the strip.
+    Show(usize),
     /// Show the file in the file manager.
     Reveal,
 }
@@ -243,10 +253,118 @@ fn fit(pixels: Vec2, bounds: Rect) -> Rect {
     Rect::from_center_size(room.center(), pixels * scale)
 }
 
+const STRIP_THUMB: f32 = 44.0;
+const STRIP_PAD: f32 = 6.0;
+/// From one small copy to the next.
+const STRIP_PITCH: f32 = STRIP_THUMB + 6.0;
+const STRIP: f32 = STRIP_THUMB + STRIP_PAD * 2.0;
+/// A shorter window keeps its height for the picture.
+const STRIP_MIN_HEIGHT: f32 = 320.0;
+
+/// The band of small copies at the foot of the window, as wide as they need
+/// or as the window allows.
+fn strip(bounds: Rect, count: usize) -> Rect {
+    let content = count as f32 * STRIP_PITCH - (STRIP_PITCH - STRIP_THUMB) + STRIP_PAD * 2.0;
+    Rect::from_center_size(
+        Pos2::new(
+            bounds.center().x,
+            bounds.bottom() - VIEW_MARGIN * 0.5 - STRIP * 0.5,
+        ),
+        vec2(content.min(bounds.width() - VIEW_MARGIN * 2.0), STRIP),
+    )
+}
+
+/// How far the copies are moved along a band too narrow for all of them, to
+/// keep the one in view at its middle.
+fn strip_scroll(band: Rect, count: usize, current: usize) -> f32 {
+    let room = band.width() - STRIP_PAD * 2.0;
+    let content = count as f32 * STRIP_PITCH - (STRIP_PITCH - STRIP_THUMB);
+    let centre = current as f32 * STRIP_PITCH + STRIP_THUMB * 0.5;
+    (centre - room * 0.5).clamp(0.0, (content - room).max(0.0))
+}
+
+fn thumb(band: Rect, index: usize, scroll: f32) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(
+            band.left() + STRIP_PAD + index as f32 * STRIP_PITCH - scroll,
+            band.top() + STRIP_PAD,
+        ),
+        Vec2::splat(STRIP_THUMB),
+    )
+}
+
+/// Paints the band and returns the place of the copy that was clicked.
+fn strip_contents(
+    ui: &Ui,
+    p: Palette,
+    band: Rect,
+    thumbs: &[Thumb<'_>],
+    current: usize,
+) -> Option<usize> {
+    let ctx = ui.ctx();
+    // The band is not the dimmed window: a click between copies stays.
+    ui.interact(band, Id::new("image-view-strip"), Sense::click());
+    let painter = ui.painter();
+    painter.add(p.popup_shadow().as_shape(band, RADIUS));
+    painter.rect_filled(band, RADIUS, p.elevated);
+    painter.rect_stroke(band, RADIUS, Stroke::new(1.0, p.border), StrokeKind::Inside);
+    let scroll = ctx.animate_value_with_time(
+        Id::new("image-view-strip-scroll"),
+        strip_scroll(band, thumbs.len(), current),
+        0.16,
+    );
+    let inside = band.shrink2(vec2(STRIP_PAD, 0.0));
+    let painter = painter.with_clip_rect(inside);
+    let mut clicked = None;
+    for (index, copy) in thumbs.iter().enumerate() {
+        let well = thumb(band, index, scroll);
+        let seen = well.intersect(inside);
+        if seen.width() <= 0.0 {
+            continue;
+        }
+        let response = ui
+            .interact(seen, Id::new(("image-view-thumb", index)), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| {
+            WidgetInfo::selected(
+                WidgetType::Button,
+                true,
+                index == current,
+                format!("Show {}", copy.name),
+            )
+        });
+        let lit = index == current || response.hovered();
+        painter.rect_filled(well, 6, p.control);
+        // The whole picture, centred in its well; the others stand back.
+        let size = copy.texture.size_vec2();
+        let fitted = size * (STRIP_THUMB / size.x.max(size.y).max(1.0));
+        let mut picture = textured(
+            Rect::from_center_size(well.center(), fitted),
+            if fitted.min_elem() >= 12.0 { 5 } else { 2 },
+            copy.texture,
+        );
+        if !lit {
+            picture.fill = Color32::WHITE.gamma_multiply(0.55);
+        }
+        painter.add(picture);
+        let stroke = if index == current {
+            Stroke::new(2.0, p.accent)
+        } else {
+            Stroke::new(1.0, p.hairline().color)
+        };
+        painter.rect_stroke(well, 6, stroke, StrokeKind::Inside);
+        if response.on_hover_text(copy.name).clicked() {
+            clicked = Some(index);
+        }
+    }
+    clicked
+}
+
 /// The picture over the dimmed window. The wheel, a pinch and the plus and
 /// minus keys zoom, a drag moves a zoomed picture and 0 fits it again. One of
 /// several is left for its neighbours with the arrow keys or the controls at
-/// the window's sides. A click anywhere else closes it, as Escape does.
+/// the window's sides, or for any of them by its small copy in the band at
+/// the window's foot. A click anywhere else closes it, as Escape does.
 pub fn view(ui: &Ui, p: Palette, bounds: Rect, view: View<'_>, zoom: &mut Zoom) -> Verdict {
     let ctx = ui.ctx();
     egui::Area::new(Id::new("image-view"))
@@ -294,6 +412,16 @@ fn view_contents(
     });
     let scale = ctx.pixels_per_point();
     let size = vec2(view.pixels[0] as f32, view.pixels[1] as f32) / scale;
+    // The picture and its caption keep clear of the band of small copies.
+    let band = view
+        .position
+        .filter(|_| view.strip.len() > 1 && bounds.height() >= STRIP_MIN_HEIGHT)
+        .map(|(place, _)| (strip(bounds, view.strip.len()), place.saturating_sub(1)));
+    let bounds = if band.is_some() {
+        Rect::from_min_max(bounds.min, bounds.max - vec2(0.0, STRIP))
+    } else {
+        bounds
+    };
     let fitted = fit(size, bounds);
     let most = VIEW_PIXEL * size.x / fitted.width();
     let (by, reset, step) = ctx.input(|input| {
@@ -434,6 +562,11 @@ fn view_contents(
             }
         }
     }
+    if let Some((band, current)) = band
+        && let Some(index) = strip_contents(ui, p, band, view.strip, current)
+    {
+        verdict = Verdict::Show(index);
+    }
     if verdict == Verdict::Stay && response.clicked() {
         verdict = Verdict::Close;
     }
@@ -547,6 +680,7 @@ mod tests {
                             name: "a.png",
                             pixels: [300, 200],
                             position: None,
+                            strip: &[],
                         };
                         view(ui, p, BOUNDS, full, &mut Zoom::default()) == Verdict::Close
                     } else {
@@ -607,6 +741,7 @@ mod tests {
                         name: "a.png",
                         pixels: [300, 200],
                         position,
+                        strip: &[],
                     };
                     verdict = view(ui, p, BOUNDS, full, &mut Zoom::default());
                 },
@@ -656,5 +791,92 @@ mod tests {
         assert_eq!(click(right, several), Verdict::Next);
         // Without neighbours the same place is the dimmed window: it closes.
         assert_eq!(click(left, None), Verdict::Close);
+    }
+
+    #[test]
+    fn the_band_of_small_copies_shows_the_one_clicked_and_keeps_the_view_open() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let p = Palette::for_config(&crate::config::Config::default());
+        let mut texture = None;
+        let mut frame = |events: Vec<egui::Event>, bounds: Rect| {
+            let mut verdict = Verdict::Stay;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(bounds),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let texture = texture.get_or_insert_with(|| {
+                        ui.ctx().load_texture(
+                            "test",
+                            egui::ColorImage::filled([300, 200], Color32::RED),
+                            Default::default(),
+                        )
+                    });
+                    let strip = ["a.png", "b.png", "c.png"].map(|name| Thumb { name, texture });
+                    let full = View {
+                        texture,
+                        name: "a.png",
+                        pixels: [300, 200],
+                        position: Some((1, 3)),
+                        strip: &strip,
+                    };
+                    verdict = view(ui, p, bounds, full, &mut Zoom::default());
+                },
+            );
+            output.textures_delta.clear();
+            verdict
+        };
+        let mut click = |pos: Pos2, bounds| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(vec![egui::Event::PointerMoved(pos)], bounds);
+            frame(Vec::new(), bounds);
+            frame(vec![button(true)], bounds);
+            frame(vec![button(false)], bounds)
+        };
+        let band = strip(BOUNDS, 3);
+        assert!(BOUNDS.shrink(VIEW_MARGIN * 0.5 - 0.5).contains_rect(band));
+        assert_eq!(
+            click(thumb(band, 2, 0.0).center(), BOUNDS),
+            Verdict::Show(2)
+        );
+        assert_eq!(
+            click(thumb(band, 0, 0.0).center(), BOUNDS),
+            Verdict::Show(0)
+        );
+        // Between two copies is the band, not the dimmed window.
+        let between = thumb(band, 0, 0.0).right_center() + vec2(3.0, 0.0);
+        assert_eq!(click(between, BOUNDS), Verdict::Stay);
+        // A short window has no band: the caption keeps that place.
+        let short = Rect::from_min_max(Pos2::ZERO, Pos2::new(800.0, 300.0));
+        let place = thumb(strip(short, 3), 2, 0.0).center();
+        assert_eq!(click(place, short), Verdict::Stay);
+    }
+
+    #[test]
+    fn more_copies_than_fit_move_along_to_keep_the_one_in_view_among_them() {
+        let narrow = Rect::from_min_max(Pos2::ZERO, Pos2::new(640.0, 440.0));
+        let band = strip(narrow, 24);
+        assert_eq!(band.width(), 640.0 - VIEW_MARGIN * 2.0);
+        let inside = band.shrink2(vec2(STRIP_PAD, 0.0));
+        assert_eq!(strip_scroll(band, 24, 0), 0.0);
+        for current in [0, 1, 11, 22, 23] {
+            let well = thumb(band, current, strip_scroll(band, 24, current));
+            assert!(inside.contains_rect(well), "{current}: {well:?}");
+        }
+        // The ends stop at the band's edges; one in the middle is centred.
+        let last = thumb(band, 23, strip_scroll(band, 24, 23));
+        assert!((last.right() - inside.right()).abs() < 0.01);
+        let middle = thumb(band, 11, strip_scroll(band, 24, 11));
+        assert!((middle.center().x - band.center().x).abs() < 0.01);
+        // All of a few fit, and are not moved.
+        assert_eq!(strip_scroll(strip(narrow, 3), 3, 2), 0.0);
     }
 }

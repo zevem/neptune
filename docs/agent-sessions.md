@@ -181,13 +181,15 @@ WebP or BMP, decided by its contents). A row does this:
 
 | Click | What happens |
 | --- | --- |
-| A picture's row | The picture at full size over the window. The wheel and the plus and minus keys zoom, 0 fits it again, the arrow keys and the controls at the window's sides step through the terminal's other attached pictures, and a click or Escape closes it. The folder control in its caption shows the file in the file manager. |
+| A picture's row | The picture at full size over the window. The wheel and the plus and minus keys zoom, 0 fits it again, the arrow keys and the controls at the window's sides step through the terminal's other attached pictures, and a click or Escape closes it. With several pictures, a band at the foot of the window holds a small copy of each, newest first: click one to see it. The folder control in its caption shows the file in the file manager. |
 | Another file's row | The file opens with its default application. |
 | The folder control | The file manager opens with the file selected. |
 | The cross (**Dismiss**) | The file leaves the list. The file itself is not touched. |
 
-**Dismiss all** under the rows empties the list. The list stays open
-while you dismiss files and closes when you open one.
+When the list holds more than one picture, **View all pictures** under the rows
+opens that full view on the newest, to look through them without returning to
+the list. **Dismiss all** empties the list. The list stays open while you
+dismiss files and closes when you open one.
 
 A terminal keeps its 24 most recent files. Attaching the same path again moves
 it to the top with its new title and reads its picture afresh, so an agent can
@@ -861,3 +863,11 @@ architecture boundary check passed. Not exercised: the installed Claude Code
 and Codex calling `attach_file` from its instructions alone, a real file
 manager and default application (the regression records what would be
 launched), macOS, Windows and native Wayland.
+
+**View all pictures** and the band of small copies were checked on 2026-10-06
+in the same build and session. The native regression passed, with captures
+reviewed of the list's entry, the full view opened from it and after a click
+on another copy at 1100×700, and of fifteen pictures at 640×440 with the band
+moved to its newest and its oldest. Focused widget and application tests and
+Clippy for the desktop library passed. Not exercised: a real pointer on the
+band, macOS, Windows and native Wayland.

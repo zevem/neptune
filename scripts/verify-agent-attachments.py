@@ -109,6 +109,9 @@ def main():
     dialog(project/'shots/before.png', (150, 154, 164))
     dialog(project/'shots/after.png', (64, 120, 242))
     dialog(project/'shots/narrow.png', (38, 166, 91), 420, 760)
+    more = [f'more-{index:02}.png' for index in range(1, 15)]
+    for index, name in enumerate(more):
+        dialog(project/'shots'/name, (40 + index * 15, 200 - index * 10, 120 + index * 8), 480, 300)
     (project/'report.md').write_text('# Review\n\nThe settings dialog now saves on close.\n')
     (project/'build.log').write_text('ok\n')
     (data/'config.toml').write_text('shell = "/bin/bash"\nconfirm_close = false\nwarn_running_processes = false\n')
@@ -164,6 +167,9 @@ def main():
         count=len(events()) if (output/'events.jsonl').exists() else 0
         text(f'attach {path}' + (f' :: {title}' if title else ''))
         return wait(lambda: events()[count], f'the tool to answer for {path}')
+    def viewing(title):
+        # The full view names its picture and how to leave it.
+        return any(title in (n.get('label') or '') and 'Escape' in (n.get('label') or '') for n in nodes())
     def menu(): return wait(lambda: click('Attached files'), 'the attached files control')
     linux = sys.platform.startswith(('linux','freebsd'))
     try:
@@ -208,6 +214,15 @@ def main():
         wait(lambda: any('After: it saves on close' in (n.get('label') or '') and 'Escape' in (n.get('label') or '') for n in nodes()), 'the previous picture')
         call('key','Escape')
         wait(lambda: not labelled('Next picture'))
+        # All the pictures open on the newest, each a click on its small copy away.
+        menu(); wait(lambda: click('View all pictures'))
+        wait(lambda: viewing('After: it saves on close') and labelled('Show Before: the settings dialog'), 'the band of small copies')
+        shot('view-all.png')
+        click('Show Before: the settings dialog')
+        wait(lambda: viewing('Before: the settings dialog'), 'the picture of the clicked copy')
+        shot('view-all-other.png')
+        call('key','Escape')
+        wait(lambda: not labelled('Next picture'))
         # The same file again moves to the top under its new title.
         assert not attach('shots/before.png', 'Before')['error']
         first=[first[1],first[2],('before.png','Before')]
@@ -235,6 +250,23 @@ def main():
         wait(lambda: labelled('View attached file The narrow layout'), 'the second terminal\'s list')
         shot('split-menu.png')
         call('key','Escape')
+        # More pictures than the band holds move along with the one in view.
+        for name in more: assert not attach(f'shots/{name}')['error']
+        second += [(name, None) for name in more]
+        wait(lambda: attached()==[first,second])
+        call('resize',640,440)
+        wait(lambda: click('Attached files', 1))
+        wait(lambda: click('View all pictures'), 'every picture to be read')
+        wait(lambda: viewing(more[-1]) and labelled(f'Show {more[-1]}'), 'the newest of many')
+        assert not labelled('Show The narrow layout')
+        shot('view-many-narrow.png')
+        call('key','ArrowLeft')
+        wait(lambda: viewing('The narrow layout') and labelled('Show The narrow layout'), 'the oldest of many')
+        assert not labelled(f'Show {more[-1]}')
+        shot('view-many-narrow-end.png')
+        call('key','Escape')
+        wait(lambda: not labelled('Next picture'))
+        call('resize',1100,700)
         close()
         assert attached()==[first,second]
         # They return with their agents.
@@ -258,7 +290,7 @@ def main():
         wait(lambda: agents()[1] is None and attached()==[[],[]])
         shot('agent-exited.png')
         close()
-        (output/'result.json').write_text(json.dumps({'status':'passed','platform':sys.platform,'features':['inspection'],'provider':'deterministic fixtures','checks':['files attached through each provider\'s tool server by absolute and relative path, with and without a title','a folder and a missing file are refused with the reason','the toolbar and each tab count their own terminal\'s files','the list shows pictures and other files, reveals one in the file manager and opens another with its application','a picture opens at full size and steps to its neighbours by key and by control','the same file again moves to the top under its new title','one file and all files are removed from the list','attached files return after close and reopen and leave with their agent','narrow window list and full view'],'address':endpoint},indent=2))
+        (output/'result.json').write_text(json.dumps({'status':'passed','platform':sys.platform,'features':['inspection'],'provider':'deterministic fixtures','checks':['files attached through each provider\'s tool server by absolute and relative path, with and without a title','a folder and a missing file are refused with the reason','the toolbar and each tab count their own terminal\'s files','the list shows pictures and other files, reveals one in the file manager and opens another with its application','a picture opens at full size and steps to its neighbours by key and by control','all pictures open from the list on the newest and each is shown by its small copy','more small copies than fit move along with the picture in view','the same file again moves to the top under its new title','one file and all files are removed from the list','attached files return after close and reopen and leave with their agent','narrow window list and full view'],'address':endpoint},indent=2))
         print(output)
     except Exception:
         if process and process.poll() is None:

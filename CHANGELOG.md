@@ -14,6 +14,10 @@ their preparation records remain in Git history.
 - See the new value when you change the terminal font size or window zoom from
   the keyboard or the command palette: a chip under the toolbar shows it for a
   moment, such as "Font size 15 pt" or "Window zoom 110%".
+- Look through everything an agent attached in one go. **View all pictures** in
+  a terminal's list of attached files opens them at full size, newest first,
+  and a band of small pictures at the foot of the window shows each one:
+  click any of them, or keep using the arrow keys.
 
 ## [0.1.0-rc.4] - 2026-10-05
 
