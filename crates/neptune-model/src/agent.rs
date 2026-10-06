@@ -214,6 +214,27 @@ impl Attachment {
     }
 }
 
+/// What an agent linked and attached in a conversation that is on no tab
+/// now, kept for when the conversation is resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation {
+    pub kind: AgentKind,
+    pub session_id: String,
+    pub pull_requests: Vec<PullRequest>,
+    pub attachments: Vec<Attachment>,
+}
+impl Conversation {
+    /// The most recent conversations set aside are kept.
+    pub const MAX: usize = 32;
+
+    pub fn is_valid(&self) -> bool {
+        self.kind.names_session(&self.session_id)
+            && self.pull_requests.len() <= PullRequest::MAX_PER_PANE
+            && self.attachments.len() <= Attachment::MAX_PER_PANE
+            && !(self.pull_requests.is_empty() && self.attachments.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,10 +479,8 @@ mod tests {
             link(&mut controller, generation, number);
         }
         assert_eq!(numbers(&controller), [2, 3, 4, 5, 6, 7, 8, 9]);
-        // A new conversation in the same run keeps them; restore does too.
-        let mut next = agent();
-        next.session_id = Some("019a1234-5678-7000-8000-123456789def".into());
-        open(&mut controller, generation, Some(next));
+        // The same conversation reported again keeps them; restore does too.
+        open(&mut controller, generation, Some(agent()));
         assert_eq!(numbers(&controller).len(), 8);
         let restored = Model::restore(
             controller.model().specs(),
@@ -473,7 +492,142 @@ mod tests {
         assert_eq!(restored.pane(pane).unwrap().pull_requests().len(), 8);
         open(&mut controller, generation, None);
         assert!(numbers(&controller).is_empty());
+        // An agent's first ID names the conversation its links were made in,
+        // and brings back what that conversation had when the agent exited.
+        let mut unnamed = agent();
+        unnamed.session_id = None;
+        open(&mut controller, generation, Some(unnamed));
+        link(&mut controller, generation, 1);
         open(&mut controller, generation, Some(agent()));
+        let first = vec![3, 4, 5, 6, 7, 8, 9, 1];
+        assert_eq!(numbers(&controller), first);
+        // Another conversation in the same run starts without them, and the
+        // one before has them again when the agent returns to it.
+        let attach = |controller: &mut Controller, name: &str| {
+            controller
+                .dispatch(Command::PaneFileAttached {
+                    pane,
+                    generation,
+                    attachment: Attachment::new(std::env::temp_dir().join(name), None).unwrap(),
+                })
+                .unwrap();
+        };
+        let shown = |controller: &Controller| {
+            let item = controller.model().pane(pane).unwrap();
+            let files: Vec<_> = item.attachments().iter().map(Attachment::name).collect();
+            (numbers(controller), files)
+        };
+        let nothing = (Vec::new(), Vec::new());
+        attach(&mut controller, "a.png");
+        let mut next = agent();
+        next.session_id = Some("019a1234-5678-7000-8000-123456789def".into());
+        open(&mut controller, generation, Some(next.clone()));
+        assert_eq!(shown(&controller), nothing);
+        assert_eq!(controller.model().pane(pane).unwrap().agent(), Some(&next));
+        link(&mut controller, generation, 2);
+        open(&mut controller, generation, Some(agent()));
+        assert_eq!(shown(&controller), (first.clone(), vec!["a.png".to_owned()]));
+        assert_eq!(controller.model().conversations().len(), 1);
+        // A conversation the CLI has not named yet is another one as well;
+        // what it links joins what its name had set aside.
+        let mut unnamed = agent();
+        unnamed.session_id = None;
+        open(&mut controller, generation, Some(unnamed));
+        assert_eq!(shown(&controller), nothing);
+        link(&mut controller, generation, 3);
+        attach(&mut controller, "b.png");
+        open(&mut controller, generation, Some(next.clone()));
+        assert_eq!(shown(&controller), (vec![2, 3], vec!["b.png".to_owned()]));
+        // They wait through an exit, a restart and a close and reopen.
+        open(&mut controller, generation, None);
+        assert_eq!(shown(&controller), nothing);
+        let restored = Model::restore(
+            controller.model().specs(),
+            Some(WorkspaceId::new(1)),
+            true,
+            Default::default(),
+        )
+        .unwrap()
+        .with_conversations(controller.model().conversations().to_vec());
+        assert_eq!(restored.conversations(), controller.model().conversations());
+        open(&mut controller, generation, Some(agent()));
+        assert_eq!(shown(&controller), (first.clone(), vec!["a.png".to_owned()]));
+        controller.dispatch(Command::RestartPane(pane)).unwrap();
+        let generation = controller.model().pane(pane).unwrap().generation();
+        let open = |controller: &mut Controller, agent| {
+            controller
+                .dispatch(Command::PaneAgentChanged {
+                    pane,
+                    generation,
+                    agent,
+                })
+                .unwrap();
+        };
+        open(&mut controller, Some(next.clone()));
+        assert_eq!(numbers(&controller), [2, 3]);
+        // Another CLI is another conversation whatever its ID.
+        next.kind = AgentKind::Claude;
+        open(&mut controller, Some(next));
+        assert!(numbers(&controller).is_empty());
+        // Only the newest conversations are kept, and only well-formed ones.
+        let kept = |id: usize| crate::Conversation {
+            kind: AgentKind::Codex,
+            session_id: format!("019a1234-5678-7000-8000-{id:012}"),
+            pull_requests: vec![PullRequest::parse("https://github.com/o/r/pull/1").unwrap()],
+            attachments: Vec::new(),
+        };
+        let mut many: Vec<_> = (0..crate::Conversation::MAX + 2).map(kept).collect();
+        many.push(crate::Conversation {
+            pull_requests: Vec::new(),
+            ..kept(99)
+        });
+        many.push(crate::Conversation {
+            session_id: "--last".into(),
+            ..kept(99)
+        });
+        let model = Model::default().with_conversations(many);
+        assert_eq!(model.conversations().len(), crate::Conversation::MAX);
+        assert_eq!(model.conversations()[0], kept(2));
+    }
+    #[test]
+    fn links_leave_with_a_restart() {
+        let mut controller = Controller::new(Model::default());
+        controller
+            .dispatch(Command::AddWorkspace {
+                cwd: std::env::temp_dir(),
+                name: "a".into(),
+                remote: None,
+                group: None,
+            })
+            .unwrap();
+        let pane = controller.model().active_pane().unwrap();
+        let generation = controller.model().pane(pane).unwrap().generation();
+        controller
+            .dispatch(Command::PaneAgentChanged {
+                pane,
+                generation,
+                agent: Some(agent()),
+            })
+            .unwrap();
+        let link = |controller: &mut Controller, generation, number: u64| {
+            controller
+                .dispatch(Command::PanePullRequestLinked {
+                    pane,
+                    generation,
+                    pull_request: PullRequest::parse(&format!(
+                        "https://github.com/o/r/pull/{number}"
+                    ))
+                    .unwrap(),
+                })
+                .unwrap();
+        };
+        let numbers = |controller: &Controller| -> Vec<u64> {
+            let pane = controller.model().pane(pane).unwrap();
+            pane.pull_requests()
+                .iter()
+                .map(PullRequest::number)
+                .collect()
+        };
         link(&mut controller, generation, 1);
         controller.dispatch(Command::RestartPane(pane)).unwrap();
         assert!(numbers(&controller).is_empty());
