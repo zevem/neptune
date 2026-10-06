@@ -16,6 +16,10 @@ their preparation records remain in Git history.
   moment, such as "Font size 15 pt" or "Window zoom 110%".
 - See which agent a terminal runs from its tab: Claude Code, Codex, OpenCode
   and pi show their own mark before the tab's name.
+- Look through everything an agent attached in one go. **View all pictures** in
+  a terminal's list of attached files opens them at full size, newest first,
+  and a band of small pictures at the foot of the window shows each one:
+  click any of them, or keep using the arrow keys.
 
 ## [0.1.0-rc.4] - 2026-10-05
 

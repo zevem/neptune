@@ -288,9 +288,9 @@ impl App {
         self.ui.overlay = OverlayState::Image;
     }
 
-    /// Leaves the attached picture in view for one `by` places along its
-    /// terminal's list, round its ends.
-    pub(super) fn step_attached(&mut self, by: isize) {
+    /// Leaves the attached picture in view for the one `to` picks from its
+    /// place on its terminal's list and the length of that list.
+    fn turn_attached(&mut self, to: impl FnOnce(usize, usize) -> usize) {
         let Some((pane, path)) = self
             .image_preview
             .view
@@ -303,10 +303,22 @@ impl App {
         let Some(index) = pictures.iter().position(|picture| picture.path == path) else {
             return;
         };
-        let next = (index as isize + by).rem_euclid(pictures.len() as isize) as usize;
-        if next != index {
+        let next = to(index, pictures.len());
+        if next != index && next < pictures.len() {
             self.view_attached(pane, pictures.swap_remove(next));
         }
+    }
+
+    /// Steps `by` places along the list, round its ends.
+    pub(super) fn step_attached(&mut self, by: isize) {
+        self.turn_attached(|index, count| {
+            (index as isize + by).rem_euclid(count as isize) as usize
+        });
+    }
+
+    /// Shows the picture at a place of the list, counted from its newest.
+    pub(super) fn show_attached(&mut self, index: usize) {
+        self.turn_attached(|_, _| index);
     }
 
     /// The file of the picture shown at full size.
@@ -347,24 +359,33 @@ impl App {
             }
         }
         // Where an attached picture stands among its terminal's others.
-        let position = self
+        let pictures = self
             .image_preview
             .view
             .as_ref()
-            .and_then(|view| Some((view.gallery?, &view.path)))
-            .and_then(|(pane, path)| {
-                let pictures = self.attached_pictures(pane);
-                let index = pictures.iter().position(|picture| &picture.path == path)?;
-                Some((index + 1, pictures.len()))
-            });
+            .and_then(|view| view.gallery)
+            .map_or_else(Vec::new, |pane| self.attached_pictures(pane));
         let Some(view) = &mut self.image_preview.view else {
             return;
         };
+        let position = pictures
+            .iter()
+            .position(|picture| picture.path == view.path)
+            .map(|index| (index + 1, pictures.len()));
+        let strip: Vec<_> = pictures
+            .iter()
+            .filter(|_| position.is_some())
+            .map(|picture| ui::image_preview::Thumb {
+                name: &picture.label,
+                texture: &picture.texture,
+            })
+            .collect();
         let full = ui::image_preview::View {
             texture: &view.texture,
             name: &view.name,
             pixels: view.pixels,
             position,
+            strip: &strip,
         };
         use ui::image_preview::Verdict;
         match ui::image_preview::view(ui, p, bounds, full, &mut view.zoom) {
@@ -372,6 +393,7 @@ impl App {
             Verdict::Close => self.action(ctx, Action::CloseOverlay),
             Verdict::Previous => self.step_attached(-1),
             Verdict::Next => self.step_attached(1),
+            Verdict::Show(index) => self.show_attached(index),
             Verdict::Reveal => {
                 let path = view.path.clone();
                 self.action(ctx, Action::RevealAttachment(path));

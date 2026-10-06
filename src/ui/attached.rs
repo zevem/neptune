@@ -1,6 +1,7 @@
 //! The files an agent attached to its terminal: a count on the terminal's
 //! tab that lists them, each with its picture where it is one, to be opened,
-//! shown in the file manager or taken off the list.
+//! shown in the file manager or taken off the list, and its pictures to be
+//! looked through together.
 use super::helpers::{elided, galley_at, menu_item, menu_layout, menu_separator};
 use super::{Action, helpers::path_label};
 use crate::{
@@ -189,6 +190,15 @@ fn list(ui: &mut Ui, p: Palette, pane: PaneId, files: &[File], actions: &mut Vec
         rows(ui);
     }
     menu_separator(ui, p);
+    let pictures = files
+        .iter()
+        .filter(|file| matches!(file.kind, Kind::Picture(_)))
+        .count();
+    // One picture is a click on its row away; several are looked through.
+    if pictures > 1 && menu_item(ui, p, Icon::Image, "View all pictures", "", false) {
+        actions.push(Action::ViewAttachedPictures(pane));
+        ui.close();
+    }
     let label = if files.len() == 1 {
         "Dismiss"
     } else {
