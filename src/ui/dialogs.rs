@@ -531,6 +531,11 @@ pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut 
     {
         actions.push(Action::DismissError);
     }
+    if let Some(level) = &state.level
+        && !super::controls::level(ctx, p, level)
+    {
+        state.level = None;
+    }
 }
 
 #[cfg(test)]

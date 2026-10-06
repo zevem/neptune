@@ -1023,6 +1023,70 @@ fn zoom_actions_respect_limits_and_defaults_reset_the_saved_zoom() {
 }
 
 #[test]
+fn stepping_font_size_or_zoom_names_the_new_value_until_it_fades() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    app.startup = None;
+    let shown = |app: &App| {
+        let level = app.ui.level.as_ref().unwrap();
+        format!("{} {}", level.name, level.value)
+    };
+    for (action, text) in [
+        (Action::IncreaseFontSize, "Font size 15 pt"),
+        (Action::ResetFontSize, "Font size 14 pt"),
+        (Action::DecreaseFontSize, "Font size 13 pt"),
+        (Action::ZoomUiIn, "Window zoom 110%"),
+        (Action::ZoomUiOut, "Window zoom 100%"),
+        (Action::ResetUiZoom, "Window zoom 100%"),
+    ] {
+        app.action(&ctx, action);
+        assert_eq!(shown(&app), text);
+    }
+    // At the end of a range the chip still answers, with the value kept.
+    app.config.window_zoom = 5.0;
+    app.action(&ctx, Action::ZoomUiIn);
+    assert_eq!(shown(&app), "Window zoom 500%");
+    app.config.font_size = 9.0;
+    app.action(&ctx, Action::DecreaseFontSize);
+    assert_eq!(shown(&app), "Font size 9 pt");
+
+    // A value set in Preferences is already in view there.
+    app.ui.level = None;
+    app.action(
+        &ctx,
+        Action::Preferences(Config {
+            font_size: 20.0,
+            ..Config::default()
+        }),
+    );
+    assert_eq!(app.ui.level, None);
+
+    app.action(&ctx, Action::IncreaseFontSize);
+    ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+    let frame = |app: &mut App, time: f64| {
+        let input = egui::RawInput {
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ui::dialogs::show(
+                ui.ctx(),
+                Palette::for_config(&app.config),
+                &mut app.ui,
+                &mut vec![],
+            );
+        });
+        output.textures_delta.clear();
+    };
+    let start = app.ui.level.as_ref().unwrap().shown;
+    frame(&mut app, start + 1.0);
+    assert_eq!(shown(&app), "Font size 21 pt");
+    frame(&mut app, start + 2.0);
+    assert_eq!(app.ui.level, None);
+}
+
+#[test]
 fn terminal_font_shortcuts_use_primary_shift_in_preferences_and_respect_limits() {
     for modifiers in [
         egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
