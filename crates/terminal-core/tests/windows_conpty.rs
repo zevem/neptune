@@ -277,7 +277,8 @@ fn process_activity_distinguishes_cmd_prompt_from_a_running_child() {
             .unwrap()
     };
     wait_for(&session, || screen(&session).contains("ACTIVITY_READY>"));
-    assert_eq!(activity(), Idle);
+    // A process the console starts with may outlive the first prompt briefly.
+    wait_for(&session, || activity() == Idle);
     let executable = std::env::current_exe().unwrap();
     session
         .write(
