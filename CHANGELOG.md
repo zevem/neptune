@@ -14,6 +14,8 @@ their preparation records remain in Git history.
 - See the new value when you change the terminal font size or window zoom from
   the keyboard or the command palette: a chip under the toolbar shows it for a
   moment, such as "Font size 15 pt" or "Window zoom 110%".
+- See which agent a terminal runs from its tab: Claude Code, Codex, OpenCode
+  and pi show their own mark before the tab's name.
 
 ## [0.1.0-rc.4] - 2026-10-05
 
