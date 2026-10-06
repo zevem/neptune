@@ -336,6 +336,16 @@ impl App {
             }
         }
     }
+    /// Names a setting stepped by a shortcut or the palette with the value it
+    /// now has, which at either end of its range is the one it already had.
+    fn show_level(&mut self, ctx: &egui::Context, name: &'static str, value: String) {
+        self.ui.level = Some(ui::controls::Level {
+            name,
+            value,
+            shown: ctx.input(|input| input.time),
+        });
+        ctx.request_repaint();
+    }
     pub(super) fn action(&mut self, ctx: &egui::Context, action: Action) {
         if self.startup.is_some()
             && matches!(
@@ -673,6 +683,11 @@ impl App {
                         ..self.config.clone()
                     }),
                 );
+                self.show_level(
+                    ctx,
+                    "Font size",
+                    format!("{} pt", self.config.font_size.round() as i32),
+                );
             }
             action @ (Action::ZoomUiIn | Action::ZoomUiOut | Action::ResetUiZoom) => {
                 let zoom = match action {
@@ -693,6 +708,11 @@ impl App {
                         }),
                     );
                 }
+                self.show_level(
+                    ctx,
+                    "Window zoom",
+                    format!("{:.0}%", self.config.window_zoom * 100.0),
+                );
             }
             Action::CopyHints(pane) => self.start_hints(ctx, pane),
             Action::Find => {

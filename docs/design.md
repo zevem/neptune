@@ -388,7 +388,11 @@ uses Ctrl+Plus/Minus (Command on macOS), with Ctrl+Equals as an unshifted Plus
 alternative and Ctrl+0 to reset (Command on macOS). App zoom scales terminal
 text and chrome together without changing the saved terminal font size. Window
 zoom also appears under Appearance in Preferences and persists across launches,
-whether changed there, by shortcut or from the command palette. Labels
+whether changed there, by shortcut or from the command palette. A shortcut or
+palette command that steps either one names the result in a capsule centred
+under the toolbar, such as "Font size 15 pt" or "Window zoom 110%", also at the
+end of a range where the value stays. It appears at once, takes no input, holds
+for 1.2 s and fades over 160 ms; the window sleeps through the hold. Labels
 use sentence case.
 
 Icons are drawn natively on a 24-point grid with a 1.5-point stroke and rounded

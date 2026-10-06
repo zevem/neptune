@@ -1036,11 +1036,102 @@ pub fn toast(ctx: &egui::Context, p: Palette, message: &str) -> bool {
     dismissed
 }
 
+/// A setting stepped from the keyboard or the command palette, named with its
+/// new value for a moment at the top of the window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Level {
+    pub name: &'static str,
+    pub value: String,
+    /// When the value was set, in the context's time.
+    pub shown: f64,
+}
+
+impl Level {
+    /// How long the chip stays before it fades.
+    const HOLD: f64 = 1.2;
+    const FADE: f64 = 0.16;
+
+    /// Opacity at `now`, or `None` once the chip has gone.
+    pub fn opacity(&self, now: f64) -> Option<f32> {
+        let age = now - self.shown;
+        (age < Self::HOLD + Self::FADE).then(|| {
+            let fading = ((age - Self::HOLD) / Self::FADE).clamp(0.0, 1.0);
+            1.0 - egui::emath::easing::cubic_out(fading as f32)
+        })
+    }
+}
+
+/// Shows a stepped setting's chip under the toolbar, where it covers neither
+/// the prompt nor a message. It takes no input. Returns false once it has gone.
+pub fn level(ctx: &egui::Context, p: Palette, level: &Level) -> bool {
+    let now = ctx.input(|input| input.time);
+    let Some(opacity) = level.opacity(now) else {
+        return false;
+    };
+    // Sleep through the hold; repaint only for the fade.
+    let hold = level.shown + Level::HOLD - now;
+    if hold > 0.0 {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(hold));
+    } else {
+        ctx.request_repaint();
+    }
+    egui::Area::new(Id::new("neptune-level"))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .anchor(Align2::CENTER_TOP, vec2(0.0, metrics::TOOLBAR_HEIGHT + 8.0))
+        .show(ctx, |ui| {
+            ui.set_opacity(opacity);
+            let painter = ui.painter().clone();
+            let name = painter.layout_no_wrap(level.name.into(), theme::medium(12.0), p.secondary);
+            let value = painter.layout_no_wrap(level.value.clone(), theme::medium(12.0), p.fg);
+            let (rect, response) = ui.allocate_exact_size(
+                vec2(name.size().x + value.size().x + 36.0, 28.0),
+                Sense::hover(),
+            );
+            response.widget_info(|| {
+                WidgetInfo::labeled(
+                    WidgetType::Label,
+                    true,
+                    format!("{} {}", level.name, level.value),
+                )
+            });
+            capsule(&painter, rect, p);
+            let name = galley_at(
+                &painter,
+                Pos2::new(rect.left() + 14.0, rect.center().y),
+                name,
+            );
+            galley_at(
+                &painter,
+                Pos2::new(name.right() + 8.0, rect.center().y),
+                value,
+            );
+        });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
     use eframe::egui::{Event, Modifiers, PointerButton};
+
+    #[test]
+    fn a_level_chip_holds_then_fades_out() {
+        let level = Level {
+            name: "Font size",
+            value: "15 pt".into(),
+            shown: 0.0,
+        };
+        assert_eq!(level.opacity(0.0), Some(1.0));
+        assert_eq!(level.opacity(Level::HOLD), Some(1.0));
+        let fading = level.opacity(Level::HOLD + Level::FADE * 0.5).unwrap();
+        assert!(
+            fading > 0.0 && fading < 0.5,
+            "ease-out fades early: {fading}"
+        );
+        assert_eq!(level.opacity(Level::HOLD + Level::FADE), None);
+    }
 
     fn context() -> egui::Context {
         let ctx = egui::Context::default();

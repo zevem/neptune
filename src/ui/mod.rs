@@ -93,6 +93,8 @@ pub struct UiState {
     /// A dialog field should take keyboard focus on its first frame.
     pub overlay_focus: bool,
     pub error: Option<String>,
+    /// The font size or window zoom just stepped to, while its chip shows.
+    pub level: Option<controls::Level>,
     pub search_open: bool,
     pub search: String,
     pub search_error: Option<String>,
