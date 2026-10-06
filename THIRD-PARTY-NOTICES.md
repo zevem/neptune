@@ -36,6 +36,13 @@ The iTerm2-Color-Schemes collection supplies Neptune's offline terminal palettes
 [MIT license](assets/themes/LICENSE), and complete [author credits](assets/themes/CREDITS.md)
 are retained in `assets/themes/` and copied into release archives.
 
+## Agent marks
+
+The marks of Claude Code, Codex, OpenCode and pi shown on terminal tabs are
+trademarks of their respective owners, used only to identify the agent a
+terminal runs. [Their sources](assets/icons/providers/README.md) are recorded
+with the artwork. Neptune's license does not extend to them.
+
 ## Bundled fonts and dependencies
 
 Geist and JetBrains Mono retain their SIL Open Font License 1.1 notices in
