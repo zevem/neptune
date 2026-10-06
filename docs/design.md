@@ -235,7 +235,9 @@ icon buttons keep a 28-point target around a 16-point glyph.
   terminals as tabs, with one in view. With several terminals, each place has
   a header with a tab per terminal, naming the program and directory (the
   host, for a remote terminal), followed by "New tab", zoom and split
-  controls. The tab in view is filled once it has neighbours; a tab out of
+  controls. A tab whose terminal runs Claude Code, Codex, OpenCode or pi leads
+  with that agent's mark at 13 points while it has room, and the chip of a
+  carried tab shows the same mark. The tab in view is filled once it has neighbours; a tab out of
   view shows a dot for unread alerts, and each tab closes from its own button
   or a middle click. The focused pane carries an accent ring and the others
   recede slightly. Zooming shows one place, with its tabs, and a "Zoomed" chip
@@ -397,7 +399,9 @@ use sentence case.
 
 Icons are drawn natively on a 24-point grid with a 1.5-point stroke and rounded
 ends, matching regular-weight text. Recolour an icon for state; do not swap
-assets. Every icon-only control has a tooltip and an accessible name that match.
+assets. An agent's mark is the exception to native drawing: it is the agent's
+own artwork, bundled as a mask and tinted like an icon, except Claude Code's,
+which keeps its orange. Every icon-only control has a tooltip and an accessible name that match.
 
 ## Bundled fonts and notices
 
