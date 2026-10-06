@@ -338,6 +338,8 @@ pub struct Model {
     pub(crate) next_pane: u64,
     pub(crate) next_split: u64,
     pub(crate) limits: Limits,
+    /// Oldest first.
+    pub(crate) conversations: Vec<crate::Conversation>,
 }
 impl Default for Model {
     fn default() -> Self {
@@ -357,7 +359,22 @@ impl Model {
             next_pane: 1,
             next_split: 1,
             limits,
+            conversations: Vec::new(),
         }
+    }
+    /// What agents linked and attached in conversations no tab shows now,
+    /// oldest first.
+    pub fn conversations(&self) -> &[crate::Conversation] {
+        &self.conversations
+    }
+    /// A restored model takes back the conversations saved with it; the
+    /// newest are kept, and one that is not well formed is left out.
+    pub fn with_conversations(mut self, mut conversations: Vec<crate::Conversation>) -> Self {
+        conversations.retain(crate::Conversation::is_valid);
+        let extra = conversations.len().saturating_sub(crate::Conversation::MAX);
+        conversations.drain(..extra);
+        self.conversations = conversations;
+        self
     }
     pub fn workspaces(&self) -> &[Workspace] {
         &self.workspaces
@@ -787,6 +804,82 @@ impl Model {
             .iter_mut()
             .find(|workspace| workspace.id == id)
             .ok_or(Error::UnknownWorkspace(id))
+    }
+    /// Empties what the pane's agent linked and attached, keeping it under
+    /// the conversation it named, if it named one. Reports a change.
+    pub(crate) fn set_aside(&mut self, id: PaneId) -> bool {
+        let Some(pane) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.panes.iter_mut())
+            .find(|pane| pane.id == id)
+        else {
+            return false;
+        };
+        if pane.pull_requests.is_empty() && pane.attachments.is_empty() {
+            return false;
+        }
+        let pull_requests = std::mem::take(&mut pane.pull_requests);
+        let attachments = std::mem::take(&mut pane.attachments);
+        if let Some(crate::AgentSession {
+            kind,
+            session_id: Some(session_id),
+            ..
+        }) = &pane.agent
+        {
+            self.conversations
+                .retain(|kept| !(kept.kind == *kind && kept.session_id == *session_id));
+            if self.conversations.len() >= crate::Conversation::MAX {
+                self.conversations.remove(0);
+            }
+            self.conversations.push(crate::Conversation {
+                kind: *kind,
+                session_id: session_id.clone(),
+                pull_requests,
+                attachments,
+            });
+        }
+        true
+    }
+    /// Gives the pane what was set aside for the conversation its agent
+    /// names, before anything it has linked since. Reports a change.
+    pub(crate) fn take_back(&mut self, id: PaneId) -> bool {
+        let Some(pane) = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.panes.iter_mut())
+            .find(|pane| pane.id == id)
+        else {
+            return false;
+        };
+        let Some(index) = pane.agent.as_ref().and_then(|agent| {
+            self.conversations.iter().position(|kept| {
+                kept.kind == agent.kind && Some(&kept.session_id) == agent.session_id.as_ref()
+            })
+        }) else {
+            return false;
+        };
+        let mut kept = self.conversations.remove(index);
+        for link in pane.pull_requests.drain(..) {
+            kept.pull_requests.retain(|known| !known.same(&link));
+            kept.pull_requests.push(link);
+        }
+        for file in pane.attachments.drain(..) {
+            kept.attachments.retain(|known| known.path() != file.path());
+            kept.attachments.push(file);
+        }
+        let extra = |len: usize, most: usize| ..len.saturating_sub(most);
+        kept.pull_requests.drain(extra(
+            kept.pull_requests.len(),
+            crate::PullRequest::MAX_PER_PANE,
+        ));
+        kept.attachments.drain(extra(
+            kept.attachments.len(),
+            crate::Attachment::MAX_PER_PANE,
+        ));
+        pane.pull_requests = kept.pull_requests;
+        pane.attachments = kept.attachments;
+        true
     }
     pub(crate) fn pane_mut(&mut self, id: PaneId) -> Result<&mut Pane, Error> {
         self.workspaces

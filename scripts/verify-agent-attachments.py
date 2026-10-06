@@ -71,6 +71,13 @@ while True:
         path, _, title = line.strip().removeprefix('attach ').partition(' :: ')
         attach(path, title)
         continue
+    if line.split()[:1] in (['clear'], ['resume']):
+        # Another conversation in the same run: a new one as `/clear` starts
+        # it, or an earlier one as `/resume` returns to it.
+        session = line.split()[1] if line.startswith('resume') else str(uuid.uuid4())
+        subprocess.run(hook, shell=True, input=json.dumps({'session_id':session,'cwd':os.getcwd(),'hook_event_name':'SessionStart','source':line.split()[0]}), text=True, check=True)
+        print(provider.upper() + ' SESSION ' + session, flush=True)
+        continue
     print('AGENT INPUT: ' + line.strip(), flush=True)
 '''
 
@@ -286,11 +293,32 @@ def main():
         wait(lambda: click('Dismiss all'))
         wait(lambda: attached()==[[],second])
         wait(lambda: len(labelled('Attached files'))==1)
+        # A new conversation in the same run starts with none of the last one's.
+        before=agents()[1]['session_id']
+        text('clear')
+        wait(lambda: agents()[1]['session_id']!=before and attached()==[[],[]], 'the new conversation')
+        wait(lambda: not labelled('Attached files'))
+        shot('new-conversation.png')
+        assert not attach('build.log')['error']
+        wait(lambda: attached()==[[],[('build.log',None)]])
+        # Each conversation has its own again when the agent returns to it.
+        after=agents()[1]['session_id']
+        text(f'resume {before}')
+        wait(lambda: attached()==[[],second], 'the earlier conversation')
+        wait(lambda: len(labelled('Attached files'))==1)
+        shot('resumed-conversation.png')
+        text(f'resume {after}')
+        wait(lambda: attached()==[[],[('build.log',None)]], 'the later conversation')
+        # They wait for it through an exit as well.
+        text('exit')
+        wait(lambda: agents()[1] is None and attached()==[[],[]])
+        text(f'codex resume {before}')
+        wait(lambda: attached()==[[],second], 'the conversation resumed by a new run')
         text('exit')
         wait(lambda: agents()[1] is None and attached()==[[],[]])
         shot('agent-exited.png')
         close()
-        (output/'result.json').write_text(json.dumps({'status':'passed','platform':sys.platform,'features':['inspection'],'provider':'deterministic fixtures','checks':['files attached through each provider\'s tool server by absolute and relative path, with and without a title','a folder and a missing file are refused with the reason','the toolbar and each tab count their own terminal\'s files','the list shows pictures and other files, reveals one in the file manager and opens another with its application','a picture opens at full size and steps to its neighbours by key and by control','all pictures open from the list on the newest and each is shown by its small copy','more small copies than fit move along with the picture in view','the same file again moves to the top under its new title','one file and all files are removed from the list','attached files return after close and reopen and leave with their agent','narrow window list and full view'],'address':endpoint},indent=2))
+        (output/'result.json').write_text(json.dumps({'status':'passed','platform':sys.platform,'features':['inspection'],'provider':'deterministic fixtures','checks':['files attached through each provider\'s tool server by absolute and relative path, with and without a title','a folder and a missing file are refused with the reason','the toolbar and each tab count their own terminal\'s files','the list shows pictures and other files, reveals one in the file manager and opens another with its application','a picture opens at full size and steps to its neighbours by key and by control','all pictures open from the list on the newest and each is shown by its small copy','more small copies than fit move along with the picture in view','the same file again moves to the top under its new title','one file and all files are removed from the list','attached files return after close and reopen and leave with their agent','a new conversation in the same run starts without the files of the last','a conversation has its files again when the agent returns to it, in the same run or a later one','narrow window list and full view'],'address':endpoint},indent=2))
         print(output)
     except Exception:
         if process and process.poll() is None:

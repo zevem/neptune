@@ -73,9 +73,10 @@ Only provider, session ID, directory, the addresses of
 [linked pull requests](#linked-pull-requests), the paths and titles of
 [attached files](#attached-files), the terminal whose agent
 [started an agent](#agents-that-start-agents) and the
-[worktree made for an agent](#agents-in-worktrees) are saved in workspace schema 11,
-which reads versions 1–10; version 10 widened the CLIs a reference can
-name. Invalid references receive the same recovery-copy protection
+[worktree made for an agent](#agents-in-worktrees) are saved in workspace schema 12,
+which reads versions 1–11; version 10 widened the CLIs a reference can
+name, and version 12 added the pull requests and files of
+[conversations set aside](#a-new-conversation), under their provider and session ID. Invalid references receive the same recovery-copy protection
 as other damaged workspace state. Prompts, transcripts, arbitrary commands,
 credentials and permission-bypass flags are not saved or replayed. Transcripts
 remain owned by the CLI. Launch-only options and temporary environment changes
@@ -155,9 +156,11 @@ requests, with a 20-second limit and a bounded response; the window is drawn
 again only when a state changed. Only the workspace in view is read; the last
 state of another is kept for an hour, shown again on return and read afresh.
 
-Links belong to the agent's run in that terminal. They return with the agent
-when workspaces are restored, and leave when the agent exits, the terminal is
-restarted or closed, or the workspace changes SSH hosts. Only an address that
+Links belong to the agent's conversation. They return with the agent when
+workspaces are restored, and leave the tab when the agent turns to another
+conversation or exits, the terminal is restarted or closed, or the workspace
+changes SSH hosts; they are back when the conversation is resumed
+([below](#a-new-conversation)). Only an address that
 names a pull request over HTTPS is accepted; it is saved without credentials,
 query or fragment, and nothing else about the pull request is stored.
 
@@ -196,10 +199,11 @@ it to the top with its new title and reads its picture afresh, so an agent can
 replace a screenshot it has retaken. A file that was moved or deleted since
 stays on the list, marked "No longer there", until you remove it.
 
-Attached files belong to the agent's run in that terminal, like linked pull
-requests: they return with the agent when workspaces are restored, and leave
-when the agent exits, the terminal is restarted or closed, or the workspace
-changes SSH hosts. Only the path and the title are kept and saved; Neptune
+Attached files belong to the agent's conversation, like linked pull requests:
+they return with the agent when workspaces are restored, leave the tab when
+the agent turns to another conversation or exits, the terminal is restarted
+or closed, or the workspace changes SSH hosts, and are back when the
+conversation is resumed. Only the path and the title are kept and saved; Neptune
 does not copy the file, so it shows what is at the path when you open it.
 Pictures are read on a worker within fixed limits (64 MB a file, 16,384 pixels
 a side), one at a time, for the workspace in view. Paths, titles and pictures
@@ -210,13 +214,33 @@ a screenshot it only names in its answer is not attached. Ask it to attach the
 file. Only Claude Code and Codex in local terminals are given the tool; an
 agent of another kind, or one on an SSH host, has none.
 
-Claude Code receives Neptune's tools as an invocation-scoped server through
-`--mcp-config`, and permission for the ones that read, link, attach or answer through
-`--settings`; its other servers and permissions are unchanged. Codex receives it through
-`-c mcp_servers.neptune…` overrides, on versions that expose `--no-daemon`, and
-may ask before the first call according to its approval settings. The server is
-the Neptune executable followed by `--agent-mcp`. A server of your own named
-`neptune` is replaced for that launch.
+### A new conversation
+
+Neptune tells one conversation from the next by the session ID the CLI
+reports, and shows on a tab the pull requests and files of the conversation
+its agent is in. When the agent turns to another one without exiting, the
+tab's pull requests and attached files are set aside with the conversation
+that made them, and the tab shows those of the one it turned to: none for a
+new conversation, and its own again for one that is resumed. They also wait
+for a conversation whose agent exited or whose terminal was restarted, and
+return when a tab's agent resumes it, in that terminal or another. Compacting
+a conversation keeps its ID, and so what the tab shows.
+
+| CLI | The tab changes |
+| --- | --- |
+| Claude Code | At once, on `/clear` and on `/resume` |
+| Codex | It empties at once on `/new`, `/clear` and `/resume`; what a resumed session had returns with the first prompt sent in it |
+
+Codex names a session only when a prompt is sent in it. Neptune learns that
+it turned to another from its tool server, which Codex starts again for each
+session, and that needs Codex's hooks trusted: without them a tab keeps what
+it shows until the agent exits.
+
+The 32 conversations set aside most recently are kept, with the same
+addresses, paths and titles as on a tab, and are saved with the workspaces.
+Closing a terminal while its agent runs, or changing a workspace's SSH host,
+drops what its tab showed. The agents a conversation started stay listed
+until they are closed or their starter exits.
 
 ## Agents in worktrees
 
@@ -598,7 +622,15 @@ session. A linked pull request is accepted only from the invocation that is open
 in its pane, and reaches the model as a generation-tagged
 `PanePullRequestLinked` command; an attached file takes the same path as a
 `PaneFileAttached` command, and the tool server checks that the file exists
-before it sends the path. The state of a linked pull request stays out
+before it sends the path. A `PaneAgentChanged` that names another session ID
+or CLI for an agent still open, or none, moves both lists in the model to a
+bounded list of conversations under the ID they were made in, and one that
+names an ID on that list moves them back; the bridge drops what the earlier
+conversation had queued for a frame. Codex's hooks name a session with its
+first prompt, so the bridge also takes the start of Codex's tool server,
+between the turns of a conversation that had a prompt, for the end of that
+conversation, and reports the agent without a session ID until the next
+prompt names one. The state of a linked pull request stays out
 of the model: `runtime/pull_requests.rs` owns one worker that runs `gh api
 graphql` off the frame and wakes the application when a state changed. Pending updates coalesce per pane; hooks wake the application on change,
 so idle integrations do not poll or repaint. Socket reads have byte and total-time
@@ -719,8 +751,9 @@ and relative path, a folder and a missing file are refused, the toolbar and
 each tab count their own terminal's files, the list reveals a file and opens
 another through stand-in launchers, a picture opens at full size and steps to
 its neighbour by key and by control, files are removed one at a time and all
-at once, and the lists return after a close and reopen and leave with their
-agent.
+at once, and the lists return after a close and reopen, are empty for a new
+conversation in the same run, return with an earlier one in the same run or
+a later one, and leave with their agent.
 
 `python3 scripts/verify-agent-restore.py` runs deterministic CLI fixtures in an
 isolated native app, with fresh storage and a unique inspection endpoint. It
@@ -871,3 +904,15 @@ on another copy at 1100×700, and of fifteen pictures at 640×440 with the band
 moved to its newest and its oldest. Focused widget and application tests and
 Clippy for the desktop library passed. Not exercised: a real pointer on the
 band, macOS, Windows and native Wayland.
+
+Links that follow the conversation were checked on 2026-10-06 in the Linux
+development build with `inspection` (Wayland session, XWayland window). The
+deterministic native regression passed, with captures reviewed of a tab
+emptied by a new conversation and filled again by the earlier one at
+1100×700. With **Claude Code 2.1.292**, `/clear` emptied a tab of one file
+and one pull request and `/resume` of that session brought both back at
+once. With **Codex CLI 0.160.1**, `/new` emptied the tab at once and
+`/resume` of the earlier session brought both back with the first prompt
+sent in it. Focused model, persistence and runtime tests passed. Not
+exercised: Codex with untrusted hooks, a conversation resumed in another
+terminal with an installed CLI, macOS, Windows and native Wayland.

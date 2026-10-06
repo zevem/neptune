@@ -86,6 +86,8 @@ pub(super) enum Event {
     },
     /// The CLI is gone but its reference is kept, as after a failed resume.
     Stopped,
+    /// The CLI started Neptune's tool server.
+    Serving,
     /// Start another agent with a task, in a tab beside this one.
     Spawn {
         kind: AgentKind,
@@ -627,6 +629,10 @@ struct Slot {
     remote: bool,
     /// The CLI of the open invocation.
     kind: Option<AgentKind>,
+    /// The conversation the open invocation is in, as it last named it.
+    conversation: Option<AgentSession>,
+    /// A prompt was sent in that conversation.
+    prompted: bool,
     /// Set while an invocation is open.
     activity: Option<Tracked>,
     /// What the application shows once the terminal's title has corrected
@@ -866,6 +872,8 @@ impl AgentBridge {
                         run: None,
                         remote: false,
                         kind: None,
+                        conversation: None,
+                        prompted: false,
                         activity: None,
                         shown: None,
                         since: Instant::now(),
@@ -929,6 +937,8 @@ impl AgentBridge {
                     run: None,
                     remote: true,
                     kind: None,
+                    conversation: None,
+                    prompted: false,
                     activity: None,
                     shown: None,
                     since: Instant::now(),
@@ -1270,6 +1280,7 @@ impl Shared {
         let slot = self.slots.get_mut(&pane)?;
         let before = slot.state();
         let prompt = signal == Signal::Prompt;
+        slot.prompted |= prompt;
         let tracked = slot.activity.as_mut()?;
         let news = tracked.apply(signal);
         let state = tracked.state;
@@ -1545,6 +1556,31 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
         wake();
         return true;
     }
+    if matches!(message.event, Event::Serving) {
+        // Codex starts its tool servers again when it turns to another
+        // conversation (`/new`, `/clear`, `/resume`), and names that one only
+        // with its first prompt. Between turns of a conversation that had a
+        // prompt, the start says the conversation on the tab is over.
+        let between = slot.kind == Some(AgentKind::Codex)
+            && slot.prompted
+            && slot
+                .activity
+                .as_ref()
+                .is_some_and(|tracked| tracked.state == Activity::Idle);
+        let Some(agent) = slot.conversation.as_mut().filter(|_| open && between) else {
+            return open;
+        };
+        agent.session_id = None;
+        let agent = agent.clone();
+        slot.prompted = false;
+        shared.links.retain(|link| link.0 != pane);
+        shared.attachments.retain(|file| file.0 != pane);
+        let left = shared.changes.get(&pane).is_some_and(|change| change.2);
+        shared.changes.insert(pane, (generation, Some(agent), left));
+        drop(guard);
+        wake();
+        return true;
+    }
     if matches!(message.event, Event::Stopped) {
         if !open {
             return false;
@@ -1621,17 +1657,38 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
             left = slot.run.is_some();
             slot.run = Some(message.run);
             slot.kind = Some(agent.kind);
+            slot.conversation = Some(agent.clone());
+            slot.prompted = false;
             slot.activity = Some(Tracked::idle());
             slot.shown = None;
             slot.since = now;
             reset = Some(Some(Activity::Idle));
             Some(agent)
         }
-        Event::Session { agent } if open && agent.is_valid() => Some(agent),
+        Event::Session { agent } if open && agent.is_valid() => {
+            // What the conversation before linked and no frame has taken yet
+            // stays with it.
+            let named = slot.conversation.as_ref();
+            // Codex names its conversation again with each prompt.
+            if named == Some(&agent) {
+                return true;
+            }
+            if named.is_some_and(|named| {
+                named.session_id.is_some() && named.session_id != agent.session_id
+            }) {
+                shared.links.retain(|link| link.0 != pane);
+                shared.attachments.retain(|file| file.0 != pane);
+                slot.prompted = false;
+            }
+            slot.conversation = Some(agent.clone());
+            Some(agent)
+        }
         Event::Close if open => {
             left = true;
             slot.run = None;
             slot.kind = None;
+            slot.conversation = None;
+            slot.prompted = false;
             slot.activity = None;
             slot.shown = None;
             reset = Some(None);
@@ -2076,7 +2133,11 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
                 });
             if let Some(hook) = hook {
                 let run = std::env::var(RUN).unwrap_or_default();
-                if hook.hook_event_name == "SessionStart"
+                // Codex names a conversation it resumed or began anew with
+                // the first prompt; each prompt says which one is open.
+                let names = hook.hook_event_name == "SessionStart"
+                    || (provider == AgentKind::Codex && hook.hook_event_name == "UserPromptSubmit");
+                if names
                     && hook.agent_id.is_none()
                     && let (Some(session_id), Some(cwd)) = (&hook.session_id, &hook.cwd)
                 {
@@ -2130,10 +2191,12 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
                     ask(event, &self.0)
                 }
             }
+            let run = std::env::var(RUN).unwrap_or_default();
+            let _ = send(Event::Serving, &run);
             super::agent_mcp::serve(
                 std::io::stdin(),
                 std::io::stdout().lock(),
-                &mut Bridge(std::env::var(RUN).unwrap_or_default()),
+                &mut Bridge(run),
                 std::env::var_os(SPAWNED).is_some(),
             )?;
             Ok(Some(0))
@@ -3077,6 +3140,8 @@ mod tests {
                 run: None,
                 remote: false,
                 kind: None,
+                conversation: None,
+                prompted: false,
                 activity: None,
                 shown: None,
                 since: Instant::now(),
@@ -3216,6 +3281,8 @@ mod tests {
                 run: None,
                 remote: false,
                 kind: None,
+                conversation: None,
+                prompted: false,
                 activity: None,
                 shown: None,
                 since: Instant::now(),
@@ -3270,12 +3337,109 @@ mod tests {
             (files[0].2.path(), files[0].2.title()),
             (&*shot, Some("After"))
         );
-        // What has not reached a frame leaves with its pane.
+        // What has not reached a frame stays with its conversation: the same
+        // one named again keeps it, another starts without it.
+        assert!(emit("one", "a", link(url)));
+        assert!(emit("one", "a", file(&shot)));
+        let session = |id| Event::Session { agent: agent(id) };
+        assert!(emit("one", "a", session(FIRST)));
+        assert!(emit("one", "a", session(SECOND)));
+        assert!(bridge.drain_links().is_empty());
+        assert!(bridge.drain_attachments().is_empty());
+        assert!(emit("one", "a", link(url)));
+        assert!(emit("one", "a", session(SECOND)));
+        assert_eq!(bridge.drain_links().len(), 1);
+        // And it leaves with its pane.
         assert!(emit("one", "a", link(url)));
         assert!(emit("one", "a", file(&shot)));
         bridge.close(PaneId::new(1));
         assert!(bridge.drain_links().is_empty());
         assert!(bridge.drain_attachments().is_empty());
+    }
+    #[test]
+    fn codex_ends_a_conversation_by_starting_its_tool_server_between_turns() {
+        let bridge = AgentBridge::default();
+        bridge.shared.lock().unwrap().slots.insert(
+            PaneId::new(1),
+            Slot {
+                generation: 7,
+                token: "one".into(),
+                run: None,
+                remote: false,
+                kind: None,
+                conversation: None,
+                prompted: false,
+                activity: None,
+                shown: None,
+                since: Instant::now(),
+                wake: Arc::new(|| {}),
+                _startup: None,
+            },
+        );
+        let emit = |token: &str, run: &str, event| {
+            apply_message(
+                &bridge.shared,
+                Message {
+                    token: token.into(),
+                    run: run.into(),
+                    event,
+                },
+            )
+        };
+        let named = |id: &str| AgentSession {
+            kind: AgentKind::Codex,
+            ..agent(id)
+        };
+        let link = |url: &str| Event::PullRequest { url: url.into() };
+        let url = "https://github.com/zevem/neptune/pull/83";
+        assert!(emit(
+            "one",
+            "a",
+            Event::Open {
+                agent: named(SECOND)
+            }
+        ));
+        // Codex opens another conversation by starting its tool server
+        // again between turns, and names it with the next prompt.
+        let turn = |signal| Event::Activity { signal };
+        assert!(emit("one", "a", Event::Serving), "before any prompt");
+        assert_eq!(bridge.drain(), [(PaneId::new(1), 7, Some(named(SECOND)))]);
+        assert!(emit("one", "a", turn(Signal::Prompt)));
+        assert!(emit("one", "a", link(url)));
+        assert!(
+            emit("one", "a", Event::Serving),
+            "a server started in a turn"
+        );
+        assert_eq!(bridge.drain_links().len(), 1);
+        assert!(emit("one", "a", turn(Signal::Done)));
+        assert!(emit("one", "a", link(url)));
+        assert!(!emit("one", "b", Event::Serving));
+        assert!(emit("one", "a", Event::Serving));
+        assert!(bridge.drain_links().is_empty());
+        let unnamed = AgentSession {
+            session_id: None,
+            ..named(SECOND)
+        };
+        assert_eq!(bridge.drain(), [(PaneId::new(1), 7, Some(unnamed))]);
+        assert!(emit("one", "a", Event::Serving));
+        assert!(bridge.drain().is_empty());
+        // A prompt in the conversation it resumed names it again.
+        assert!(emit(
+            "one",
+            "a",
+            Event::Session {
+                agent: named(FIRST)
+            }
+        ));
+        assert!(emit(
+            "one",
+            "a",
+            Event::Session {
+                agent: named(FIRST)
+            }
+        ));
+        assert_eq!(bridge.drain(), [(PaneId::new(1), 7, Some(named(FIRST)))]);
+        assert!(bridge.drain().is_empty());
     }
     #[test]
     fn hooks_are_bound_to_pane_generation_and_invocation_and_coalesced() {
@@ -3289,6 +3453,8 @@ mod tests {
                     run: None,
                     remote: false,
                     kind: None,
+                    conversation: None,
+                    prompted: false,
                     activity: None,
                     shown: None,
                     since: Instant::now(),
@@ -3379,6 +3545,8 @@ mod tests {
                     run: None,
                     remote: false,
                     kind: None,
+                    conversation: None,
+                    prompted: false,
                     activity: None,
                     shown: None,
                     since: Instant::now(),
