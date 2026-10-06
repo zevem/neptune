@@ -2136,8 +2136,7 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
                 // Codex names a conversation it resumed or began anew with
                 // the first prompt; each prompt says which one is open.
                 let names = hook.hook_event_name == "SessionStart"
-                    || (provider == AgentKind::Codex
-                        && hook.hook_event_name == "UserPromptSubmit");
+                    || (provider == AgentKind::Codex && hook.hook_event_name == "UserPromptSubmit");
                 if names
                     && hook.agent_id.is_none()
                     && let (Some(session_id), Some(cwd)) = (&hook.session_id, &hook.cwd)
@@ -3407,7 +3406,10 @@ mod tests {
         assert_eq!(bridge.drain(), [(PaneId::new(1), 7, Some(named(SECOND)))]);
         assert!(emit("one", "a", turn(Signal::Prompt)));
         assert!(emit("one", "a", link(url)));
-        assert!(emit("one", "a", Event::Serving), "a server started in a turn");
+        assert!(
+            emit("one", "a", Event::Serving),
+            "a server started in a turn"
+        );
         assert_eq!(bridge.drain_links().len(), 1);
         assert!(emit("one", "a", turn(Signal::Done)));
         assert!(emit("one", "a", link(url)));
@@ -3422,8 +3424,20 @@ mod tests {
         assert!(emit("one", "a", Event::Serving));
         assert!(bridge.drain().is_empty());
         // A prompt in the conversation it resumed names it again.
-        assert!(emit("one", "a", Event::Session { agent: named(FIRST) }));
-        assert!(emit("one", "a", Event::Session { agent: named(FIRST) }));
+        assert!(emit(
+            "one",
+            "a",
+            Event::Session {
+                agent: named(FIRST)
+            }
+        ));
+        assert!(emit(
+            "one",
+            "a",
+            Event::Session {
+                agent: named(FIRST)
+            }
+        ));
         assert_eq!(bridge.drain(), [(PaneId::new(1), 7, Some(named(FIRST)))]);
         assert!(bridge.drain().is_empty());
     }

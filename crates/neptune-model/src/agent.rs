@@ -526,7 +526,10 @@ mod tests {
         assert_eq!(controller.model().pane(pane).unwrap().agent(), Some(&next));
         link(&mut controller, generation, 2);
         open(&mut controller, generation, Some(agent()));
-        assert_eq!(shown(&controller), (first.clone(), vec!["a.png".to_owned()]));
+        assert_eq!(
+            shown(&controller),
+            (first.clone(), vec!["a.png".to_owned()])
+        );
         assert_eq!(controller.model().conversations().len(), 1);
         // A conversation the CLI has not named yet is another one as well;
         // what it links joins what its name had set aside.
@@ -551,7 +554,10 @@ mod tests {
         .with_conversations(controller.model().conversations().to_vec());
         assert_eq!(restored.conversations(), controller.model().conversations());
         open(&mut controller, generation, Some(agent()));
-        assert_eq!(shown(&controller), (first.clone(), vec!["a.png".to_owned()]));
+        assert_eq!(
+            shown(&controller),
+            (first.clone(), vec!["a.png".to_owned()])
+        );
         controller.dispatch(Command::RestartPane(pane)).unwrap();
         let generation = controller.model().pane(pane).unwrap().generation();
         let open = |controller: &mut Controller, agent| {
