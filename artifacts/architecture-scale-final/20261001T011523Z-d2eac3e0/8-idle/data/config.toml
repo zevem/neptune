@@ -1,4 +1,0 @@
-shell="/bin/sh"
-scrollback=1000
-cursor_blink=false
-confirm_close=false

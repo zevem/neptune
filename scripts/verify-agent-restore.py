@@ -65,6 +65,7 @@ while True:
 '''
 
 def main():
+    (ROOT / 'artifacts').mkdir(exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix='agent-restore-', dir=ROOT/'artifacts')).resolve()
     data = output / 'data'; data.mkdir()
     home = output / 'home'; home.mkdir()

@@ -1,5 +1,5 @@
 **/target/
-/artifacts/*.log
+/artifacts/
 *.tmp
 .DS_Store
 __pycache__/

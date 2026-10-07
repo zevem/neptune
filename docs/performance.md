@@ -70,7 +70,8 @@ hardware, power mode, and competing workload information.
 
 The release [`pty_bench`](../crates/terminal-core/examples/pty_bench.rs) measured
 **53.0 MiB/s** on the same Linux host: exactly 64 MiB received and parsed in
-1.208 seconds. The raw output is in [pty-bench.log](../artifacts/pty-bench.log).
+1.208 seconds. The original `pty-bench.log` was local-only and is not available
+in the [tracked evidence archive](artifact-archive.md).
 Peak process RSS was 42,180 KiB. This is another engine-only process, rather
 than the desktop application's resident memory.
 
@@ -153,7 +154,7 @@ the five-second warmup or twenty-second sample.
 | RSS throughout 81 samples | 230,228 KiB (224.8 MiB) |
 | Application threads | 14 |
 
-The raw record is [idle-release-final.json](../artifacts/idle-release-final.json).
+The raw record is [idle-release-final.json](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/idle-release-final.json).
 Its `idle_verified: false` field remains unchanged: the script cannot infer
 activity conditions, which are recorded above by the operator. This single
 local observation includes application/driver mappings in RSS and excludes child
@@ -188,7 +189,7 @@ twenty-second sample. Window focus was not verified.
 | Application threads | 18 |
 
 The raw record is
-[idle-release-wayland.json](../artifacts/ui-rebuild/idle-release-wayland.json).
+[idle-release-wayland.json](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/ui-rebuild/idle-release-wayland.json).
 It is one local observation with the same scope limits as above. An input
 method that is actively composing, other compositors and other input-method
 frameworks were not observed.
@@ -234,7 +235,7 @@ Three-second CPU observations have coarse OS tick resolution. These scenarios
 validate bounded behavior and provide local observations, rather than a
 comparative performance claim.
 
-The [accepted Linux summary](../artifacts/architecture-scale-accepted/accepted-summary.json)
+The [accepted Linux summary](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-scale-accepted/accepted-summary.json)
 records 19 passing applicable cases and the one-pane hidden-output exception.
 Each accepted output case has parsed-byte activity evidence through sampling;
 one 64-pane several-output case was repeated with a longer bounded producer
@@ -245,7 +246,7 @@ accepted results.
 
 The refactored real-PTY pipeline also verified exactly **67,108,864 bytes**
 received and parsed, the final marker, 10,000 retained rows and worker cleanup.
-Its [raw verification output](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/pty-bench.log)
+Its [raw verification output](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/pty-bench.log)
 records 2.021 seconds, 31.7 MiB/s and 88.166 ms cleanup. This run overlapped native
 verification on the host, so it is transport correctness evidence and is not an
 uncontended throughput baseline.
