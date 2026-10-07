@@ -377,6 +377,157 @@ Unicode. Five fresh native captures were visually reviewed, including the
 closed gracefully. This establishes the Linux/OpenSSH/Zsh behavior, not remote
 shell integration on other shells or native macOS/Windows behavior.
 
+## Projects verification: 2026-10-05
+
+[Projects](projects.md) were built in slices. The first was exercised in the
+running application on 2026-10-05 and the whole on 2026-10-06; this record
+keeps apart what each pass saw and what no pass has seen.
+
+Host and build for every native run: Linux 7.0.0-38, GNOME Wayland session
+with the window **forced onto X11** (`WAYLAND_DISPLAY` removed for the child),
+NVIDIA RTX 4060 with Vulkan, Rust 1.97.1, development profile with the
+`inspection` feature, Claude Code 2.1.290. Input was sent through the
+inspection protocol, not the operating system.
+
+**Seen running, with a fixture lead.** `python3 scripts/verify-project.py`
+passed twice on the build of that day. A stand-in `claude` plays the lead
+over the stream protocol and starts Neptune's real tool server, and plays an
+agent in a terminal. The script asserted, through the accessibility tree and
+the fixture's log:
+
+- the Project tab and its creation form, the project folder (mode 0700) and
+  the goal becoming the first message;
+- the lead's working directory, arguments and environment; a credential file
+  of mode 0600 in a 0700 folder that is gone once the lead is ready; no token
+  on the command line;
+- a streamed reply, the "Started agent" card, the roster row, no new tab, and
+  the agent's report returning as a row and as a turn of the lead;
+- an agent that asks before its task pinned under Needs you, its terminal
+  opened from there and answered, with one row and one turn of the lead for
+  one question;
+- pause and resume saved, a paused project starting nothing, Stop ending a
+  streamed turn with the same lead process going on;
+- no chat words, titles, tasks or replies in `workspaces.json` or the log;
+- removal: confirmation, agents given tabs, the lead's process ended.
+
+**Seen running, with the installed Claude Code as lead and agent** (two short
+runs on a small model): the lead's arguments as read from `/proc`, including
+`--mcp-config` as a file path; a reply about five seconds after the goal; an
+agent started on the person's word; Claude Code's folder trust question
+surfacing as a Needs-you row and a turn of the lead; the terminal opened from
+the row and answered; the agent's report and the lead's follow-up within
+seconds; nothing left running or in the temporary folder after closing. Two
+defects found this way were fixed and seen fixed: one unanswered trust
+question producing repeated rows and turns, and the credential file outliving
+the application.
+
+Captures of the running application were reviewed at 1180×760 for the
+creation form, a chat with the agent list, Needs you, a streaming reply with
+Stop, the project's menu (then only **Rename…** and **Remove project…**),
+the removal sheet and the state after removal; the first three were also
+captured at 640×480, where the panel still fits. Idle frame counts with `--diagnostics` on X11 were the same with and
+without a resting project (two an interval).
+
+**Final native pass: 2026-10-06.** Same host and build settings, Claude Code
+2.1.291 and Codex CLI 0.160.1. `python3 scripts/verify-project.py` was extended
+and passed twice in a row on the final build (about 2 min 45 s a run). It still
+plays lead and agents with a stand-in `claude` that starts Neptune's real tool
+server, reads pull requests through the stand-in `gh` of
+`verify-pull-request-status.py`, and works in a real temporary git repository.
+Beyond the list above it asserted:
+
+- the lead's `close_agent` on an agent whose terminal the person had opened:
+  the tab and its CLI stay, the agent leaves the list;
+- a paused refusal saying why in its card;
+- `record_decision` and `write_context` by the lead, the instructions editor
+  saved, `add_note` by an agent, all as files of mode 0600 listed under
+  Context, and the next agent's brief holding instructions, decision and
+  status; the lead told of the changed instructions;
+- two agents started with `worktree`, each on its own branch in its own
+  checkout beside the repository;
+- Watches: the add form refusing five minutes, a schedule added and run with
+  **Run now**, a pull request added in the form, one linked by an agent
+  followed without being asked, first sight silent, failing checks waking
+  the lead once for each, **Fix CI** on the pull request's own row and on
+  the newest row about the agent, pressed on the former with its words
+  reaching the agent's terminal, rows that say "Next in … min" and "Last ran
+  …", a schedule proposed by the lead waiting for **Allow**;
+- a quit in the middle of a streamed turn and a relaunch on the same data:
+  the chat with one notice of the cut turn, the agents listed again and their
+  CLIs resumed, no turn of the lead for agents that only opened again, the
+  lead started with `--resume` and its earlier conversation for the next
+  message, and a schedule made two runs late (by editing its saved time)
+  running once, half a minute after opening;
+- **New chat** keeping the earlier chat in the folder and starting a lead
+  that is handed the decisions and instructions;
+- **Remove project…** deleting the folder and leaving worktrees in place;
+- no chat, context or watch words in `workspaces.json` or the log, at three
+  points;
+- in a second data root: the sheet at 640×400 with the window at 150 %, its
+  list of agents folded and unfolded, a message sent from it, the sheet becoming the tab with its draft when the
+  window is widened; a damaged `project.json` copied to
+  `project-recovery-*.json` once before it is replaced; a `project.json` of a
+  later version shown read-only, its Watches saying they are off, starting
+  no lead and leaving every file byte for byte;
+- idle: with a resting project and a schedule ahead, 1.0 frames a second with
+  the chat in view and 1.5 with the watches, over 12 seconds each with no
+  inspection request (X11, `--diagnostics`).
+
+**With the installed CLIs.** One run with Claude Code as lead on a small
+model in a new git repository: a plan, then on approval two agents in
+worktrees of their own, a recorded decision, both folder trust questions
+surfacing as Needs-you rows and answered in the opened terminals, both
+reports returning and the lead's summary; after a quit and relaunch the lead
+ran with `--resume` and answered from the earlier conversation. One turn with
+Codex as lead ("READY"), picked in the creation form.
+
+Defects found by this pass and fixed, each with a test:
+
+- After every relaunch, each restored agent of a project was reported as
+  having finished a turn once its CLI had opened again, and the lead took a
+  turn about it unasked. Seen with the installed Claude Code; the script now
+  delays the restored shells to show it.
+- A paused refusal's card lacked its reason when the lead's turn began and
+  was refused within one frame.
+- A watch's second line was cut off at the panel's width, so how a pull
+  request stands could not be read; it wraps now.
+
+Captures of the final build were reviewed at 1180×760 for every state above
+and at 640×480 for the creation form, the chat with the agent list, Needs
+you, Context, Watches, the allow card, a result row, the restored chat and
+the read-only project.
+
+**Still not seen running.**
+
+| Area | Unverified natively |
+| --- | --- |
+| Durable chat | The "Not everything is saved" row, **Reveal project folder**, the reopen offer for a closed workspace's project, **Load earlier**, rotation of a large chat |
+| Shared context | A file's **Open**, **Reveal** and **Delete…**; an installed CLI calling `read_context`, `write_context` or `add_note` (the installed Claude Code called `record_decision`) |
+| Watches | A schedule firing at its own time without a restart, pausing and deleting a watch, declining a proposal, a pull request read through the real `gh`, **Address comments**, a merged pull request or worktree, desktop banners |
+| Codex as lead | A tool call, an interrupt, a resume or a failure with the installed Codex |
+| Lead failures | A usage limit, a signed-out CLI, a retry, an interrupted real turn, three leads at once, the automatic pause |
+| Agents | A project agent's permission request with an installed CLI; Codex as a project agent; a restored agent that takes longer than its start grace to report |
+
+Limits seen in that pass were taken up afterwards and seen in the same run
+on the changed build: the follow-ups on the pull request's row, an agent's
+report drawn with its Markdown, the list of agents scrolling in two fifths
+of the room with its bar in view at 640×480, relative times and the
+read-only wording in Watches, plain primary buttons where a form cannot be
+sent, and the sheet at the smallest window with 150 % zoom, which names the
+project in its title row and keeps about four lines of chat while the list
+of agents is folded. Left as it is: unfolded there, the list takes a row's
+height and the chat keeps one line; by its layout test only, the same holds
+while something is under Needs you. **Address comments** was shown and not
+pressed.
+
+Also not established: native Wayland (appearance, focus, idle repainting,
+input), macOS and Windows (not compiled there for this change; on Windows the
+tab only says projects are unavailable), an input method composing in the
+chat field or any other project field, the Ctrl+Shift+C/V shortcuts while a
+project field has the keyboard, operating-system keyboard input in general,
+screen-reader navigation of the tab, and idle cost while the Context segment
+re-reads its folder every two seconds.
+
 ## Historical visual acceptance
 
 The following acceptance record predates the architecture refactor. It is useful

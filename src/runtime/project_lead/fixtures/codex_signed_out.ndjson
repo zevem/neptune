@@ -1,0 +1,5 @@
+{"dir":"in","frame":{"id":"init","method":"initialize","params":{"clientInfo":{"name":"neptune","title":"Neptune","version":"0.0.0"}}}}
+{"dir":"out","frame":{"id":"init","result":{"userAgent":"neptune_probe/0.160.1 (Ubuntu 26.4.0; x86_64) neptune/0.1.0 (neptune_probe; 0.0.1)","codexHome":"/home/USER/.codex","platformFamily":"unix","platformOs":"linux"}}}
+{"dir":"in","frame":{"method":"initialized"}}
+{"dir":"in","frame":{"id":"account","method":"account/read","params":{}}}
+{"dir":"out","frame":{"id":"account","result":{"account":null,"requiresOpenaiAuth":true,"workspaceRouting":null}}}

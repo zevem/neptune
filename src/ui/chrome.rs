@@ -2269,6 +2269,7 @@ mod tests {
                         pull_requests: Vec::new(),
                         attachments: Vec::new(),
                         spawned_by: None,
+                        project: None,
                         worktree: None,
                     }],
                     layout: neptune_model::Layout::pane(PaneId::new(*id)),

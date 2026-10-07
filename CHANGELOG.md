@@ -11,6 +11,31 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Put an agent in charge of a piece of work with Projects. The new Project
+  tab of the right panel starts a **lead**, your installed Claude Code or
+  Codex, in the workspace in view: tell it what you want done and it plans,
+  starts agents in terminals of their own, hears when they finish and reports
+  back in a chat. Its agents run out of view and are listed in the tab; click
+  one to open its terminal. **Needs you** pins whatever only you can clear,
+  such as an agent waiting for a permission. The lead has no file or shell
+  tools of its own and cannot answer permission requests. Attach files to a
+  message with the paperclip, by dropping them on the chat or by pasting a
+  picture: the lead sees pictures and hands other files to its agents by
+  path. **Context** keeps
+  your instructions and the lead's decisions for every agent it starts, and
+  **Watches** wake the lead on a schedule or when a pull request's checks or
+  review comments change, only while Neptune is open. Unlike other agent
+  features, a project's chat and context are saved on this computer, in a
+  folder of its own that **Remove project…** deletes. Needs Claude Code or
+  Codex installed and signed in, and a workspace on this computer; not
+  available on Windows yet. Saved workspaces move to a newer format, which
+  earlier versions of Neptune leave untouched instead of restoring.
+- Send an agent's tab back to the background without stopping the agent. Once
+  you open the terminal of an agent that a project's lead or another agent
+  started, **Send to background** in the tab's menu, in the agent's row menu
+  and in the command palette puts the tab away again: the agent runs on out
+  of view and stays listed where you opened it from. Closing the tab still
+  ends the agent.
 - See the new value when you change the terminal font size or window zoom from
   the keyboard or the command palette: a chip under the toolbar shows it for a
   moment, such as "Font size 15 pt" or "Window zoom 110%".

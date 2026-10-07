@@ -31,7 +31,7 @@ impl App {
             return;
         };
         let mode = session.modes();
-        let events = ctx.input(|i| i.events.clone());
+        let events = Self::terminal_events(ctx);
         let normalized = crate::input::normalize_events(&events, ctx.input(|i| i.modifiers));
         for input in crate::input::route_events(context, &normalized, mode) {
             let result = match input.action {
@@ -209,6 +209,26 @@ impl App {
             })
     }
 
+    /// Whether text of a panel is selected, such as a reply of a project's
+    /// lead. A copy is then that text's: labels take no keyboard focus, so
+    /// the terminal would otherwise get the chord as a key.
+    fn text_selected(ctx: &egui::Context) -> bool {
+        ctx.with_plugin(|labels: &mut egui::text_selection::LabelSelectionState| {
+            labels.has_selection()
+        })
+        .unwrap_or(false)
+    }
+
+    /// The frame's events as a terminal takes them. A copy left for the text
+    /// selected in a panel is not also the terminal's interrupt.
+    pub(super) fn terminal_events(ctx: &egui::Context) -> Vec<egui::Event> {
+        let mut events = ctx.input(|input| input.events.clone());
+        if Self::text_selected(ctx) {
+            events.retain(|event| !matches!(event, egui::Event::Copy | egui::Event::Cut));
+        }
+        events
+    }
+
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
         self.shortcuts_with_keymap(ctx, crate::platform::keyboard::unshifted_zoom_key);
     }
@@ -281,28 +301,36 @@ impl App {
                     modifiers,
                     ..
                 } => (*key, *physical_key, *pressed, *modifiers),
-                egui::Event::Copy if self.terminal_owns_shortcuts(ctx) => (
-                    if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
-                        egui::Key::C
-                    } else {
-                        egui::Key::Copy
-                    },
-                    None,
-                    true,
-                    frame_modifiers,
-                ),
-                egui::Event::Cut if self.terminal_owns_shortcuts(ctx) => (
-                    if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
-                        egui::Key::X
-                    } else if cfg!(windows) && frame_modifiers.shift {
-                        egui::Key::Delete
-                    } else {
-                        egui::Key::Cut
-                    },
-                    None,
-                    true,
-                    frame_modifiers,
-                ),
+                egui::Event::Copy
+                    if !Self::text_selected(ctx) && self.terminal_owns_shortcuts(ctx) =>
+                {
+                    (
+                        if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
+                            egui::Key::C
+                        } else {
+                            egui::Key::Copy
+                        },
+                        None,
+                        true,
+                        frame_modifiers,
+                    )
+                }
+                egui::Event::Cut
+                    if !Self::text_selected(ctx) && self.terminal_owns_shortcuts(ctx) =>
+                {
+                    (
+                        if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
+                            egui::Key::X
+                        } else if cfg!(windows) && frame_modifiers.shift {
+                            egui::Key::Delete
+                        } else {
+                            egui::Key::Cut
+                        },
+                        None,
+                        true,
+                        frame_modifiers,
+                    )
+                }
                 egui::Event::Paste(_) if self.terminal_owns_shortcuts(ctx) => (
                     if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
                         egui::Key::V
@@ -335,7 +363,13 @@ impl App {
                     && ctx.memory(|memory| {
                         memory.has_focus(search) || memory.had_focus_last_frame(search)
                     });
-                if self.ui.overlay == OverlayState::Settings && egui::Popup::is_any_open(ctx) {
+                // A menu or list open over a sheet that holds them is left
+                // before the sheet is.
+                if matches!(
+                    self.ui.overlay,
+                    OverlayState::Settings | OverlayState::Project
+                ) && egui::Popup::is_any_open(ctx)
+                {
                     egui::Popup::close_all(ctx);
                 } else if self.ui.pane_drag.is_some() {
                     self.cancel_pane_drag(ctx);
@@ -351,6 +385,9 @@ impl App {
                     self.search_task = None;
                 } else if self.explorer_escape(ctx) {
                     // A name being typed, a search or its field was left.
+                } else if self.project_escape(ctx) {
+                    // A message being written keeps its text; the keyboard
+                    // returns to the terminal.
                 } else if self.ui.error.is_some() && self.controller.model().active_pane().is_none()
                 {
                     self.ui.error = None;
@@ -440,6 +477,20 @@ impl App {
                                 .strip_prefix('F')
                                 .is_some_and(|number| number.parse::<u8>().is_ok()))));
             if terminal_only && !self.terminal_owns_shortcuts(ctx) {
+                continue;
+            }
+            // The copy chord is the selected text's too, as it is the
+            // terminal selection's.
+            if binding == Binding::Copy && Self::text_selected(ctx) {
+                if pressed {
+                    self.shortcut_keys.insert(physical_key.unwrap_or(key));
+                }
+                ctx.input_mut(|input| {
+                    consume_binding(&mut input.events, &event, key, physical_key, m);
+                    if pressed {
+                        input.events.push(egui::Event::Copy);
+                    }
+                });
                 continue;
             }
             let action = self.binding_action(binding);
@@ -550,9 +601,11 @@ impl App {
             ResetFontSize => Action::ResetFontSize,
             ClearScrollback => Action::Clear(pane?),
             RestartPane => Action::Restart(pane?),
+            BackgroundPane => Action::Background(pane?),
             Notifications => Action::Notifications,
             ShowFiles => Action::Panel(ui::panel::Event::Show(ui::panel::Tab::Files)),
             ShowAgents => Action::Panel(ui::panel::Event::Show(ui::panel::Tab::Agents)),
+            ShowProject => Action::Panel(ui::panel::Event::Show(ui::panel::Tab::Project)),
             BrowseThemes => Action::Themes,
             _ => return None,
         })

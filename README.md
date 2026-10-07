@@ -22,6 +22,10 @@ shell sessions, GPU rendering, and a quiet workspace interface, with no webview.
   attaches, and a panel lists which agents are working, idle or
   waiting for you. Either agent can start the other out of view and
   work with it.
+- [Projects](docs/projects.md): a lead agent that plans work in a chat panel,
+  starts and follows other agents in their own terminals, keeps shared notes
+  for them and wakes on schedules or pull request changes while Neptune is
+  open. Local Unix workspaces, with Claude Code or Codex installed.
 
 ## Download
 
@@ -61,6 +65,7 @@ Build job limits, optional compiler caching, and scoped verification are in the
 | [Configuration example](config.example.toml) | Supported settings and defaults |
 | [Notifications](docs/notifications.md) | Terminal alerts and coding-agent setup |
 | [Agent sessions](docs/agent-sessions.md) | Coding-agent session resumption and activity, locally and on SSH hosts |
+| [Projects](docs/projects.md) | A lead agent that runs other agents: chat, shared context, watches, limits and what is stored |
 | [Development](docs/development.md) | Build tooling, native inspection, CI, and artifacts |
 | [Architecture](docs/architecture.md) · [Interface design](docs/design.md) | Ownership, terminal engine, renderer, and UI direction |
 | [Verification](docs/verification.md) · [Performance](docs/performance.md) | Native evidence, release gates, and reproducible measurements |

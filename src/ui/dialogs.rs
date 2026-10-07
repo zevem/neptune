@@ -66,6 +66,9 @@ fn rename(
             "Workspace group rename",
             "Save",
         ),
+        OverlayState::RenameProject(_) => {
+            ("Rename project", "Project name", "Project rename", "Save")
+        }
         _ => (
             "Rename workspace",
             "Workspace name",
@@ -82,10 +85,10 @@ fn rename(
             let field = text_field(
                 ui,
                 p,
-                Id::new(if matches!(target, OverlayState::Rename(_)) {
-                    "workspace-rename"
-                } else {
-                    "workspace-group-name"
+                Id::new(match target {
+                    OverlayState::Rename(_) => "workspace-rename",
+                    OverlayState::RenameProject(_) => "project-rename",
+                    _ => "workspace-group-name",
                 }),
                 &mut state.rename_name,
                 hint,
@@ -111,6 +114,9 @@ fn rename(
             OverlayState::NewGroup => Action::CreateGroup(name),
             OverlayState::RenameGroup(group) => Action::SetGroupName(group, name),
             OverlayState::Rename(workspace) => Action::SetName(workspace, name),
+            OverlayState::RenameProject(project) => {
+                Action::Project(super::project::Event::SetName(project, name))
+            }
             _ => return,
         });
         actions.push(Action::CloseOverlay);
@@ -497,6 +503,85 @@ fn confirm_delete(
     }
 }
 
+/// Removing a project ends its lead and discards its chat. Its agents are
+/// the person's from then on, so nothing of theirs is stopped.
+fn remove_project(
+    ctx: &egui::Context,
+    p: Palette,
+    project: neptune_model::ProjectId,
+    actions: &mut Vec<Action>,
+) {
+    let mut confirm = false;
+    let mut cancel = false;
+    let output = sheet(
+        ctx,
+        p,
+        "Remove project",
+        380.0,
+        SheetPlacement::Center,
+        |ui| {
+            ui.add_space(22.0);
+            padded(ui, 22.0, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Remove this project?")
+                            .font(theme::semibold(15.0))
+                            .color(p.fg),
+                    )
+                    .wrap()
+                    .selectable(false),
+                );
+                ui.add_space(6.0);
+                for (lead, text) in [
+                    (
+                        "Deleted",
+                        "The chat with its lead, the project's notes and its watches. Its \
+                         lead stops.",
+                    ),
+                    (
+                        "Stays",
+                        "Its agents keep running: each terminal gets a tab in this workspace. \
+                         Worktrees, branches and what Claude Code and Codex keep of their own \
+                         conversations are not touched.",
+                    ),
+                ] {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(lead)
+                                .font(theme::medium(12.0))
+                                .color(p.fg),
+                        )
+                        .selectable(false),
+                    );
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .font(theme::regular(13.0))
+                                .color(p.secondary),
+                        )
+                        .wrap()
+                        .selectable(false),
+                    );
+                    ui.add_space(8.0);
+                }
+            });
+            ui.add_space(6.0);
+            footer(ui, "remove-project-actions", |ui| {
+                confirm = button(ui, p, "Remove", ButtonKind::Destructive).clicked();
+                cancel = button(ui, p, "Cancel", ButtonKind::Secondary).clicked();
+            });
+        },
+    );
+    if confirm {
+        actions.push(Action::Project(super::project::Event::ConfirmRemove(
+            project,
+        )));
+    } else if cancel || output.backdrop_clicked {
+        actions.push(Action::CloseOverlay);
+    }
+}
+
 pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut Vec<Action>) {
     match state.overlay {
         OverlayState::DeleteFile => match &state.explorer.delete {
@@ -509,7 +594,9 @@ pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut 
         }
         target @ (OverlayState::Rename(_)
         | OverlayState::RenameGroup(_)
+        | OverlayState::RenameProject(_)
         | OverlayState::NewGroup) => rename(ctx, p, state, target, actions),
+        OverlayState::RemoveProject(project) => remove_project(ctx, p, project, actions),
         OverlayState::Ssh(workspace) => ssh(ctx, p, state, workspace, None, actions),
         OverlayState::SshInGroup(group) => ssh(ctx, p, state, None, Some(group), actions),
         OverlayState::ConfirmClose(close) => {
@@ -597,6 +684,75 @@ mod tests {
                     matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == close_copy(close).0)
                 }), "{close:?}: {status:?}");
                 assert!(actions.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn removing_a_project_says_what_is_deleted_and_what_stays_in_a_narrow_window_too() {
+        for size in [vec2(900.0, 640.0), vec2(360.0, 300.0)] {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+            let config = crate::config::Config::default();
+            theme::apply(&ctx, &config);
+            let p = Palette::for_config(&config);
+            let project = neptune_model::ProjectId::new(4);
+            let mut state = UiState {
+                overlay: OverlayState::RemoveProject(project),
+                ..UiState::default()
+            };
+            let mut actions = Vec::new();
+            let screen = egui::Rect::from_min_size(Pos2::ZERO, size);
+            let mut texts = Vec::new();
+            for _ in 0..4 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| show(ui.ctx(), p, &mut state, &mut actions),
+                );
+                output.textures_delta.clear();
+                texts = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some((
+                            text.galley.text().to_owned(),
+                            text.visual_bounding_rect(),
+                            shape.clip_rect,
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            let all: String = texts
+                .iter()
+                .map(|(text, ..)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for wanted in [
+                "Remove this project?",
+                "Deleted",
+                "The chat with its lead, the project's notes and its watches.",
+                "Stays",
+                "each terminal gets a tab in this workspace",
+                "Worktrees, branches and what Claude Code and Codex keep",
+                "Remove",
+                "Cancel",
+            ] {
+                assert!(all.contains(wanted), "{wanted} at {size:?}: {all}");
+            }
+            // Nothing is asked for before the person answers, and both
+            // answers stay within the window.
+            assert!(actions.is_empty());
+            for (text, rect, clip) in &texts {
+                if text == "Remove" || text == "Cancel" {
+                    assert!(
+                        screen.contains_rect(*rect) && clip.contains_rect(*rect),
+                        "{text} at {rect:?} in {size:?}"
+                    );
+                }
             }
         }
     }

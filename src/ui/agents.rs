@@ -1,9 +1,10 @@
 //! The agents tab: every CLI agent running in a terminal of any workspace,
 //! grouped by what it is doing. Agents waiting for a person come first.
 use super::Action;
-use super::helpers::{elided, galley_at};
+use super::helpers::{elided, galley_at, menu_item, menu_layout};
 use crate::{
     agent_activity::{Activity, Attention},
+    icons::Icon,
     theme::{self, Palette},
 };
 use eframe::egui::{
@@ -31,6 +32,8 @@ pub struct Row {
     pub folder: String,
     /// The agent's terminal is the focused one.
     pub focused: bool,
+    /// Its terminal has a tab that can be put away again.
+    pub can_background: bool,
 }
 
 /// An agent that the agent of a terminal started, for that terminal's tab.
@@ -45,6 +48,8 @@ pub struct Spawned {
     /// `Some` until its CLI has taken its task: whether it stands at a
     /// question of its own, which a person answers in its terminal.
     pub starting: Option<bool>,
+    /// Its terminal has a tab that can be put away again.
+    pub can_background: bool,
 }
 impl Spawned {
     pub fn state(&self) -> &'static str {
@@ -100,6 +105,32 @@ pub fn elapsed_label(elapsed: Duration) -> String {
         seconds => format!("{}d", seconds / 86_400),
     }
 }
+
+/// What a row about an agent offers on a secondary click: its terminal, and
+/// for one opened as a tab the way back out of view. The target is the
+/// terminal as it was when the row was made.
+pub fn row_menu(
+    response: &egui::Response,
+    p: Palette,
+    (pane, generation): (PaneId, u64),
+    can_background: bool,
+    actions: &mut Vec<Action>,
+) {
+    response.context_menu(|ui| {
+        menu_layout(ui, 200.0);
+        if menu_item(ui, p, Icon::Terminal, "Open terminal", "", false) {
+            actions.push(Action::OpenAgent(pane, generation));
+            ui.close();
+        }
+        if can_background && menu_item(ui, p, Icon::Minus, BACKGROUND, "", false) {
+            actions.push(Action::Background(pane));
+            ui.close();
+        }
+    });
+}
+
+/// What sends a terminal's tab out of view, wherever it is offered.
+pub const BACKGROUND: &str = "Send to background";
 
 /// The order of the groups, and each one's heading.
 fn group(activity: Activity) -> (u8, &'static str) {
@@ -207,6 +238,13 @@ fn row(ui: &mut Ui, rect: Rect, p: Palette, row: &Row, actions: &mut Vec<Action>
     if response.clicked() {
         actions.push(Action::OpenAgent(row.pane, row.generation));
     }
+    row_menu(
+        &response,
+        p,
+        (row.pane, row.generation),
+        row.can_background,
+        actions,
+    );
     response.on_hover_text(format!("{} in {}", kind_name(row.kind), row.folder));
 }
 

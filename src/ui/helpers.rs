@@ -585,6 +585,23 @@ impl<'a> SpawnedChip<'a> {
                     ui.close();
                 }
             }
+            // Under them, the way back out of view for each one that was
+            // opened as a tab.
+            if self.agents.iter().any(|agent| agent.can_background) {
+                menu_separator(ui, p);
+            }
+            for agent in self.agents.iter().filter(|agent| agent.can_background) {
+                let label = format!("Send {} to background", ellipsize(&agent.title, 24));
+                let chosen = ui
+                    .push_id(("background", agent.pane), |ui| {
+                        menu_item(ui, p, Icon::Minus, &label, "", false)
+                    })
+                    .inner;
+                if chosen {
+                    actions.push(super::Action::Background(agent.pane));
+                    ui.close();
+                }
+            }
         });
         if !listing {
             response.on_hover_text(match self.agents.len() {

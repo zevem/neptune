@@ -60,6 +60,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         notifications: Default::default(),
         agents: Default::default(),
         delegation: Default::default(),
+        projects: projects::Projects::new(root.join("projects"), true),
         desktop_notifier: Default::default(),
         updates: Default::default(),
         relaunch: false,
@@ -2699,6 +2700,23 @@ fn theme_color_popup_escape_keeps_preferences_open() {
 }
 
 #[test]
+fn a_list_open_over_the_project_sheet_takes_escape_before_the_sheet() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    app.ui.overlay = OverlayState::Project;
+    let ctx = egui::Context::default();
+    egui::Popup::open_id(&ctx, egui::Id::new("test-project-agents"));
+    let escape = || key(egui::Key::Escape, None, egui::Modifiers::NONE);
+    assert!(press(&mut app, &ctx, escape()));
+    assert!(!egui::Popup::is_any_open(&ctx));
+    assert_eq!(app.ui.overlay, OverlayState::Project);
+    // With nothing over it, the sheet itself is left.
+    assert!(press(&mut app, &ctx, escape()));
+    assert_eq!(app.ui.overlay, OverlayState::None);
+}
+
+#[test]
 fn a_changed_theme_draft_survives_closing_and_other_overlays() {
     let root = tempfile::tempdir().unwrap();
     let (mut app, _sender) = fixture(root.path());
@@ -4050,6 +4068,109 @@ fn custom_keybindings_disabled_clipboard_chords_reach_the_terminal_protocol() {
     )
     .textures_delta
     .clear();
+}
+
+#[test]
+fn a_copy_chord_copies_the_text_selected_in_a_panel_before_it_reaches_the_terminal() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    app.startup = None;
+    let ctx = egui::Context::default();
+    let label = |ui: &mut egui::Ui| {
+        ui.add(egui::Label::new("a reply of the lead").selectable(true))
+            .rect
+    };
+    let frame = |app: &mut App, events: Vec<egui::Event>| {
+        let mut seen = Vec::new();
+        let mut written = 0;
+        let mut rect = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.shortcuts(ui.ctx());
+                seen = shortcut_events(ui.ctx());
+                // What the terminal in front would write for them.
+                let events = App::terminal_events(ui.ctx());
+                let normalized = crate::input::normalize_events(&events, ui.input(|i| i.modifiers));
+                written = crate::input::route_events(
+                    crate::input::RoutingContext::TerminalPane(1),
+                    &normalized,
+                    terminal_core::Mode::empty(),
+                )
+                .into_iter()
+                .filter(|event| matches!(event.action, crate::input::InputAction::Write(_)))
+                .count();
+                rect = label(ui);
+            },
+        );
+        output.textures_delta.clear();
+        let copied =
+            output
+                .platform_output
+                .commands
+                .into_iter()
+                .find_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text),
+                    _ => None,
+                });
+        (seen, rect, copied, written)
+    };
+    let ctrl = egui::Modifiers::CTRL;
+    let chord = || vec![egui::Event::ModifiersChanged(ctrl), egui::Event::Copy];
+
+    // With nothing selected the chord is the terminal's key.
+    let (seen, rect, copied, written) = frame(&mut app, chord());
+    assert_eq!(seen, [key(egui::Key::C, None, ctrl)]);
+    assert_eq!(copied, None);
+    assert_eq!(written, 1, "the interrupt");
+
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let (from, to) = (rect.left_center(), rect.right_center());
+    frame(
+        &mut app,
+        vec![
+            egui::Event::ModifiersChanged(egui::Modifiers::NONE),
+            egui::Event::PointerMoved(from),
+        ],
+    );
+    frame(&mut app, vec![button(from, true)]);
+    frame(&mut app, vec![egui::Event::PointerMoved(to)]);
+    frame(&mut app, vec![button(to, false)]);
+    let (seen, _, copied, written) = frame(&mut app, chord());
+    assert_eq!(seen, [egui::Event::Copy], "the terminal got no key");
+    assert_eq!(written, 0, "nothing is written to the terminal");
+    assert_eq!(copied.as_deref(), Some("a reply of the lead"));
+
+    // The chord bound to copying does the same, and is not left to type.
+    let host = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+    let (seen, _, copied, _) = frame(
+        &mut app,
+        vec![
+            egui::Event::ModifiersChanged(host),
+            key(egui::Key::C, Some(egui::Key::C), host),
+        ],
+    );
+    if !cfg!(target_os = "macos") {
+        assert_eq!(seen, [egui::Event::Copy]);
+        assert_eq!(copied.as_deref(), Some("a reply of the lead"));
+    }
+
+    // A press elsewhere ends the selection, and the key is the terminal's.
+    let away = rect.right_bottom() + egui::vec2(40.0, 40.0);
+    frame(&mut app, vec![egui::Event::PointerMoved(away)]);
+    frame(&mut app, vec![button(away, true)]);
+    frame(&mut app, vec![button(away, false)]);
+    let (seen, _, _, written) = frame(&mut app, chord());
+    assert_eq!(seen, [key(egui::Key::C, None, ctrl)]);
+    assert_eq!(written, 1);
 }
 
 #[test]

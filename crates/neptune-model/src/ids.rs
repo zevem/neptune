@@ -30,3 +30,4 @@ identity!(WorkspaceId);
 identity!(WorkspaceGroupId);
 identity!(SplitId);
 identity!(SessionGeneration);
+identity!(ProjectId);

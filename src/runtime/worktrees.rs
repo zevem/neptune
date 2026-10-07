@@ -79,7 +79,10 @@ pub enum Event {
         cwd: PathBuf,
         result: Result<Repository, String>,
     },
+    /// `cwd` and `branch` as they were asked for: who asked knows its own
+    /// request by them.
     Created {
+        cwd: PathBuf,
         branch: String,
         result: Result<Worktree, String>,
     },
@@ -171,7 +174,11 @@ fn work(receiver: mpsc::Receiver<Request>, events: Arc<Mutex<Vec<Event>>>, wake:
             }
             Some(Request::Create { cwd, branch }) => {
                 let result = create(&cwd, &branch);
-                report(Event::Created { branch, result });
+                report(Event::Created {
+                    cwd,
+                    branch,
+                    result,
+                });
             }
             Some(Request::Inspect(worktree)) => report(Event::Inspected {
                 result: condition(&worktree),

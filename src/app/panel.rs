@@ -24,6 +24,15 @@ impl App {
     }
 
     pub(super) fn panel_event(&mut self, ctx: &egui::Context, event: Event) {
+        // A window too narrow for the panel shows the project in a sheet:
+        // asked for by name, it must not open nothing.
+        if event == Event::Show(Tab::Project) && !self.ui.panel.available {
+            self.ui.panel.tab = Tab::Project;
+            self.ui.overlay = ui::OverlayState::Project;
+            self.ui.overlay_focus = true;
+            ctx.request_repaint();
+            return;
+        }
         let state = &mut self.ui.panel;
         let (open, tab) = match event {
             Event::Toggle => (!state.open, state.tab),
@@ -40,6 +49,9 @@ impl App {
         state.tab = tab;
         if !open || tab != Tab::Files {
             self.leave_explorer(ctx);
+        }
+        if !open || tab != Tab::Project {
+            self.leave_project(ctx);
         }
         ctx.request_repaint();
     }
@@ -86,6 +98,8 @@ impl App {
             let Some(pane) = model
                 .pane(turn.pane)
                 .filter(|pane| pane.generation() == turn.generation)
+                // A project speaks for its agents.
+                .filter(|pane| pane.project().is_none())
             else {
                 continue;
             };
@@ -172,6 +186,7 @@ impl App {
                     workspace: workspace.name().to_owned(),
                     folder,
                     focused: focused == Some(pane.id()),
+                    can_background: model.can_background(pane.id()).is_ok(),
                 });
             }
         }
@@ -199,6 +214,7 @@ impl App {
                     title,
                     activity: self.agents.get(pane.id()).map(|(activity, _)| activity),
                     starting: self.delegation.starting(pane.id()),
+                    can_background: self.controller.model().can_background(pane.id()).is_ok(),
                 }
             })
             .collect()

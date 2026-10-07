@@ -72,14 +72,18 @@ Neptune restores new processes, not unfinished tool execution or process memory.
 Only provider, session ID, directory, the addresses of
 [linked pull requests](#linked-pull-requests), the paths and titles of
 [attached files](#attached-files), the terminal whose agent
-[started an agent](#agents-that-start-agents) and the
-[worktree made for an agent](#agents-in-worktrees) are saved in workspace schema 12,
-which reads versions 1–11; version 10 widened the CLIs a reference can
-name, and version 12 added the pull requests and files of
-[conversations set aside](#a-new-conversation), under their provider and session ID. Invalid references receive the same recovery-copy protection
-as other damaged workspace state. Prompts, transcripts, arbitrary commands,
-credentials and permission-bypass flags are not saved or replayed. Transcripts
-remain owned by the CLI. Launch-only options and temporary environment changes
+[started an agent](#agents-that-start-agents), the
+[worktree made for an agent](#agents-in-worktrees) and the
+[project](#projects) a terminal's agent belongs to are saved in workspace
+schema 13, which reads versions 1–12; version 10 widened the CLIs a reference
+can name, version 12 added the pull requests and files of
+[conversations set aside](#a-new-conversation), under their provider and
+session ID, and version 13 added projects. Invalid references receive the same
+recovery-copy protection as other damaged workspace state. Prompts,
+transcripts, arbitrary commands, credentials and permission-bypass flags are
+not saved or replayed. The one exception is a [project](#projects), which
+keeps the conversation with its lead and its shared context in a folder of
+its own, never in workspace state. Transcripts remain owned by the CLI. Launch-only options and temporary environment changes
 (such as a different `CODEX_HOME`) must be reapplied by the user's configuration.
 
 This integration is for local interactive CLIs. Batch/print commands and
@@ -88,7 +92,8 @@ agent runs from its own shell, as opposed to an agent it
 [starts through Neptune](#agents-that-start-agents). An agent in an SSH
 workspace is [listed with what it is doing](#agents-on-ssh-hosts) and nothing
 more: it is not saved, reopened, given Neptune's tools or started by another
-agent. Only Claude Code and Codex can be started by another agent. An application update
+agent. Only Claude Code and Codex can be started by another agent or lead a
+[project](#projects). An application update
 cannot discover agents launched before its adapters were installed. macOS uses
 the Unix adapter but still needs native verification; Linux/X11 is the verified
 host for this change.
@@ -349,6 +354,19 @@ person. Started agents are also rows of the [Agents tab](#agent-activity) like
 any other, and opening one there gives it its tab too. The sidebar counts a
 workspace's tabs, so a terminal out of view is not counted.
 
+Send to background. An opened agent goes back out of view without being
+stopped: choose **Send to background** from its tab's menu, from the list
+under the count, from a secondary click on its row in the Agents tab, or run
+**Send terminal to background** from the command palette (config name
+`background-pane`, no default shortcut). Its tab goes, the keyboard passes to
+the tab that takes its place, and the agent runs on and stays listed as it
+was before you opened it; it is saved and restored that way too. From then on
+it is a terminal out of view again in every respect: `close_agent` closes it,
+and it closes with its agent if that exits. This is offered only for a
+terminal whose agent another agent of the same workspace or a project
+started, since nothing lists any other terminal, and not for the last
+terminal in view in its workspace. Closing a tab still ends what runs in it.
+
 The started CLI runs interactively, as if you had typed `claude "task"` or
 `codex "task"` there: it has its own conversation, tools, permission mode and
 settings, and once you open it you can read along, answer it or type to it.
@@ -437,8 +455,8 @@ started instead.
 Lifetime. A link lasts while both agents run. It returns with them when
 workspaces are restored, out of view where it was, and the restored agents
 can go on talking. It ends when the started agent exits or its terminal is
-restarted or closed. A started agent that exits in a terminal you never
-opened takes that terminal with it; one whose terminal has a tab leaves its
+restarted or closed. A started agent that exits in a terminal out of view
+takes that terminal with it; one whose terminal has a tab leaves its
 shell there. When the starting agent exits or its terminal is closed, the
 agents it started keep running, answer to no one, and each gets a tab so that
 nothing runs out of view unattended. An agent reaches only the agents it
@@ -463,8 +481,123 @@ sessions, Windows shells or bypassed adapters.
 Tasks, messages, replies and the lines of a question before the task pass
 through the application's memory between the two terminals. They are not saved, logged or sent to diagnostics; a reply
 nobody collected is dropped with its link. Only an agent that another agent
-started hands over the last message of its turns; every other agent's hooks
-send what they did before.
+or a project's lead started hands over the last message of its turns; every
+other agent's hooks send what they did before.
+
+A [project](#projects) is the exception to "not saved". What its lead's
+agents report is written to the project's chat as it is handed to the lead,
+under the [storage contract](#what-a-project-stores) below. The lines of a
+question before the task are still never written, and nothing is logged or
+sent to diagnostics. Agents that agents start outside a project stay
+memory-only, as this section says.
+
+## Projects
+
+A project gives a workspace a **lead**: a Claude Code or Codex that plans,
+starts agents through Neptune and is told what they do. The
+[projects guide](projects.md) describes it for the person using it; this
+section says how it differs from [agents that start agents](#agents-that-start-agents),
+on which it is built.
+
+The lead is not in a terminal. Neptune runs the installed CLI as a process of
+its own, in the project's folder, and speaks its machine protocol: Claude
+Code's `stream-json` input and output, or `codex app-server`. The lead's only
+tools are Neptune's, from the same tool server (`neptune --agent-mcp`) the
+adapters give a terminal's agent, under an identity that belongs to the
+project instead of to a terminal:
+
+| | A terminal's agent | A project's lead |
+| --- | --- | --- |
+| Runs in | Its terminal, interactively | A process without a terminal, started on the first message and let go after 30 minutes at rest with no agents |
+| Its own tools | All of the CLI's | None for Claude Code (`--tools ""`, no settings sources, `--strict-mcp-config`, permission mode `dontAsk`). For Codex a read-only sandbox without network, approvals `never`, web search and the optional features off, and your other tool servers disabled for that conversation |
+| Agents it starts | End their link when it exits, and get tabs | Belong to the project: they stay out of view when the lead's process exits or is replaced, and get tabs when the project is removed |
+| Learns of its agents' news | By calling `wait_for_agent` | Neptune collects it and gives it to the lead as a turn; the lead has no waiting tool |
+| Told about a paused project | Not applicable | Starting, messaging and reopening agents and adding watches are refused while the project is paused |
+
+The lead is offered thirteen tools, all allowed without asking:
+
+| Tool | What it does |
+| --- | --- |
+| `spawn_agent` | Starts `claude` or `codex` out of view with a `title` and a task, optionally on a `model` and at an `effort`, in the project's directory, in a `cwd` inside it, or in a git `worktree` Neptune makes for the branch named. Returns once the terminal exists: "Agent N started in …. You will be told when it finishes or needs someone." |
+| `send_agent_message` | Gives one of its agents its next prompt, preceded by the decisions recorded since that agent was last told |
+| `list_agents` | Says what each of its agents is doing |
+| `agent_report` | Returns the whole last report of an agent, which a turn carries only the first 6 KB of |
+| `close_agent` | Closes an agent's terminal, or, when a person has it open as a tab, takes the agent out of the project and leaves the terminal open |
+| `reopen_agent` | Opens a closed agent again with its conversation, also after Neptune was restarted |
+| `read_context` | Reads the index of the project's shared context, or one of its files, 20 KB at a time |
+| `write_context` | Replaces `STATUS.md` or adds to a note |
+| `record_decision` | Adds a dated entry to `DECISIONS.md` |
+| `add_subscription` | Adds a watch: a schedule of at least 15 minutes, which waits for the person's **Allow**, or a pull request, which runs at once |
+| `list_subscriptions`, `remove_subscription` | Lists and removes the project's watches |
+| `pull_request_status` | Says how a pull request stands: state, checks and unresolved review conversations |
+
+It is not offered `wait_for_agent`, `press_agent_keys`, `link_pull_request`,
+`attach_file` or `reply_to_parent`. Watches are called subscriptions in the
+tools' names.
+
+An agent the lead starts is a **project agent**. It has the tools of any
+[started agent](#agents-that-start-agents), `reply_to_parent` included, which
+reaches the lead as news, and two more that Neptune allows Claude Code
+without asking:
+
+| Tool | What it does |
+| --- | --- |
+| `read_context` | As for the lead |
+| `add_note` | Adds an entry to `notes/<topic>.md`, signed with the agent's number and title |
+
+Neptune writes the project agent's brief itself, in place of the one sentence
+a started agent gets: the person's instructions, the newest decisions, the
+top of the status, the index, the folder's path, its worktree if it has one,
+and the rule that the last message of each turn is its report. A project
+agent may start agents of its own with `spawn_agent`; those are ordinary
+started agents, are not members of the project, get none of its context and
+cannot start more. A project has at most six agents open and starts at most
+forty in a day.
+
+Credentials. A lead gets a token and run of its own for the loopback
+channel, and the role `NEPTUNE_AGENT_ROLE=lead`; a project agent's shell has
+`NEPTUNE_AGENT_ROLE=member`. The role only chooses which tools the tool
+server lists: authority follows the token, and a lead's token is refused once
+its process has been replaced. Before either CLI starts, inherited
+`NEPTUNE_AGENT_*` variables are removed from its environment and the
+adapters' folder from its `PATH`; a Claude Code lead also loses `CLAUDECODE`,
+`CLAUDE_CODE_*`, `NODE_OPTIONS` and `ANTHROPIC_API_KEY`, and a Codex lead
+`CODEX_SANDBOX*`. A Claude Code lead then has its own four variables in its
+process environment, and again in a file readable by your account alone, in
+a private temporary folder, named by `--mcp-config` and removed as soon as
+the CLI has read it. A Codex lead's process has none of them: they travel
+only in the line that opens the conversation, on its standard input, for
+Codex to give the tool server. The token is in neither command line.
+
+The lead runs on the model its CLI chooses. `NEPTUNE_LEAD_MODEL` in
+Neptune's own environment names another; native checks set it to keep their
+runs small, and it is not a setting.
+
+A project agent's brief is the CLI's argument, like any task, so the
+instructions and decisions in it are visible in the process list while the
+agent starts.
+
+### What a project stores
+
+This is the storage contract. It amends the memory-only rule above for
+projects and for nothing else.
+
+| Question | Answer |
+| --- | --- |
+| What is stored | The person's messages to the lead; the lead's finished replies; the tools the lead used, each with a one-line summary Neptune wrote; agents' reports as handed to the lead; watch titles and instructions; the shared context files; the project's name and directory; the lead's conversation ID; and a record of the project's agents (title, CLI, conversation ID, directory, worktree, pull request addresses, state, last report) |
+| Where | Only `projects/<key>/` in the data directory: `chat.jsonl` with one earlier `chat.1.jsonl`, `project.json`, and `context/`. Folders are mode 0700 and files 0600 |
+| What workspace state holds | The project's number, folder key, name, workspace, lead CLI and paused flag, and each member terminal's project number. No words of the chat, tasks, watches or context |
+| What is never stored | Terminal contents; the lines of a question an agent asks before its task (the chat records that it asked, without the text); credentials; text the lead was still streaming; the lead's reasoning |
+| What enters diagnostics | The operation, the project's number, elapsed time and a closed failure kind. Never text, titles, paths or tokens |
+| What leaves the machine | Nothing through Neptune. The lead and its agents are the person's own CLIs, which send conversations to their providers and keep their own transcripts |
+| How it is deleted | **Remove project…** deletes the folder. **New chat** sets the chat aside as `chat.1.jsonl`. Context files are deleted from their rows or in a file manager |
+| What is unchanged | Agents that agents start outside a project stay memory-only |
+
+`project.json` is version 1 and `chat.jsonl` begins with a format line. A
+`project.json` of another version, an unreadable or oversize one, or a chat
+with another format line makes that project read-only: its lead stays off
+and nothing in its folder is written. A damaged `project.json` is copied
+aside before it is replaced. Screenshot launches write nothing.
 
 ## Agent activity
 
@@ -511,7 +644,9 @@ private loopback channel, prints nothing and exits 0, so it never decides
 anything for the agent. Prompts, commands, tool input and results, and the
 transcript are not sent, logged or saved; the state itself is not saved either.
 The one exception is the last message of a turn of an agent that
-[another agent started](#agents-that-start-agents), held in memory for that agent.
+[another agent started](#agents-that-start-agents), held in memory for that
+agent, or that a [project's lead](#projects) started, handed to the project
+and written to its chat.
 The hooks run in order with a five-second limit (three for Codex's Interrupt,
 the most Codex allows) and normally take a few milliseconds; input over 4 MB is not parsed and only its event is used.
 
@@ -687,6 +822,24 @@ of them moved, and wakes the application only when an answer changes. Branch
 names are checked before git sees them and never begin with a dash; paths and
 branch names are not logged or sent to diagnostics.
 
+A project is identity and membership in the model and nothing else there: a
+project has a number, a folder key, a name, its workspace, its lead's CLI and
+a paused flag, and a pane names the project it belongs to. Such a pane may be
+outside the layout as a started agent's may, with the project answering for
+it in place of a starting pane. The bridge resolves a caller's token to a
+pane or to a project's lead and keeps a project's agents when its lead's
+process is replaced. `runtime/project_lead.rs` owns each lead's process and
+three threads (reader, writer, error tail) behind a provider-neutral event
+type, with one pure driver per CLI tested against recorded exchanges; events
+reach the frame through a bounded queue that blocks the CLI when full, and
+streamed text wakes the window at most every 50 ms. `runtime/project_store.rs`
+owns one worker for every project folder: appends, atomic replacement,
+context files, the watch clock and removal. `app/projects.rs` joins them on
+the frame without waiting on any of them, and holds user messages and agent
+news in a bounded inbox until the lead is idle, so nothing is written into a
+running turn. Pure rules for the inbox, the turn envelope, context, schedules
+and the saved formats are in `src/projects/`.
+
 A small POSIX supervisor preserves foreground signal handling and reports normal
 CLI exit. Resumption runs as part of shell startup with quoted arguments, never
 by typing commands into a terminal that could still be showing another prompt.
@@ -734,6 +887,27 @@ reopened; a fixture that asks before taking its task is reported with what it
 shows by the call that started it and answered with the keys given; links
 return after a close and reopen, out of view where they were, and no task or
 reply is in the saved state.
+
+`python3 scripts/verify-project.py` covers a project from its first message
+to its removal in an isolated native app. One `claude` fixture plays both parts: as the lead it
+speaks the stream protocol, starts Neptune's real tool server from the file
+it was given and calls `spawn_agent` through it; as an agent in a terminal it
+fires the injected hooks and answers its task. The script checks the creation
+form, the lead's arguments, environment and credential file, the tool card
+and roster row, an agent's report returning as a turn of the lead, an agent
+that asks before its task under Needs you, pause, stop, what is and is not in
+the saved window state, and removal. It goes on to shared context, watches
+(with a stand-in `gh`), worktrees in a real temporary repository, a quit in
+the middle of a turn and a relaunch, **New chat**, the narrow-window sheet, a
+damaged and a later `project.json`, and idle frame counts; it last passed on
+2026-10-06. Focused tests:
+
+```sh
+cargo test -p neptune-terminal --lib projects:: --locked
+cargo test -p neptune-terminal --lib app::projects --locked
+cargo test -p neptune-terminal --lib runtime::project_lead --locked
+cargo test -p neptune-terminal --lib runtime::project_store --locked
+```
 
 `python3 scripts/verify-agent-worktree.py` covers agents in worktrees, in a
 repository it makes: a branch named in the sheet becomes a tab in its own
@@ -916,3 +1090,15 @@ once. With **Codex CLI 0.160.1**, `/new` emptied the tab at once and
 sent in it. Focused model, persistence and runtime tests passed. Not
 exercised: Codex with untrusted hooks, a conversation resumed in another
 terminal with an installed CLI, macOS, Windows and native Wayland.
+
+Projects were checked on 2026-10-05 and 2026-10-06 in the Linux development
+build with `inspection` (Wayland session, XWayland window), with a fixture
+lead, with the installed **Claude Code 2.1.290** and **2.1.291** as lead and
+as agent, and for one turn with **Codex CLI 0.160.1** as lead. What was and
+was not seen running is recorded under
+[projects verification](verification.md#projects-verification-2026-10-05):
+in short, creating a project, turns, agents with worktrees of their own,
+reports returning, an agent asking before its task, shared context, watches
+read through a stand-in `gh`, pause, stop, a restart with a resumed lead, the
+narrow-window sheet and removal were; lead failures, a real `gh`, desktop
+banners and a Codex lead's tool calls were not.
