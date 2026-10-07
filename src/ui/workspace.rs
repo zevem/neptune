@@ -27,6 +27,8 @@ pub struct PanePresentation {
     pub attached: Vec<super::attached::File>,
     /// The agents this terminal's agent started, oldest first.
     pub spawned: Vec<super::agents::Spawned>,
+    /// Its tab can be put away: an agent or a project lists the terminal.
+    pub can_background: bool,
     /// The git worktree made for the terminal's agent, which names its tab.
     pub worktree: Option<super::worktrees::Tab>,
     pub unread: usize,
@@ -259,8 +261,9 @@ fn pane_menu(
     ui: &mut Ui,
     p: Palette,
     id: PaneId,
-    // Zoomed, on this machine, and in a worktree made for its agent.
-    (zoomed, local, worktree): (bool, bool, bool),
+    // Zoomed, on this machine, in a worktree made for its agent, and listed
+    // by whoever started its agent, so that its tab can be put away.
+    (zoomed, local, worktree, background): (bool, bool, bool, bool),
     bindings: &Keybindings,
     actions: &mut Vec<Action>,
 ) {
@@ -384,6 +387,18 @@ fn pane_menu(
         chosen.push(Action::Restart(id));
     }
     helpers::menu_separator(ui, p);
+    if background
+        && menu_item(
+            ui,
+            p,
+            Icon::Minus,
+            super::agents::BACKGROUND,
+            &bindings.hint(Binding::BackgroundPane),
+            false,
+        )
+    {
+        chosen.push(Action::Background(id));
+    }
     if worktree && menu_item(ui, p, Icon::Trash, "Remove worktree…", "", true) {
         chosen.push(Action::Worktree(super::worktrees::Event::RemoveOf(id)));
     }
@@ -641,6 +656,7 @@ fn tab(
                 stage.zoomed,
                 presentation.remote.is_none(),
                 presentation.worktree.is_some(),
+                presentation.can_background,
             ),
             &stage.config.keybindings,
             actions,
@@ -935,6 +951,7 @@ fn draw_pane(
                         stage.zoomed,
                         presentation.remote.is_none(),
                         presentation.worktree.is_some(),
+                        presentation.can_background,
                     ),
                     &stage.config.keybindings,
                     actions,
@@ -1584,6 +1601,7 @@ mod tests {
                                 pull_requests: Vec::new(),
                                 attached: Vec::new(),
                                 spawned: Vec::new(),
+                                can_background: false,
                                 worktree: None,
                                 unread: 0,
                                 metadata: metadata(""),
@@ -1740,6 +1758,7 @@ mod tests {
             pull_requests: Vec::new(),
             attached: Vec::new(),
             spawned: Vec::new(),
+            can_background: false,
             worktree: None,
             unread: 1,
             metadata: metadata(""),
@@ -1797,6 +1816,61 @@ mod tests {
         // Its own place has no centre to drop on.
         bench.carry_to(Pos2::new(200.0, 200.0));
         assert!(moves(&bench.button(Pos2::new(200.0, 200.0), false)).is_empty());
+    }
+
+    #[test]
+    fn a_terminals_menu_sends_its_tab_to_the_background_only_where_something_lists_it() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let config = Config::default();
+        let id = PaneId::new(3);
+        // The menu's actions, and where it offers the background.
+        let menu = |background: bool, events: Vec<egui::Event>| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    pane_menu(
+                        ui,
+                        Palette::for_config(&config),
+                        id,
+                        (false, true, false, background),
+                        &config.keybindings,
+                        &mut actions,
+                    )
+                },
+            );
+            output.textures_delta.clear();
+            let offered = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text() == super::super::agents::BACKGROUND =>
+                    {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                });
+            (actions, offered)
+        };
+        assert!(menu(false, vec![]).1.is_none());
+        let at = menu(true, vec![]).1.expect("the menu does not offer it");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        menu(true, vec![egui::Event::PointerMoved(at)]);
+        menu(true, vec![button(true)]);
+        let (actions, _) = menu(true, vec![button(false)]);
+        // The tab goes; nothing is focused, closed or asked.
+        assert!(matches!(actions.as_slice(), [Action::Background(pane)] if *pane == id));
     }
 
     #[test]
@@ -1946,6 +2020,7 @@ mod tests {
                     pull_requests: Vec::new(),
                     attached: Vec::new(),
                     spawned: Vec::new(),
+                    can_background: false,
                     worktree: None,
                     unread: 0,
                     metadata: metadata("zsh"),

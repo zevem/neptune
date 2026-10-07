@@ -3,17 +3,20 @@
 pub mod agents;
 pub mod attached;
 pub mod changes;
+pub mod chat;
 pub mod chrome;
 pub mod controls;
 pub mod dialogs;
 pub mod explorer;
 pub mod helpers;
 pub mod image_preview;
+pub mod markup;
 pub mod notifications;
 pub mod palette;
 pub mod panel;
 pub(crate) mod ports;
 pub mod preferences;
+pub mod project;
 pub mod search;
 pub mod theme_browser;
 mod theme_editor;
@@ -22,7 +25,7 @@ pub mod workspace;
 pub mod worktrees;
 use crate::{config::Config, terminal::Cache};
 use neptune_model::{
-    Axis, Destination, PaneId, SidebarItem, SplitId, WorkspaceGroupId, WorkspaceId,
+    Axis, Destination, PaneId, ProjectId, SidebarItem, SplitId, WorkspaceGroupId, WorkspaceId,
 };
 use std::path::PathBuf;
 
@@ -58,6 +61,12 @@ pub enum OverlayState {
     NewWorktree(PaneId),
     /// Confirm removing the worktree the sheet's state holds.
     RemoveWorktree,
+    RenameProject(ProjectId),
+    /// Confirm removing a project; its agents stay.
+    RemoveProject(ProjectId),
+    /// The project of the workspace in view, in a window too narrow for the
+    /// panel that holds its tab.
+    Project,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CloseStatus {
@@ -118,6 +127,8 @@ pub struct UiState {
     pub changes: changes::State,
     /// The sheets that make and remove an agent's git worktree.
     pub worktree: worktrees::State,
+    /// The project tab: what is being written to a lead, or for a new one.
+    pub project: project::State,
 }
 #[derive(Clone)]
 pub enum Action {
@@ -126,6 +137,9 @@ pub enum Action {
     NewTab(PaneId),
     MovePane(PaneId, Destination),
     ClosePane(PaneId),
+    /// Put a terminal's tab away. Its agent runs on out of view, listed
+    /// where the agent or the project that started it lists it.
+    Background(PaneId),
     CloseWorkspace(WorkspaceId),
     SelectWorkspace(WorkspaceId),
     MoveWorkspace(WorkspaceId, usize),
@@ -168,6 +182,7 @@ pub enum Action {
     Explorer(explorer::Event),
     Changes(changes::Event),
     Worktree(worktrees::Event),
+    Project(project::Event),
     Find,
     CopyHints(PaneId),
     SearchChanged,

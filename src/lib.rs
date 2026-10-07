@@ -9,6 +9,7 @@ pub mod keybindings;
 pub mod notifications;
 pub mod persistence;
 pub mod platform;
+pub mod projects;
 pub mod runtime;
 pub mod terminal;
 pub mod terminal_theme;

@@ -1,16 +1,29 @@
 //! An agent's git worktree: the sheets' requests go to the git worker, and
 //! its answers open the tab, mark a merged branch and remove what is done.
+use super::projects::Briefing;
 use super::*;
 use crate::runtime::worktrees::{Event as GitEvent, Request};
 use crate::ui::worktrees::{Event, Probe, Removal, Tab};
-use neptune_model::{AgentKind, Worktree};
+use neptune_model::{AgentKind, ProjectId, Worktree};
 
 /// The worktree git is making: the terminal its tab follows and what runs
 /// in it. Captured when Create is pressed, whatever is focused by then.
 struct Creating {
     pane: PaneId,
+    /// Where git was asked from, with the branch: what its answer names.
+    cwd: PathBuf,
     branch: String,
     agent: AgentKind,
+}
+/// Worktrees git may be making for projects' agents at once.
+const MAX_ASKED: usize = 8;
+/// An agent a project's lead asked for in a worktree of its own: it starts
+/// once git has made the worktree, and is refused with what git said where
+/// it could not.
+struct Asked {
+    cwd: PathBuf,
+    branch: String,
+    briefing: Box<Briefing>,
 }
 #[derive(Default)]
 pub(super) struct Worktrees {
@@ -22,6 +35,22 @@ pub(super) struct Worktrees {
     /// The directory the open sheet asked about.
     probing: Option<PathBuf>,
     creating: Option<Creating>,
+    /// What projects wait for, in the order it was asked.
+    asked: Vec<Asked>,
+}
+impl Worktrees {
+    /// The agents of `project` that wait for git to make their worktree.
+    pub(super) fn asked_for(&self, project: ProjectId) -> usize {
+        self.asked
+            .iter()
+            .filter(|asked| asked.briefing.project == project)
+            .count()
+    }
+    /// The branch the worktree at `path` was merged into, where it was and
+    /// nothing in it is left uncommitted.
+    pub(super) fn merged_into(&self, path: &std::path::Path) -> Option<&str> {
+        self.finished.get(path).map(String::as_str)
+    }
 }
 
 impl App {
@@ -99,7 +128,7 @@ impl App {
                 if self.git(
                     ctx,
                     Request::Create {
-                        cwd,
+                        cwd: cwd.clone(),
                         branch: branch.clone(),
                     },
                 ) {
@@ -107,6 +136,7 @@ impl App {
                     self.ui.worktree.error = None;
                     self.worktrees.creating = Some(Creating {
                         pane,
+                        cwd,
                         branch,
                         agent,
                     });
@@ -163,6 +193,50 @@ impl App {
                     },
                 );
             }
+        }
+    }
+
+    /// Has git make the worktree of the branch a project's lead named for
+    /// a new agent, in the repository the project works in. The agent
+    /// starts when git answers, on a later frame. `Err` hands the request
+    /// back with why git was not asked.
+    pub(super) fn project_worktree(
+        &mut self,
+        ctx: &egui::Context,
+        briefing: Box<Briefing>,
+    ) -> Result<(), (Box<Briefing>, String)> {
+        // In the repository the project works in, wherever its workspace
+        // was opened.
+        let Some(cwd) = self.project_home(briefing.project) else {
+            return Err((briefing, "This project no longer exists.".into()));
+        };
+        let Some(branch) = briefing.task.worktree.clone() else {
+            return Err((briefing, "No branch was named for the worktree.".into()));
+        };
+        if self.worktrees.asked.len() >= MAX_ASKED {
+            return Err((
+                briefing,
+                "Neptune is still making other worktrees; try again in a moment.".into(),
+            ));
+        }
+        let wake = ctx.clone();
+        let asked = self.worktrees.git.request(
+            Request::Create {
+                cwd: cwd.clone(),
+                branch: branch.clone(),
+            },
+            Arc::new(move || wake.request_repaint()),
+        );
+        match asked {
+            Ok(()) => {
+                self.worktrees.asked.push(Asked {
+                    cwd,
+                    branch,
+                    briefing,
+                });
+                Ok(())
+            }
+            Err(error) => Err((briefing, format!("{error}."))),
         }
     }
 
@@ -238,12 +312,28 @@ impl App {
                         };
                     }
                 }
-                GitEvent::Created { branch, result } => {
+                GitEvent::Created {
+                    cwd,
+                    branch,
+                    result,
+                } => {
+                    // The sheet's own request first, then a project's: git
+                    // answers in the order it was asked, and two that ask
+                    // for one branch are given the same worktree.
                     let Some(creating) = self
                         .worktrees
                         .creating
-                        .take_if(|creating| creating.branch == branch)
+                        .take_if(|creating| creating.branch == branch && creating.cwd == cwd)
                     else {
+                        if let Some(at) = self
+                            .worktrees
+                            .asked
+                            .iter()
+                            .position(|asked| asked.branch == branch && asked.cwd == cwd)
+                        {
+                            let asked = self.worktrees.asked.remove(at);
+                            self.worktree_made(ctx, *asked.briefing, result);
+                        }
                         continue;
                     };
                     self.ui.worktree.creating = false;

@@ -15,6 +15,7 @@ mod image_preview;
 mod input;
 mod panel;
 mod ports;
+mod projects;
 mod ssh;
 #[cfg(test)]
 mod tests;
@@ -122,6 +123,8 @@ pub struct App {
     agents: crate::agent_activity::AgentActivities,
     /// What agents asked for the agents they start, between frames.
     delegation: delegation::Delegation,
+    /// Each project's lead, chat and what waits for the lead.
+    projects: projects::Projects,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
     updates: crate::runtime::updates::Updates,
     /// Start the installed update once this approved exit completes.
@@ -260,6 +263,7 @@ impl App {
             notifications: Default::default(),
             agents: Default::default(),
             delegation: Default::default(),
+            projects: projects::Projects::new(data.join("projects"), ephemeral),
             desktop_notifier: Default::default(),
             updates: Default::default(),
             relaunch: false,
@@ -396,7 +400,9 @@ impl App {
                 },
             );
         }
-        // The workspace in view is the one whose pull requests have chips.
+        // The workspace in view is the one whose pull requests have chips:
+        // they come first. Then those projects follow for their leads, as
+        // far as one round reads.
         let model = self.controller.model();
         self.pull_requests.watch(
             model
@@ -404,7 +410,8 @@ impl App {
                 .and_then(|id| model.workspace(id))
                 .into_iter()
                 .flat_map(|workspace| workspace.panes())
-                .flat_map(|pane| pane.pull_requests().iter().cloned()),
+                .flat_map(|pane| pane.pull_requests().iter().cloned())
+                .chain(self.projects.links(model)),
             ctx,
         );
         for (pane, generation, attachment) in self.sessions.attached_files() {
@@ -470,7 +477,9 @@ impl App {
                         {
                             continue;
                         }
-                        if self.config.desktop_notifications {
+                        // A project speaks for its agents, once: none of
+                        // them raises a banner of its own.
+                        if self.config.desktop_notifications && item.project().is_none() {
                             self.desktop_notifier.show(
                                 pane,
                                 notification.title.clone(),
@@ -501,7 +510,8 @@ impl App {
         self.poll_agents(ctx);
         self.poll_ports(ctx);
         self.serve_agents(ctx);
-        self.poll_attachments();
+        self.poll_projects(ctx);
+        self.poll_attachments(ctx);
         self.poll_attached(ctx);
         self.poll_explorer(ctx);
         self.poll_changes(ctx);
@@ -635,6 +645,7 @@ impl App {
             .map(|remote| remote.destination().to_owned());
         // Tabs out of view contribute a title, not their content.
         let shown = self.shown();
+        let can_background = |pane| self.controller.model().can_background(pane).is_ok();
         workspace
             .panes()
             .iter()
@@ -658,6 +669,7 @@ impl App {
                             .collect(),
                         attached: self.attached_files(pane),
                         spawned: self.spawned_agents(pane.id()),
+                        can_background: can_background(pane.id()),
                         worktree: self.worktree_tab(pane),
                         unread: self.notifications.unread(Some(pane.id())),
                         metadata: session.metadata(),
@@ -677,6 +689,7 @@ impl App {
                         pull_requests: Vec::new(),
                         attached: Vec::new(),
                         spawned: Vec::new(),
+                        can_background: can_background(pane.id()),
                         worktree: self.worktree_tab(pane),
                         unread: self.notifications.unread(Some(pane.id())),
                         metadata: SessionMetadata {
@@ -873,6 +886,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.observe_window(&ctx, ui.max_rect().size());
+        self.paste_into_composer(&ctx);
         self.shortcuts(&ctx);
         self.release_closed_overlay_focus(&ctx);
         // Sampled before widgets run: a menu that closes on this frame's key
@@ -998,7 +1012,39 @@ impl eframe::App for App {
         } else {
             self.rest_explorer(&ctx);
         }
+        self.ui.panel.available = panel_available;
+        // The sheet stands in for the panel only while there is no room for
+        // it: in a window made wider, the project is in its tab again.
+        if panel_available && self.ui.overlay == OverlayState::Project {
+            // A message being written goes on in the tab. Its field takes
+            // the keyboard there: left to the closing sheet, what is typed
+            // next would reach the shell.
+            let writing = ctx.memory(|memory| memory.has_focus(ui::chat::composer_id()));
+            self.ui.overlay = OverlayState::None;
+            self.panel_event(&ctx, ui::panel::Event::Show(ui::panel::Tab::Project));
+            if writing {
+                self.ui.project.focus = true;
+                self.overlay_was_open = false;
+            }
+        }
+        let project_sheet = self.ui.overlay == OverlayState::Project;
         let agents_shown = panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Agents;
+        let project_shown =
+            (panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Project) || project_sheet;
+        // A window too narrow for the panel has no field to give the
+        // keyboard to unless the sheet is open; the request does not wait
+        // for a wider one.
+        if !panel_available && !project_sheet {
+            self.ui.project.focus = false;
+        }
+        // What a project keeps is read again only while its list is in view.
+        if project_shown && self.ui.project.segment == ui::project::Segment::Context {
+            self.sync_context(&ctx);
+        }
+        if project_shown && self.ui.project.segment == ui::project::Segment::Watches {
+            self.tick_watches(&ctx);
+        }
+        let project_needs = self.project_needs();
         // Git is asked about what is in view: the sidebar's rows and the tab.
         self.sync_changes(
             &ctx,
@@ -1032,7 +1078,8 @@ impl eframe::App for App {
             sidebar_available,
             pane_drag: self.ui.pane_drag,
             panel: panel_available.then_some(self.ui.panel.open),
-            panel_attention: !agents_shown && self.agents.waiting_count() > 0,
+            panel_attention: (!agents_shown && self.agents.waiting_count() > 0)
+                || (!project_shown && project_needs > 0),
         };
         if edge > 0.0 {
             let side = Rect::from_min_size(
@@ -1083,6 +1130,7 @@ impl eframe::App for App {
         let overlay = self.ui.overlay != OverlayState::None;
         // Polled every frame, so a drop over a sheet is not delivered later.
         let file_drag = self.file_drag.poll(&ctx);
+        let file_drag = self.drop_on_lead(&ctx, file_drag);
         let mut output = ui::workspace::StageOutput::default();
         if let Some(workspace) = active.and_then(|id| self.controller.model().workspace(id)) {
             // A zoomed terminal keeps the tabs it shares its place with.
@@ -1151,6 +1199,15 @@ impl eframe::App for App {
                 panel_reveal,
                 bounds,
             );
+            let project = self.project_panel(project_shown);
+            self.projects.look_for_leads(&ctx, &project);
+            if project.has_agents() {
+                Self::tick_agents(&ctx);
+            }
+            if project.running() {
+                // The time its lead's turn has taken is counted in seconds.
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
             let view = ui::panel::View {
                 files: &files,
                 changes: &changes,
@@ -1159,7 +1216,14 @@ impl eframe::App for App {
                     window: bounds,
                     reveal: panel_reveal,
                 },
+                project: &ui::project::View {
+                    body: self.projects.view(&project, self.ui.project.shown),
+                    composing: self.ime_composing,
+                    window: bounds,
+                    reveal: panel_reveal,
+                },
                 waiting: self.agents.waiting_count(),
+                needs: project_needs,
                 window: bounds,
                 reveal: panel_reveal,
             };
@@ -1172,6 +1236,7 @@ impl eframe::App for App {
                 ui::panel::Contents {
                     files: &mut self.ui.explorer,
                     changes: &mut self.ui.changes,
+                    project: &mut self.ui.project,
                 },
                 &mut actions,
             );
@@ -1277,6 +1342,25 @@ impl eframe::App for App {
                 &mut actions,
             ),
             OverlayState::Update => ui::updates::show(&ctx, p, &self.updates, &mut actions),
+            OverlayState::Project => {
+                let project = self.project_panel(true);
+                self.projects.look_for_leads(&ctx, &project);
+                if project.has_agents() {
+                    Self::tick_agents(&ctx);
+                }
+                if project.running() {
+                    ctx.request_repaint_after(Duration::from_secs(1));
+                }
+                let view = ui::project::View {
+                    body: self.projects.view(&project, self.ui.project.shown),
+                    composing: self.ime_composing,
+                    window: bounds,
+                    reveal: 1.0,
+                };
+                if ui::project::show_sheet(&ctx, p, &view, &mut self.ui.project, &mut actions) {
+                    actions.push(Action::CloseOverlay);
+                }
+            }
             OverlayState::Palette => ui::palette::show(
                 &ctx,
                 p,
@@ -1296,6 +1380,18 @@ impl eframe::App for App {
                         .and_then(|pane| self.controller.model().pane(pane))
                         .and_then(|pane| pane.worktree())
                         .map(|worktree| worktree.branch.as_str()),
+                    can_background: active_pane
+                        .and_then(|pane| presentations.get(&pane))
+                        .is_some_and(|presentation| presentation.can_background),
+                    project: self
+                        .controller
+                        .model()
+                        .active_workspace()
+                        .and_then(|id| self.controller.model().project_of(id))
+                        .map(|project| {
+                            let id = project.id();
+                            (id, project.paused(), self.projects.lead_busy(id))
+                        }),
                     pane_generation: active_pane
                         .and_then(|pane| self.controller.model().pane(pane))
                         .map_or(0, |p| p.generation()),
@@ -1374,6 +1470,9 @@ impl eframe::App for App {
         self.release_closed_overlay_focus(&ctx);
     }
     fn on_exit(&mut self) {
+        // Leads are let go first, so each has until the shells have closed
+        // to end.
+        self.projects.shutdown();
         self.ports.shutdown(Duration::from_secs(8));
         // Capture reports received since the final frame before flushing state.
         let ctx = egui::Context::default();

@@ -12,8 +12,8 @@ use crate::{
     theme::{self, Palette, metrics},
 };
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, FontId, Frame, Id, Layout, Margin, Pos2, Rect,
-    Response, Sense, Stroke, TextFormat, Ui, Vec2, WidgetInfo, WidgetType, text::LayoutJob, vec2,
+    self, Align, Align2, Color32, CursorIcon, Frame, Id, Layout, Margin, Pos2, Rect, Response,
+    Sense, Stroke, Ui, Vec2, WidgetInfo, WidgetType, text::LayoutJob, vec2,
 };
 
 fn status(updates: &Updates) -> String {
@@ -132,108 +132,6 @@ pub fn notification(ctx: &egui::Context, p: Palette, updates: &Updates, actions:
                     });
                 });
         });
-}
-
-/// A block of the release notes. The changelog is hard-wrapped Markdown, so
-/// continuation lines are joined to the block they belong to and the sheet
-/// decides where text wraps.
-#[derive(Debug, PartialEq, Eq)]
-enum Block {
-    Heading(String),
-    Bullet(String),
-    Text(String),
-}
-
-fn blocks(notes: &str) -> Vec<Block> {
-    let mut blocks = Vec::new();
-    // Whether the last block is still open to continuation lines.
-    let mut open = false;
-    for line in notes.lines().map(str::trim) {
-        if line.is_empty() {
-            open = false;
-        } else if line.starts_with('#') {
-            blocks.push(Block::Heading(
-                line.trim_start_matches('#').trim().to_owned(),
-            ));
-            open = false;
-        } else if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            blocks.push(Block::Bullet(item.trim().to_owned()));
-            open = true;
-        } else if open && let Some(Block::Bullet(text) | Block::Text(text)) = blocks.last_mut() {
-            text.push(' ');
-            text.push_str(line);
-        } else {
-            blocks.push(Block::Text(line.to_owned()));
-            open = true;
-        }
-    }
-    blocks
-}
-
-const NOTE_LINE: f32 = 19.0;
-
-/// Body text with `code` spans set in the terminal face. Plain text styling
-/// keeps release notes independent of external images or executable rich
-/// content.
-fn body(text: &str, color: Color32) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    // An unpaired backtick is ordinary text.
-    let paired = text.matches('`').count().is_multiple_of(2);
-    for (index, span) in text.split('`').enumerate() {
-        let code = paired && index % 2 == 1;
-        if !paired && index > 0 {
-            job.append("`", 0.0, format(theme::regular(13.0), color));
-        }
-        let font = if code {
-            FontId::monospace(12.0)
-        } else {
-            theme::regular(13.0)
-        };
-        job.append(span, 0.0, format(font, color));
-    }
-    job
-}
-
-fn format(font_id: FontId, color: Color32) -> TextFormat {
-    TextFormat {
-        font_id,
-        color,
-        line_height: Some(NOTE_LINE),
-        valign: Align::Center,
-        ..Default::default()
-    }
-}
-
-fn release_notes(ui: &mut Ui, p: Palette, notes: &str) {
-    for (index, block) in blocks(notes).iter().enumerate() {
-        match block {
-            Block::Heading(text) => {
-                ui.add_space(if index == 0 { 0.0 } else { 14.0 });
-                ui.label(
-                    egui::RichText::new(text)
-                        .font(theme::medium(11.5))
-                        .color(p.secondary),
-                );
-                ui.add_space(2.0);
-            }
-            Block::Bullet(text) => {
-                ui.add_space(6.0);
-                ui.horizontal_top(|ui| {
-                    let (_, marker) = ui.allocate_space(vec2(16.0, NOTE_LINE));
-                    ui.painter().circle_filled(
-                        Pos2::new(marker.left() + 5.0, marker.center().y),
-                        1.75,
-                        p.muted,
-                    );
-                    ui.add(egui::Label::new(body(text, p.fg)).wrap());
-                });
-            }
-            Block::Text(text) => {
-                ui.add_space(6.0);
-                ui.add(egui::Label::new(body(text, p.fg)).wrap());
-            }
-        }
-    }
 }
 
 /// A text link that leaves the application.
@@ -383,7 +281,7 @@ pub fn show(ctx: &egui::Context, p: Palette, updates: &Updates, actions: &mut Ve
                         let Some(release) = &updates.release else {
                             return;
                         };
-                        ui.spacing_mut().interact_size.y = NOTE_LINE;
+                        ui.spacing_mut().interact_size.y = super::markup::LINE;
                         ui.label(
                             egui::RichText::new(format!("Neptune {}", release.version))
                                 .font(theme::semibold(20.0))
@@ -421,7 +319,8 @@ pub fn show(ctx: &egui::Context, p: Palette, updates: &Updates, actions: &mut Ve
                         ui.painter()
                             .line_segment([rule.left_center(), rule.right_center()], p.hairline());
                         ui.add_space(16.0);
-                        release_notes(ui, p, &release.notes);
+                        let lines = super::markup::Lines::Joined;
+                        super::markup::show_in(ui, p, &release.notes, lines, p.fg, actions);
                         ui.add_space(14.0);
                         ui.label(
                             egui::RichText::new("Installing")
@@ -430,7 +329,11 @@ pub fn show(ctx: &egui::Context, p: Palette, updates: &Updates, actions: &mut Ve
                         );
                         ui.add_space(8.0);
                         ui.add(
-                            egui::Label::new(body(install_guidance(updates), p.secondary)).wrap(),
+                            egui::Label::new(super::markup::body(
+                                install_guidance(updates),
+                                p.secondary,
+                            ))
+                            .wrap(),
                         );
                         ui.add_space(18.0);
                     });
@@ -481,35 +384,5 @@ pub fn show(ctx: &egui::Context, p: Palette, updates: &Updates, actions: &mut Ve
     if close || output.backdrop_clicked {
         actions.push(Action::DismissUpdate);
         actions.push(Action::CloseOverlay);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hard_wrapped_notes_become_whole_blocks() {
-        let notes = "### What's New\n\n- Open a tab with\n  Ctrl+Shift+T, and drag tabs\n  between splits.\n- Shorter rows.\n\nA closing line\nin two parts.\n\nSeparate.";
-        assert_eq!(
-            blocks(notes),
-            [
-                Block::Heading("What's New".into()),
-                Block::Bullet("Open a tab with Ctrl+Shift+T, and drag tabs between splits.".into()),
-                Block::Bullet("Shorter rows.".into()),
-                Block::Text("A closing line in two parts.".into()),
-                Block::Text("Separate.".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn code_spans_keep_every_character_of_unpaired_notes() {
-        let text = |job: LayoutJob| job.text;
-        assert_eq!(
-            text(body("run `chmod u+x` first", Color32::WHITE)),
-            "run chmod u+x first"
-        );
-        assert_eq!(text(body("a ` alone", Color32::WHITE)), "a ` alone");
     }
 }

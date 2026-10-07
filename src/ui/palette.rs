@@ -19,6 +19,12 @@ pub struct PaletteView<'a> {
     pub local: bool,
     /// The branch of the worktree the focused terminal is in.
     pub worktree: Option<&'a str>,
+    /// The focused terminal's tab can be put away: an agent or a project
+    /// lists the terminal.
+    pub can_background: bool,
+    /// The project of the workspace in view, whether it is paused, and
+    /// whether its lead's turn is running.
+    pub project: Option<(neptune_model::ProjectId, bool, bool)>,
     pub pane_generation: u64,
     pub ports: &'a [crate::runtime::ports::Port],
     pub layout: Option<&'a neptune_model::Layout>,
@@ -204,6 +210,19 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                     "New agent in worktree",
                     view.config.keybindings.hint(Binding::NewWorktree),
                     [Action::Worktree(super::worktrees::Event::New(pane))],
+                ),
+            );
+        }
+        if view.can_background {
+            // Before "Close terminal": the other way to be rid of a tab.
+            list.insert(
+                list.len() - 1,
+                command(
+                    "Terminal",
+                    Icon::Minus,
+                    "Send terminal to background",
+                    view.config.keybindings.hint(Binding::BackgroundPane),
+                    [Action::Background(pane)],
                 ),
             );
         }
@@ -528,6 +547,15 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         ),
         command(
             "View",
+            Icon::Agents,
+            "Show project",
+            view.config.keybindings.hint(Binding::ShowProject),
+            [Action::Panel(super::panel::Event::Show(
+                super::panel::Tab::Project,
+            ))],
+        ),
+        command(
+            "View",
             Icon::Bell,
             "Notifications",
             view.config.keybindings.hint(Binding::Notifications),
@@ -541,6 +569,57 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             [Action::Settings],
         ),
     ]);
+    // A project belongs to the workspace in view, which must be on this
+    // computer to have one.
+    use super::project::{Event as Project, Segment};
+    match view.project {
+        Some((project, paused, busy)) => {
+            let entry = |icon, title: &str, event| {
+                command("Project", icon, title, "", [Action::Project(event)])
+            };
+            list.push(entry(Icon::Comment, "Message the lead", Project::Compose));
+            // Listed only while there is a turn to stop.
+            if busy {
+                list.push(entry(Icon::Stop, "Stop the lead", Project::Stop(project)));
+            }
+            list.extend([
+                entry(
+                    if paused { Icon::Play } else { Icon::Pause },
+                    if paused {
+                        "Resume project"
+                    } else {
+                        "Pause project"
+                    },
+                    Project::SetPaused(project, !paused),
+                ),
+                entry(Icon::Plus, "New chat", Project::NewChat(project)),
+                entry(Icon::Agents, "Show project agents", Project::ShowAgents),
+                entry(Icon::Files, "Show context", Project::Show(Segment::Context)),
+                entry(
+                    Icon::Refresh,
+                    "Show watches",
+                    Project::Show(Segment::Watches),
+                ),
+                entry(Icon::Plus, "Add watch", Project::WriteWatch),
+                entry(
+                    Icon::Settings,
+                    "Project settings",
+                    Project::Show(Segment::Settings),
+                ),
+                entry(Icon::Pencil, "Rename project…", Project::Rename(project)),
+                entry(Icon::Folder, "Reveal saved files", Project::Reveal(project)),
+                entry(Icon::Trash, "Remove project…", Project::Remove(project)),
+            ]);
+        }
+        None if view.local && view.active.is_some() => list.push(command(
+            "Project",
+            Icon::Plus,
+            "New project here",
+            "",
+            [Action::Project(Project::Compose)],
+        )),
+        None => {}
+    }
     for (title, binding, action) in [
         ("Zoom app in", Binding::ZoomIn, Action::ZoomUiIn),
         ("Zoom app out", Binding::ZoomOut, Action::ZoomUiOut),
@@ -864,6 +943,8 @@ mod tests {
             pane: None,
             local: true,
             worktree: None,
+            can_background: false,
+            project: None,
             pane_generation: 1,
             ports: &[],
             layout: None,
@@ -1116,6 +1197,129 @@ mod tests {
     }
 
     #[test]
+    fn a_project_is_started_shown_spoken_to_and_paused_from_the_palette() {
+        use crate::ui::{panel, project::Event};
+        let config = Config::default();
+        let workspaces = [WorkspaceView {
+            id: WorkspaceId::new(1),
+            group: None,
+            name: "shop".into(),
+            cwd: "/tmp".into(),
+            branch: None,
+            remote: None,
+            panes: 1,
+            unread: 0,
+            alert: None,
+            running: true,
+        }];
+        let titles = |view: &PaletteView| -> Vec<String> {
+            commands(view)
+                .into_iter()
+                .filter(|command| command.group == "Project")
+                .map(|command| command.title)
+                .collect()
+        };
+        let local = PaletteView {
+            active: Some(WorkspaceId::new(1)),
+            ..view(&config, &workspaces)
+        };
+        // A local workspace without a project can start one; one over SSH
+        // and an empty window cannot.
+        assert_eq!(titles(&local), ["New project here"]);
+        assert!(
+            titles(&PaletteView {
+                local: false,
+                ..view(&config, &workspaces)
+            })
+            .is_empty()
+        );
+        assert!(titles(&view(&config, &[])).is_empty());
+        let project = neptune_model::ProjectId::new(4);
+        for (paused, title) in [(false, "Pause project"), (true, "Resume project")] {
+            let with = PaletteView {
+                project: Some((project, paused, false)),
+                active: Some(WorkspaceId::new(1)),
+                ..view(&config, &workspaces)
+            };
+            // What the tab keeps behind its menu and its details is a
+            // command away as well.
+            assert_eq!(
+                titles(&with),
+                [
+                    "Message the lead",
+                    title,
+                    "New chat",
+                    "Show project agents",
+                    "Show context",
+                    "Show watches",
+                    "Add watch",
+                    "Project settings",
+                    "Rename project…",
+                    "Reveal saved files",
+                    "Remove project…",
+                ]
+            );
+            let list = commands(&with);
+            let does = |title: &str| {
+                let command = list.iter().find(|command| command.title == title).unwrap();
+                match command.actions.as_slice() {
+                    [Action::Project(event)] => event.clone(),
+                    _ => panic!("{title} does something else"),
+                }
+            };
+            use crate::ui::project::Segment;
+            for (title, event) in [
+                (title, Event::SetPaused(project, !paused)),
+                ("Message the lead", Event::Compose),
+                ("New chat", Event::NewChat(project)),
+                ("Show project agents", Event::ShowAgents),
+                ("Show context", Event::Show(Segment::Context)),
+                ("Show watches", Event::Show(Segment::Watches)),
+                ("Add watch", Event::WriteWatch),
+                ("Project settings", Event::Show(Segment::Settings)),
+                ("Rename project…", Event::Rename(project)),
+                ("Reveal saved files", Event::Reveal(project)),
+                ("Remove project…", Event::Remove(project)),
+            ] {
+                assert_eq!(does(title), event, "{title}");
+            }
+            // Asked for by its name, the tab itself comes first.
+            let found: Vec<String> = commands(&with)
+                .into_iter()
+                .filter(|command| matches(command, "Show project"))
+                .map(|command| command.title)
+                .collect();
+            assert_eq!(found[0], "Show project", "{found:?}");
+            // A turn that runs can be stopped from here, and only then.
+            let busy = PaletteView {
+                project: Some((project, paused, true)),
+                active: Some(WorkspaceId::new(1)),
+                ..view(&config, &workspaces)
+            };
+            assert_eq!(titles(&busy)[1], "Stop the lead");
+            assert!(matches!(
+                commands(&busy)
+                    .iter()
+                    .find(|command| command.title == "Stop the lead")
+                    .unwrap()
+                    .actions
+                    .as_slice(),
+                [Action::Project(Event::Stop(target))] if *target == project
+            ));
+        }
+        // The tab itself is always a command away, bound or not.
+        let show = commands(&local)
+            .into_iter()
+            .find(|command| command.title == "Show project")
+            .unwrap();
+        assert!(matches!(
+            show.actions.as_slice(),
+            [Action::Panel(panel::Event::Show(panel::Tab::Project))]
+        ));
+        assert_eq!(show.shortcut, "");
+    }
+
+    #[test]
     fn terminal_commands_require_a_focused_pane() {
         let config = Config::default();
         let without = commands(&view(&config, &[]));
@@ -1137,6 +1341,51 @@ mod tests {
             split.actions[..],
             [Action::Split(pane, Axis::Vertical)] if pane == PaneId::new(7)
         ));
+    }
+
+    #[test]
+    fn a_tab_is_sent_to_the_background_only_where_something_lists_its_terminal() {
+        let config: Config = toml::from_str(
+            r#"[keybindings]
+            background-pane = ["Alt+B"]
+        "#,
+        )
+        .unwrap();
+        let titles = |view: &PaletteView| -> Vec<String> {
+            commands(view)
+                .into_iter()
+                .map(|command| command.title)
+                .collect()
+        };
+        let title = "Send terminal to background".to_owned();
+        let plain = PaletteView {
+            pane: Some(PaneId::new(7)),
+            ..view(&config, &[])
+        };
+        assert!(!titles(&plain).contains(&title));
+        let listed = PaletteView {
+            can_background: true,
+            ..plain
+        };
+        let list = commands(&listed);
+        let at = list
+            .iter()
+            .position(|command| command.title == title)
+            .expect("the command");
+        assert!(matches!(
+            list[at].actions[..],
+            [Action::Background(pane)] if pane == PaneId::new(7)
+        ));
+        assert_eq!(list[at].shortcut, "Alt+B");
+        assert_eq!(list[at + 1].title, "Close terminal");
+        // Without a focused terminal there is none to send.
+        assert!(
+            !titles(&PaletteView {
+                can_background: true,
+                ..view(&config, &[])
+            })
+            .contains(&title)
+        );
     }
 
     #[test]

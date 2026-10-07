@@ -2,6 +2,7 @@
 //! shortcuts, sidebar, dialogs and pane widgets.
 use super::*;
 use crate::persistence::workspace_state::StateSnapshot;
+use crate::runtime::agents::Starter;
 use crate::runtime::persistence::SaveKind;
 
 /// The system OpenSSH client, resolved through `PATH`.
@@ -128,11 +129,13 @@ impl App {
                             },
                         );
                     }
-                    let spawned_by = self
-                        .controller
-                        .model()
-                        .pane(pane)
-                        .and_then(|pane| pane.spawned_by());
+                    // An agent's terminal answers to the agent that started
+                    // it, a project's to the project.
+                    let spawned_by = self.controller.model().pane(pane).and_then(|pane| {
+                        pane.spawned_by()
+                            .map(Starter::Pane)
+                            .or(pane.project().map(Starter::Project))
+                    });
                     // The task of an agent being started is held for its
                     // shell before the session is requested.
                     if let (Some(parent), Some(spawning)) =
@@ -546,6 +549,8 @@ impl App {
                 self.dispatch(ctx, Command::MovePane { pane, destination })
             }
             Action::ClosePane(pane) => self.request_close(ctx, Close::Pane(pane)),
+            // Nothing is closed, so nothing is confirmed.
+            Action::Background(pane) => self.dispatch(ctx, Command::BackgroundPane(pane)),
             Action::CloseWorkspace(id) => self.request_close(ctx, Close::Workspace(id)),
             Action::WindowClose => {
                 self.relaunch = false;
@@ -660,6 +665,7 @@ impl App {
             Action::Explorer(event) => self.explorer_event(ctx, event),
             Action::Changes(event) => self.changes_event(ctx, event),
             Action::Worktree(event) => self.worktree_event(ctx, event),
+            Action::Project(event) => self.project_event(ctx, event),
             Action::SidebarWidth(width) => {
                 let config = Config {
                     sidebar_width: width.clamp(170.0, 360.0),

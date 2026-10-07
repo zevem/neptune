@@ -10,6 +10,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 - [Dev servers and ports](#dev-servers-and-ports)
 - [Closing terminals safely](#closing-terminals-safely)
 - [Coding agent sessions](#coding-agent-sessions)
+- [Projects](#projects)
 - [Notifications](#notifications)
 - [Command-line options](#command-line-options)
 - [Preferences and themes](#preferences-and-themes)
@@ -126,7 +127,10 @@ and it starts the other agent, hands it the task, reads its answer and can
 keep talking to it. The started agent runs out of view, without a tab. The tab
 of the agent that started others shows how many it started; click the count
 for the list and an agent in it to open its terminal, which is a tab from then
-on. If a started agent's CLI asks something before it begins, such as whether
+on. To have the tab out of the way again without stopping the agent, choose
+**Send to background** from the tab's menu or **Send terminal to background**
+from the command palette: the agent runs on out of view and stays in the
+list. Closing the tab would end it. If a started agent's CLI asks something before it begins, such as whether
 to trust a folder, the agent that started it tells you what it asks, and the
 count changes colour: answer in its terminal, or tell the first agent your answer.
 An agent you closed can be opened again by the agent that started it, with its
@@ -154,6 +158,49 @@ controls at the sides step through the terminal's other pictures; click any
 other file to open it with its application. The folder control on a row shows
 the file in your file manager and the cross dismisses it from the list without touching the file. See
 [attached files](agent-sessions.md#attached-files).
+
+## Projects
+
+A project gives a workspace a **lead**: your installed Claude Code or Codex,
+which plans a piece of work, starts agents in terminals of their own and
+reports back in a chat. Open the right panel's **Project** tab, type what you
+want done and press Enter. The agents the lead starts run out of view and
+each has a pill in a one-row strip over the chat, with the list of all of
+them a click away at the strip's end; click one to
+open its terminal as a tab, and secondary-click its pill for **Send to background**,
+which puts the tab away again while the agent runs on. A row pinned over the chat says whatever only you
+can clear, such as an agent waiting
+for a permission or a lead that is not signed in.
+
+| Command palette | Does |
+| --- | --- |
+| **Show project** | Opens the right panel on the Project tab (config name `show-project`, no default shortcut) |
+| **New project here** | The same, with the keyboard in the creation form; listed while the workspace in view is local and has no project |
+| **Message the lead** | The same, with the keyboard in the chat's field; listed while the workspace has a project |
+| **Pause project** / **Resume project** | Holds or releases what the project does by itself |
+| **Stop the lead** | Ends the lead's turn; listed while one runs |
+| **New chat** | Starts the lead on a fresh conversation |
+| **Show project agents** | Shows the chat with the list of the project's agents open over it |
+| **Show context** / **Show watches** / **Project settings** | Opens that part of the project's details |
+| **Add watch** | Opens the watches on the form that adds one |
+| **Rename project…** / **Reveal saved files** / **Remove project…** | As in the project's "⋯" menu |
+
+In the tab, Enter sends, Shift+Enter starts a new line and Escape returns the
+keyboard to the terminal. The paperclip in the field attaches files to the
+message, as does dropping them on the chat or pasting a picture into the
+field; see [talking to the lead](projects.md#attaching-files). The tab is the conversation; **Project details**
+beside the project's name shows the rest in three parts: **Context**, the
+notes the project keeps for its agents; **Watches**, what wakes the lead on a
+schedule or when a pull request changes; and **Settings**, the model and
+effort of the lead and of the agents it starts. Watches run only while
+Neptune is open. The project's "⋯" menu has **New chat**, **Pause project**,
+**Rename…**, **Reveal saved files** and **Remove project…**.
+
+Unlike the other agent features, a project's chat and notes are saved on this
+computer, in a folder of its own under Neptune's data directory; removing the
+project deletes it. Projects need Claude Code or Codex installed and signed
+in, and a local workspace on Linux or macOS. See [projects](projects.md) for
+what the lead can and cannot do, limits, storage and troubleshooting.
 
 ## Notifications
 
@@ -229,13 +276,15 @@ launches bypass migration.
 
 Neptune also remembers the window's size and maximized state when closed. Window state is saved as `window.json` in the data directory, independently of workspace restoration; `--no-restore` and `restore_workspaces = false` only affect workspaces. Use `--size WIDTHxHEIGHT` to override the saved geometry and start with a non-maximized window. Screenshot launches use the default or explicit size and do not save window state.
 
+Each [project](#projects) keeps its chat, shared context and watches in `projects/<key>/` in the data directory, apart from workspace state: `--no-restore` and `restore_workspaces = false` do not delete it, and removing the project does. See [what a project stores](projects.md#what-is-stored-and-how-to-delete-it).
+
 ## Right panel
 
-The **Toggle right panel** button at the trailing end of the toolbar, Ctrl+Shift+O (Command+O on macOS) or the command palette slides a panel in from the right. Its three tabs, **Files**, **Agents** and **Changes**, are chosen by clicking them or with **Show files**, **Show agents** and **Show changes** in the command palette, which also open the panel. The panel opens on the tab it last showed. Drag its leading edge to resize it, or double-click the edge for the default width. It starts closed with each launch; its width, its tab and what is typed in it are not saved.
+The **Toggle right panel** button at the trailing end of the toolbar, Ctrl+Shift+O (Command+O on macOS) or the command palette slides a panel in from the right. Its four tabs, **Files**, **Agents**, **Changes** and **Project**, are chosen by clicking them or with **Show files**, **Show agents**, **Show changes** and **Show project** in the command palette, which also open the panel. The Project tab holds the workspace's [project](#projects). The panel opens on the tab it last showed. Drag its leading edge to resize it, or double-click the edge for the default width. It starts closed with each launch; its width, its tab and what is typed in it are not saved.
 
 ## Agents
 
-The **Agents** tab lists every Claude Code, Codex, OpenCode, Gemini CLI, pi and Oh My Pi agent running in a terminal of any workspace, local or SSH, including workspaces and tabs out of view. Agents are grouped by what they are doing: **Needs input** first (an agent asking to allow a tool, asking a question, waiting for a plan to be approved, or otherwise blocked on you), then **Working**, then **Idle**. Each row shows the agent's name for its conversation, its state, which agent it is, its workspace and how long it has been in that state. Click a row to go to its terminal. While an agent waits for input and the list is not in view, the panel's toolbar button carries a dot, and the Agents tab shows how many are waiting.
+The **Agents** tab lists every Claude Code, Codex, OpenCode, Gemini CLI, pi and Oh My Pi agent running in a terminal of any workspace, local or SSH, including workspaces and tabs out of view. Agents are grouped by what they are doing: **Needs input** first (an agent asking to allow a tool, asking a question, waiting for a plan to be approved, or otherwise blocked on you), then **Working**, then **Idle**. Each row shows the agent's name for its conversation, its state, which agent it is, its workspace and how long it has been in that state. Click a row to go to its terminal. Secondary-click the row of an agent that another agent or a project started, once its terminal is a tab, for **Send to background**: the tab goes and the agent runs on, as [before it was opened](agent-sessions.md#agents-that-start-agents). While an agent waits for input and the list is not in view, the panel's toolbar button carries a dot, and the Agents tab shows how many are waiting.
 
 An agent is listed while its CLI runs: it appears when its CLI starts and leaves when the CLI exits or its terminal is restarted or closed. In an SSH workspace Neptune installs small adapters in your cache directory on the host to report this through the terminal; see [agents on SSH hosts](agent-sessions.md#agents-on-ssh-hosts). Agents started inside `tmux` on a host, in an `ssh` you typed yourself, on Windows, as batch commands (`claude -p`, `codex exec`) or through an alias or absolute path that bypasses Neptune's adapters are not listed. Codex asks once to trust the hooks that report its activity; until it does, its state is read from its terminal title alone, about two seconds behind. Gemini CLI is always read from its title. See [agent sessions](agent-sessions.md#agent-activity) for how states are detected and where they can lag.
 
@@ -271,11 +320,11 @@ Press Ctrl+Shift+H (Command+Shift+H on macOS), or choose **Copy with hints** in 
 
 Rest the pointer on the path of a picture in a terminal to preview it: when a CLI agent or a command reports a screenshot or chart it wrote, the picture appears beside the path with its file name and pixel size, and goes away when the pointer leaves. Move the pointer onto the preview and click it to see the picture as large as the window allows. There, scroll or pinch to zoom in and out around the pointer, or press + and -; drag a zoomed picture to move it, and press 0 to fit it to the window again. Click or press Escape to return to the terminal. No key is needed, and it works while a TUI owns the mouse. PNG, JPEG, GIF (first frame), WebP and BMP files are shown, recognized by their contents. Absolute paths, `~/` paths, `file://` hyperlinks and paths relative to the directory the agent or shell is in are found, including names with spaces and soft-wrapped paths in visible scrollback. A path that a program breaks across lines itself, a file larger than 64 MiB and a path in a terminal connected over SSH, which names a file on the other machine, show no preview.
 
-Use Ctrl+Shift on Linux/Windows and Command on macOS: T opens a tab beside the focused terminal, N opens a workspace, PageDown/PageUp step through the tabs of the focused place, D splits right, E splits below, G opens a new agent in a git worktree, W closes the focused pane, F searches, P opens commands, B toggles the sidebar, O toggles the right panel, Enter zooms the focused pane to full size and back, and 1–9 select a workspace by its sidebar position. Ctrl+Tab switches workspaces. Ctrl+Shift+Left/Right/Up/Down focuses the adjacent pane on every platform, including while zoomed; at an outer edge, focus stays put. These moves are also available in the command palette. Escape cancels a terminal drag, or leaves a sheet, a focused search field or a name being typed in the file explorer; otherwise it goes to the shell, as do Tab and unmodified arrow keys. Ctrl+comma opens preferences. Ctrl+plus/minus (Command on macOS) zooms the whole app; Ctrl+equals also zooms in, and Ctrl+0 resets app zoom (Command on macOS). On keyboards where Plus requires Shift, use Ctrl+equals (Command on macOS) for app zoom. Change terminal font size in Preferences or with Ctrl+Shift+plus/minus on Linux/Windows and Command+Shift+plus/minus on macOS; Ctrl+Shift+0 (Command+Shift+0 on macOS) resets it to the default (14 pt). On macOS these font shortcuts follow the active keyboard layout's labeled +, -, and 0 keys, even when Shift produces *, _, or =, as on Latin American keyboards. Each zoom or font size step shows the new value for a moment in a chip under the toolbar, such as "Window zoom 110%" or "Font size 15 pt". Use Ctrl+Shift+C/V to copy/paste on Linux/Windows, Command+C/V on macOS. Plain Ctrl+C interrupts the shell; Shift+PageUp/PageDown scrolls history. Hold Shift to select text when a TUI owns the mouse.
+Use Ctrl+Shift on Linux/Windows and Command on macOS: T opens a tab beside the focused terminal, N opens a workspace, PageDown/PageUp step through the tabs of the focused place, D splits right, E splits below, G opens a new agent in a git worktree, W closes the focused pane, F searches, P opens commands, B toggles the sidebar, O toggles the right panel, Enter zooms the focused pane to full size and back, and 1–9 select a workspace by its sidebar position. Ctrl+Tab switches workspaces. Ctrl+Shift+Left/Right/Up/Down focuses the adjacent pane on every platform, including while zoomed; at an outer edge, focus stays put. These moves are also available in the command palette. Escape cancels a terminal drag, or leaves a sheet, a focused search field, a field of the Project tab or a name being typed in the file explorer; otherwise it goes to the shell, as do Tab and unmodified arrow keys. Ctrl+comma opens preferences. Ctrl+plus/minus (Command on macOS) zooms the whole app; Ctrl+equals also zooms in, and Ctrl+0 resets app zoom (Command on macOS). On keyboards where Plus requires Shift, use Ctrl+equals (Command on macOS) for app zoom. Change terminal font size in Preferences or with Ctrl+Shift+plus/minus on Linux/Windows and Command+Shift+plus/minus on macOS; Ctrl+Shift+0 (Command+Shift+0 on macOS) resets it to the default (14 pt). On macOS these font shortcuts follow the active keyboard layout's labeled +, -, and 0 keys, even when Shift produces *, _, or =, as on Latin American keyboards. Each zoom or font size step shows the new value for a moment in a chip under the toolbar, such as "Window zoom 110%" or "Font size 15 pt". Use Ctrl+Shift+C/V to copy/paste on Linux/Windows, Command+C/V on macOS. Plain Ctrl+C interrupts the shell; Shift+PageUp/PageDown scrolls history. Hold Shift to select text when a TUI owns the mouse.
 
-Paste also takes a picture: when the clipboard holds a screenshot or another image instead of text, Neptune saves it as a PNG and pastes the file's path. Use the paste shortcut on Linux and Windows, or **Paste** in the terminal's menu or the command palette on any platform. A shell gets the path to use in a command; Claude Code and Codex attach the image a pasted path names. Plain Ctrl+V still goes to the program in the terminal, so an agent that reads the clipboard itself keeps doing so. Neptune keeps the 32 most recent pasted pictures in `pasted-images` beside its settings, readable only by your account, and removes older ones.
+Paste also takes a picture: when the clipboard holds a screenshot or another image instead of text, Neptune saves it as a PNG and pastes the file's path. Use the paste shortcut on Linux and Windows, or **Paste** in the terminal's menu or the command palette on any platform. A shell gets the path to use in a command; Claude Code and Codex attach the image a pasted path names. Plain Ctrl+V still goes to the program in the terminal, so an agent that reads the clipboard itself keeps doing so. Neptune keeps the 32 most recent pasted pictures in `pasted-images` beside its settings, readable only by your account, and removes older ones. A picture pasted into a [project's](#projects) message field is kept there too.
 
-Drag files from a file manager or another application onto a terminal to paste their paths, quoted for the shell and separated by spaces. While the files are held over the window, the terminal that will take them is highlighted and says what the drop does; with several terminals in view, that is the one under the pointer on Linux, and the focused one on macOS and Windows or while the files are over the sidebar or toolbar. Dropping on a terminal focuses it. A terminal whose shell has exited, and the window while a sheet or the command palette is open, take no files. Over SSH the pasted path still names a file on this computer.
+Drag files from a file manager or another application onto a terminal to paste their paths, quoted for the shell and separated by spaces. While the files are held over the window, the terminal that will take them is highlighted and says what the drop does; with several terminals in view, that is the one under the pointer on Linux, and the focused one on macOS and Windows or while the files are over the sidebar or toolbar. Dropping on a terminal focuses it. A terminal whose shell has exited, and the window while a sheet or the command palette is open, take no files. Files held over a [project's](#projects) chat are attached to the message to its lead instead. Over SSH the pasted path still names a file on this computer.
 
 ## Updates
 
@@ -317,10 +366,11 @@ Chords contain modifiers separated by `+`, followed by one logical key. Names ar
 | --- | --- |
 | Create and arrange terminals | `new-workspace`, `new-worktree`, `new-tab`, `split-right`, `split-below`, `zoom-pane` |
 | Close and restart | `close-pane`, `close-workspace`, `restart-pane` |
+| Agents out of view | `background-pane` (no default shortcut): sends the focused terminal's tab to the background, where that is offered |
 | Clipboard, history and search | `copy`, `copy-hints`, `paste`, `clear-scrollback`, `find` |
 | Move through terminals | `next-tab`, `previous-tab`, `focus-left`, `focus-right`, `focus-up`, `focus-down` |
 | Move through workspaces | `next-workspace`, `previous-workspace`, `workspace-1` through `workspace-9` |
-| Window and panels | `command-palette`, `preferences`, `toggle-sidebar`, `toggle-right-panel`, `show-files`, `show-agents`, `notifications`, `browse-themes` |
+| Window and panels | `command-palette`, `preferences`, `toggle-sidebar`, `toggle-right-panel`, `show-files`, `show-agents`, `show-project`, `notifications`, `browse-themes` |
 | App zoom | `zoom-in`, `zoom-out`, `reset-zoom` |
 | Terminal text size | `increase-font-size`, `decrease-font-size`, `reset-font-size` |
 

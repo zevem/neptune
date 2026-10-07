@@ -132,7 +132,7 @@ impl Lookup {
 }
 
 /// Reads the pull requests of one host; `None` for each it could not read.
-type Fetch = Box<dyn Fn(&str, &[PullRequest]) -> Vec<Option<Status>> + Send>;
+pub(crate) type Fetch = Box<dyn Fn(&str, &[PullRequest]) -> Vec<Option<Status>> + Send>;
 
 #[derive(Default)]
 struct Watched {
@@ -171,7 +171,8 @@ impl Default for Watcher {
     }
 }
 impl Watcher {
-    fn with(fetch: Fetch) -> Self {
+    /// A watcher that reads through `fetch` in place of the GitHub CLI.
+    pub(crate) fn with(fetch: Fetch) -> Self {
         Self {
             shared: Arc::default(),
             fetch: Some(fetch),

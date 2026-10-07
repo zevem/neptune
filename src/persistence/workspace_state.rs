@@ -1,6 +1,6 @@
 use neptune_model::{
-    Axis, Layout, Limits, Model, PaneId, PaneSpec, SidebarItem, SplitId, WorkspaceGroupId,
-    WorkspaceGroupSpec, WorkspaceId, WorkspaceSpec,
+    Axis, Layout, Limits, Model, PaneId, PaneSpec, ProjectId, ProjectKey, ProjectSpec, SidebarItem,
+    SplitId, WorkspaceGroupId, WorkspaceGroupSpec, WorkspaceId, WorkspaceSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,14 +9,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Version 11 adds the files an agent attached to its pane. Version 10 added
-/// the git worktree made for a pane's agent, and OpenCode, Gemini CLI, pi and
-/// Oh My Pi to the agents a pane's resume reference can name, which an
+/// Version 12 adds projects: the identity of each, the workspace it works in
+/// and the panes whose agents its lead started. Nothing a project says or is
+/// asked is saved here. Version 11 added the files an agent attached to its
+/// pane. Version 10 added the git worktree made for a pane's agent, and
+/// OpenCode, Gemini CLI, pi and Oh My Pi to the agents a pane's resume
+/// reference can name, which an
 /// earlier build would take for damage. Version 9 added the pane whose agent
 /// started a pane's agent. Version 8 added workspace group default
 /// directories and the pull requests an agent linked to its pane. Versions
-/// 1–10 remain readable.
-pub const SCHEMA_VERSION: u32 = 11;
+/// 1–11 remain readable.
+pub const SCHEMA_VERSION: u32 = 12;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -29,8 +32,37 @@ pub struct StateSnapshot {
     pub groups: Vec<SavedWorkspaceGroup>,
     #[serde(default)]
     pub sidebar_order: Option<Vec<SavedSidebarItem>>,
+    /// The projects of the window, from schema version 12.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<SavedProject>,
     pub active: Option<WorkspaceId>,
     pub sidebar: bool,
+}
+
+/// Which project this is, where it works and which CLI leads it. Its
+/// conversation, tasks and context are kept elsewhere and never here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedProject {
+    pub id: ProjectId,
+    /// Names the project's folder under the data root.
+    pub key: String,
+    pub name: String,
+    pub workspace: WorkspaceId,
+    pub lead: neptune_model::AgentKind,
+    pub paused: bool,
+}
+impl SavedProject {
+    fn restore(&self) -> Option<ProjectSpec> {
+        Some(ProjectSpec {
+            id: self.id,
+            key: ProjectKey::parse(&self.key)?,
+            name: self.name.clone(),
+            workspace: self.workspace,
+            lead: self.lead,
+            paused: self.paused,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -109,6 +141,9 @@ pub struct SavedPane {
     /// The pane whose agent started this pane's agent, from schema version 9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<PaneId>,
+    /// The project whose lead started this pane's agent, from schema version 12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectId>,
     /// The git worktree made for the pane's agent, from schema version 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<neptune_model::Worktree>,
@@ -189,6 +224,7 @@ impl StateSnapshot {
                             // An agent that has not opened yet cannot be
                             // resumed, so neither can its link.
                             spawned_by: pane.spawned_by().filter(|_| pane.agent().is_some()),
+                            project: pane.project().filter(|_| pane.agent().is_some()),
                             worktree: pane.worktree().cloned(),
                             attachments: pane
                                 .attachments()
@@ -214,6 +250,18 @@ impl StateSnapshot {
                     default_directory: group.default_directory().map(Path::to_path_buf),
                 })
                 .collect(),
+            projects: model
+                .projects()
+                .iter()
+                .map(|project| SavedProject {
+                    id: project.id(),
+                    key: project.key().as_str().to_owned(),
+                    name: project.name().into(),
+                    workspace: project.workspace(),
+                    lead: project.lead(),
+                    paused: project.paused(),
+                })
+                .collect(),
             active: model.active_workspace(),
             sidebar: model.sidebar(),
             sidebar_order: Some(
@@ -230,7 +278,16 @@ impl StateSnapshot {
     /// Conversion enforces the same invariants as new commands without checking
     /// directories; callers can use it for headless snapshots and round trips.
     pub fn into_model(self, limits: Limits) -> Result<Model, neptune_model::Error> {
-        Model::restore_ordered(
+        let projects = self
+            .projects
+            .iter()
+            .map(|project| {
+                project
+                    .restore()
+                    .ok_or(neptune_model::Error::InvalidIdentity)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Model::restore_with_projects(
             self.workspaces
                 .into_iter()
                 .map(SavedWorkspace::into_spec)
@@ -241,6 +298,7 @@ impl StateSnapshot {
                 .collect(),
             self.sidebar_order
                 .map(|items| items.into_iter().map(Into::into).collect()),
+            projects,
             self.active,
             self.sidebar,
             limits,
@@ -269,6 +327,7 @@ impl SavedWorkspace {
                         .filter_map(|url| neptune_model::PullRequest::parse(url))
                         .collect(),
                     spawned_by: pane.spawned_by,
+                    project: pane.project,
                     worktree: pane.worktree,
                     attachments: pane
                         .attachments
@@ -503,6 +562,7 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
     // Links between agents cross workspaces, so they are checked once every
     // workspace has been; until then each workspace is validated without them.
     let mut spawned = Vec::new();
+    let mut members = Vec::new();
     let mut background = Vec::new();
     for mut workspace in snapshot.workspaces {
         if let Some(group) = workspace.group
@@ -593,11 +653,14 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
             if let Some(parent) = pane.spawned_by.take() {
                 spawned.push((pane.id, parent));
             }
+            if let Some(project) = pane.project.take() {
+                members.push((pane.id, project));
+            }
         }
         let name = workspace.name.clone();
         let mut spec = workspace.into_spec();
         // A terminal saved without a tab is checked with one, and loses it
-        // again once the agent that started its agent is found.
+        // again once the agent or the project that started its agent is found.
         let placed = spec.layout.panes();
         for pane in &spec.panes {
             if !placed.contains(&pane.id) && park(&mut spec.layout, Some(spec.active), pane.id) {
@@ -616,6 +679,64 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                 .push(format!("Skipped invalid workspace {name:?}: {error}")),
         }
     }
+    // A project needs its workspace, and a project's agent needs its project.
+    // Both come before the links between agents: how many agents may stand
+    // behind one depends on whether a project started it.
+    let mut projects = Vec::new();
+    for saved in snapshot.projects {
+        let mut candidate = projects.clone();
+        let result = match saved.restore() {
+            Some(spec) => {
+                candidate.push(spec);
+                Model::restore_with_projects(
+                    specs.clone(),
+                    groups.clone(),
+                    None,
+                    candidate.clone(),
+                    None,
+                    snapshot.sidebar,
+                    limits,
+                )
+                .map(|_| ())
+            }
+            None => Err(neptune_model::Error::InvalidIdentity),
+        };
+        match result {
+            Ok(()) => projects = candidate,
+            Err(error) => report
+                .diagnostics
+                .push(format!("Skipped invalid project {}: {error}", saved.id)),
+        }
+    }
+    for (pane, project) in members {
+        let mut linked = specs.clone();
+        if let Some(spec) = linked
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.panes)
+            .find(|spec| spec.id == pane)
+        {
+            spec.project = Some(project);
+        }
+        if background.contains(&pane) {
+            for workspace in &mut linked {
+                unpark(&mut workspace.layout, pane);
+            }
+        }
+        match Model::restore_with_projects(
+            linked.clone(),
+            groups.clone(),
+            None,
+            projects.clone(),
+            None,
+            snapshot.sidebar,
+            limits,
+        ) {
+            Ok(_) => specs = linked,
+            Err(_) => report.diagnostics.push(format!(
+                "Pane {pane}: its project was unavailable; restored on its own"
+            )),
+        }
+    }
     for (pane, parent) in spawned {
         let mut linked = specs.clone();
         if let Some(spec) = linked
@@ -630,9 +751,11 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                 unpark(&mut workspace.layout, pane);
             }
         }
-        match Model::restore_grouped(
+        match Model::restore_with_projects(
             linked.clone(),
             groups.clone(),
+            None,
+            projects.clone(),
             None,
             snapshot.sidebar,
             limits,
@@ -650,9 +773,11 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                 .into(),
         );
     }
-    match Model::restore_grouped(
+    match Model::restore_with_projects(
         specs.clone(),
         groups.clone(),
+        None,
+        projects.clone(),
         active,
         snapshot.sidebar,
         limits,
@@ -684,7 +809,15 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                     .diagnostics
                     .push("Missing sidebar order; restored the historical workspace order".into());
             }
-            match Model::restore_ordered(specs, groups, order, active, snapshot.sidebar, limits) {
+            match Model::restore_with_projects(
+                specs,
+                groups,
+                order,
+                projects,
+                active,
+                snapshot.sidebar,
+                limits,
+            ) {
                 Ok(model) => report.model = Some(model),
                 Err(error) => report
                     .diagnostics
@@ -801,6 +934,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 pull_requests: Vec::new(),
                 attachments: Vec::new(),
                 spawned_by: None,
+                project: None,
                 worktree: None,
             });
         }
@@ -820,6 +954,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 pull_requests: Vec::new(),
                 attachments: Vec::new(),
                 spawned_by: None,
+                project: None,
                 worktree: None,
             });
             next_pane += 1;
@@ -1310,7 +1445,7 @@ mod tests {
     fn earlier_schema_versions_are_read_without_loss_and_saved_as_the_current_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspaces.json");
-        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+        for version in 1..SCHEMA_VERSION {
             let mut saved = serde_json::to_value(sample(directory.path())).unwrap();
             saved["version"] = version.into();
             saved.as_object_mut().unwrap().remove("groups");
@@ -1327,8 +1462,9 @@ mod tests {
             assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
             // No recovery copy: nothing was repaired or dropped.
             assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
-            let resaved =
-                serde_json::to_value(StateSnapshot::from_model(&report.model.unwrap())).unwrap();
+            let model = report.model.unwrap();
+            assert!(model.projects().is_empty());
+            let resaved = serde_json::to_value(StateSnapshot::from_model(&model)).unwrap();
             saved["version"] = SCHEMA_VERSION.into();
             saved["groups"] = serde_json::json!([]);
             assert_eq!(resaved, saved);
@@ -1383,14 +1519,22 @@ mod tests {
     fn unsupported_future_schema_cannot_be_overwritten() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("workspaces.json");
-        let original = br#"{"version":99,"future_data":{"keep":"everything"}}"#;
-        std::fs::write(&path, original).unwrap();
-        let report = load_state(&path, Limits::default());
-        assert!(!report.can_write);
-        assert!(report.model.is_none());
-        assert!(report.diagnostics[0].contains("Unsupported"));
-        assert_eq!(std::fs::read(path).unwrap(), original);
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        // The next version is as unknown as a distant one, even when the rest
+        // of the file is one this build could read.
+        let mut next = serde_json::to_value(sample(directory.path())).unwrap();
+        next["version"] = (SCHEMA_VERSION + 1).into();
+        for original in [
+            br#"{"version":99,"future_data":{"keep":"everything"}}"#.to_vec(),
+            serde_json::to_vec(&next).unwrap(),
+        ] {
+            std::fs::write(&path, &original).unwrap();
+            let report = load_state(&path, Limits::default());
+            assert!(!report.can_write);
+            assert!(report.model.is_none());
+            assert!(report.diagnostics[0].contains("Unsupported"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]
@@ -1468,6 +1612,7 @@ mod tests {
             pull_requests: Vec::new(),
             attachments: Vec::new(),
             spawned_by: None,
+            project: None,
             worktree: None,
         }];
         second.layout = SavedLayout::Pane {
@@ -1541,6 +1686,330 @@ mod tests {
             assert!(!report.can_write);
         }
         assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+    use neptune_model::{AgentKind, AgentSession, Command, Controller, Effect};
+
+    const KEY: &str = "0123456789abcdef";
+
+    fn agent(directory: &Path) -> AgentSession {
+        AgentSession {
+            kind: AgentKind::Claude,
+            session_id: Some("019a1234-5678-7000-8000-123456789abc".into()),
+            cwd: directory.into(),
+        }
+    }
+    /// A workspace with a project whose lead started one agent, out of view.
+    fn project(directory: &Path) -> (Controller, PaneId) {
+        let mut controller = Controller::new(Model::default());
+        controller
+            .dispatch(Command::AddWorkspace {
+                group: None,
+                cwd: directory.into(),
+                name: "fixture".into(),
+                remote: None,
+            })
+            .unwrap();
+        let workspace = controller.model().active_workspace().unwrap();
+        controller
+            .dispatch(Command::AddProject {
+                workspace,
+                name: "shop".into(),
+                key: ProjectKey::parse(KEY).unwrap(),
+                lead: AgentKind::Claude,
+            })
+            .unwrap();
+        let project = controller.model().projects()[0].id();
+        let pane = controller
+            .dispatch(Command::SpawnProjectAgent {
+                project,
+                cwd: directory.into(),
+                worktree: None,
+            })
+            .unwrap()
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StartSession { pane, .. } => Some(*pane),
+                _ => None,
+            })
+            .unwrap();
+        (controller, pane)
+    }
+    fn open(controller: &mut Controller, pane: PaneId, directory: &Path) {
+        controller
+            .dispatch(Command::PaneAgentChanged {
+                pane,
+                generation: 1,
+                agent: Some(agent(directory)),
+            })
+            .unwrap();
+    }
+    fn recovery(directory: &Path, path: &Path) -> Vec<Vec<u8>> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|file| file != path)
+            .map(|file| std::fs::read(file).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_project_and_its_agents_round_trip_and_nothing_it_says_is_saved() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let (mut controller, pane) = project(root.path());
+        open(&mut controller, pane, root.path());
+        let project = controller.model().projects()[0].id();
+        controller
+            .dispatch(Command::SetProjectPaused {
+                project,
+                paused: true,
+            })
+            .unwrap();
+        let snapshot = StateSnapshot::from_model(controller.model());
+        let saved = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(saved["version"], 12);
+        // Identity and membership only: a new field here needs a decision.
+        assert_eq!(
+            saved["projects"],
+            serde_json::json!([{
+                "id": project, "key": KEY, "name": "shop",
+                "workspace": controller.model().active_workspace().unwrap(),
+                "lead": "claude", "paused": true,
+            }])
+        );
+        assert_eq!(saved["workspaces"][0]["panes"][1]["project"], project.get());
+        assert!(saved["workspaces"][0]["panes"][0].get("project").is_none());
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write && !report.migrated);
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.projects(), controller.model().projects());
+        assert_eq!(model.workspaces(), controller.model().workspaces());
+        assert!(model.workspaces()[0].is_background(pane));
+        assert_eq!(model.pane(pane).unwrap().project(), Some(project));
+        assert_eq!(
+            serde_json::to_value(StateSnapshot::from_model(&model)).unwrap(),
+            saved
+        );
+        assert_eq!(
+            serde_json::to_value(StateSnapshot::from_model(
+                &snapshot.into_model(Limits::default()).unwrap()
+            ))
+            .unwrap(),
+            saved
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_tab_sent_back_out_of_view_is_saved_as_one_that_was_never_opened() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let (mut controller, pane) = project(root.path());
+        open(&mut controller, pane, root.path());
+        let saved = |controller: &Controller| {
+            serde_json::to_value(StateSnapshot::from_model(controller.model())).unwrap()
+        };
+        let unopened = saved(&controller);
+        let workspace = controller.model().active_workspace().unwrap();
+        controller
+            .dispatch(Command::FocusPane { workspace, pane })
+            .unwrap();
+        assert_ne!(saved(&controller), unopened);
+        controller.dispatch(Command::BackgroundPane(pane)).unwrap();
+        // Where a terminal is shown is all that tells the two apart, so
+        // the file needs no new field and no new version.
+        assert_eq!(saved(&controller), unopened);
+        std::fs::write(&path, serde_json::to_vec(&unopened).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write && !report.migrated);
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.workspaces(), controller.model().workspaces());
+        assert!(model.workspaces()[0].is_background(pane));
+        assert!(model.pane(pane).unwrap().project().is_some());
+    }
+
+    #[test]
+    fn a_link_to_a_project_is_not_saved_before_the_agent_can_be_resumed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let (mut controller, pane) = project(root.path());
+        assert!(controller.model().pane(pane).unwrap().project().is_some());
+        let snapshot = StateSnapshot::from_model(controller.model());
+        assert_eq!(snapshot.workspaces[0].panes[1].project, None);
+        assert_eq!(snapshot.projects.len(), 1);
+        // What was saved loads: the project returns and the terminal is an
+        // ordinary one with a tab.
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.projects().len(), 1);
+        assert!(model.pane(pane).unwrap().project().is_none());
+        assert!(!model.workspaces()[0].is_background(pane));
+        open(&mut controller, pane, root.path());
+        let project = controller.model().projects()[0].id();
+        assert_eq!(
+            StateSnapshot::from_model(controller.model()).workspaces[0].panes[1].project,
+            Some(project)
+        );
+    }
+
+    #[test]
+    fn an_agent_of_a_missing_project_is_restored_on_its_own_and_the_original_is_archived() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let (mut controller, pane) = project(root.path());
+        open(&mut controller, pane, root.path());
+        let mut snapshot = StateSnapshot::from_model(controller.model());
+        snapshot.projects.clear();
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write);
+        assert!(report.diagnostics.iter().any(|message| {
+            message.contains(&format!("Pane {pane}")) && message.contains("restored on its own")
+        }));
+        let model = report.model.unwrap();
+        assert!(model.projects().is_empty());
+        let restored = model.pane(pane).unwrap();
+        assert!(restored.project().is_none() && restored.agent().is_some());
+        assert!(!model.workspaces()[0].is_background(pane));
+        assert_eq!(recovery(root.path(), &path), [bytes]);
+    }
+
+    #[test]
+    fn an_invalid_project_is_skipped_alone_and_the_original_is_archived() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let (mut controller, pane) = project(root.path());
+        open(&mut controller, pane, root.path());
+        let valid = StateSnapshot::from_model(controller.model());
+        let damage: [fn(&mut SavedProject); 5] = [
+            |project| project.key = "../../etc".into(),
+            |project| project.name = " ".into(),
+            |project| project.lead = AgentKind::Gemini,
+            |project| project.workspace = WorkspaceId::new(99),
+            |project| project.id = ProjectId::new(0),
+        ];
+        for change in damage {
+            for file in recovery_paths(root.path(), &path) {
+                std::fs::remove_file(file).unwrap();
+            }
+            let mut snapshot = valid.clone();
+            change(&mut snapshot.projects[0]);
+            let bytes = serde_json::to_vec(&snapshot).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let report = load_state(&path, Limits::default());
+            assert!(report.can_write);
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|message| message.contains("Skipped invalid project")),
+                "{:?}",
+                report.diagnostics
+            );
+            let model = report.model.unwrap();
+            assert!(model.projects().is_empty());
+            assert_eq!(model.workspaces()[0].panes().len(), 2);
+            assert!(model.pane(pane).unwrap().project().is_none());
+            assert_eq!(recovery(root.path(), &path), [bytes]);
+        }
+        // A second project for the same workspace goes; the first stays with
+        // its agent.
+        for file in recovery_paths(root.path(), &path) {
+            std::fs::remove_file(file).unwrap();
+        }
+        let mut snapshot = valid.clone();
+        let mut second = snapshot.projects[0].clone();
+        second.id = ProjectId::new(2);
+        second.key = "fedcba9876543210".into();
+        snapshot.projects.push(second);
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.projects(), controller.model().projects());
+        assert!(model.pane(pane).unwrap().project().is_some());
+        assert!(model.workspaces()[0].is_background(pane));
+    }
+
+    #[test]
+    fn an_agent_started_by_a_projects_agent_returns_with_it_and_a_longer_chain_loses_its_end() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let (mut controller, worker) = project(root.path());
+        open(&mut controller, worker, root.path());
+        controller
+            .dispatch(Command::SpawnAgent {
+                parent: worker,
+                generation: 1,
+                cwd: root.path().into(),
+            })
+            .unwrap();
+        let helper = controller.model().workspaces()[0].panes()[2].id();
+        open(&mut controller, helper, root.path());
+        let project = controller.model().projects()[0].id();
+        let snapshot = StateSnapshot::from_model(controller.model());
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.workspaces(), controller.model().workspaces());
+        assert_eq!(model.pane(helper).unwrap().spawned_by(), Some(worker));
+
+        // One agent more than a project's agent may start: that one loses its
+        // link, and the project keeps its agent.
+        let mut damaged = snapshot.clone();
+        let mut extra = damaged.workspaces[0].panes[2].clone();
+        extra.id = PaneId::new(90);
+        extra.spawned_by = Some(helper);
+        damaged.workspaces[0].panes.push(extra);
+        std::fs::write(&path, serde_json::to_vec(&damaged).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
+        assert_eq!(
+            report.diagnostics[0],
+            "Pane 90: the agent that started its agent was unavailable; restored on its own"
+        );
+        let model = report.model.unwrap();
+        assert_eq!(model.pane(worker).unwrap().project(), Some(project));
+        assert!(model.workspaces()[0].is_background(worker));
+        assert_eq!(model.pane(helper).unwrap().spawned_by(), Some(worker));
+        let extra = model.pane(PaneId::new(90)).unwrap();
+        assert_eq!((extra.spawned_by(), extra.project()), (None, None));
+        assert!(!model.workspaces()[0].is_background(extra.id()));
+    }
+
+    fn recovery_paths(directory: &Path, path: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|file| file != path)
+            .collect()
+    }
+
+    #[test]
+    fn a_project_field_this_build_does_not_know_is_not_dropped_silently() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let (controller, _) = project(root.path());
+        let mut saved =
+            serde_json::to_value(StateSnapshot::from_model(controller.model())).unwrap();
+        saved["projects"][0]["chat"] = "words".into();
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write && report.model.is_none());
+        assert_eq!(recovery(root.path(), &path), [bytes]);
     }
 }
 

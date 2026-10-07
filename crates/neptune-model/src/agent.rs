@@ -723,6 +723,7 @@ mod tests {
             pull_requests: Vec::new(),
             attachments: Vec::new(),
             spawned_by: None,
+            project: None,
             worktree: None,
         });
         assert!(Model::restore(specs, None, true, Default::default()).is_err());

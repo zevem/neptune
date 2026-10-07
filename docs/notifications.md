@@ -69,6 +69,17 @@ focused window. If you turn the CLI's own notifications on, or use one of the
 recipes below, you get both alerts. Claude Code, Codex and Oh My Pi are left
 to their own notifications.
 
+Agents that a [project's](projects.md) lead starts are the other exception,
+in the opposite direction: their terminals raise no desktop banners of their
+own, since the project speaks for them. With desktop banners on, a project
+raises one banner, titled "Project" and its name and reading "Needs you",
+when it starts to need you (an agent waits for a person, its lead cannot go
+on, or Neptune paused it for running on by itself) and one reading "The
+lead has an update" when a turn the lead took by itself ends with something
+to say. The body is one of those fixed texts, never anything from the chat,
+and nothing is raised while you are looking at that project's tab in a
+focused window.
+
 ### Codex
 
 Codex's interactive CLI enables notifications by default, but emits them only

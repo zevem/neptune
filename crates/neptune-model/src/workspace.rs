@@ -1,4 +1,6 @@
-use crate::{Layout, PaneId, Remote, WorkspaceGroupId, WorkspaceId};
+use crate::{
+    Layout, PaneId, Project, ProjectId, ProjectSpec, Remote, WorkspaceGroupId, WorkspaceId,
+};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -26,6 +28,14 @@ pub enum Error {
     SpawnLimit,
     SpawnDepth,
     InvalidWorktree,
+    UnknownProject(ProjectId),
+    ProjectLimit,
+    ProjectExists,
+    ProjectAgentLimit,
+    ProjectPaused,
+    InvalidProject,
+    LastInView,
+    Unanswered,
 }
 
 impl std::fmt::Display for Error {
@@ -65,6 +75,24 @@ impl std::fmt::Display for Error {
             Self::InvalidWorktree => {
                 f.write_str("A worktree needs a local workspace, a branch and its own directory")
             }
+            Self::UnknownProject(id) => write!(f, "Project {id} does not exist"),
+            Self::ProjectLimit => write!(f, "A window can have {} projects", Project::MAX),
+            Self::ProjectExists => f.write_str("This workspace already has a project"),
+            Self::ProjectAgentLimit => write!(
+                f,
+                "A project can have {} agents open at once",
+                Project::MAX_AGENTS
+            ),
+            Self::ProjectPaused => f.write_str("The project is paused"),
+            Self::InvalidProject => write!(
+                f,
+                "A project runs in a local workspace, with a name of at most {} characters and Claude Code or Codex as its lead",
+                Project::MAX_NAME
+            ),
+            Self::LastInView => f.write_str("A workspace keeps one terminal in view"),
+            Self::Unanswered => f.write_str(
+                "Only a terminal an agent or a project started for its own agent runs without a tab",
+            ),
         }
     }
 }
@@ -113,6 +141,7 @@ pub struct Pane {
     pub(crate) pull_requests: Vec<crate::PullRequest>,
     pub(crate) attachments: Vec<crate::Attachment>,
     pub(crate) spawned_by: Option<PaneId>,
+    pub(crate) project: Option<ProjectId>,
     pub(crate) worktree: Option<crate::Worktree>,
     pub(crate) generation: u64,
     pub(crate) lifecycle: Lifecycle,
@@ -132,6 +161,12 @@ impl Pane {
     /// The terminal whose agent started this one's, while both agents last.
     pub fn spawned_by(&self) -> Option<PaneId> {
         self.spawned_by
+    }
+    /// The project whose lead started this terminal's agent, while the agent
+    /// and the project last. Whoever starts the session of a new terminal
+    /// reads this to tell a project's agent from any other.
+    pub fn project(&self) -> Option<ProjectId> {
+        self.project
     }
     /// The git worktree Neptune made for this terminal's agent.
     pub fn worktree(&self) -> Option<&crate::Worktree> {
@@ -166,6 +201,8 @@ pub struct PaneSpec {
     pub attachments: Vec<crate::Attachment>,
     /// The terminal whose agent started this one's.
     pub spawned_by: Option<PaneId>,
+    /// The project whose lead started this terminal's agent.
+    pub project: Option<ProjectId>,
     /// The git worktree Neptune made for this terminal's agent.
     pub worktree: Option<crate::Worktree>,
 }
@@ -226,7 +263,8 @@ impl Workspace {
     }
 
     /// A terminal that runs without a tab: one an agent started for another
-    /// agent, until someone opens it.
+    /// agent or for a project, until someone opens it, and again once its
+    /// tab was put away.
     pub fn is_background(&self, pane: PaneId) -> bool {
         self.pane(pane).is_some() && !self.layout.contains(pane)
     }
@@ -331,12 +369,14 @@ pub struct Model {
     pub(crate) workspaces: Vec<Workspace>,
     pub(crate) groups: Vec<WorkspaceGroup>,
     pub(crate) sidebar_order: Vec<SidebarItem>,
+    pub(crate) projects: Vec<Project>,
     pub(crate) active: Option<WorkspaceId>,
     pub(crate) sidebar: bool,
     pub(crate) next_workspace: u64,
     pub(crate) next_group: u64,
     pub(crate) next_pane: u64,
     pub(crate) next_split: u64,
+    pub(crate) next_project: u64,
     pub(crate) limits: Limits,
 }
 impl Default for Model {
@@ -350,12 +390,14 @@ impl Model {
             workspaces: Vec::new(),
             groups: Vec::new(),
             sidebar_order: Vec::new(),
+            projects: Vec::new(),
             active: None,
             sidebar: true,
             next_workspace: 1,
             next_group: 1,
             next_pane: 1,
             next_split: 1,
+            next_project: 1,
             limits,
         }
     }
@@ -400,24 +442,102 @@ impl Model {
             .flat_map(|workspace| &workspace.panes)
             .filter(move |pane| pane.spawned_by == Some(parent))
     }
+    /// The projects of this window, oldest first.
+    pub fn projects(&self) -> &[Project] {
+        &self.projects
+    }
+    pub fn project(&self, id: ProjectId) -> Option<&Project> {
+        self.projects.iter().find(|project| project.id == id)
+    }
+    /// A workspace has at most one project.
+    pub fn project_of(&self, workspace: WorkspaceId) -> Option<&Project> {
+        self.projects
+            .iter()
+            .find(|project| project.workspace == workspace)
+    }
+    /// The terminals whose agents the lead of `project` started and that
+    /// still run them, oldest first.
+    pub fn project_agents(&self, project: ProjectId) -> impl Iterator<Item = &Pane> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.panes)
+            .filter(move |pane| pane.project == Some(project))
+    }
+    /// Whether the tab of `pane` may be put away while its terminal runs on.
+    /// A workspace keeps one terminal in view, and a terminal without a tab
+    /// is found again only where its project or the agent that started it
+    /// lists it.
+    pub fn can_background(&self, pane: PaneId) -> Result<(), Error> {
+        let workspace = self
+            .workspace_for_pane(pane)
+            .and_then(|id| self.workspace(id))
+            .filter(|workspace| !workspace.is_background(pane))
+            .ok_or(Error::UnknownPane(pane))?;
+        if workspace.layout.panes().len() == 1 {
+            return Err(Error::LastInView);
+        }
+        let listed = workspace.pane(pane).is_some_and(|item| {
+            item.project.is_some()
+                || item
+                    .spawned_by
+                    .is_some_and(|parent| workspace.pane(parent).is_some())
+        });
+        if listed {
+            Ok(())
+        } else {
+            Err(Error::Unanswered)
+        }
+    }
     /// How many agents stand between `pane` and one a person started. A chain
-    /// longer than the limit, as a loop would be, counts as past it.
+    /// longer than the limit, as a loop would be, counts as past it. A
+    /// project's lead counts as an agent a person started, so its agents can
+    /// start agents and those cannot.
     pub(crate) fn spawn_depth(&self, pane: PaneId) -> usize {
         let mut depth = 0;
-        let mut next = self.pane(pane).and_then(|pane| pane.spawned_by);
-        while let Some(parent) = next {
+        let mut next = self.pane(pane);
+        while let Some(item) = next {
+            let Some(parent) = item.spawned_by else {
+                depth += usize::from(item.project.is_some());
+                break;
+            };
             depth += 1;
             if depth > crate::AgentSession::MAX_SPAWN_DEPTH {
                 break;
             }
-            next = self.pane(parent).and_then(|pane| pane.spawned_by);
+            next = self.pane(parent);
         }
         depth
     }
-    /// Ends every link to a terminal that is gone or no longer runs an agent.
-    /// A background terminal whose link ended gets a tab: nothing runs out
-    /// of view that no agent answers for.
+    /// Ends every link to a terminal that is gone or no longer runs an agent,
+    /// every project whose workspace is gone, and every link to a project
+    /// that is gone or belongs to another workspace. A background terminal
+    /// whose link ended gets a tab: nothing runs out of view that no agent
+    /// or project answers for.
     pub(crate) fn release_spawned(&mut self) -> bool {
+        let projects = self.projects.len();
+        self.projects.retain(|project| {
+            self.workspaces
+                .iter()
+                .any(|workspace| workspace.id == project.workspace)
+        });
+        let strays: Vec<PaneId> = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace.panes.iter().filter(|pane| {
+                    pane.project.is_some_and(|project| {
+                        self.project(project)
+                            .is_none_or(|project| project.workspace != workspace.id)
+                    })
+                })
+            })
+            .map(|pane| pane.id)
+            .collect();
+        for pane in &strays {
+            if let Ok(pane) = self.pane_mut(*pane) {
+                pane.project = None;
+            }
+        }
         let orphans: Vec<PaneId> = self
             .workspaces
             .iter()
@@ -435,12 +555,13 @@ impl Model {
                 pane.spawned_by = None;
             }
         }
-        let mut changed = !orphans.is_empty();
+        let mut changed =
+            !orphans.is_empty() || !strays.is_empty() || self.projects.len() != projects;
         for workspace in &mut self.workspaces {
             let unlinked: Vec<PaneId> = workspace
                 .panes
                 .iter()
-                .filter(|pane| pane.spawned_by.is_none())
+                .filter(|pane| pane.spawned_by.is_none() && pane.project.is_none())
                 .map(|pane| pane.id)
                 .collect();
             for pane in unlinked {
@@ -473,11 +594,37 @@ impl Model {
         Self::restore_grouped(specs, Vec::new(), active, sidebar, limits)
     }
 
+    /// Restores projects along with everything `restore_ordered` does. This
+    /// is the only entry that accepts a terminal's link to a project: the
+    /// others restore no project, so they reject such a terminal.
+    pub fn restore_with_projects(
+        specs: Vec<WorkspaceSpec>,
+        groups: Vec<WorkspaceGroupSpec>,
+        order: Option<Vec<SidebarItem>>,
+        projects: Vec<ProjectSpec>,
+        active: Option<WorkspaceId>,
+        sidebar: bool,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        Self::restore_all(specs, groups, projects, active, sidebar, limits)?.ordered(order, active)
+    }
+
     /// Restores organization along with workspaces, validating membership atomically.
     /// Empty groups are retained; their count shares the workspace resource limit.
     pub fn restore_grouped(
         specs: Vec<WorkspaceSpec>,
         groups: Vec<WorkspaceGroupSpec>,
+        active: Option<WorkspaceId>,
+        sidebar: bool,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        Self::restore_all(specs, groups, Vec::new(), active, sidebar, limits)
+    }
+
+    fn restore_all(
+        specs: Vec<WorkspaceSpec>,
+        groups: Vec<WorkspaceGroupSpec>,
+        projects: Vec<ProjectSpec>,
         active: Option<WorkspaceId>,
         sidebar: bool,
         limits: Limits,
@@ -574,10 +721,13 @@ impl Model {
                         .ok_or(Error::IdentityExhausted)?,
                 );
             }
-            // Only a terminal an agent started for another runs without a tab.
+            // Only a terminal an agent started for another, or for a project,
+            // runs without a tab.
             let placed: HashSet<PaneId> = spec.layout.panes().into_iter().collect();
             for pane in &spec.panes {
-                if pane.spawned_by.is_some() && !placed.contains(&pane.id) {
+                if (pane.spawned_by.is_some() || pane.project.is_some())
+                    && !placed.contains(&pane.id)
+                {
                     members.remove(&pane.id);
                 }
             }
@@ -617,6 +767,7 @@ impl Model {
                         pull_requests: pane.pull_requests,
                         attachments: pane.attachments,
                         spawned_by: pane.spawned_by,
+                        project: pane.project,
                         worktree: pane.worktree,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
@@ -648,6 +799,66 @@ impl Model {
             {
                 return Err(Error::InvalidLayout("invalid spawned agent"));
             }
+        }
+        if projects.len() > Project::MAX {
+            return Err(Error::ProjectLimit);
+        }
+        for spec in projects {
+            if spec.id.get() == 0
+                || model
+                    .projects
+                    .iter()
+                    .any(|project| project.id == spec.id || project.key == spec.key)
+            {
+                return Err(Error::InvalidIdentity);
+            }
+            Project::validate(&spec.name, spec.lead)?;
+            let workspace = model
+                .workspace(spec.workspace)
+                .ok_or(Error::UnknownWorkspace(spec.workspace))?;
+            if workspace.remote.is_some() {
+                return Err(Error::InvalidProject);
+            }
+            if model.project_of(spec.workspace).is_some() {
+                return Err(Error::ProjectExists);
+            }
+            model.next_project = model.next_project.max(
+                spec.id
+                    .get()
+                    .checked_add(1)
+                    .ok_or(Error::IdentityExhausted)?,
+            );
+            model.projects.push(Project {
+                id: spec.id,
+                key: spec.key,
+                name: spec.name,
+                workspace: spec.workspace,
+                lead: spec.lead,
+                paused: spec.paused,
+            });
+        }
+        // A project's agent is a resumable one in the project's workspace
+        // that no other agent started.
+        for workspace in &model.workspaces {
+            for pane in &workspace.panes {
+                let Some(id) = pane.project else {
+                    continue;
+                };
+                let project = model.project(id).ok_or(Error::UnknownProject(id))?;
+                if project.workspace != workspace.id
+                    || pane.agent.is_none()
+                    || pane.spawned_by.is_some()
+                {
+                    return Err(Error::InvalidLayout("invalid project agent"));
+                }
+            }
+        }
+        if model
+            .projects
+            .iter()
+            .any(|project| model.project_agents(project.id).count() > Project::MAX_AGENTS)
+        {
+            return Err(Error::ProjectAgentLimit);
         }
         if let Some(id) = active
             && model.workspace(id).is_none()
@@ -683,6 +894,7 @@ impl Model {
                         pull_requests: pane.pull_requests.clone(),
                         attachments: pane.attachments.clone(),
                         spawned_by: pane.spawned_by,
+                        project: pane.project,
                         worktree: pane.worktree.clone(),
                     })
                     .collect(),
@@ -702,19 +914,40 @@ impl Model {
         sidebar: bool,
         limits: Limits,
     ) -> Result<Self, Error> {
-        let mut model = Self::restore_grouped(specs, groups, active, sidebar, limits)?;
+        Self::restore_grouped(specs, groups, active, sidebar, limits)?.ordered(order, active)
+    }
+
+    fn ordered(
+        mut self,
+        order: Option<Vec<SidebarItem>>,
+        active: Option<WorkspaceId>,
+    ) -> Result<Self, Error> {
         if let Some(order) = order {
-            let expected: HashSet<_> = model.sidebar_order.iter().copied().collect();
+            let expected: HashSet<_> = self.sidebar_order.iter().copied().collect();
             if order.len() != expected.len()
                 || order.iter().copied().collect::<HashSet<_>>() != expected
             {
                 return Err(Error::InvalidSidebarOrder);
             }
-            model.sidebar_order = order;
-            model.order_workspaces();
-            model.active = active.or_else(|| model.workspaces.first().map(Workspace::id));
+            self.sidebar_order = order;
+            self.order_workspaces();
+            self.active = active.or_else(|| self.workspaces.first().map(Workspace::id));
         }
-        Ok(model)
+        Ok(self)
+    }
+
+    pub fn project_specs(&self) -> Vec<ProjectSpec> {
+        self.projects
+            .iter()
+            .map(|project| ProjectSpec {
+                id: project.id,
+                key: project.key.clone(),
+                name: project.name.clone(),
+                workspace: project.workspace,
+                lead: project.lead,
+                paused: project.paused,
+            })
+            .collect()
     }
 
     pub fn group_specs(&self) -> Vec<WorkspaceGroupSpec> {

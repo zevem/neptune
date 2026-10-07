@@ -53,8 +53,9 @@ pub enum AgentLaunch {
     Remote,
     Local {
         resume: Option<neptune_model::AgentSession>,
-        /// The terminal whose agent started the one this terminal opens.
-        spawned_by: Option<PaneId>,
+        /// The terminal whose agent started the one this terminal opens,
+        /// or the project that did.
+        spawned_by: Option<super::agents::Starter>,
     },
 }
 impl From<SessionOptions> for SessionLaunch {
@@ -393,6 +394,10 @@ impl SessionManager {
     }
     /// The bridge agents reach the application through: what they asked for,
     /// and what the application tells it about the agents they started.
+    /// The bridge itself, for a worker that opens a project's lead to it.
+    pub fn bridge(&self) -> Arc<super::agents::AgentBridge> {
+        self.agents.clone()
+    }
     pub fn agents(&self) -> &super::agents::AgentBridge {
         &self.agents
     }

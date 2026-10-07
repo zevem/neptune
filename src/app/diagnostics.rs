@@ -10,6 +10,10 @@ pub(super) struct Diagnostics {
     frames: VecDeque<f64>,
     last: Instant,
     total: u64,
+    /// Every failure line, whether or not it was printed, for tests of
+    /// what such a line may hold.
+    #[cfg(test)]
+    pub said: std::cell::RefCell<Vec<String>>,
 }
 impl Diagnostics {
     pub fn new(enabled: bool) -> Self {
@@ -18,6 +22,8 @@ impl Diagnostics {
             frames: VecDeque::with_capacity(2048),
             last: Instant::now(),
             total: 0,
+            #[cfg(test)]
+            said: Default::default(),
         }
     }
     pub fn enabled(&self) -> bool {
@@ -30,11 +36,14 @@ impl Diagnostics {
         generation: Option<u64>,
         kind: &str,
     ) {
+        let line = || {
+            serde_json::json!({"operation":"failure","source_operation":operation,"pane":pane.map(PaneId::get),"generation":generation,"error_kind":kind})
+                .to_string()
+        };
+        #[cfg(test)]
+        self.said.borrow_mut().push(line());
         if self.enabled {
-            eprintln!(
-                "{}",
-                serde_json::json!({"operation":"failure","source_operation":operation,"pane":pane.map(PaneId::get),"generation":generation,"error_kind":kind})
-            );
+            eprintln!("{}", line());
         }
     }
     pub fn operation(&self, operation: &str, pane: PaneId, generation: u64, elapsed: Duration) {

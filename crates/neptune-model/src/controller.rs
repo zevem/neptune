@@ -1,6 +1,6 @@
 use crate::{
-    Axis, Edge, Error, Layout, Lifecycle, Model, Pane, PaneId, Remote, SidebarItem, SplitId,
-    Workspace, WorkspaceGroup, WorkspaceGroupId, WorkspaceId,
+    Axis, Edge, Error, Layout, Lifecycle, Model, Pane, PaneId, Project, ProjectId, ProjectKey,
+    Remote, SidebarItem, SplitId, Workspace, WorkspaceGroup, WorkspaceGroupId, WorkspaceId,
 };
 use std::path::PathBuf;
 
@@ -95,6 +95,9 @@ pub enum Command {
         destination: Destination,
     },
     ClosePane(PaneId),
+    /// The reverse of opening a background terminal: its tab goes and its
+    /// session runs on. Refused where `Model::can_background` refuses.
+    BackgroundPane(PaneId),
     CloseWorkspace(WorkspaceId),
     /// Moves a workspace to `index` in the ordered list. A position past the
     /// end means last.
@@ -153,6 +156,40 @@ pub enum Command {
         parent: PaneId,
         generation: u64,
         cwd: PathBuf,
+    },
+    /// Gives a local workspace its project. The key names what the desktop
+    /// keeps for it; the lead is Claude Code or Codex.
+    AddProject {
+        workspace: WorkspaceId,
+        name: String,
+        key: ProjectKey,
+        lead: crate::AgentKind,
+    },
+    RenameProject {
+        project: ProjectId,
+        name: String,
+    },
+    /// A paused project starts no agent. Those it has keep running.
+    SetProjectPaused {
+        project: ProjectId,
+        paused: bool,
+    },
+    /// The project's agents keep running and get tabs; nothing is stopped.
+    RemoveProject(ProjectId),
+    /// The lead of `project` starts an agent in a terminal of the project's
+    /// workspace that runs without a tab, as `SpawnAgent` does for an agent.
+    /// The new terminal is the pane of the returned `Effect::StartSession`,
+    /// and `Pane::project` names the project it was started for.
+    SpawnProjectAgent {
+        project: ProjectId,
+        cwd: PathBuf,
+        worktree: Option<crate::Worktree>,
+    },
+    /// The agent in `pane` leaves its project. Its terminal goes on as an
+    /// ordinary one, with a tab if it had none; nothing is stopped.
+    ReleaseProjectAgent {
+        pane: PaneId,
+        generation: u64,
     },
     /// An agent named a pull request it made or works on in this terminal.
     PanePullRequestLinked {
@@ -361,6 +398,7 @@ impl Controller {
                         pull_requests: Vec::new(),
                         attachments: Vec::new(),
                         spawned_by: None,
+                        project: None,
                         worktree: None,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
@@ -592,6 +630,17 @@ impl Controller {
                 }
                 dirty = true;
             }
+            Command::BackgroundPane(pane) => {
+                self.model.can_background(pane)?;
+                let workspace = self
+                    .model
+                    .workspace_for_pane(pane)
+                    .ok_or(Error::UnknownPane(pane))?;
+                self.model
+                    .workspace_mut(workspace)?
+                    .remove_from_layout(pane)?;
+                dirty = true;
+            }
             Command::CloseWorkspace(workspace) => {
                 self.close_workspace(workspace, &mut effects)?;
                 dirty = true;
@@ -635,7 +684,12 @@ impl Controller {
             }
             Command::SetWorkspaceRemote { workspace, remote } => {
                 let remote = remote.as_deref().map(Remote::parse).transpose()?;
+                // A project and its agents run on this machine.
+                let project = remote.is_some() && self.model.project_of(workspace).is_some();
                 let ws = self.model.workspace_mut(workspace)?;
+                if project {
+                    return Err(Error::InvalidProject);
+                }
                 if ws.remote != remote {
                     if ws
                         .panes
@@ -711,6 +765,7 @@ impl Controller {
                 item.lifecycle = Lifecycle::Starting;
                 dirty |= item.agent.take().is_some();
                 dirty |= item.spawned_by.take().is_some();
+                dirty |= item.project.take().is_some();
                 item.pull_requests.clear();
                 item.attachments.clear();
                 effects.push(Effect::StopSession {
@@ -754,6 +809,7 @@ impl Controller {
                     && item.generation == generation
                 {
                     dirty |= item.spawned_by.take().is_some();
+                    dirty |= item.project.take().is_some();
                     self.close_background(pane, &mut effects);
                 }
             }
@@ -764,6 +820,7 @@ impl Controller {
                 {
                     dirty |= item.agent.take().is_some();
                     dirty |= item.spawned_by.take().is_some();
+                    dirty |= item.project.take().is_some();
                     item.pull_requests.clear();
                     item.attachments.clear();
                     self.close_background(pane, &mut effects);
@@ -791,6 +848,7 @@ impl Controller {
                         item.pull_requests.clear();
                         item.attachments.clear();
                         dirty |= item.spawned_by.take().is_some();
+                        dirty |= item.project.take().is_some();
                     }
                     let left = agent.is_none();
                     if item.agent != agent {
@@ -847,6 +905,7 @@ impl Controller {
                     pull_requests: Vec::new(),
                     attachments: Vec::new(),
                     spawned_by: Some(parent),
+                    project: None,
                     worktree: None,
                     generation: 1,
                     lifecycle: Lifecycle::Starting,
@@ -860,6 +919,142 @@ impl Controller {
                     replacement: false,
                 });
                 dirty = true;
+            }
+            Command::AddProject {
+                workspace,
+                name,
+                key,
+                lead,
+            } => {
+                Project::validate(&name, lead)?;
+                let ws = self
+                    .model
+                    .workspace(workspace)
+                    .ok_or(Error::UnknownWorkspace(workspace))?;
+                if ws.remote.is_some() {
+                    return Err(Error::InvalidProject);
+                }
+                if self.model.project_of(workspace).is_some() {
+                    return Err(Error::ProjectExists);
+                }
+                // What a key names belongs to one project.
+                if self.model.projects.iter().any(|project| project.key == key) {
+                    return Err(Error::InvalidIdentity);
+                }
+                if self.model.projects.len() >= Project::MAX {
+                    return Err(Error::ProjectLimit);
+                }
+                let id = ProjectId::new(self.model.next_project);
+                self.model.next_project = self
+                    .model
+                    .next_project
+                    .checked_add(1)
+                    .ok_or(Error::IdentityExhausted)?;
+                self.model.projects.push(Project {
+                    id,
+                    key,
+                    name,
+                    workspace,
+                    lead,
+                    paused: false,
+                });
+                dirty = true;
+            }
+            Command::RenameProject { project, name } => {
+                let item = self.project_mut(project)?;
+                Project::validate(&name, item.lead)?;
+                if item.name != name {
+                    item.name = name;
+                    dirty = true;
+                }
+            }
+            Command::SetProjectPaused { project, paused } => {
+                let item = self.project_mut(project)?;
+                if item.paused != paused {
+                    item.paused = paused;
+                    dirty = true;
+                }
+            }
+            Command::RemoveProject(project) => {
+                let position = self
+                    .model
+                    .projects
+                    .iter()
+                    .position(|item| item.id == project)
+                    .ok_or(Error::UnknownProject(project))?;
+                // Its agents lose their link and get tabs below.
+                self.model.projects.remove(position);
+                dirty = true;
+            }
+            Command::SpawnProjectAgent {
+                project,
+                cwd,
+                worktree,
+            } => {
+                let item = self
+                    .model
+                    .project(project)
+                    .ok_or(Error::UnknownProject(project))?;
+                if item.paused {
+                    return Err(Error::ProjectPaused);
+                }
+                let workspace = item.workspace;
+                let ws = self
+                    .model
+                    .workspace(workspace)
+                    .ok_or(Error::UnknownWorkspace(workspace))?;
+                if ws.remote.is_some() {
+                    return Err(Error::InvalidProject);
+                }
+                if worktree
+                    .as_ref()
+                    .is_some_and(|worktree| !worktree.is_valid())
+                {
+                    return Err(Error::InvalidWorktree);
+                }
+                if self.model.project_agents(project).count() >= Project::MAX_AGENTS {
+                    return Err(Error::ProjectAgentLimit);
+                }
+                // It runs out of view: no tab until someone opens it.
+                self.check_pane_capacity(ws.panes.len())?;
+                let id = PaneId::new(self.model.next_pane);
+                self.model.next_pane = self
+                    .model
+                    .next_pane
+                    .checked_add(1)
+                    .ok_or(Error::IdentityExhausted)?;
+                let ws = self.model.workspace_mut(workspace)?;
+                ws.panes.push(Pane {
+                    id,
+                    cwd: cwd.clone(),
+                    remote_cwd: None,
+                    agent: None,
+                    pull_requests: Vec::new(),
+                    attachments: Vec::new(),
+                    spawned_by: None,
+                    project: Some(project),
+                    worktree,
+                    generation: 1,
+                    lifecycle: Lifecycle::Starting,
+                });
+                effects.push(Effect::StartSession {
+                    pane: id,
+                    generation: 1,
+                    cwd,
+                    remote: None,
+                    remote_cwd: None,
+                    replacement: false,
+                });
+                dirty = true;
+            }
+            Command::ReleaseProjectAgent { pane, generation } => {
+                // The tab it may lack is given below, with every other
+                // terminal nothing answers for.
+                if let Ok(item) = self.model.pane_mut(pane)
+                    && item.generation == generation
+                {
+                    dirty |= item.project.take().is_some();
+                }
             }
             Command::PanePullRequestLinked {
                 pane,
@@ -982,6 +1177,14 @@ impl Controller {
         Ok(effects)
     }
 
+    fn project_mut(&mut self, id: ProjectId) -> Result<&mut Project, Error> {
+        self.model
+            .projects
+            .iter_mut()
+            .find(|project| project.id == id)
+            .ok_or(Error::UnknownProject(id))
+    }
+
     fn check_pane_capacity(&self, count: usize) -> Result<(), Error> {
         if count >= self.model.limits.panes_per_workspace {
             return Err(Error::PaneLimit);
@@ -1040,6 +1243,7 @@ impl Controller {
             pull_requests: Vec::new(),
             attachments: Vec::new(),
             spawned_by: None,
+            project: None,
             worktree: None,
             generation: 1,
             lifecycle: Lifecycle::Starting,
@@ -1098,6 +1302,30 @@ impl Controller {
         {
             return Err(Error::UnknownPane(target));
         }
+        if destination != source {
+            // A local shell would be shown as running on the host, and a
+            // connection as a local shell, until the next restart.
+            if self.model.workspace(source).map(|ws| &ws.remote)
+                != self.model.workspace(destination).map(|ws| &ws.remote)
+            {
+                return Err(Error::RemoteMismatch);
+            }
+            let limit = self.model.limits.panes_per_workspace;
+            if self
+                .model
+                .workspace(destination)
+                .is_some_and(|ws| ws.panes.len() >= limit)
+            {
+                return Err(Error::PaneLimit);
+            }
+        }
+        // Refused moves leave a background terminal where it was.
+        let split = SplitId::new(self.model.next_split);
+        let next_split = self
+            .model
+            .next_split
+            .checked_add(1)
+            .ok_or(Error::IdentityExhausted)?;
         self.model.workspace_mut(source)?.reveal(pane);
         // A pane placed relative to itself is placed relative to the tabs it
         // shares a place with. Alone there, it is already where it would land.
@@ -1116,12 +1344,6 @@ impl Controller {
         } else {
             target
         };
-        let split = SplitId::new(self.model.next_split);
-        let next_split = self
-            .model
-            .next_split
-            .checked_add(1)
-            .ok_or(Error::IdentityExhausted)?;
         let place = |layout: &mut Layout| match edge {
             Some(edge) => layout.split(target, pane, split, edge),
             None => layout.add_tab(target, pane, index),
@@ -1145,21 +1367,6 @@ impl Controller {
             ws.layout = layout;
             ws.active = pane;
         } else {
-            // A local shell would be shown as running on the host, and a
-            // connection as a local shell, until the next restart.
-            if self.model.workspace(source).map(|ws| &ws.remote)
-                != self.model.workspace(destination).map(|ws| &ws.remote)
-            {
-                return Err(Error::RemoteMismatch);
-            }
-            let limit = self.model.limits.panes_per_workspace;
-            if self
-                .model
-                .workspace(destination)
-                .is_some_and(|ws| ws.panes.len() >= limit)
-            {
-                return Err(Error::PaneLimit);
-            }
             let ws = self.model.workspace_mut(source)?;
             let position = ws
                 .panes
@@ -1247,7 +1454,7 @@ impl Controller {
     }
 
     /// Closes a terminal that ran without a tab once the agent it was opened
-    /// for is gone: a shell nobody has seen is nobody's to keep.
+    /// for is gone: a shell nobody has in view is nobody's to keep.
     fn close_background(&mut self, pane: PaneId, effects: &mut Vec<Effect>) -> bool {
         let Some(ws) = self
             .model
@@ -2303,7 +2510,8 @@ mod tests {
     fn mixed_command_sequences_always_preserve_restorable_layout_and_focus() {
         let (mut controller, _, _) = setup();
         let mut sequence = 0x1234_5678_u64;
-        for step in 0..400 {
+        let (mut spawned, mut put_away) = (0, 0);
+        for step in 0..4000 {
             sequence = sequence
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
@@ -2317,7 +2525,9 @@ mod tests {
             let other = controller.model().workspaces()
                 [(sequence.rotate_right(29) as usize) % controller.model().workspaces().len()]
             .active();
-            let command = match sequence % 13 {
+            let project = controller.model().project_of(workspace).map(Project::id);
+            let stale = ProjectId::new(1 + sequence.rotate_right(41) % 8);
+            let command = match sequence % 20 {
                 0 => Command::AddWorkspace {
                     group: None,
                     cwd: PathBuf::from("/fake"),
@@ -2369,25 +2579,89 @@ mod tests {
                     pane,
                     cwd: PathBuf::from("/fake"),
                 },
+                12 => Command::AddProject {
+                    workspace,
+                    name: format!("project {step}"),
+                    key: ProjectKey::parse(&format!("{step:016x}")).unwrap(),
+                    lead: crate::AgentKind::Claude,
+                },
+                13 | 16 | 17 => Command::SpawnProjectAgent {
+                    project: project.unwrap_or(stale),
+                    cwd: PathBuf::from("/fake"),
+                    worktree: None,
+                },
+                14 => Command::RemoveProject(project.unwrap_or(stale)),
+                15 => Command::SetProjectPaused {
+                    project: project.unwrap_or(stale),
+                    paused: step % 5 == 0,
+                },
+                18 => Command::BackgroundPane(pane),
                 _ => Command::SelectWorkspace(workspace),
             };
             let before = controller.model().clone();
-            if controller.dispatch(command).is_err() {
-                assert_eq!(controller.model(), &before);
+            let hides = command == Command::BackgroundPane(pane);
+            match controller.dispatch(command) {
+                Err(_) => assert_eq!(controller.model(), &before),
+                Ok(effects) => {
+                    put_away += usize::from(hides);
+                    // A project's agent reports itself, as one that lasts does.
+                    for effect in effects {
+                        if let Effect::StartSession { pane, .. } = effect
+                            && controller.model().pane(pane).unwrap().project().is_some()
+                        {
+                            spawned += 1;
+                            controller
+                                .dispatch(Command::PaneAgentChanged {
+                                    pane,
+                                    generation: 1,
+                                    agent: Some(crate::AgentSession {
+                                        kind: crate::AgentKind::Claude,
+                                        session_id: None,
+                                        cwd: std::env::temp_dir(),
+                                    }),
+                                })
+                                .unwrap();
+                        }
+                    }
+                }
             }
-            for ws in controller.model().workspaces() {
+            let model = controller.model();
+            assert!(model.projects().len() <= Project::MAX);
+            for project in model.projects() {
+                let ws = model.workspace(project.workspace()).unwrap();
+                assert!(ws.remote().is_none(), "step {step}");
+                assert_eq!(model.project_of(ws.id()), Some(project), "step {step}");
+                assert!(model.project_agents(project.id()).count() <= Project::MAX_AGENTS);
+            }
+            for ws in model.workspaces() {
                 assert!(ws.layout().shown().contains(&ws.active()), "step {step}");
+                for pane in ws.panes() {
+                    // Nothing runs out of view that no project answers for.
+                    let owner = pane.project().and_then(|id| model.project(id));
+                    assert_eq!(pane.project().is_some(), owner.is_some(), "step {step}");
+                    assert!(owner.is_none_or(|owner| owner.workspace() == ws.id()));
+                    assert!(
+                        owner.is_some() || !ws.is_background(pane.id()),
+                        "step {step}"
+                    );
+                }
             }
-            assert!(
-                Model::restore(
-                    controller.model().specs(),
-                    controller.model().active_workspace(),
-                    controller.model().sidebar(),
-                    controller.model().limits()
-                )
-                .is_ok()
-            );
+            let restored = Model::restore_with_projects(
+                model.specs(),
+                model.group_specs(),
+                Some(model.sidebar_order().to_vec()),
+                model.project_specs(),
+                model.active_workspace(),
+                model.sidebar(),
+                model.limits(),
+            )
+            .unwrap();
+            assert_eq!(restored.projects(), model.projects(), "step {step}");
         }
+        // The sequence did put project agents among the moves and closes.
+        assert!(spawned > 20, "{spawned}");
+        // And sent a tab of theirs back out of view.
+        assert!(put_away > 0, "{put_away}");
     }
 
     #[test]
@@ -2900,6 +3174,7 @@ mod tests {
                     pull_requests: Vec::new(),
                     attachments: Vec::new(),
                     spawned_by: None,
+                    project: None,
                     worktree: None,
                 },
                 PaneSpec {
@@ -2910,6 +3185,7 @@ mod tests {
                     pull_requests: Vec::new(),
                     attachments: Vec::new(),
                     spawned_by: None,
+                    project: None,
                     worktree: None,
                 },
             ],

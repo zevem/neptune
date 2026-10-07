@@ -70,7 +70,8 @@ imported red is too light to carry it. Amber (`attention`) is reserved for what
 waits for the person: unread terminal alerts (the pane ring, the bell's dot and
 unread counts) and agents waiting for input (their row's mark and state, their
 count on the Agents tab, the dot on the panel toggle, and the count of
-unresolved review comments beside a linked pull request). In the three
+unresolved review comments beside a linked pull request) and what a project
+needs the person for (its "Needs you" rows and counts). In the three
 original themes it turns yellow when the accent itself is orange, so an alert
 never reads as focus; an imported or custom palette supplies its ANSI yellow,
 held to 3:1 against the main surfaces.
@@ -154,7 +155,8 @@ icon buttons keep a 28-point target around a 16-point glyph.
   searching. Trailing: find and split controls for the focused terminal, the
   notification bell and the right panel toggle, which stays pressed while its
   panel is open and carries a dot in the attention colour while an agent waits
-  for input where the panel does not show it. When
+  for input, or the project of the workspace in view needs the person, where
+  the panel does not show it. When
   the sidebar is hidden the toolbar also carries the window controls, the
   sidebar toggle and "New workspace". In narrow windows the command field
   collapses to an icon and search takes the title's room.
@@ -165,12 +167,13 @@ icon buttons keep a 28-point target around a 16-point glyph.
   is resized once to the size it will rest at, and a toggle reversed midway
   turns around from where it is. Its leading edge resizes it (220–560 points;
   double-click restores 300) and it always leaves the terminals 240 points. A
-  34-point strip at its top holds three tabs, "Files", "Agents" and "Changes",
-  of equal width unless the panel is too narrow for a name, where each takes
-  what its name needs. They are drawn like terminal tabs: the one in view takes a faint fill. They
+  34-point strip at its top holds four tabs, "Files", "Agents", "Changes" and
+  "Project", of equal width unless the panel is too narrow for a name, where
+  they are set closer and each takes what its name needs. They are drawn like terminal tabs: the one in view takes a faint fill. They
   are chosen with the pointer or the command palette, never with Tab or the
   arrow keys. The Agents tab counts the agents waiting for input in a pill in
-  the attention colour. The panel opens on the tab last shown.
+  the attention colour, and the Project tab counts what its project needs the
+  person for in the same way. The panel opens on the tab last shown.
 - **File explorer.** The Files tab shows the focused terminal's folder; it
   follows that terminal as it changes directory, and says why when the
   workspace is connected over SSH. The
@@ -222,6 +225,128 @@ icon buttons keep a 28-point target around a 16-point glyph.
   is not a repository, an SSH workspace, a missing Git and a branch with
   nothing to compare with each say so in muted text. Git runs off the UI
   thread; a frame is drawn only when what it reported changed.
+- **Project.** The Project tab holds the project of the workspace in view,
+  and is a conversation with its lead. A workspace without one shows the
+  creation form: "New project", a muted line naming the directory, and one
+  multi-line field with the send control inside it, which Enter also
+  presses. The line under the field names the lead ("Claude Code ›") and
+  unfolds its options: the CLI (a two-part segmented control when both are
+  installed), its model and its effort, each a select whose first choice is
+  "Default". A muted paragraph says what a lead is; a project that worked in
+  the directory before is offered in a card instead. The form scrolls where
+  the panel is short. A workspace over SSH, no workspace and an unsupported
+  system each say so in muted text. A project shows, from the top: a title
+  row with its name, its directory in muted text, a "Project details" control
+  and a "⋯" menu; what needs the person; a strip of its agents; the chat;
+  the composer; and a line naming the lead. Nothing else is drawn until it is
+  true or asked for. What needs the person is a row in the attention tint
+  with an amber mark, a title, at most one accent action at its trailing
+  edge ("Open", "Try again", "Resume") and its explanation in the secondary
+  colour: amber is the mark, never a paragraph. A project the person paused
+  shows a plain row "Paused" with "Resume" there instead; pausing itself is
+  in the "⋯" menu. The strip of the agents is one 26-point row, absent
+  without agents, that never grows: the chat's height does not depend on
+  how many agents there are or on whether they are being looked at. It
+  holds a pill for each agent in the terminal tabs' language (22 points
+  tall, radius 7, the label in the medium weight at 11.5): the agent's mark,
+  its number and its title, in the secondary colour and unfilled at rest,
+  with the tab's hover fill; an agent whose terminal is a tab has the fill
+  and the foreground colour of the tab in view; one that waits for a person
+  has the attention tint of the rows above. Agents that wait come first,
+  then those at work, then the rest, each by number. Pills are as wide as
+  their words up to 130 points with 4 points between them; where they do
+  not fit they narrow alike, down to the mark and the number, and past that
+  the strip scrolls sideways by wheel, trackpad or drag with no bar, its
+  clipped edge fading into the surface. A pill is pressed as a tab is and
+  opens the agent's terminal; resting on it shows its number and title, its
+  CLI and branch, and its state with its age. At the strip's trailing edge,
+  never scrolling, a control with the agents icon, their count and a
+  chevron opens the list of all of them in a popover anchored under the
+  strip and as wide, over the chat: a line that says how they stand
+  ("2 working · 1 ready for review"), then a row for each in the pills'
+  order, at most three fifths of the tab's height and scrolling past that.
+  The control's tooltip and accessible name say the same words. The
+  popover closes on Escape, a press outside, a second press on its control
+  and a press on a row. An agent's row there is two lines: a mark, its
+  number and title and its state in words, then its CLI, branch, pull
+  request chips and age. The mark and the state follow the Agents tab's
+  vocabulary. A secondary click on an agent's pill, and on its row on the
+  Agents tab, opens a menu with "Open terminal" and, once the terminal is a
+  tab that can go out of view again, "Send to background"; a terminal's own
+  menu and the command palette offer the same only where it applies, never
+  disabled. What needs the person takes at most two fifths of the room over
+  the composer less the strip's row, leaves the chat about four lines and
+  scrolls by itself with the bar in view; the strip never scrolls away. The
+  chat has no speaker labels: the person's messages
+  are filled bubbles at the trailing edge, the lead's replies plain text
+  with its Markdown drawn natively and a copy control at the end of each;
+  what Neptune did is a muted one-line row, and what it heard is an
+  outlined card with its actions beneath ("Open terminal", "Changes", or
+  "Allow", "Decline" and "Watches" on a proposed watch). A turn the lead
+  finished shows its reply alone, the last block it wrote: what it said
+  and what Neptune did before that is its work, folded behind one row
+  "Worked for 4m 52s" with a chevron after the words, in the muted ink and
+  size of the rows of what Neptune did, over a `separator` hairline. The
+  whole row is pressed and unfolds the work in place and in order, with
+  the chevron turned down; pointer and focus draw it in the text's ink.
+  The row is absent where nothing would be folded. A turn that runs, was
+  stopped or failed is shown in full, and a refused request, a card and
+  a notice are never folded. Markdown keeps a
+  side panel's scale: the first two heading levels are a little larger
+  than the text (16 and 14.5 points, medium) and the others are told apart
+  by weight and ink; lists nest by 18 points to four levels, tasks carry a
+  box, a quote has a two-point bar in `border`, a table has a medium
+  header over a `border` line and `separator` hairlines between rows, and
+  code sits on `control` with long lines wrapped. A table's cells wrap
+  before the table scrolls sideways inside its own width; nothing makes
+  the panel scroll sideways. Emphasis is the regular face slanted, since
+  no italic is bundled. A link is the text's ink underlined, never the
+  accent; it shows where it leads under the pointer and opens only when
+  pressed, and only a web address or a file of this computer does. A
+  picture is never loaded: it is the link its words are. A card is an
+  event, not a message: its headline, at most two lines of the report's
+  words without their marks, ended after a whole word, and its actions. A
+  report that two lines do not hold has the chevron of the rows above it
+  before its headline, which unfolds all of it in place, drawn as a reply
+  is, and folds it again. What the person is asked to allow is always
+  shown whole. The composer is fixed at the bottom with one control that sends,
+  or stops the lead while it works and the field is empty, and a paperclip
+  beside it that attaches files. Attached files are outlined chips of an
+  icon and a name cut to fit: over the field, each with a control that
+  takes it off, at most three rows before they scroll, and under the
+  person's message in the chat. Files held over the chat tint it in the
+  accent with "Drop to attach for the lead", as a terminal does. The line under
+  it names the lead's CLI, model and effort and opens the settings; at its
+  trailing edge it says how long the lead has worked and how many messages
+  wait. No field takes the keyboard unasked, and Escape returns it to the
+  terminal with the draft kept. "Project details" replaces the chat with a
+  row of a back chevron and a segmented control "Context", "Watches",
+  "Settings", and stays pressed meanwhile; where something needs the person
+  one amber line counts it and leads back to the chat. Context is an editor
+  for the person's instructions, whose "Save" and "Revert" appear only while
+  it differs from what is kept, over the kept files, longest untouched
+  first. Watches lists one row per watch with a "⋯" menu (Pause or Resume,
+  Run now, Delete…), a proposed one with "Allow" and "Decline" in its row,
+  and "Add watch" at the trailing edge of its label; the form opens over the
+  list and chooses how often in words, with "Custom…" for a number of
+  minutes. A row says how soon it runs and how long ago it ran, and the
+  list in view is drawn again every 30 seconds while a watch has such a
+  time. Settings is grouped cards of setting rows as in Preferences: the
+  lead (its CLI, said and not chosen, its model and effort), the agents the
+  lead starts for each CLI (model, effort and, for Claude Code, ultracode),
+  and the project (its name and directory). Every select names its value
+  ("Default" for the lead, "Lead decides" for agents); "Custom…" puts a
+  field in the select's place for a model no list names, outlined in the
+  problem colour while a CLI would not take it. A change applies at once. An
+  action that cannot be taken is a plain control, not a fainter accent.
+  Deleting a file or a watch asks once more inside its row; removing the
+  project waits for a sheet that says what is deleted and what stays. Where
+  the panel has no room, the same body opens in a centred sheet whose title
+  row is the project's header; in a sheet too low for whole rows, what needs
+  the person is one line a row. Reading and writing of project files and
+  all talk with the lead happen off the UI thread; while a turn runs and the
+  tab is in view it is drawn again once a second for the elapsed time, and
+  otherwise only when something changed.
 - **Window controls.** Close, minimize and maximize are three lights at the
   leading edge. Glyphs appear as the pointer approaches, and the lights turn
   neutral in an inactive window. Their accessible names are "Close window",

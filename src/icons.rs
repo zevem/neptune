@@ -56,6 +56,9 @@ pub enum Icon {
     FolderPlus,
     Trash,
     Paperclip,
+    Pause,
+    Play,
+    Stop,
 }
 
 /// Paint an icon into its visual bounds. The caller controls the hit area.
@@ -217,6 +220,14 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[[6.0, 13.0], [12.0, 19.0], [18.0, 13.0]]);
         }
         Icon::Minus => line(&[[5.0, 12.0], [19.0, 12.0]]),
+        Icon::Pause => {
+            line(&[[9.0, 6.0], [9.0, 18.0]]);
+            line(&[[15.0, 6.0], [15.0, 18.0]]);
+        }
+        Icon::Play => {
+            line(&[[8.0, 5.5], [18.5, 12.0], [8.0, 18.5], [8.0, 5.5]]);
+        }
+        Icon::Stop => rectangle(7.0, 7.0, 10.0, 10.0, 2.0),
         Icon::Maximize => {
             line(&[[4.0, 9.0], [4.0, 4.0], [9.0, 4.0]]);
             line(&[[15.0, 4.0], [20.0, 4.0], [20.0, 9.0]]);
