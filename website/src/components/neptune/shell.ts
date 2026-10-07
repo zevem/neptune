@@ -3,7 +3,7 @@
 
 import { ACCENTS, type Accent, type Prefs } from "../prefs";
 import { BUILTINS } from "./themes";
-import { out, row, type Action, type Line, type Pane } from "./model";
+import { AGENT_NAMES, out, row, type Action, type Line, type Pane } from "./model";
 
 export interface ShellEnv {
   dispatch: (action: Action) => void;
@@ -12,7 +12,7 @@ export interface ShellEnv {
 
 const dir = (name: string) => ({ t: name, c: 4, b: true });
 
-const LISTINGS: Record<string, string[]> = {
+export const LISTINGS: Record<string, string[]> = {
   "~": ["code/", "notes/"],
   "~/code": ["api/", "neptune/"],
   "~/code/neptune": [
@@ -70,6 +70,7 @@ const HELP: Line[] = [
   row({ t: "  ls  cd  pwd  echo  clear  exit", c: 6 }),
   row({ t: "  cargo test   git log   git status", c: 6 }),
   row({ t: "  neptune --help  neptune --version", c: 6 }),
+  row({ t: "  claude   codex", c: 6 }),
   row({ t: "  theme dusk   accent pink", c: 6 }),
   row({ t: "  printf '\\e]9;Build finished\\a'", c: 6 }),
 ];
@@ -180,6 +181,27 @@ export function execute(env: ShellEnv, pane: Pane) {
       // The pane stays, stating plainly that its process ended.
       dispatch({ type: "patch", pane: id, patch: { status: "exited", prompt: false } });
       return;
+    case "claude":
+    case "codex": {
+      // The tab takes the agent's mark and the Agents tab lists it.
+      const kind = name as "claude" | "codex";
+      dispatch({
+        type: "patch",
+        pane: id,
+        patch: {
+          agent: { kind, activity: "idle", title: AGENT_NAMES[kind], minutes: 0, workspace: 0 },
+        },
+      });
+      print(
+        out(""),
+        row({ t: kind === "claude" ? "✻ " : ">_ ", c: kind === "claude" ? 3 : "muted" }, { t: AGENT_NAMES[kind], b: true }),
+        out(""),
+        out(`In Neptune, ${AGENT_NAMES[kind]} runs here: its tab carries its mark, its pull`),
+        out("requests and files, and the Agents tab says when it waits for you."),
+        row({ t: "This window is a demonstration, so no agent starts.", c: "muted" }),
+      );
+      break;
+    }
     case "neptune":
       if (args[0] === "--version" || args[0] === "-V") print(out("Neptune 0.1.0"));
       else print(...NEPTUNE_HELP.map((line) => out(line)));

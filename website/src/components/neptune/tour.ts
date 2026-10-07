@@ -11,7 +11,9 @@ import {
   place,
   row,
   type Action,
+  type Agent,
   type Box,
+  type ChangedFile,
   type Destination,
   type Line,
   type State,
@@ -31,6 +33,7 @@ export const BASE: State = {
       group: 1,
       layout: place(1),
       active: 1,
+      branch: { name: "main", dirty: false },
     },
     {
       id: 2,
@@ -46,6 +49,7 @@ export const BASE: State = {
         second: place(3),
       },
       active: 3,
+      branch: { name: "main", dirty: false },
     },
     {
       id: 3,
@@ -90,6 +94,8 @@ export const BASE: State = {
       busy: true,
       ok: true,
       status: "running",
+      // The dev server's listener, which its tab offers to open.
+      ports: [3000],
     },
     3: {
       id: 3,
@@ -125,6 +131,10 @@ export const BASE: State = {
   search: { open: false, query: "", typed: false },
   drag: null,
   hud: null,
+  level: null,
+  panel: { open: false, tab: "agents" },
+  changes: { scope: "working", file: null },
+  projects: {},
   nextId: 100,
   nextWorkspace: 4,
 };
@@ -151,6 +161,105 @@ const LOG: Line[] = [
 const LOG_LATER: Line[] = [
   log("12:04:29", "WARN", "retry 2/3 billing"),
   log("12:04:31", "INFO", "POST /invoices 201 44ms"),
+];
+
+
+// What the agents print, in the manner of their own interfaces.
+const said = (text: string): Line => row({ t: "● ", c: "fg" }, text);
+const tool = (name: string, args: string): Line => row({ t: "● ", c: 2 }, { t: name, b: true }, `(${args})`);
+const done = (text: string): Line => row({ t: "  ⎿ ", c: "muted" }, { t: text, c: "muted" });
+
+const CLAUDE_BANNER: Line[] = [
+  out(""),
+  row({ t: "✻ ", c: 3 }, { t: "Claude Code", b: true }),
+  row({ t: "  ~/code/neptune", c: "muted" }),
+  out(""),
+];
+const ASK = "Add a --json flag to neptune-inspect. Ask Codex for the tests.";
+
+const CODEX_TASK: Line[] = [
+  row({ t: ">_ ", c: "muted" }, { t: "OpenAI Codex", b: true }),
+  row({ t: "   ~/code/neptune", c: "muted" }),
+  out(""),
+  row({ t: "› ", c: "muted" }, "Write tests for neptune-inspect --json"),
+  out(""),
+  row({ t: "• ", c: 6 }, "Added tests/inspect_json.rs with 3 cases"),
+];
+const CODEX_ASKS: Line[] = [
+  out(""),
+  row({ t: "Allow command?", b: true }),
+  row({ t: "  $ cargo test -p neptune-terminal --test inspect_json", c: 6 }),
+  row({ t: "  › 1. Yes, run it   2. No", c: "muted" }),
+];
+const CODEX_TESTS: Line[] = [
+  out(""),
+  out("running 3 tests"),
+  out("..."),
+  row("test result: ", { t: "ok", c: 2 }, ". 3 passed; 0 failed"),
+  out(""),
+  row({ t: "• ", c: 6 }, "All three pass. Handing back to Claude Code."),
+];
+
+const GOAL = "Refresh the website's hero demo with the new panel and check its copy.";
+
+/** What the branch of the Agents chapter changes, as git reports it. */
+const CHANGED: ChangedFile[] = [
+  {
+    path: "src/bin/neptune-inspect.rs",
+    status: "M",
+    added: 31,
+    removed: 4,
+    diff: [
+      { k: "@", text: "@@ -41,9 +41,14 @@ struct Options {" },
+      { k: " ", n: 41, text: "    endpoint: String," },
+      { k: " ", n: 42, text: "    /// Wait this long for the window." },
+      { k: " ", n: 43, text: "    timeout: Duration," },
+      { k: "+", n: 44, text: "    /// Print the tree as JSON instead of text." },
+      { k: "+", n: 45, text: "    json: bool," },
+      { k: " ", n: 46, text: "}" },
+      { k: "@", text: "@@ -88,7 +93,12 @@ fn main() -> ExitCode {" },
+      { k: "-", n: 88, text: '    print!("{}", tree.render());' },
+      { k: "+", n: 93, text: "    if options.json {" },
+      { k: "+", n: 94, text: '        println!("{}", tree.to_json());' },
+      { k: "+", n: 95, text: "    } else {" },
+      { k: "+", n: 96, text: '        print!("{}", tree.render());' },
+      { k: "+", n: 97, text: "    }" },
+      { k: " ", n: 98, text: "    ExitCode::SUCCESS" },
+    ],
+  },
+  {
+    path: "tests/inspect_json.rs",
+    status: "A",
+    added: 17,
+    removed: 0,
+    diff: [
+      { k: "@", text: "@@ -0,0 +1,17 @@" },
+      { k: "+", n: 1, text: "use neptune_terminal::inspection::Tree;" },
+      { k: "+", n: 2, text: "" },
+      { k: "+", n: 3, text: "#[test]" },
+      { k: "+", n: 4, text: "fn json_names_every_pane() {" },
+      { k: "+", n: 5, text: "    let tree = Tree::sample();" },
+      { k: "+", n: 6, text: "    let json = tree.to_json();" },
+      { k: "+", n: 7, text: "    assert!(json.contains(\"\\\"panes\\\"\"));" },
+      { k: "+", n: 8, text: "}" },
+    ],
+  },
+  {
+    path: "CHANGELOG.md",
+    status: "M",
+    added: 2,
+    removed: 0,
+    committed: true,
+    diff: [
+      { k: "@", text: "@@ -10,6 +10,8 @@" },
+      { k: " ", n: 10, text: "## [Unreleased]" },
+      { k: " ", n: 11, text: "" },
+      { k: " ", n: 12, text: "### What's New" },
+      { k: " ", n: 13, text: "" },
+      { k: "+", n: 14, text: "- Print the inspection tree as JSON with" },
+      { k: "+", n: 15, text: "  `neptune-inspect --json`." },
+    ],
+  },
 ];
 
 interface Script {
@@ -268,10 +377,216 @@ export const CHAPTERS: Chapter[] = [
     },
   },
   {
+    id: "agents",
+    label: "Agents",
+    caption:
+      "Claude Code and Codex in terminals of their own. One can start the other, and the panel says who works and who waits for you.",
+    async run(s) {
+      s.d({ type: "selectWorkspace", workspace: 1 });
+      await key(s, "T", "New tab");
+      s.d({ type: "newTab", pane: 1 });
+      const lead = active(s);
+      await s.wait(500);
+      await type(s, lead, "claude");
+      await s.wait(260);
+      s.d({ type: "commit", pane: lead });
+      const agent: Agent = { kind: "claude", activity: "idle", title: "Claude Code", minutes: 0, workspace: 1 };
+      s.d({ type: "patch", pane: lead, patch: { agent, title: "Claude Code", busy: true } });
+      s.d({ type: "print", pane: lead, lines: CLAUDE_BANNER });
+      await s.wait(700);
+      // The request is typed into the agent, not the shell.
+      s.d({ type: "print", pane: lead, lines: [row({ t: "> ", c: "muted" })] });
+      for (let index = 1; index <= ASK.length; index += 2) {
+        s.d({ type: "amend", pane: lead, line: row({ t: "> ", c: "muted" }, ASK.slice(0, index)) });
+        await s.wait(40);
+      }
+      s.d({ type: "amend", pane: lead, line: row({ t: "> ", c: "muted" }, ASK) });
+      await s.wait(500);
+      s.d({ type: "agent", pane: lead, patch: { activity: "working", title: "Inspect JSON output" } });
+      s.d({ type: "patch", pane: lead, patch: { title: "Inspect JSON output" } });
+      await s.wait(600);
+      s.d({ type: "print", pane: lead, lines: [out(""), said("I'll add the flag and have Codex write its tests.")] });
+      await s.wait(700);
+      s.d({ type: "print", pane: lead, lines: [tool("Bash", "git switch -c inspect-json")] });
+      s.d({
+        type: "workspacePatch",
+        workspace: 1,
+        patch: { branch: { name: "inspect-json", dirty: true }, changes: CHANGED },
+      });
+      await s.wait(700);
+      // The agent it starts runs out of view, in a terminal with no tab.
+      const tests = s.get().nextId;
+      s.d({
+        type: "spawn",
+        cwd: "~/code/neptune",
+        agent: { kind: "codex", activity: "working", title: "Inspect JSON tests", minutes: 0, parent: lead, workspace: 1 },
+        lines: CODEX_TASK,
+      });
+      s.d({
+        type: "print",
+        pane: lead,
+        lines: [tool("start_agent", "codex, “Write tests for --json”"), done(`Started Codex as agent ${tests}`)],
+      });
+      await s.wait(900);
+      s.d({ type: "print", pane: lead, lines: [tool("Update", "src/bin/neptune-inspect.rs"), done("Added 31 lines, removed 4")] });
+      await s.wait(700);
+      await key(s, "O", "Toggle right panel");
+      s.d({ type: "panel", open: true, tab: "agents" });
+      await s.wait(1100);
+      s.d({ type: "agent", pane: tests, patch: { activity: "permission" } });
+      s.d({ type: "print", pane: tests, lines: CODEX_ASKS });
+      await s.wait(1800);
+      // Its row opens its terminal as a tab.
+      s.d({ type: "openAgent", pane: tests });
+      await s.wait(1300);
+      s.d({ type: "amend", pane: tests, line: row({ t: "  ✔ Yes, run it", c: 2 }) });
+      s.d({ type: "agent", pane: tests, patch: { activity: "working" } });
+      await s.wait(500);
+      s.d({ type: "print", pane: tests, lines: CODEX_TESTS });
+      await s.wait(1100);
+      // Back out of view; the agent runs on, listed in the panel.
+      s.d({ type: "background", pane: tests });
+      s.d({ type: "focus", pane: lead });
+      await s.wait(900);
+      s.d({ type: "agent", pane: tests, patch: { activity: "idle", minutes: 1 } });
+      s.d({ type: "print", pane: lead, lines: [tool("attach_file", "target/inspect.json"), out("")] });
+      s.d({ type: "patch", pane: lead, patch: { attached: 1 } });
+      await s.wait(700);
+      s.d({ type: "print", pane: lead, lines: [said("Done: --json prints the tree, Codex's 3 tests pass and PR #118 is open.")] });
+      s.d({ type: "agent", pane: lead, patch: { activity: "idle", minutes: 2 } });
+      s.d({
+        type: "patch",
+        pane: lead,
+        patch: { pulls: [{ number: 118, state: "open", checks: "pending", comments: 0 }] },
+      });
+      await s.wait(1600);
+      s.d({
+        type: "patch",
+        pane: lead,
+        patch: { pulls: [{ number: 118, state: "open", checks: "passing", comments: 0 }] },
+      });
+      await s.wait(1600);
+    },
+  },
+  {
+    id: "project",
+    label: "Projects",
+    caption: "Put a lead in charge. It plans, starts agents of its own and reports back in a chat; what only you can clear is pinned.",
+    async run(s) {
+      s.d({ type: "panel", open: true, tab: "project" });
+      s.d({ type: "project", workspace: 1, patch: {} });
+      await s.wait(900);
+      for (let index = 1; index <= GOAL.length; index += 2) {
+        s.d({ type: "project", workspace: 1, patch: { draft: GOAL.slice(0, index) } });
+        await s.wait(32);
+      }
+      s.d({ type: "project", workspace: 1, patch: { draft: GOAL } });
+      await s.wait(500);
+      s.d({ type: "chat", workspace: 1, entry: { k: "user", text: GOAL } });
+      s.d({ type: "project", workspace: 1, patch: { draft: "", working: 1 } });
+      await s.wait(1100);
+      s.d({ type: "chat", workspace: 1, entry: { k: "lead", text: "I'll give the demo and its copy an agent each." } });
+      await s.wait(600);
+      const demo = s.get().nextId;
+      s.d({
+        type: "spawn",
+        cwd: "~/code/neptune-hero-demo",
+        agent: { kind: "claude", activity: "working", title: "Hero demo", minutes: 0, workspace: 1 },
+      });
+      s.d({ type: "project", workspace: 1, patch: { members: [demo], working: 4 } });
+      s.d({
+        type: "chat",
+        workspace: 1,
+        entry: { k: "tool", text: `Started agent ${demo} · Claude Code · hero demo · in its own worktree, on hero-demo` },
+      });
+      await s.wait(700);
+      const copy = s.get().nextId;
+      s.d({
+        type: "spawn",
+        cwd: "~/code/neptune",
+        agent: { kind: "codex", activity: "working", title: "Copy review", minutes: 0, workspace: 1 },
+      });
+      s.d({ type: "project", workspace: 1, patch: { members: [demo, copy], working: 7 } });
+      s.d({ type: "chat", workspace: 1, entry: { k: "tool", text: `Started agent ${copy} · Codex · copy review` } });
+      await s.wait(700);
+      s.d({ type: "chat", workspace: 1, entry: { k: "lead", text: "Both are at work. I'll report back when they finish." } });
+      s.d({ type: "project", workspace: 1, patch: { working: null } });
+      await s.wait(1300);
+      // What only the person can clear waits above the chat.
+      s.d({ type: "agent", pane: copy, patch: { activity: "permission" } });
+      s.d({
+        type: "project",
+        workspace: 1,
+        patch: { needs: [{ agent: copy, title: `Agent ${copy} needs a permission answer`, detail: "Run bun run lint in website/" }] },
+      });
+      await s.wait(2200);
+      s.d({ type: "project", workspace: 1, patch: { needs: [] } });
+      s.d({ type: "agent", pane: copy, patch: { activity: "working" } });
+      await s.wait(1000);
+      s.d({ type: "agent", pane: copy, patch: { activity: "idle", minutes: 1 } });
+      s.d({
+        type: "chat",
+        workspace: 1,
+        entry: {
+          k: "card",
+          agent: copy,
+          what: "finished its turn",
+          text: "The copy reads well. Two captions named features by their old names; both are fixed and lint passes.",
+        },
+      });
+      await s.wait(1300);
+      s.d({ type: "agent", pane: demo, patch: { activity: "idle", minutes: 3 } });
+      s.d({ type: "patch", pane: demo, patch: { pulls: [{ number: 119, state: "open", checks: "passing", comments: 0 }] } });
+      s.d({
+        type: "chat",
+        workspace: 1,
+        entry: {
+          k: "card",
+          agent: demo,
+          what: "finished its turn",
+          text: "The hero window shows the right panel, agent tabs and pull request chips. Tests, lint and the build pass.",
+        },
+      });
+      await s.wait(900);
+      s.d({
+        type: "chat",
+        workspace: 1,
+        entry: { k: "lead", text: "Both are done. Pull request #119 has the new demo and the copy fixes, with its checks passing." },
+      });
+      await s.wait(2400);
+    },
+  },
+  {
+    id: "changes",
+    label: "Changes",
+    caption: "Review a branch without leaving the terminal: what changed, file by file, with each diff.",
+    async run(s) {
+      s.d({ type: "panel", open: true, tab: "changes" });
+      s.d({ type: "changes", scope: "working", file: null });
+      await s.wait(1100);
+      s.d({ type: "changes", file: CHANGED[0].path });
+      await s.wait(2200);
+      s.d({ type: "changes", file: CHANGED[1].path });
+      await s.wait(1600);
+      // Everything the branch holds since it left main, committed or not.
+      s.d({ type: "changes", scope: "branch" });
+      await s.wait(1200);
+      s.d({ type: "changes", file: CHANGED[2].path });
+      await s.wait(2000);
+    },
+  },
+  {
     id: "tabs",
     label: "Tabs",
     caption: "Terminals share a place as tabs. A finished job rings its tab, the sidebar and the bell.",
     async run(s) {
+      // The terminals take the window back from the panel.
+      if (s.get().panel.open) {
+        await key(s, "O", "Toggle right panel");
+        s.d({ type: "panel", open: false });
+        await s.wait(700);
+      }
+      s.d({ type: "focus", pane: 1 });
       await key(s, "T", "New tab");
       s.d({ type: "newTab", pane: 1 });
       const build = active(s);
