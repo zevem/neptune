@@ -12,7 +12,9 @@ import {
   adjacent,
   nextTab,
   ordered,
+  panesOf,
   type Action,
+  type Layout,
   type Close,
   type Direction,
   type State,
@@ -76,6 +78,21 @@ export function commands(
       typed: true,
     });
     add("Terminal", "eraser", "Clear scrollback", "", { type: "clear", pane });
+    // An agent's tab can be put away; the agent runs on, listed in the panel.
+    if (state.panes[pane]?.agent && panesOf(workspace.layout).length > 1) {
+      add("Terminal", "minus", "Send to background", "", { type: "background", pane });
+    }
+    if (workspace.layout.kind === "split") {
+      push("Terminal", "grid", "Even terminal sizes", "", () => {
+        const even = (layout: Layout) => {
+          if (layout.kind === "tabs") return;
+          dispatch({ type: "ratio", split: layout.id, ratio: 0.5 });
+          even(layout.first);
+          even(layout.second);
+        };
+        even(workspace.layout);
+      });
+    }
     add("Terminal", "refresh", "Restart terminal", "", { type: "restart", pane });
     push("Terminal", "close", "Close terminal", shortcut(mac, "W"), () =>
       close({ kind: "pane", pane }),
@@ -213,6 +230,15 @@ export function commands(
     }
   }
   add("View", "sidebar", "Toggle sidebar", shortcut(mac, "B"), { type: "toggleSidebar" });
+  add("View", "panelRight", "Toggle right panel", shortcut(mac, "O"), { type: "panel" });
+  for (const [tab, title, icon] of [
+    ["files", "Show files", "file"],
+    ["agents", "Show agents", "agents"],
+    ["changes", "Show changes", "branch"],
+    ["project", "Show project", "agents"],
+  ] as const) {
+    add("View", icon, title, "", { type: "panel", open: true, tab });
+  }
   add("View", "bell", "Notifications", "", {
     type: "overlay",
     overlay: { kind: "notifications" },
@@ -228,7 +254,21 @@ export function commands(
     ["Zoom app out", "-", zoom(-0.1)],
     ["Reset app zoom", "0", 1],
   ] as const) {
-    push("View", "textSize", title, editShortcut(mac, key), () => setPrefs({ windowZoom: value }));
+    push("View", "textSize", title, editShortcut(mac, key), () => {
+      setPrefs({ windowZoom: value });
+      dispatch({ type: "level", text: `Window zoom ${Math.round(value * 100)}%` });
+    });
+  }
+  // A stepped value is shown for a moment under the toolbar.
+  for (const [title, value] of [
+    ["Increase font size", Math.min(32, prefs.fontSize + 1)],
+    ["Decrease font size", Math.max(9, prefs.fontSize - 1)],
+    ["Reset font size", 14],
+  ] as const) {
+    push("View", "textSize", title, "", () => {
+      setPrefs({ fontSize: value });
+      dispatch({ type: "level", text: `Font size ${value} pt` });
+    });
   }
   add("Appearance", "settings", "Browse themes", "", {
     type: "overlay",

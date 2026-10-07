@@ -8,6 +8,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Icon } from "../icons";
 import { usePrefs, useMac, type Prefs } from "../prefs";
+import { PaneChips } from "./chips";
 import { Button, IconButton, Keycaps, Pill, shortcut } from "./controls";
 import {
   activeWorkspace,
@@ -18,7 +19,9 @@ import {
   ordered,
   panesOf,
   tabsOf,
+  spawnedBy,
   unreadIn,
+  waits,
   type Action,
   type Box,
   type Close,
@@ -34,6 +37,7 @@ import {
   type Workspace,
 } from "./model";
 import { Palette, commands, matches, type Command } from "./palette";
+import { Panel, TabMark } from "./panel";
 import { execute } from "./shell";
 import {
   ConfirmSheet,
@@ -231,7 +235,17 @@ function WorkspaceRow({
               <span className="truncate">{workspace.remote}</span>
             </>
           ) : (
-            <span className="truncate">{workspace.cwd}</span>
+            <>
+              <span className="truncate">{workspace.cwd}</span>
+              {workspace.branch && (
+                // The branch trails the folder; uncommitted work marks it.
+                <span className="ml-1 flex min-w-0 items-center gap-[3px]">
+                  <Icon name="branch" size={11} />
+                  <span className="truncate">{workspace.branch.name}</span>
+                  {workspace.branch.dirty && <span className="ml-0.5 size-[5px] shrink-0 rounded-full bg-warn" />}
+                </span>
+              )}
+            </>
           )}
         </span>
       </button>
@@ -581,6 +595,10 @@ function Toolbar({
   const location = pane?.remote ?? pane?.cwd;
   const unread = state.alerts.some((alert) => alert.unread);
   const listing = state.overlay.kind === "notifications";
+  const several = !!workspace && panesOf(workspace.layout).length > 1;
+  // An agent out of view that waits for a person dots the panel's control.
+  const agentsShown = state.panel.open && state.panel.tab === "agents";
+  const waiting = !agentsShown && Object.values(state.panes).some((other) => waits(other.agent));
   const palette: Action = {
     type: "overlay",
     overlay: { kind: "palette", query: "", selected: 0, typed: true },
@@ -602,6 +620,12 @@ function Toolbar({
               {pane && (
                 <span className="min-w-[48px] flex-1 truncate text-[12px] text-secondary">
                   {pane.title} — {location}
+                </span>
+              )}
+              {/* A terminal alone in its workspace has no tab to carry them. */}
+              {pane && !several && (
+                <span className="self-center">
+                  <PaneChips pane={pane} state={state} dispatch={dispatch} />
                 </span>
               )}
             </>
@@ -703,6 +727,21 @@ function Toolbar({
               }`}
             />
           </span>
+          <span className="relative shrink-0">
+            <IconButton
+              icon="panelRight"
+              label="Toggle right panel"
+              hint={shortcut(mac, "O")}
+              pressed={state.panel.open}
+              className={state.panel.open ? "[&>span]:bg-pressed" : ""}
+              onClick={() => dispatch({ type: "panel" })}
+            />
+            <span
+              className={`pointer-events-none absolute top-[5.5px] right-[5.5px] size-[7px] rounded-full bg-attention ring-[1.5px] ring-chrome transition-transform duration-[160ms] ease-out ${
+                waiting ? "scale-100" : "scale-0"
+              }`}
+            />
+          </span>
           {/* "New workspace" moves here while the sidebar is away. */}
           <IconButton
             icon="plus"
@@ -748,7 +787,9 @@ function Tab({
   dispatch,
   close,
   onCarry,
+  state,
 }: {
+  state: State;
   pane: Pane;
   /** In view in its place. */
   shown: boolean;
@@ -764,6 +805,9 @@ function Tab({
 }) {
   const press = useRef<{ x: number; y: number; carrying: boolean } | null>(null);
   const location = pane.remote ?? pane.cwd.split("/").pop();
+  // Chips take the room the folder's name would.
+  const chips =
+    !!pane.ports?.length || !!pane.attached || !!pane.pulls?.length || spawnedBy(state, pane.id).length > 0;
   return (
     <div
       role="tab"
@@ -799,16 +843,23 @@ function Tab({
         if (press.current?.carrying) dispatch({ type: "drag", drag: null });
         press.current = null;
       }}
-      className={`group/tab @container/tab relative mr-0.5 flex h-full max-w-[218px] min-w-0 flex-1 cursor-grab items-center rounded-[7px] pt-px pr-[7px] pl-[9px] hover:pr-6 data-[shown=true]:group-hover/pane:pr-6 data-[shown=true]:group-data-[selected=true]/pane:pr-6 ${
+      className={`group/tab @container/tab relative mr-0.5 flex h-full ${chips ? "max-w-[340px] min-w-[96px]" : "max-w-[218px] min-w-0"} flex-1 cursor-grab items-center rounded-[7px] pt-px pr-[7px] pl-[9px] hover:pr-6 data-[shown=true]:group-hover/pane:pr-6 data-[shown=true]:group-data-[selected=true]/pane:pr-6 ${
         alone ? "" : shown ? "bg-fg/8" : "hover:bg-fg/[0.045]"
       }`}
     >
       {!shown && unread && <span className="mr-[5px] size-1.5 shrink-0 rounded-full bg-attention" />}
+      {/* The agent's own mark leads the tab while the terminal runs one. */}
+      {pane.agent && <TabMark kind={pane.agent.kind} />}
       <span className={`truncate text-[12px] font-medium ${focused ? "text-fg" : "text-secondary"}`}>
         {pane.title}
       </span>
-      <span className="ml-[9px] hidden min-w-0 truncate text-[11.5px] text-muted @min-[104px]/tab:block">
-        {location}
+      {!chips && (
+        <span className="ml-[9px] hidden min-w-0 truncate text-[11.5px] text-muted @min-[104px]/tab:block">
+          {location}
+        </span>
+      )}
+      <span className="ml-auto flex min-w-0 items-center pl-1.5">
+        <PaneChips pane={pane} state={state} dispatch={dispatch} />
       </span>
       <button
         type="button"
@@ -900,6 +951,7 @@ function PlaceView({
                 tab && (
                   <Tab
                     key={id}
+                    state={state}
                     pane={tab}
                     shown={id === place.shown}
                     alone={place.tabs.length === 1}
@@ -1052,7 +1104,8 @@ function Stage({
   // Where a tab dropped on a header would land between the tabs there.
   const [insertion, setInsertion] = useState<{ x: number; y: number; height: number } | null>(null);
   const workspace = activeWorkspace(state);
-  const className = `absolute top-11 right-1.5 bottom-1.5 left-1.5 transition-[left] ${SLIDE} @min-[820px]/win:group-data-[sidebar=open]/win:left-0`;
+  // The panel takes the trailing edge; a narrow window gives it the stage.
+  const className = `absolute top-11 right-1.5 bottom-1.5 left-1.5 transition-[left,right] ${SLIDE} @min-[820px]/win:group-data-[sidebar=open]/win:left-0 @min-[561px]/win:group-data-[panel=open]/win:right-[300px]`;
   if (!workspace) {
     return (
       <div className={className}>
@@ -1336,6 +1389,7 @@ export function NeptuneWindow({
       const bound: Record<string, (() => void) | undefined> = {
         P: () => perform("P", "Command palette", open),
         B: () => perform("B", "Toggle sidebar", { type: "toggleSidebar" }),
+        O: () => perform("O", "Toggle right panel", { type: "panel" }),
         N: () => perform("N", "New workspace", { type: "newWorkspace" }),
         // Without a terminal to join, a new tab is a new workspace.
         T: () =>
@@ -1439,6 +1493,7 @@ export function NeptuneWindow({
       aria-roledescription="terminal window"
       tabIndex={0}
       data-sidebar={state.sidebar ? "open" : "closed"}
+      data-panel={state.panel.open ? "open" : "closed"}
       className="group/win relative overflow-hidden rounded-window bg-chrome text-[13px] leading-normal shadow-window outline-none select-none [container:win_/_size]"
       style={{ zoom, width: `${100 / zoom}%`, height: `${100 / zoom}%` }}
       onFocus={() => setFocused(true)}
@@ -1462,6 +1517,7 @@ export function NeptuneWindow({
       <Sidebar state={state} dispatch={dispatch} mac={mac} hinting={hinting} />
       <div className={`absolute inset-y-0 right-0 left-0 transition-[left] ${SLIDE} @min-[820px]/win:group-data-[sidebar=open]/win:left-[216px]`}>
         <Toolbar state={state} dispatch={dispatch} mac={mac} />
+        <Panel state={state} dispatch={dispatch} />
         <Stage
           state={state}
           dispatch={dispatch}
@@ -1543,6 +1599,15 @@ export function NeptuneWindow({
       )}
 
       {state.hud && <Hud hud={state.hud} mac={mac} />}
+      {state.level && (
+        // A stepped value, such as the font size, shown for a moment.
+        <div
+          key={state.level.n}
+          className="hud pointer-events-none absolute top-[52px] left-1/2 z-50 flex h-7 -translate-x-1/2 animate-hud-in items-center rounded-full border border-edge bg-elevated px-3 text-[12px] font-medium whitespace-nowrap text-fg shadow-popup"
+        >
+          {state.level.text}
+        </div>
+      )}
     </div>
   );
 }

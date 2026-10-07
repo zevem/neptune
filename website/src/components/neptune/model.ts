@@ -28,6 +28,84 @@ export type Line =
   | { k: "cmd"; text: string; ok: boolean }
   | { k: "out"; spans: Span[] };
 
+/** The CLI agents whose marks a terminal's tab shows. */
+export type AgentKind = "claude" | "codex";
+
+/** What an agent is doing, as the Agents tab groups it. */
+export type Activity = "working" | "idle" | "permission" | "question";
+
+/** A coding agent running in a terminal. */
+export interface Agent {
+  kind: AgentKind;
+  activity: Activity;
+  /** What the agent calls its conversation. */
+  title: string;
+  /** How long it has been doing it, in minutes. */
+  minutes: number;
+  /** The terminal whose agent started this one. */
+  parent?: number;
+  /** The workspace it belongs to, which it keeps while it has no tab. */
+  workspace: number;
+}
+
+/** A pull request linked to a terminal, with what its checks say. */
+export interface Pull {
+  number: number;
+  state: "open" | "draft" | "merged";
+  checks: "none" | "pending" | "passing" | "failing";
+  /** Unresolved review comments. */
+  comments: number;
+}
+
+/** A file that differs from the last commit or from the main branch. */
+export interface ChangedFile {
+  path: string;
+  status: "M" | "A" | "D";
+  added: number;
+  removed: number;
+  /** Already committed on the branch, so the working tree no longer lists it. */
+  committed?: boolean;
+  /** Lines of its diff: a hunk header, context, an addition or a removal. */
+  diff: { k: "@" | " " | "+" | "-"; text: string; n?: number }[];
+}
+
+export type PanelTab = "files" | "agents" | "changes" | "project";
+
+/** One entry of a project's chat. */
+export type ChatEntry =
+  /** What the person said. */
+  | { k: "user"; text: string }
+  /** What the lead said. */
+  | { k: "lead"; text: string }
+  /** Something Neptune did for the lead, such as starting an agent. */
+  | { k: "tool"; text: string }
+  /** A report about one of its agents, outlined apart from what was said. */
+  | { k: "card"; agent: number; what: string; text: string };
+
+/** Something only the person can clear, pinned above the chat. */
+export interface Need {
+  agent: number;
+  title: string;
+  detail: string;
+}
+
+/** A lead agent in charge of the work of one workspace. */
+export interface Project {
+  name: string;
+  directory: string;
+  /** The lead's CLI and what it runs with. */
+  lead: string;
+  chat: ChatEntry[];
+  /** The terminals of the agents it started. */
+  members: number[];
+  needs: Need[];
+  /** How long the lead's turn has run, in seconds, while it runs. */
+  working: number | null;
+  /** The message being written, and whether a visitor is writing it. */
+  draft: string;
+  typed: boolean;
+}
+
 export interface Pane {
   id: number;
   title: string;
@@ -35,6 +113,13 @@ export interface Pane {
   branch?: string;
   /** SSH destination when the terminal runs on another machine. */
   remote?: string;
+  /** The coding agent the terminal runs, if any. */
+  agent?: Agent;
+  pulls?: Pull[];
+  /** Local listeners, as the port chips name them. */
+  ports?: number[];
+  /** How many files its agent attached to the tab. */
+  attached?: number;
   lines: Line[];
   input: string;
   /** A prompt is waiting for input. False while a command is producing output. */
@@ -55,6 +140,10 @@ export interface Workspace {
   group?: number;
   layout: Layout;
   active: number;
+  /** The branch of its folder, and whether work is not committed yet. */
+  branch?: { name: string; dirty: boolean };
+  /** What git reports for its folder: the files that differ. */
+  changes?: ChangedFile[];
 }
 
 /** A folder of workspaces in the sidebar. */
@@ -117,6 +206,14 @@ export interface State {
   drag: Drag | null;
   /** The last shortcut performed, shown briefly over the window. */
   hud: { keys: string; label: string; n: number } | null;
+  /** A value just stepped, such as the font size, shown under the toolbar. */
+  level: { text: string; n: number } | null;
+  /** The panel at the trailing edge and the tab in view. */
+  panel: { open: boolean; tab: PanelTab };
+  /** What the Changes tab compares with, and the file whose diff is shown. */
+  changes: { scope: "working" | "branch"; file: string | null };
+  /** Each workspace's project, by workspace. */
+  projects: Record<number, Project>;
   /** The program new local terminals start. */
   shell: string;
   nextId: number;
@@ -190,7 +287,21 @@ export type Action =
   | { type: "dismissAlert"; alert: number }
   | { type: "readAlerts" }
   | { type: "clearAlerts" }
-  | { type: "shell"; name: string };
+  | { type: "shell"; name: string }
+  | { type: "level"; text: string }
+  /** Shows or hides the panel; a tab alone brings that tab into view. */
+  | { type: "panel"; open?: boolean; tab?: PanelTab }
+  | { type: "changes"; scope?: "working" | "branch"; file?: string | null }
+  | { type: "workspacePatch"; workspace: number; patch: Partial<Workspace> }
+  /** An agent starts another, out of view: a terminal with no tab. */
+  | { type: "spawn"; agent: Agent; cwd: string; lines?: Line[] }
+  | { type: "agent"; pane: number; patch: Partial<Agent> }
+  /** Opens an agent's terminal, as a tab where it has none. */
+  | { type: "openAgent"; pane: number }
+  /** Puts an agent's tab away; the agent runs on out of view. */
+  | { type: "background"; pane: number }
+  | { type: "project"; workspace: number; patch: Partial<Project> }
+  | { type: "chat"; workspace: number; entry: ChatEntry };
 
 export type Direction = "left" | "right" | "up" | "down";
 
@@ -200,6 +311,34 @@ export type Dispatch = (action: Action) => void;
 const HISTORY = 240;
 /** Alert history is capped across the application. */
 const ALERTS = 128;
+/** A project's chat keeps a page of entries here. */
+const CHAT = 60;
+
+export const AGENT_NAMES: Record<AgentKind, string> = { claude: "Claude Code", codex: "Codex" };
+
+/** The state in words, as the Agents tab says it. */
+export const ACTIVITY_NAMES: Record<Activity, string> = {
+  working: "Working",
+  idle: "Idle",
+  permission: "Needs permission",
+  question: "Asked a question",
+};
+
+export const waits = (agent: Agent | undefined) =>
+  agent?.activity === "permission" || agent?.activity === "question";
+
+/** A project for a workspace that has none yet: a lead and an empty chat. */
+export const newProject = (workspace: Workspace): Project => ({
+  name: workspace.name,
+  directory: workspace.cwd,
+  lead: "Claude Code · Opus · High",
+  chat: [],
+  members: [],
+  needs: [],
+  working: null,
+  draft: "",
+  typed: false,
+});
 
 export const out = (text: string, c?: Tone, b?: boolean): Line => ({
   k: "out",
@@ -1082,8 +1221,136 @@ export function reduce(state: State, action: Action): State {
 
     case "shell":
       return state.shell === action.name ? state : { ...state, shell: action.name };
+
+    case "level":
+      return { ...state, level: { text: action.text, n: (state.level?.n ?? 0) + 1 } };
+
+    case "panel": {
+      const tab = action.tab ?? state.panel.tab;
+      const open = action.open ?? (action.tab ? true : !state.panel.open);
+      return { ...state, panel: { open, tab } };
+    }
+
+    case "changes":
+      return {
+        ...state,
+        changes: {
+          scope: action.scope ?? state.changes.scope,
+          // A new comparison lists other files; its diff starts closed.
+          file: action.file !== undefined ? action.file : action.scope ? null : state.changes.file,
+        },
+      };
+
+    case "workspacePatch":
+      return editWorkspace(state, action.workspace, (workspace) => ({ ...workspace, ...action.patch }));
+
+    case "spawn": {
+      const pane = state.nextId;
+      return {
+        ...state,
+        panes: {
+          ...state.panes,
+          [pane]: {
+            id: pane,
+            title: action.agent.title,
+            cwd: action.cwd,
+            lines: action.lines ?? [],
+            input: "",
+            prompt: false,
+            busy: true,
+            ok: true,
+            status: "running",
+            agent: action.agent,
+          },
+        },
+        nextId: state.nextId + 1,
+      };
+    }
+
+    case "agent":
+      return editPane(state, action.pane, (pane) =>
+        pane.agent ? { ...pane, agent: { ...pane.agent, ...action.patch } } : pane,
+      );
+
+    case "openAgent": {
+      const pane = state.panes[action.pane];
+      if (!pane?.agent) return state;
+      const home = owner(state, action.pane);
+      if (home) {
+        const selected = reduce(state, { type: "selectWorkspace", workspace: home.id });
+        return { ...reduce(selected, { type: "focus", pane: action.pane }), zoomed: false };
+      }
+      const workspace = state.workspaces.find((w) => w.id === pane.agent!.workspace);
+      if (!workspace) return state;
+      // Beside the agent that started it where that one has a tab.
+      const parent = pane.agent.parent;
+      const beside = parent !== undefined && panesOf(workspace.layout).includes(parent) ? parent : workspace.active;
+      return reveal(
+        {
+          ...editWorkspace(state, workspace.id, (current) => ({
+            ...current,
+            layout: addTab(current.layout, beside, action.pane, Number.MAX_SAFE_INTEGER),
+            active: action.pane,
+          })),
+          active: workspace.id,
+          zoomed: false,
+        },
+        workspace.id,
+      );
+    }
+
+    case "background": {
+      const workspace = owner(state, action.pane);
+      // A workspace keeps at least one terminal in view.
+      if (!workspace || !state.panes[action.pane]?.agent || panesOf(workspace.layout).length < 2) {
+        return state;
+      }
+      return reduce(detach(state, action.pane), {
+        type: "agent",
+        pane: action.pane,
+        patch: { workspace: workspace.id },
+      });
+    }
+
+    case "project": {
+      const workspace = state.workspaces.find((w) => w.id === action.workspace);
+      const current = state.projects[action.workspace] ?? (workspace && newProject(workspace));
+      if (!current) return state;
+      return {
+        ...state,
+        projects: { ...state.projects, [action.workspace]: { ...current, ...action.patch } },
+      };
+    }
+
+    case "chat": {
+      const current = state.projects[action.workspace];
+      if (!current) return state;
+      return {
+        ...state,
+        projects: {
+          ...state.projects,
+          [action.workspace]: { ...current, chat: [...current.chat, action.entry].slice(-CHAT) },
+        },
+      };
+    }
   }
 }
+
+/** Agents in any workspace, those waiting for a person first, then working, then idle. */
+export function agentRows(state: State): { pane: Pane; agent: Agent; workspace: Workspace }[] {
+  const order: Record<Activity, number> = { permission: 0, question: 0, working: 1, idle: 2 };
+  return Object.values(state.panes)
+    .flatMap((pane) => {
+      if (!pane.agent) return [];
+      const workspace = owner(state, pane.id) ?? state.workspaces.find((w) => w.id === pane.agent!.workspace);
+      return workspace ? [{ pane, agent: pane.agent, workspace }] : [];
+    })
+    .sort((a, b) => order[a.agent.activity] - order[b.agent.activity]);
+}
+
+/** The agents a terminal's agent started. */
+export const spawnedBy = (state: State, pane: number): Pane[] =>
+  Object.values(state.panes).filter((other) => other.agent?.parent === pane);
 
 /** A minimal external store, so scripted steps read each change at once. */
 export class Store {
