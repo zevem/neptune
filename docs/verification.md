@@ -6,8 +6,8 @@ the local verification platform. macOS and Windows build/test jobs are configure
 in CI; their existence does not establish a successful CI run or desktop runtime
 verification. A production release requires the remaining gates below.
 
-Historical captures and raw reports under `artifacts/` retain the branding,
-paths and executable names of the build they actually measured. They are
+Historical captures and raw reports in the [evidence archive](artifact-archive.md)
+retain the branding, paths and executable names of the build they actually measured. They are
 evidence of those builds; Neptune's rename does not rewrite past evidence.
 
 ## Local proof and CI coverage
@@ -185,12 +185,12 @@ display scale. The run opened `nvim --clean -R README.md`, paged with Ctrl+F,
 moved with Down, resized from 1180×760 to 900×640 logical points, and quit with
 `:q`. The alternate screen returned to the existing shell, and a subsequent
 `printf` command produced a file whose exact sentinel content was checked.
-The [full-size TUI](../artifacts/native-nvim.png),
-[resized TUI](../artifacts/native-nvim-resized.png), and
-[returned shell](../artifacts/native-tui-return.png) captures show aligned grid
+The [full-size TUI](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/native-nvim.png),
+[resized TUI](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/native-nvim-resized.png), and
+[returned shell](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/native-tui-return.png) captures show aligned grid
 content, preserved native status lines, and clean font/icon rendering.
 
-The [final normal-release workspace](../artifacts/native-final.png) combines a
+The [final normal-release workspace](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/native-final.png) combines a
 read-only Neovim session, a ready shell after `ls src`, and actual parser-benchmark
 output. Its three-pane hierarchy, consistent header spacing, and restrained
 lavender marker clearly identify the focused top-right shell without competing
@@ -198,7 +198,7 @@ with terminal content. This capture passed the final designer review.
 
 A separate normal-release Wayland run at 1.5× scale used the Vulkan/NVIDIA
 renderer and displayed real shell output from ten passing terminal-core tests.
-Its [native capture](../artifacts/native-wayland.png) verifies launch, terminal
+Its [native capture](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/native-wayland.png) verifies launch, terminal
 output, and rendering at that scale. This smoke test does not establish complete
 Wayland keyboard, pointer, clipboard, or IME coverage; the broader platform and
 desktop-integration gates below remain open.
@@ -230,14 +230,14 @@ Clippy configurations pass with warnings denied. Architecture checking and its
 three rejection self-tests pass, along with the Python harness/metric tests.
 The Rust totals comprise 14 pure-model tests, 61 desktop tests, 37 terminal-core
 tests, 13 Unix PTY tests and, with inspection enabled, two client tests.
-The [default test log](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/test-default.log)
-and [inspection test log](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/test-inspection.log)
+The [default test log](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/test-default.log)
+and [inspection test log](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/test-inspection.log)
 retain the final results.
 
 The final optimized inspection build passed **18 native semantic checks** and
 produced **23 screenshots** in the
-[accepted native run](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/ui-regression.json).
-The [run metadata](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/run.json)
+[accepted native run](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/ui-regression.json).
+The [run metadata](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/run.json)
 records compiler, platform, binary/lockfile hashes, endpoint and isolated state.
 The workflow exercised independent shell processes, Ctrl+C, theme/preferences,
 search ownership, close cancellation, graceful save/relaunch restoration and
@@ -250,8 +250,8 @@ The ordinary release build also rendered a native screenshot, executed an exact
 launch-command marker, left ephemeral workspace storage untouched and ignored
 `EGUI_INSPECTION` (no listener), using both a controlled `/bin/sh` configuration
 and the host's default zsh. See the
-[ordinary-build record](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/normal-release.json)
-and [zsh record](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/normal-zsh-release.json).
+[ordinary-build record](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/normal-release.json)
+and [zsh record](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/normal-zsh-release.json).
 An initial host-zsh attempt contained an extra character before the command;
 that capture is retained as `normal-zsh-first-attempt.png`. The same invocation,
 three additional native launches and a direct core-session probe subsequently
@@ -263,14 +263,14 @@ The optimized scaling build passed **19 applicable scenarios** across
 Every accepted case confirmed complete session teardown. Output cases include
 startup markers, parsed-byte verification and an activity audit; the 64-pane
 several-output case was rerun after its first producers ended too soon.
-The [accepted scenario summary](../artifacts/architecture-scale-accepted/accepted-summary.json)
+The [accepted scenario summary](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-scale-accepted/accepted-summary.json)
 links the original and replacement records. See [performance.md](performance.md)
 for workload and measurement limits. These runs preceded the final failure-only
 diagnostic additions; their recorded executable hashes identify the measured
 build independently of the final ordinary executable.
 
 After the final diagnostic/error-handling changes, the rebuilt ordinary release
-passed [two targeted native smokes](../artifacts/architecture-accepted/20261001T012656Z-6ff804df/final-smokes/report.json):
+passed [two targeted native smokes](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/architecture-accepted/20261001T012656Z-6ff804df/final-smokes/report.json):
 successful exact command execution and an unavailable-shell failure. The latter
 verified a visible error, a structured `Spawn` category with pane/generation,
 complete teardown and no execution of the pending launch command. Both confirmed
@@ -280,7 +280,7 @@ inspection was disabled and ephemeral storage remained unchanged.
 
 The interface was rebuilt on this date; [design.md](design.md) records the
 direction and the corrections made during review. Evidence is under
-[`artifacts/ui-rebuild`](../artifacts/ui-rebuild).
+[`artifacts/ui-rebuild`](https://github.com/zevem/neptune/tree/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/ui-rebuild).
 
 - **Focused tests.** The desktop library suite passes 85 tests on Linux with
   Rust 1.97.1 (`cargo test -p neptune-terminal --lib --locked`), and the
@@ -290,12 +290,12 @@ direction and the corrections made during review. Evidence is under
   `terminal-core` tests were not rerun locally; neither crate changed.
 - **Native regression.** The optimized inspection build passed 24 semantic
   checks and produced 25 captures in the
-  [accepted run](../artifacts/ui-rebuild/20261001T034328Z-2d49bbe2/ui-regression.json);
-  its [metadata](../artifacts/ui-rebuild/20261001T034328Z-2d49bbe2/run.json)
+  [accepted run](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/ui-rebuild/20261001T034328Z-2d49bbe2/ui-regression.json);
+  its [metadata](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/ui-rebuild/20261001T034328Z-2d49bbe2/run.json)
   records the binary and lockfile hashes. The run used X11 through the harness.
   New checks cover Tab delivery with the terminal keeping focus, the terminal
   menu and its dismissal, and sidebar resize and reset. An
-  [earlier run](../artifacts/ui-rebuild/20261001T033954Z-4724214b/ui-regression.json)
+  [earlier run](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/ui-rebuild/20261001T033954Z-4724214b/ui-regression.json)
   failed at the sidebar reset: the handle accepted only an exact double-click,
   and the toolkit counted the clicks as a triple because another click had just
   happened. Both resize handles now accept either. That run is retained as
@@ -306,7 +306,7 @@ direction and the corrections made during review. Evidence is under
   separate restoration showed both resizes of every pane within 34 ms of launch
   and none later, and capture 18 shows the settled prompts.
 - **Native Wayland.** The ordinary release build rendered
-  [a one-shot capture](../artifacts/ui-rebuild/wayland-release.png) at 1.5×
+  [a one-shot capture](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/ui-rebuild/wayland-release.png) at 1.5×
   scale with transparent window corners, and was observed idle; see
   [performance.md](performance.md#native-wayland-idle-after-the-interface-rebuild).
   Wayland keyboard, pointer, clipboard and IME behaviour were not exercised.
@@ -536,7 +536,7 @@ are required after the changes described in the architecture review appendix.
 
 On 2026-09-30, the final native inspection workflow passed **18 semantic checks**
 and produced **23 fresh screenshots**. Its
-[machine-readable report](../artifacts/final-review/ui-regression.json) records
+[machine-readable report](https://github.com/zevem/neptune/blob/994604ee9d27c907d32630287c7aaba43eb7302e/artifacts/final-review/ui-regression.json) records
 workspace creation, three distinct shell processes, interruption, preferences,
 responsive focus/search, close/cancel, restoration, and typed-input preservation.
 The final designer review accepted the single/three-pane hierarchy, both theme

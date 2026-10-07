@@ -1,8 +1,0 @@
-{
-  "panes": 32,
-  "scenario": "hidden-output",
-  "endpoint": "127.0.0.1:44439",
-  "data_root": "/home/biggabo/Documents/Projects/rust-terminal/rust-terminal/artifacts/architecture-scale/20261001T010937Z-282d7324/32-hidden-output/data",
-  "status": "running",
-  "startup_seconds": 1.3805659799982095
-}

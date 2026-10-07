@@ -7,8 +7,8 @@ for focus and selection. The terminal remains the dominant surface. Chrome earns
 its space by being useful at a glance and then getting out of the way.
 
 This replaces the earlier StarkIDE-derived interface. That design, its tokens and
-its acceptance record remain in git history and under `artifacts/`; they are
-historical evidence, not the current direction.
+its acceptance record remain in git history and the [evidence archive](artifact-archive.md);
+they are historical evidence, not the current direction.
 
 ## Principles
 

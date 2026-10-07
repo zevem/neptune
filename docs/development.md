@@ -11,6 +11,7 @@ Commands in this guide run from the repository root.
 - [Native inspection](#native-inspection)
 - [Performance and Ghostty](#performance-and-ghostty)
 - [Continuous integration](#continuous-integration)
+- [Verification artifacts](#verification-artifacts)
 - [Release artifacts](#release-artifacts)
 - [Website](#website)
 
@@ -70,6 +71,21 @@ GitHub Actions runs CI on pull requests and every push to `main`, including afte
 CI uses read-only repository permissions and a timeout for every job. New commits cancel older CI runs for the same PR; each push to `main` runs independently. The final `Check` status succeeds only when every CI job succeeds, rejecting failed, cancelled, or skipped jobs. The `main` ruleset requires this single `Check` status from GitHub Actions.
 
 The active `main` ruleset requires only a pull request and passing CI. It does not require approvals, resolved review threads, a merge queue, or the PR branch to be up to date before merging. CI runs again on the resulting `main` commit after the merge.
+
+## Verification artifacts
+
+`artifacts/` is ignored local output for screenshots, reports, logs and isolated
+test data. Verification scripts create their output directories as needed; the
+folder does not need to exist in a fresh checkout. Keep generated files out of
+source control.
+
+Historical verification links point to the [evidence archive](artifact-archive.md)
+at a fixed Git commit. New PR evidence uses the
+[GitHub attachment workflow](agents/issue-tracker.md#pr-attachments). CI uploads
+its native run as a Linux inspection artifact; download it from the relevant
+Actions run. Local output can contain terminal captures and test state; review
+files before uploading and retain the build/platform metadata needed to assess
+the evidence.
 
 ## Release artifacts
 
