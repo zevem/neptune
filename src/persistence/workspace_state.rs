@@ -9,17 +9,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Version 12 adds projects: the identity of each, the workspace it works in
+/// Version 13 adds projects: the identity of each, the workspace it works in
 /// and the panes whose agents its lead started. Nothing a project says or is
-/// asked is saved here. Version 11 added the files an agent attached to its
-/// pane. Version 10 added the git worktree made for a pane's agent, and
-/// OpenCode, Gemini CLI, pi and Oh My Pi to the agents a pane's resume
-/// reference can name, which an
+/// asked is saved here. Version 12 adds what agents linked and attached in conversations that are
+/// on no pane now. Version 11 added the files an agent attached to its pane. Version 10 added
+/// the git worktree made for a pane's agent, and OpenCode, Gemini CLI, pi and
+/// Oh My Pi to the agents a pane's resume reference can name, which an
 /// earlier build would take for damage. Version 9 added the pane whose agent
 /// started a pane's agent. Version 8 added workspace group default
 /// directories and the pull requests an agent linked to its pane. Versions
-/// 1–11 remain readable.
-pub const SCHEMA_VERSION: u32 = 12;
+/// 1–12 remain readable.
+pub const SCHEMA_VERSION: u32 = 13;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -32,11 +32,48 @@ pub struct StateSnapshot {
     pub groups: Vec<SavedWorkspaceGroup>,
     #[serde(default)]
     pub sidebar_order: Option<Vec<SavedSidebarItem>>,
-    /// The projects of the window, from schema version 12.
+    /// The projects of the window, from schema version 13.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<SavedProject>,
     pub active: Option<WorkspaceId>,
     pub sidebar: bool,
+    /// From schema version 12.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversations: Vec<SavedConversation>,
+}
+
+/// The pull requests and files of a conversation no pane shows now, kept
+/// for when it is resumed: addresses, paths and titles as on a pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedConversation {
+    pub kind: neptune_model::AgentKind,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pull_requests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<SavedAttachment>,
+}
+impl SavedConversation {
+    /// What of it can be read; the model leaves out one with nothing left.
+    fn restore(&self) -> neptune_model::Conversation {
+        neptune_model::Conversation {
+            kind: self.kind,
+            session_id: self.session_id.clone(),
+            pull_requests: self
+                .pull_requests
+                .iter()
+                .filter_map(|url| neptune_model::PullRequest::parse(url))
+                .take(neptune_model::PullRequest::MAX_PER_PANE)
+                .collect(),
+            attachments: self
+                .attachments
+                .iter()
+                .filter_map(SavedAttachment::restore)
+                .take(neptune_model::Attachment::MAX_PER_PANE)
+                .collect(),
+        }
+    }
 }
 
 /// Which project this is, where it works and which CLI leads it. Its
@@ -141,7 +178,7 @@ pub struct SavedPane {
     /// The pane whose agent started this pane's agent, from schema version 9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<PaneId>,
-    /// The project whose lead started this pane's agent, from schema version 12.
+    /// The project whose lead started this pane's agent, from schema version 13.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<ProjectId>,
     /// The git worktree made for the pane's agent, from schema version 10.
@@ -264,6 +301,27 @@ impl StateSnapshot {
                 .collect(),
             active: model.active_workspace(),
             sidebar: model.sidebar(),
+            conversations: model
+                .conversations()
+                .iter()
+                .map(|kept| SavedConversation {
+                    kind: kept.kind,
+                    session_id: kept.session_id.clone(),
+                    pull_requests: kept
+                        .pull_requests
+                        .iter()
+                        .map(|link| link.url().to_owned())
+                        .collect(),
+                    attachments: kept
+                        .attachments
+                        .iter()
+                        .map(|file| SavedAttachment {
+                            path: file.path().into(),
+                            title: file.title().map(str::to_owned),
+                        })
+                        .collect(),
+                })
+                .collect(),
             sidebar_order: Some(
                 model
                     .sidebar_order()
@@ -287,6 +345,11 @@ impl StateSnapshot {
                     .ok_or(neptune_model::Error::InvalidIdentity)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let conversations = self
+            .conversations
+            .iter()
+            .map(SavedConversation::restore)
+            .collect();
         Model::restore_with_projects(
             self.workspaces
                 .into_iter()
@@ -303,6 +366,7 @@ impl StateSnapshot {
             self.sidebar,
             limits,
         )
+        .map(|model| model.with_conversations(conversations))
     }
 }
 
@@ -530,6 +594,11 @@ fn read_state(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadReport) {
+    let conversations: Vec<_> = snapshot
+        .conversations
+        .iter()
+        .map(SavedConversation::restore)
+        .collect();
     let requested_active = snapshot.active;
     let mut groups = Vec::new();
     for group in snapshot.groups {
@@ -818,7 +887,15 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                 snapshot.sidebar,
                 limits,
             ) {
-                Ok(model) => report.model = Some(model),
+                Ok(model) => {
+                    let model = model.with_conversations(conversations);
+                    if model.conversations().len() != snapshot.conversations.len() {
+                        report.diagnostics.push(
+                            "Left out conversations whose links could not be restored".into(),
+                        );
+                    }
+                    report.model = Some(model);
+                }
                 Err(error) => report
                     .diagnostics
                     .push(format!("Sidebar order validation failed: {error}")),
@@ -1143,6 +1220,35 @@ mod tests {
             StateSnapshot::from_model(&model).workspaces[0].panes[0].pull_requests,
             ["https://github.com/zevem/neptune/pull/83"]
         );
+        // What a conversation off the panes had waits for it; one with an ID
+        // no CLI writes, or with nothing readable, is left out with a note.
+        let kept = SavedConversation {
+            kind: neptune_model::AgentKind::Claude,
+            session_id: "019a1234-5678-7000-8000-123456789def".into(),
+            pull_requests: vec!["https://github.com/zevem/neptune/pull/85".into()],
+            attachments: vec![attached.clone()],
+        };
+        snapshot.conversations = vec![
+            kept.clone(),
+            SavedConversation {
+                session_id: "--last".into(),
+                ..kept.clone()
+            },
+            SavedConversation {
+                pull_requests: vec!["javascript:alert(1)".into()],
+                attachments: Vec::new(),
+                ..kept.clone()
+            },
+        ];
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        // One note for them, and one for the recovery copy.
+        assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
+        assert_eq!(
+            StateSnapshot::from_model(&report.model.unwrap()).conversations,
+            std::slice::from_ref(&kept)
+        );
+        snapshot.conversations.clear();
         // Unreadable links, and links without their agent, are left out.
         snapshot.workspaces[0].panes[0]
             .pull_requests
@@ -1772,7 +1878,7 @@ mod project_tests {
             .unwrap();
         let snapshot = StateSnapshot::from_model(controller.model());
         let saved = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(saved["version"], 12);
+        assert_eq!(saved["version"], 13);
         // Identity and membership only: a new field here needs a decision.
         assert_eq!(
             saved["projects"],

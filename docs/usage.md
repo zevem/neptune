@@ -155,7 +155,9 @@ screenshots of what you changed") and the agent's tab shows a paperclip with
 a count. Click it for the list, newest first, each file with its picture where
 it is one. Click a picture to see it at full size, where the arrow keys or the
 controls at the sides step through the terminal's other pictures; click any
-other file to open it with its application. The folder control on a row shows
+other file to open it with its application. **View all pictures** under the
+rows opens every picture on the list at once, with a small copy of each at the
+foot of the window to click. The folder control on a row shows
 the file in your file manager and the cross dismisses it from the list without touching the file. See
 [attached files](agent-sessions.md#attached-files).
 

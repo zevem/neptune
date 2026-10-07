@@ -228,6 +228,8 @@ pub enum Action {
     /// Show an attached picture at full size, or open another kind of file
     /// with its application.
     OpenAttachment(PaneId, PathBuf),
+    /// Show a terminal's attached pictures at full size, newest first.
+    ViewAttachedPictures(PaneId),
     /// Show an attached file in the file manager.
     RevealAttachment(PathBuf),
     /// Take one attached file, or all of them, off a terminal's list.

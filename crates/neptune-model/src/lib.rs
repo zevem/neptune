@@ -11,7 +11,7 @@ mod remote;
 mod workspace;
 mod worktree;
 
-pub use agent::{AgentKind, AgentSession, Attachment, PullRequest};
+pub use agent::{AgentKind, AgentSession, Attachment, Conversation, PullRequest};
 pub use controller::{Command, Completion, Controller, Destination, Effect};
 pub use ids::{PaneId, ProjectId, SessionGeneration, SplitId, WorkspaceGroupId, WorkspaceId};
 pub use layout::{Axis, Edge, FocusDirection, Layout};

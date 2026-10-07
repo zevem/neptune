@@ -756,18 +756,18 @@ impl Controller {
                     .workspace_for_pane(pane)
                     .and_then(|id| self.model.workspace(id))
                     .and_then(|workspace| workspace.remote.clone());
+                let item = self.model.pane(pane).ok_or(Error::UnknownPane(pane))?;
+                if item.generation.checked_add(1).is_none() {
+                    return Err(Error::IdentityExhausted);
+                }
+                self.model.set_aside(pane);
                 let item = self.model.pane_mut(pane)?;
                 let previous = item.generation;
-                item.generation = item
-                    .generation
-                    .checked_add(1)
-                    .ok_or(Error::IdentityExhausted)?;
+                item.generation += 1;
                 item.lifecycle = Lifecycle::Starting;
                 dirty |= item.agent.take().is_some();
                 dirty |= item.spawned_by.take().is_some();
                 dirty |= item.project.take().is_some();
-                item.pull_requests.clear();
-                item.attachments.clear();
                 effects.push(Effect::StopSession {
                     pane,
                     generation: previous,
@@ -815,14 +815,16 @@ impl Controller {
             }
             Command::SessionExited { pane, generation } => {
                 self.lifecycle(pane, generation, Lifecycle::Exited);
-                if let Ok(item) = self.model.pane_mut(pane)
-                    && item.generation == generation
+                if self
+                    .model
+                    .pane(pane)
+                    .is_some_and(|item| item.generation == generation)
                 {
+                    self.model.set_aside(pane);
+                    let item = self.model.pane_mut(pane)?;
                     dirty |= item.agent.take().is_some();
                     dirty |= item.spawned_by.take().is_some();
                     dirty |= item.project.take().is_some();
-                    item.pull_requests.clear();
-                    item.attachments.clear();
                     self.close_background(pane, &mut effects);
                 }
             }
@@ -836,27 +838,43 @@ impl Controller {
                     .workspace_for_pane(pane)
                     .and_then(|id| self.model.workspace(id))
                     .is_some_and(|ws| ws.remote.is_none());
+                let open = self.model.pane(pane).filter(|item| {
+                    item.generation == generation
+                        && matches!(item.lifecycle, Lifecycle::Starting | Lifecycle::Running)
+                });
                 if local
                     && agent.as_ref().is_none_or(crate::AgentSession::is_valid)
-                    && let Ok(item) = self.model.pane_mut(pane)
-                    && item.generation == generation
-                    && matches!(item.lifecycle, Lifecycle::Starting | Lifecycle::Running)
+                    && let Some(item) = open
                 {
-                    // Links belong to the agent's run; they leave with it. An
-                    // agent that never opened leaves the one that started it too.
-                    if agent.is_none() {
-                        item.pull_requests.clear();
-                        item.attachments.clear();
+                    // Links belong to the agent's conversation. They are set
+                    // aside when it exits or turns to another one, and return
+                    // when a tab's agent names that conversation again. The
+                    // first ID an open agent reports names the one it is in.
+                    let another = match (&item.agent, &agent) {
+                        (Some(old), Some(new)) => {
+                            old.kind != new.kind
+                                || (old.session_id.is_some() && old.session_id != new.session_id)
+                        }
+                        _ => false,
+                    };
+                    let left = agent.is_none();
+                    if left || another {
+                        dirty |= self.model.set_aside(pane);
+                    }
+                    let item = self.model.pane_mut(pane)?;
+                    // An agent that never opened leaves the one that started it too.
+                    if left {
                         dirty |= item.spawned_by.take().is_some();
                         dirty |= item.project.take().is_some();
                     }
-                    let left = agent.is_none();
                     if item.agent != agent {
                         item.agent = agent;
                         dirty = true;
                     }
                     if left {
                         dirty |= self.close_background(pane, &mut effects);
+                    } else {
+                        dirty |= self.model.take_back(pane);
                     }
                 }
             }

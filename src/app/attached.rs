@@ -195,6 +195,13 @@ impl App {
             None => self.explorer_event(ctx, ui::explorer::Event::Open(path)),
         }
     }
+
+    /// Opens a terminal's attached pictures at full size on the newest.
+    pub(super) fn view_attached_pictures(&mut self, pane: PaneId) {
+        if let Some(newest) = self.attached_pictures(pane).into_iter().next() {
+            self.view_attached(pane, newest);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +298,15 @@ mod tests {
         assert_eq!(app.viewed_image(), Some(file("before.png").as_path()));
         app.step_attached(1);
         assert_eq!(app.viewed_image(), Some(file("after.png").as_path()));
+        app.action(&ctx, Action::CloseOverlay);
+        // All of them open on the newest, and any is shown by its place.
+        app.action(&ctx, Action::ViewAttachedPictures(pane));
+        assert_eq!(app.ui.overlay, OverlayState::Image);
+        assert_eq!(app.viewed_image(), Some(file("after.png").as_path()));
+        app.show_attached(1);
+        assert_eq!(app.viewed_image(), Some(file("before.png").as_path()));
+        app.show_attached(7);
+        assert_eq!(app.viewed_image(), Some(file("before.png").as_path()));
         app.action(&ctx, Action::CloseOverlay);
         // Taken off the list one at a time, then all at once.
         app.action(&ctx, Action::RemoveAttachment(pane, file("gone.png")));

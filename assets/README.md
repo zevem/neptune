@@ -14,6 +14,8 @@ The supplied originals have distinct uses:
   with sizes through 256 pixels, exported from `neptune-logo.png`. The macOS ICNS
   has Retina sizes through 1024 pixels, exported from `neptune-macos-logo.png`
   without adding padding.
+- [`icons/providers/`](icons/providers/README.md) contains the marks of the CLI
+  agents a terminal tab can show.
 - [`fonts/`](fonts/README.md) contains the bundled typefaces and their licenses.
 
 Regenerate the icons and website copies from the repository root:

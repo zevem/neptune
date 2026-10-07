@@ -1,9 +1,10 @@
 //! Small, consistent vector icons. Coordinates use a 24-point design grid.
 
 use eframe::egui::{
-    Color32, CursorIcon, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui,
-    WidgetInfo, WidgetType, vec2,
+    Color32, ColorImage, CursorIcon, Id, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
+    StrokeKind, TextureHandle, TextureOptions, Ui, WidgetInfo, WidgetType, pos2, vec2,
 };
+use neptune_model::AgentKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
@@ -519,6 +520,72 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     }
 }
 
+/// Paint a CLI agent's own mark into its visual bounds, in `ink` unless the
+/// mark has a colour of its own. Reports `false`, painting nothing, for an
+/// agent without one.
+///
+/// The marks are bundled masks, scaled once for each size they are shown at.
+pub fn paint_provider(painter: &Painter, rect: Rect, kind: AgentKind, ink: Color32) -> bool {
+    let (name, mask, tint) = match kind {
+        AgentKind::Claude => (
+            "claude",
+            include_bytes!("../assets/icons/providers/claude.png").as_slice(),
+            Color32::from_rgb(0xd9, 0x77, 0x57),
+        ),
+        AgentKind::Codex => (
+            "codex",
+            include_bytes!("../assets/icons/providers/codex.png").as_slice(),
+            ink,
+        ),
+        AgentKind::Opencode => (
+            "opencode",
+            include_bytes!("../assets/icons/providers/opencode.png").as_slice(),
+            ink,
+        ),
+        AgentKind::Pi => (
+            "pi",
+            include_bytes!("../assets/icons/providers/pi.png").as_slice(),
+            ink,
+        ),
+        AgentKind::Gemini | AgentKind::Omp => return false,
+    };
+    let ctx = painter.ctx();
+    let side = rect.width().min(rect.height());
+    let pixels = (side * ctx.pixels_per_point()).round().max(1.0) as u32;
+    let id = Id::new(("provider-mark", name, pixels));
+    let texture = ctx
+        .data(|data| data.get_temp::<TextureHandle>(id))
+        .or_else(|| {
+            let mask = image::load_from_memory(mask).ok()?.resize_exact(
+                pixels,
+                pixels,
+                image::imageops::FilterType::Lanczos3,
+            );
+            let rgba: Vec<u8> = mask
+                .to_rgba8()
+                .pixels()
+                .flat_map(|pixel| [255, 255, 255, pixel[3]])
+                .collect();
+            let texture = ctx.load_texture(
+                format!("provider-mark-{name}"),
+                ColorImage::from_rgba_unmultiplied([pixels as usize; 2], &rgba),
+                TextureOptions::LINEAR,
+            );
+            ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+            Some(texture)
+        });
+    let Some(texture) = texture else {
+        return false;
+    };
+    painter.image(
+        texture.id(),
+        Rect::from_center_size(rect.center(), vec2(side, side)),
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        tint,
+    );
+    true
+}
+
 /// A compact, keyboard-focusable icon button with a rounded hover surface.
 pub fn button(ui: &mut Ui, icon: Icon, tooltip: &str) -> Response {
     button_with_hint(ui, icon, tooltip, "")
@@ -569,6 +636,29 @@ pub fn button_with_hint(ui: &mut Ui, icon: Icon, label: &str, shortcut: &str) ->
 mod tests {
     use super::*;
     use eframe::egui::{self, Align, Event, Layout, Modifiers, PointerButton, UiBuilder};
+
+    #[test]
+    fn agents_with_a_mark_paint_it_and_the_rest_leave_the_tab_as_it_was() {
+        let ctx = egui::Context::default();
+        let mut painted = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(13.0, 13.0));
+            painted = AgentKind::ALL
+                .into_iter()
+                .filter(|kind| paint_provider(ui.painter(), rect, *kind, Color32::WHITE))
+                .collect();
+        });
+        output.textures_delta.clear();
+        assert_eq!(
+            painted,
+            [
+                AgentKind::Claude,
+                AgentKind::Codex,
+                AgentKind::Opencode,
+                AgentKind::Pi
+            ]
+        );
+    }
 
     fn title_controls_frame(ctx: &egui::Context, events: Vec<Event>) -> Response {
         let mut close = None;

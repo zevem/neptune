@@ -558,6 +558,17 @@ fn tab(
     } else {
         rect.right() - 7.0
     };
+    // The agent's own mark leads the tab while the terminal runs one.
+    if let Some(agent) = presentation.agent.filter(|_| right - left > 40.0)
+        && icons::paint_provider(
+            &painter,
+            Rect::from_center_size(Pos2::new(left + 6.5, rect.center().y), Vec2::splat(13.0)),
+            agent,
+            p.secondary,
+        )
+    {
+        left += 18.0;
+    }
     // A worktree's tab is named by its branch, and says what runs there
     // where another tab names its folder.
     let branch = presentation.worktree.as_ref().map(|tab| &tab.branch);
@@ -1356,15 +1367,17 @@ pub fn pane_drag(ui: &mut Ui, stage: &Stage, output: &StageOutput, actions: &mut
         size,
     );
     capsule(&painter, chip, p);
-    icons::paint(
-        &painter,
-        Rect::from_center_size(
-            Pos2::new(chip.left() + 16.0, chip.center().y),
-            Vec2::splat(13.0),
-        ),
-        Icon::Terminal,
-        p.secondary,
+    let mark = Rect::from_center_size(
+        Pos2::new(chip.left() + 16.0, chip.center().y),
+        Vec2::splat(13.0),
     );
+    // The chip carries the mark its tab shows.
+    if !presentation
+        .agent
+        .is_some_and(|agent| icons::paint_provider(&painter, mark, agent, p.secondary))
+    {
+        icons::paint(&painter, mark, Icon::Terminal, p.secondary);
+    }
     galley_at(
         &painter,
         Pos2::new(chip.left() + 29.0, chip.center().y),
