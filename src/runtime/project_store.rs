@@ -1081,7 +1081,8 @@ mod tests {
                 if path.is_dir() {
                     walk(&path, root, found);
                 } else {
-                    found.push(path.strip_prefix(root).unwrap().display().to_string());
+                    let below = path.strip_prefix(root).unwrap().display().to_string();
+                    found.push(below.replace('\\', "/"));
                 }
             }
         }
@@ -1961,6 +1962,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     fn a_removed_project_leaves_nothing_and_a_kept_one_is_offered_again() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::inline(data.path().into());

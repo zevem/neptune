@@ -538,15 +538,19 @@ mod tests {
             let broken = directory.path().join("two\nlines.txt");
             std::fs::write(&broken, b"x").unwrap();
             assert!(look(&broken).unwrap_err().ends_with("cannot be given."));
-            let deep = directory.path().join("d".repeat(200)).join("e".repeat(200));
-            let deep = deep.join("f".repeat(200)).join("g".repeat(200));
-            let deep = deep.join("h".repeat(200));
-            std::fs::create_dir_all(&deep).unwrap();
-            std::fs::write(deep.join("far.txt"), b"x").unwrap();
-            assert_eq!(
-                look(&deep.join("far.txt")),
-                Err("“far.txt” has a path the lead cannot be given.".into())
-            );
+            // macOS makes no path this long.
+            #[cfg(target_os = "linux")]
+            {
+                let deep = directory.path().join("d".repeat(200)).join("e".repeat(200));
+                let deep = deep.join("f".repeat(200)).join("g".repeat(200));
+                let deep = deep.join("h".repeat(200));
+                std::fs::create_dir_all(&deep).unwrap();
+                std::fs::write(deep.join("far.txt"), b"x").unwrap();
+                assert_eq!(
+                    look(&deep.join("far.txt")),
+                    Err("“far.txt” has a path the lead cannot be given.".into())
+                );
+            }
             let secret = directory.path().join("secret.txt");
             std::fs::write(&secret, b"x").unwrap();
             std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();

@@ -4810,6 +4810,7 @@ mod tests {
         )
     }
 
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     #[test]
     fn the_form_offers_the_clis_found_off_the_frame_and_codex_leads_where_it_is_picked() {
         use std::{cell::Cell, sync::mpsc::sync_channel};
@@ -4948,6 +4949,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     #[test]
     fn a_project_is_made_talks_to_its_lead_starts_an_agent_and_hears_what_became_of_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -5232,6 +5234,7 @@ mod tests {
         assert!(app.ui.error.is_none());
     }
 
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     #[test]
     fn a_paused_project_sends_only_the_users_words_and_a_removed_one_lets_its_lead_go() {
         let dir = tempfile::tempdir().unwrap();
@@ -6368,6 +6371,7 @@ mod tests {
         assert!(!dir.path().join("projects").exists());
     }
 
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     #[test]
     fn a_new_chat_sets_the_old_one_aside_and_a_closed_workspaces_project_is_offered_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -8492,6 +8496,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     #[test]
     fn a_lead_gives_an_agent_a_worktree_of_its_own_and_hears_why_where_git_makes_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -8795,6 +8800,7 @@ mod tests {
         assert!(app.controller.model().pane(shell).is_some());
     }
 
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     #[test]
     fn an_agent_is_ready_for_review_until_its_terminal_is_opened_and_is_told_what_its_pull_request_needs()
      {
@@ -9151,6 +9157,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(windows, ignore = "its directories are written as on Unix")]
     #[test]
     fn a_project_works_where_the_terminal_in_front_was_when_it_was_made_and_stays_there() {
         let dir = tempfile::tempdir().unwrap();
