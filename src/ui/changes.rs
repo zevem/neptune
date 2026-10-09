@@ -267,6 +267,7 @@ fn diff(
     rect: Rect,
     p: Palette,
     (file, body): (&File, &DiffBody),
+    lines_of: &Lines,
     events: &mut Vec<Event>,
 ) {
     ui.painter().rect_filled(rect, metrics::PANE_RADIUS, p.bg);
@@ -407,6 +408,37 @@ fn diff(
                             &number.to_string(),
                             p.muted,
                         );
+                        // A line something is said of carries a mark, and
+                        // where lines are picked a press picks this one.
+                        let at = (number, line.new.is_none());
+                        if lines_of.marked.contains(&at) {
+                            painter.rect_filled(
+                                Rect::from_min_max(
+                                    row.left_top(),
+                                    Pos2::new(row.left() + 2.0, row.bottom()),
+                                ),
+                                0,
+                                p.accent,
+                            );
+                        }
+                        if let Some(pick) = lines_of.pick {
+                            let response = ui
+                                .interact(row, ui.id().with(("diff-line", index)), Sense::click())
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            response.widget_info(|| {
+                                WidgetInfo::labeled(
+                                    WidgetType::Button,
+                                    true,
+                                    format!("Comment on line {number}"),
+                                )
+                            });
+                            if response.hovered() {
+                                painter.rect_filled(row, 0, theme::tint(p.accent, 0.10));
+                            }
+                            if response.clicked() {
+                                pick.set(Some(at));
+                            }
+                        }
                     }
                     text(numbers, Align2::LEFT_CENTER, sign, ink);
                     text(gutter, Align2::LEFT_CENTER, &line.text, p.fg);
@@ -620,10 +652,21 @@ fn contents(
             files: repository.files,
             more: repository.more,
             diff: repository.diff,
+            lines: Lines::default(),
         },
         (state.selected.as_deref(), &mut state.diff_share),
         events,
     );
+}
+
+/// What a diff's lines carry beyond their text, where a surface comments on
+/// them: each line is named by its number and whether it was removed.
+#[derive(Default)]
+pub(super) struct Lines<'a> {
+    /// Lines that something is said of.
+    pub marked: &'a [(u32, bool)],
+    /// Where a pressed line is reported; without it lines take no press.
+    pub pick: Option<&'a std::cell::Cell<Option<(u32, bool)>>>,
 }
 
 /// Changed files and the diff of the chosen one.
@@ -632,6 +675,7 @@ pub(super) struct Listed<'a> {
     /// Files beyond the most a list shows.
     pub more: usize,
     pub diff: Option<(&'a File, &'a DiffBody)>,
+    pub lines: Lines<'a>,
 }
 
 /// The files in `body`, a row each, over the diff of the chosen one. The
@@ -684,7 +728,7 @@ pub(super) fn listing(
         });
     if let Some(shown) = listed.diff {
         let surface = Rect::from_min_max(Pos2::new(body.left(), list.bottom() + 6.0), body.max);
-        diff(ui, surface, p, shown, events);
+        diff(ui, surface, p, shown, &listed.lines, events);
         let handle = Rect::from_min_max(
             Pos2::new(body.left(), list.bottom()),
             Pos2::new(body.right(), list.bottom() + 6.0),

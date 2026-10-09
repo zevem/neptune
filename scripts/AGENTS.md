@@ -101,12 +101,19 @@ NEPTUNE_PR_CAPTURE="$PWD/artifacts/native-pull-request.png" \
 `NEPTUNE_PR_STATE` names what is shown: `summary` (the default), `ready`,
 `merged`, `draft`, `conflicts`, `checks`, `confirm`, `close`, `problem`,
 `timeline`, `code`, `diff`, `comment`, `review`, `reading`, `missing`,
-`signed-out`, `linked` or `empty`. `NEPTUNE_PR_NARROW=1` uses a 640×400 window,
+`signed-out`, `linked`, `empty` or `drive`. `drive` presses a number on the
+toolbar, opens the comment field, types, sends with the command key and Enter
+and leaves a second comment with Escape, through the application's own input
+path, and fails unless each step did what it should. `NEPTUNE_PR_NARROW=1` uses a 640×400 window,
 `NEPTUNE_PR_WIDTH` sets the panel's width and `NEPTUNE_PR_THEME` names a theme.
 `NEPTUNE_PR_LIVE` names a pull request by its address and reads it with the
 signed-in GitHub CLI instead; a capture never changes a pull request. Pressing
-a number, typing a comment and every change sent to a host need a hand-driven
-native check.
+a real pointer and keyboard and every change sent to a host need a hand-driven
+native check. `NEPTUNE_PR_LIVE=<address of a merged pull request> cargo test -p
+neptune-terminal --lib runtime::pull_request::tests::the_github_cli --locked --
+--ignored` reads it with the signed-in GitHub CLI, marks one of its files as
+viewed and unmarks it (which only that account sees) and checks that a change
+the host must refuse comes back in the host's words.
 
 The integrated shell regression needs a POSIX shell. X11 injection verifies
 Linux/X11 input, not Wayland, macOS or Windows input. Inspection events verify

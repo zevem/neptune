@@ -17,8 +17,8 @@ use crate::{
     platform::links::WebLink,
     runtime::{
         pull_request::{
-            Act, Check, Commit, Decision, Detail, Entry, Failure, Kind, MAX_COMMENT, Merge, Method,
-            Outcome, Reply, Verdict,
+            Act, Allowed, Check, Choices, Commit, Decision, Detail, Emoji, Entry, Failure, Kind,
+            LineComment, MAX_COMMENT, Merge, Method, Outcome, Reaction, Reply, Verdict,
         },
         pull_requests::{Checks, Lookup, State as Standing},
     },
@@ -36,11 +36,29 @@ pub const HEADER: f32 = 30.0;
 pub const ROW: f32 = 26.0;
 /// A linked pull request in the list.
 pub const LINKED_ROW: f32 = 46.0;
+/// The strip of the pull requests open in the tab.
+pub const OPEN: f32 = 28.0;
 /// The comments shown before the older ones are asked for.
 const RECENT: usize = 10;
 /// The most drafts kept, one for each pull request written to.
 const DRAFTS: usize = 8;
 
+/// The most pull requests open in the tab at once.
+pub const MAX_OPEN: usize = 8;
+
+/// The fields of the tab, which give the keyboard back when it leaves view.
+pub fn field_ids() -> [Id; 4] {
+    [composer_id(), reply_id(), title_id(), description_id()]
+}
+pub fn reply_id() -> Id {
+    Id::new("pull-request-reply")
+}
+pub fn title_id() -> Id {
+    Id::new("pull-request-title-field")
+}
+pub fn description_id() -> Id {
+    Id::new("pull-request-description-field")
+}
 pub fn composer_id() -> Id {
     Id::new("pull-request-composer")
 }
@@ -58,12 +76,31 @@ pub enum Segment {
 pub enum Composer {
     Comment,
     Review,
+    /// A comment on the line chosen in a diff, kept for the review.
+    Line,
+}
+
+/// What of the pull request is being rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Editing {
+    Title,
+    Description,
+}
+
+/// A line of a changed file that a comment is being written on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub path: String,
+    pub line: u32,
+    pub removed: bool,
 }
 
 /// What waits for the person to say it once more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Confirm {
     Merge(Method),
+    AutoMerge(Method),
+    Revert,
     Close,
 }
 
@@ -88,6 +125,22 @@ pub struct State {
     pub verdict: Verdict,
     /// What is being written, by the address of the pull request it is for.
     drafts: Vec<(String, String)>,
+    /// The commit whose files the code part shows, in place of all of them.
+    pub scope: Option<String>,
+    pub editing: Option<Editing>,
+    /// The title or description as it is being rewritten.
+    pub edit: String,
+    /// The review conversation being answered, and the answer.
+    pub replying: Option<String>,
+    pub reply: String,
+    /// The line of a diff a comment is being written on.
+    pub line: Option<Target>,
+    /// What is being written about that line.
+    pub note: String,
+    /// Comments on lines that wait for the review, by pull request.
+    pending: Vec<(String, LineComment)>,
+    /// The labels and people of the repository were asked for.
+    pub asked: bool,
     /// The field should take the keyboard; cleared once it has.
     pub focus: bool,
 }
@@ -108,6 +161,15 @@ impl Default for State {
             composer: None,
             verdict: Verdict::Commented,
             drafts: Vec::new(),
+            scope: None,
+            editing: None,
+            edit: String::new(),
+            replying: None,
+            reply: String::new(),
+            line: None,
+            note: String::new(),
+            pending: Vec::new(),
+            asked: false,
             focus: false,
         }
     }
@@ -122,8 +184,56 @@ impl State {
             newest_first: self.newest_first,
             method: self.method,
             drafts: std::mem::take(&mut self.drafts),
+            pending: std::mem::take(&mut self.pending),
             ..Self::default()
         };
+    }
+
+    /// The comments on lines that wait for the review of this pull request.
+    pub fn pending(&self, url: &str) -> impl Iterator<Item = &LineComment> {
+        self.pending
+            .iter()
+            .filter(move |(of, _)| of == url)
+            .map(|(_, comment)| comment)
+    }
+
+    pub fn add_pending(&mut self, url: &str, comment: LineComment) {
+        self.pending.push((url.to_owned(), comment));
+    }
+
+    /// Takes the `place`th waiting comment of this pull request back.
+    pub fn discard_pending(&mut self, url: &str, place: usize) {
+        let found = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, (of, _))| of == url)
+            .map(|(index, _)| index)
+            .nth(place);
+        if let Some(index) = found {
+            self.pending.remove(index);
+        }
+    }
+
+    /// Something asked of the pull request was done: what was written for
+    /// it is put away.
+    pub fn done(&mut self, url: &str, act: &Act) {
+        match act {
+            Act::Comment(_) => self.sent(url),
+            Act::Review(..) => {
+                self.pending.retain(|(of, _)| of != url);
+                self.sent(url);
+            }
+            Act::Reply { .. } => {
+                self.replying = None;
+                self.reply.clear();
+            }
+            Act::Title(_) | Act::Description(_) => {
+                self.editing = None;
+                self.edit.clear();
+            }
+            _ => {}
+        }
     }
 
     pub fn draft(&self, url: &str) -> &str {
@@ -167,6 +277,12 @@ pub enum Event {
     Open(PullRequest),
     /// Leave it for the list of those linked.
     Back,
+    /// Take it out of the tab.
+    Close(PullRequest),
+    /// Read what its repository offers: labels and people to ask.
+    Choices,
+    /// Show the files of one commit, or of all of them.
+    Scope(Option<String>),
     Refresh,
     Act(Act),
     DismissProblem,
@@ -197,6 +313,8 @@ pub struct Shown<'a> {
     pub link: &'a PullRequest,
     pub detail: &'a Detail,
     pub files: FileList<'a>,
+    /// The labels and people of its repository, once they were asked for.
+    pub choices: Option<&'a Choices>,
     /// It is being read again because the person asked.
     pub refreshing: bool,
     /// What is being done to it; nothing else is asked meanwhile.
@@ -215,6 +333,8 @@ pub enum Body<'a> {
 
 pub struct View<'a> {
     pub body: Body<'a>,
+    /// The pull requests open in the tab, each a pill above what is shown.
+    pub opened: &'a [PullRequest],
     /// Seconds since 1970, for how long ago things happened.
     pub now: i64,
     /// An input method is composing in the comment field.
@@ -357,6 +477,11 @@ pub fn stands(detail: &Detail, now: i64) -> (Tone, String) {
                 (Tone::Quiet, format!("Out of date with {}", detail.base))
             } else if detail.merge == Merge::Blocked {
                 (Tone::Quiet, "Held by a rule of the repository".into())
+            } else if let Some(way) = detail.auto_merge {
+                (
+                    Tone::Running,
+                    format!("Merges by itself when it may · {}", way.label()),
+                )
             } else if detail.merge == Merge::Unknown {
                 (Tone::Quiet, "Open".into())
             } else {
@@ -455,12 +580,23 @@ fn button_width(ui: &Ui, label: &str) -> f32 {
 /// A compact text button. `name` is its own among the buttons of the tab,
 /// so that it keeps its press while what is above it changes.
 fn button(ui: &mut Ui, p: Palette, rect: Rect, label: &str, name: &str, fill: Fill) -> Response {
+    let id = Id::new(("pull-request-button", name));
+    button_with(ui, p, rect, label, name, id, fill)
+}
+
+/// The same for one of several buttons that share a name, such as the one
+/// under each comment: `id` tells them apart.
+fn button_with(
+    ui: &mut Ui,
+    p: Palette,
+    rect: Rect,
+    label: &str,
+    name: &str,
+    id: Id,
+    fill: Fill,
+) -> Response {
     let live = fill != Fill::Off && ui.is_enabled();
-    let response = ui.interact(
-        rect,
-        Id::new(("pull-request-button", name)),
-        if live { Sense::click() } else { Sense::hover() },
-    );
+    let response = ui.interact(rect, id, if live { Sense::click() } else { Sense::hover() });
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, live, name));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -919,6 +1055,57 @@ fn more_menu(
             ui.close();
         }
     }
+    if idle && allowed.edit {
+        led = true;
+        if menu_item(ui, p, Icon::Pencil, "Edit title…", "", false) {
+            state.editing = Some(Editing::Title);
+            state.edit = detail.title.clone();
+            state.focus = true;
+            ui.close();
+        }
+        if menu_item(ui, p, Icon::Pencil, "Edit description…", "", false) {
+            state.editing = Some(Editing::Description);
+            state.edit = detail.body.clone();
+            state.segment = Segment::Summary;
+            state.focus = true;
+            ui.close();
+        }
+    }
+    // What the host does by itself, and what keeps the branch current.
+    if idle && detail.state == Standing::Open {
+        if let Some(way) = detail.auto_merge.filter(|_| allowed.merge) {
+            led = true;
+            let label = format!("Disable auto-merge ({})", way.label().to_lowercase());
+            if menu_item(ui, p, Icon::Close, &label, "", false) {
+                events.push(Event::Act(Act::AutoMerge(None)));
+                ui.close();
+            }
+        } else if allowed.auto_merge
+            && let Some(way) = method(detail, state)
+        {
+            led = true;
+            if menu_item(ui, p, Icon::Merged, "Enable auto-merge…", "", false) {
+                state.confirm = Some(Confirm::AutoMerge(way));
+                state.segment = Segment::Summary;
+                ui.close();
+            }
+        }
+        if allowed.update_branch && detail.merge == Merge::Behind {
+            led = true;
+            if menu_item(ui, p, Icon::Refresh, "Update branch", "", false) {
+                events.push(Event::Act(Act::UpdateBranch));
+                ui.close();
+            }
+        }
+    }
+    if idle && allowed.merge && detail.state == Standing::Merged {
+        led = true;
+        if menu_item(ui, p, Icon::Swap, "Revert changes…", "", false) {
+            state.confirm = Some(Confirm::Revert);
+            state.segment = Segment::Summary;
+            ui.close();
+        }
+    }
     // Every way the repository merges, the one in use ticked.
     if idle && allowed.merge && detail.state == Standing::Open && allowed.methods.len() > 1 {
         if led {
@@ -1078,6 +1265,12 @@ fn standing_card(
                 Act::Reopen => "Reopening…",
                 Act::Comment(_) => "Posting the comment…",
                 Act::Review(..) => "Submitting the review…",
+                Act::AutoMerge(Some(_)) => "Turning on auto-merge…",
+                Act::AutoMerge(None) => "Turning off auto-merge…",
+                Act::UpdateBranch => "Updating the branch…",
+                Act::Revert => "Opening a pull request that reverts this…",
+                Act::Reply { .. } => "Posting the reply…",
+                _ => "Saving…",
             }
             .to_owned(),
         ),
@@ -1092,6 +1285,35 @@ fn standing_card(
             (
                 Tone::Quiet,
                 format!("{} #{number} into {}?", way.label(), detail.base),
+            )
+        }
+        (None, Some(Confirm::AutoMerge(way))) => {
+            buttons.push(("Cancel".into(), Fill::Plain, None, Some(None)));
+            buttons.push((
+                "Enable".into(),
+                Fill::Accent,
+                Some(Event::Act(Act::AutoMerge(Some(way)))),
+                None,
+            ));
+            (
+                Tone::Quiet,
+                format!(
+                    "Have the host {} #{number} as soon as it may?",
+                    way.label().to_lowercase()
+                ),
+            )
+        }
+        (None, Some(Confirm::Revert)) => {
+            buttons.push(("Cancel".into(), Fill::Plain, None, Some(None)));
+            buttons.push((
+                "Create revert".into(),
+                Fill::Accent,
+                Some(Event::Act(Act::Revert)),
+                None,
+            ));
+            (
+                Tone::Quiet,
+                format!("Open a pull request that reverts #{number}?"),
             )
         }
         (None, Some(Confirm::Close)) => {
@@ -1118,7 +1340,25 @@ fn standing_card(
                     Some(Event::Act(Act::Reopen)),
                     None,
                 )),
+                Standing::Open
+                    if detail.merge == Merge::Behind && allowed.update_branch && !allowed.merge =>
+                {
+                    buttons.push((
+                        "Update branch".into(),
+                        Fill::Plain,
+                        Some(Event::Act(Act::UpdateBranch)),
+                        None,
+                    ));
+                }
                 Standing::Open if allowed.merge && detail.merge != Merge::Conflicts => {
+                    if detail.merge == Merge::Behind && allowed.update_branch {
+                        buttons.push((
+                            "Update branch".into(),
+                            Fill::Plain,
+                            Some(Event::Act(Act::UpdateBranch)),
+                            None,
+                        ));
+                    }
                     if let Some(way) = way {
                         buttons.push((
                             way.label().into(),
@@ -1346,8 +1586,16 @@ struct Chip {
     hint: String,
 }
 
-/// A labelled row of chips that wraps to as many lines as they need.
-fn chips(ui: &mut Ui, p: Palette, label: &str, items: &[Chip]) {
+/// A labelled row of chips that wraps to as many lines as they need. With
+/// `add`, a control named so ends the row; it is returned for the list it
+/// opens.
+fn chips(
+    ui: &mut Ui,
+    p: Palette,
+    label: &str,
+    items: &[Chip],
+    add: Option<&str>,
+) -> Option<Response> {
     const LABEL: f32 = 70.0;
     const LINE: f32 = 24.0;
     let width = ui.available_width();
@@ -1379,7 +1627,25 @@ fn chips(ui: &mut Ui, p: Palette, label: &str, items: &[Chip]) {
         places.push((x, line));
         x += chip + 4.0;
     }
+    // A row without anything says so before the control that adds to it.
+    if items.is_empty() {
+        x += 34.0;
+    }
+    if add.is_some() && x > LABEL && x + 22.0 > width - 6.0 {
+        x = LABEL;
+        line += 1;
+    }
+    let adder = (x, line);
     let (_, rect) = ui.allocate_space(vec2(width, (line + 1) as f32 * LINE + 2.0));
+    if items.is_empty() {
+        painter.text(
+            Pos2::new(rect.left() + LABEL + 2.0, rect.top() + LINE * 0.5 + 1.0),
+            Align2::LEFT_CENTER,
+            "None",
+            theme::regular(12.0),
+            p.muted,
+        );
+    }
     painter.text(
         Pos2::new(rect.left() + 6.0, rect.top() + LINE * 0.5 + 1.0),
         Align2::LEFT_CENTER,
@@ -1427,6 +1693,39 @@ fn chips(ui: &mut Ui, p: Palette, label: &str, items: &[Chip]) {
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &item.hint));
         response.on_hover_text(&item.hint);
     }
+    let name = add?;
+    let place = Rect::from_min_size(
+        Pos2::new(
+            rect.left() + adder.0,
+            rect.top() + adder.1 as f32 * LINE + 2.0,
+        ),
+        vec2(22.0, 20.0),
+    );
+    let response = ui
+        .interact(place, Id::new(("pull-request-add", label)), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, name));
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    if response.hovered() || open {
+        painter.rect_filled(place, 10, p.hover);
+    }
+    if response.has_focus() {
+        focus_ring(&painter, place, 10, p);
+    }
+    icons::paint(
+        &painter,
+        Rect::from_center_size(place.center(), Vec2::splat(11.0)),
+        Icon::Plus,
+        if response.hovered() || open {
+            p.fg
+        } else {
+            p.muted
+        },
+    );
+    if !open {
+        return Some(response.on_hover_text(name));
+    }
+    Some(response)
 }
 
 fn check_row(ui: &mut Ui, p: Palette, check: &Check, actions: &mut Vec<Action>) {
@@ -1621,8 +1920,261 @@ fn about(ui: &mut Ui, p: Palette, path: &str, line: Option<u32>, tags: &[&str]) 
     );
 }
 
+/// What the controls of a comment need: what the person may do, whether
+/// something is under way, and where what they ask for goes.
+struct Talk<'a> {
+    allowed: &'a Allowed,
+    /// Nothing is being done to the pull request: its controls take a press.
+    idle: bool,
+    composing: bool,
+    now: i64,
+    state: &'a mut State,
+    events: &'a mut Vec<Event>,
+    actions: &'a mut Vec<Action>,
+}
+
+/// A review conversation as its controls address it.
+#[derive(Clone, Copy)]
+struct Thread<'a> {
+    id: &'a str,
+    resolved: bool,
+    can_reply: bool,
+    can_resolve: bool,
+}
+
+/// The reactions to something, each pressed to give or take one's own, the
+/// control that adds another and, for a review conversation, the controls
+/// that answer and resolve it.
+fn responses(
+    ui: &mut Ui,
+    p: Palette,
+    subject: &str,
+    given: &[Reaction],
+    thread: Option<Thread>,
+    talk: &mut Talk,
+) {
+    let react = talk.allowed.react && !subject.is_empty();
+    let answers = thread.is_some_and(|thread| thread.can_reply || thread.can_resolve);
+    if given.is_empty() && !react && !answers {
+        return;
+    }
+    ui.add_space(6.0);
+    let (_, row) = ui.allocate_space(vec2(ui.available_width(), 22.0));
+    let fill = if talk.idle { Fill::Plain } else { Fill::Off };
+    let mut right = row.right();
+    if let Some(thread) = thread {
+        if thread.can_resolve {
+            let label = if thread.resolved { "Reopen" } else { "Resolve" };
+            let width = button_width(ui, label);
+            let place = Rect::from_min_size(Pos2::new(right - width, row.top()), vec2(width, 22.0));
+            right = place.left() - 4.0;
+            let id = Id::new(("pull-request-resolve", thread.id));
+            if button_with(ui, p, place, label, label, id, fill).clicked() {
+                talk.events.push(Event::Act(Act::Resolve {
+                    thread: thread.id.to_owned(),
+                    resolved: !thread.resolved,
+                }));
+            }
+        }
+        if thread.can_reply {
+            let width = button_width(ui, "Reply");
+            let place = Rect::from_min_size(Pos2::new(right - width, row.top()), vec2(width, 22.0));
+            right = place.left() - 4.0;
+            let id = Id::new(("pull-request-answer", thread.id));
+            if button_with(ui, p, place, "Reply", "Reply", id, fill).clicked() {
+                if talk.state.replying.as_deref() != Some(thread.id) {
+                    talk.state.reply.clear();
+                }
+                talk.state.replying = Some(thread.id.to_owned());
+                talk.state.focus = true;
+            }
+        }
+    }
+    let live = react && talk.idle;
+    let mut left = row.left();
+    for reaction in given {
+        let text = format!("{} {}", reaction.emoji.word(), reaction.count);
+        let ink = if reaction.mine { p.accent } else { p.secondary };
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.clone(), theme::regular(11.0), ink);
+        let pill = Rect::from_min_size(
+            Pos2::new(left, row.top() + 1.0),
+            vec2(galley.size().x + 14.0, 20.0),
+        );
+        if pill.right() > right - 4.0 {
+            break;
+        }
+        left = pill.right() + 4.0;
+        let response = ui.interact(
+            pill,
+            Id::new(("pull-request-reaction", subject, reaction.emoji.word())),
+            if live { Sense::click() } else { Sense::hover() },
+        );
+        response
+            .widget_info(|| WidgetInfo::selected(WidgetType::Button, live, reaction.mine, &text));
+        let painter = ui.painter();
+        painter.rect_filled(
+            pill,
+            10,
+            if reaction.mine {
+                theme::tint(p.accent, 0.18)
+            } else {
+                p.pressed
+            },
+        );
+        if live && response.hovered() {
+            painter.rect_filled(pill, 10, p.hover);
+        }
+        if response.has_focus() {
+            focus_ring(painter, pill, 10, p);
+        }
+        galley_at(
+            painter,
+            Pos2::new(pill.left() + 7.0, pill.center().y + 0.5),
+            galley,
+        );
+        if live && response.clicked() {
+            talk.events.push(Event::Act(Act::React {
+                subject: subject.to_owned(),
+                emoji: reaction.emoji,
+                on: !reaction.mine,
+            }));
+        }
+        if live {
+            response
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(if reaction.mine {
+                    "Take your reaction back"
+                } else {
+                    "React the same"
+                });
+        }
+    }
+    if react && left + 26.0 <= right {
+        let place = Rect::from_min_size(Pos2::new(left, row.top() + 1.0), vec2(22.0, 20.0));
+        let response = ui
+            .interact(
+                place,
+                Id::new(("pull-request-react", subject)),
+                if talk.idle {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                },
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+        response
+            .widget_info(|| WidgetInfo::labeled(WidgetType::Button, talk.idle, "Add a reaction"));
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+        let painter = ui.painter();
+        if response.hovered() || open {
+            painter.rect_filled(place, 10, p.hover);
+        }
+        if response.has_focus() {
+            focus_ring(painter, place, 10, p);
+        }
+        icons::paint(
+            painter,
+            Rect::from_center_size(place.center(), Vec2::splat(11.0)),
+            Icon::Plus,
+            if response.hovered() || open {
+                p.fg
+            } else {
+                p.muted
+            },
+        );
+        egui::Popup::menu(&response).show(|ui| {
+            menu_layout(ui, 170.0);
+            for emoji in Emoji::ALL {
+                let mine = given
+                    .iter()
+                    .any(|reaction| reaction.emoji == emoji && reaction.mine);
+                let icon = if mine { Icon::Check } else { Icon::Plus };
+                if menu_item(ui, p, icon, emoji.word(), "", false) {
+                    talk.events.push(Event::Act(Act::React {
+                        subject: subject.to_owned(),
+                        emoji,
+                        on: !mine,
+                    }));
+                    ui.close();
+                }
+            }
+        });
+        if !open {
+            response.on_hover_text("Add a reaction");
+        }
+    }
+}
+
+/// A field under something for what is written about it, with the control
+/// that puts it away and the one that sends it. Returns whether it was
+/// sent and whether it was put away.
+fn written_under(
+    ui: &mut Ui,
+    p: Palette,
+    (id, hint, send_label): (Id, &str, &str),
+    rows: (usize, usize),
+    text: &mut String,
+    talk: (&mut bool, bool, bool),
+) -> (bool, bool) {
+    let (focus, composing, idle) = talk;
+    ui.add_space(8.0);
+    let height = chat::editor_height(ui, text, ui.available_width(), rows);
+    let (_, field) = ui.allocate_space(vec2(ui.available_width(), height));
+    let long = text.chars().count() > MAX_COMMENT;
+    let ready = idle && !long && !text.trim().is_empty();
+    // The platform's command key with Enter sends, as in any comment field.
+    let focused = ui.memory(|memory| memory.has_focus(id));
+    let mut send = focused
+        && !composing
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+    ui.add_enabled_ui(idle, |ui| {
+        chat::editor(
+            ui,
+            p,
+            field,
+            chat::Editor {
+                id,
+                text,
+                hint,
+                label: hint,
+                focus,
+                composing,
+                trailing: 0.0,
+                newline: true,
+            },
+        );
+    });
+    ui.add_space(6.0);
+    let (_, bar) = ui.allocate_space(vec2(ui.available_width(), 24.0));
+    let width = button_width(ui, send_label);
+    let place = Rect::from_min_size(Pos2::new(bar.right() - width, bar.top()), vec2(width, 24.0));
+    let fill = if ready { Fill::Accent } else { Fill::Off };
+    send |= button_with(ui, p, place, send_label, send_label, id.with("send"), fill).clicked();
+    let width = button_width(ui, "Cancel");
+    let place = Rect::from_min_size(
+        Pos2::new(place.left() - 6.0 - width, bar.top()),
+        vec2(width, 24.0),
+    );
+    let cancelled = button_with(
+        ui,
+        p,
+        place,
+        "Cancel",
+        "Cancel",
+        id.with("cancel"),
+        Fill::Plain,
+    )
+    .clicked();
+    if cancelled {
+        ui.memory_mut(|memory| memory.surrender_focus(id));
+    }
+    (send && ready, cancelled)
+}
+
 /// One thing said on the pull request, as a card.
-fn entry_card(ui: &mut Ui, p: Palette, entry: &Entry, now: i64, actions: &mut Vec<Action>) {
+fn entry_card(ui: &mut Ui, p: Palette, entry: &Entry, talk: &mut Talk) {
     Frame::new()
         .fill(p.control)
         .corner_radius(theme::metrics::ROW_RADIUS)
@@ -1630,11 +2182,11 @@ fn entry_card(ui: &mut Ui, p: Palette, entry: &Entry, now: i64, actions: &mut Ve
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.set_width(ui.available_width());
-            entry_body(ui, p, entry, now, actions);
+            entry_body(ui, p, entry, talk);
         });
 }
 
-fn entry_body(ui: &mut Ui, p: Palette, entry: &Entry, now: i64, actions: &mut Vec<Action>) {
+fn entry_body(ui: &mut Ui, p: Palette, entry: &Entry, talk: &mut Talk) {
     let (verb, ink) = match &entry.kind {
         Kind::Comment | Kind::Thread { .. } => ("commented", p.secondary),
         Kind::Review(verdict) => (verdict_words(*verdict), verdict_ink(*verdict, p)),
@@ -1644,11 +2196,15 @@ fn entry_body(ui: &mut Ui, p: Palette, entry: &Entry, now: i64, actions: &mut Ve
         p,
         (&entry.author, verb, ink),
         entry.at,
-        now,
+        talk.now,
         &entry.url,
-        actions,
+        talk.actions,
     );
+    let mut thread = None;
     if let Kind::Thread {
+        id,
+        can_reply,
+        can_resolve,
         path,
         line,
         resolved,
@@ -1665,6 +2221,12 @@ fn entry_body(ui: &mut Ui, p: Palette, entry: &Entry, now: i64, actions: &mut Ve
             tags.push("Resolved");
         }
         about(ui, p, path, *line, &tags);
+        thread = Some(Thread {
+            id,
+            resolved: *resolved,
+            can_reply: *can_reply,
+            can_resolve: *can_resolve,
+        });
     }
     if !entry.body.trim().is_empty() {
         ui.add_space(5.0);
@@ -1673,25 +2235,42 @@ fn entry_body(ui: &mut Ui, p: Palette, entry: &Entry, now: i64, actions: &mut Ve
             p,
             ("pull-request-entry", &entry.url, entry.at),
             &entry.body,
-            actions,
+            talk.actions,
         );
     }
     if let Kind::Thread { replies, .. } = &entry.kind {
         for (index, reply) in replies.iter().enumerate() {
-            reply_under(ui, p, (&entry.url, index), reply, now, actions);
+            reply_under(ui, p, (&entry.url, index), reply, talk);
+        }
+    }
+    responses(ui, p, &entry.id, &entry.reactions, thread, talk);
+    if let Some(thread) = thread
+        && talk.state.replying.as_deref() == Some(thread.id)
+    {
+        let mut focus = std::mem::take(&mut talk.state.focus);
+        let (send, cancelled) = written_under(
+            ui,
+            p,
+            (reply_id(), "Reply", "Reply"),
+            (2, 6),
+            &mut talk.state.reply,
+            (&mut focus, talk.composing, talk.idle),
+        );
+        talk.state.focus = focus;
+        if send {
+            talk.events.push(Event::Act(Act::Reply {
+                thread: thread.id.to_owned(),
+                body: talk.state.reply.trim().to_owned(),
+            }));
+        }
+        if cancelled {
+            talk.state.replying = None;
         }
     }
 }
 
 /// A reply, set in under what it answers behind a bar.
-fn reply_under(
-    ui: &mut Ui,
-    p: Palette,
-    name: (&str, usize),
-    reply: &Reply,
-    now: i64,
-    actions: &mut Vec<Action>,
-) {
+fn reply_under(ui: &mut Ui, p: Palette, name: (&str, usize), reply: &Reply, talk: &mut Talk) {
     ui.add_space(8.0);
     let top = ui.cursor().top();
     let left = ui.cursor().left();
@@ -1706,13 +2285,19 @@ fn reply_under(
                 p,
                 (&reply.author, "replied", p.secondary),
                 reply.at,
-                now,
+                talk.now,
                 "",
-                actions,
+                talk.actions,
             );
             if !reply.body.trim().is_empty() {
                 ui.add_space(4.0);
-                written(ui, p, ("pull-request-reply", name), &reply.body, actions);
+                written(
+                    ui,
+                    p,
+                    ("pull-request-reply", name),
+                    &reply.body,
+                    talk.actions,
+                );
             }
         });
     });
@@ -1738,22 +2323,59 @@ fn order(ui: &mut Ui, p: Palette, right_center: Pos2, state: &mut State) {
     }
 }
 
-fn summary(
-    ui: &mut Ui,
+/// The list a row's "+" opens: every label or person of the repository,
+/// those the pull request has ticked. A press gives or takes one.
+fn picker(
+    response: &Response,
     p: Palette,
-    shown: &Shown,
-    now: i64,
-    state: &mut State,
-    events: &mut Vec<Event>,
-    actions: &mut Vec<Action>,
+    names: Option<&[String]>,
+    chosen: &[&str],
+    act: impl Fn(String, bool) -> Act,
+    talk: &mut Talk,
 ) {
+    egui::Popup::menu(response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            menu_layout(ui, 220.0);
+            let Some(names) = names else {
+                // Read once, when the list is first opened.
+                if !talk.state.asked {
+                    talk.state.asked = true;
+                    talk.events.push(Event::Choices);
+                }
+                ui.add_space(4.0);
+                words(ui, "Reading…", 12.0, p.muted, 10.0);
+                ui.add_space(4.0);
+                return;
+            };
+            if names.is_empty() {
+                ui.add_space(4.0);
+                words(ui, "Nothing to choose from.", 12.0, p.muted, 10.0);
+                ui.add_space(4.0);
+            }
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    for name in names {
+                        let on = chosen.contains(&name.as_str());
+                        let icon = if on { Icon::Check } else { Icon::Plus };
+                        if menu_item(ui, p, icon, name, "", false) && talk.idle {
+                            talk.events.push(Event::Act(act(name.clone(), !on)));
+                            ui.close();
+                        }
+                    }
+                });
+        });
+}
+
+fn summary(ui: &mut Ui, p: Palette, shown: &Shown, talk: &mut Talk) {
     let detail = shown.detail;
-    standing_card(ui, p, shown, now, state, events);
+    standing_card(ui, p, shown, talk.now, talk.state, talk.events);
     if let Some(said) = &shown.problem {
-        problem(ui, p, said, events);
+        problem(ui, p, said, talk.events);
     }
     ui.add_space(2.0);
-    branches(ui, p, detail, events);
+    branches(ui, p, detail, talk.events);
 
     let reviewers: Vec<Chip> = detail
         .reviewers
@@ -1786,41 +2408,109 @@ fn summary(
             })
             .collect()
     };
-    if !reviewers.is_empty() {
-        chips(ui, p, "Reviewers", &reviewers);
+    let choices = shown.choices;
+    let ask = talk.allowed.request && detail.in_review();
+    if !reviewers.is_empty() || ask {
+        let add = ask.then_some("Request a review");
+        if let Some(response) = chips(ui, p, "Reviewers", &reviewers, add) {
+            let awaited: Vec<&str> = detail
+                .reviewers
+                .iter()
+                .filter(|reviewer| reviewer.verdict == Verdict::Awaited)
+                .map(|reviewer| reviewer.name.as_str())
+                .collect();
+            picker(
+                &response,
+                p,
+                choices.map(|choices| choices.people.as_slice()),
+                &awaited,
+                |name, on| Act::Request { name, on },
+                talk,
+            );
+        }
     }
     if !detail.assignees.is_empty() {
-        chips(ui, p, "Assignees", &named(&detail.assignees, true));
+        chips(ui, p, "Assignees", &named(&detail.assignees, true), None);
     }
-    if !detail.labels.is_empty() {
-        chips(ui, p, "Labels", &named(&detail.labels, false));
+    if !detail.labels.is_empty() || talk.allowed.label {
+        let add = talk.allowed.label.then_some("Change labels");
+        if let Some(response) = chips(ui, p, "Labels", &named(&detail.labels, false), add) {
+            let has: Vec<&str> = detail.labels.iter().map(String::as_str).collect();
+            picker(
+                &response,
+                p,
+                choices.map(|choices| choices.labels.as_slice()),
+                &has,
+                |name, on| Act::Label { name, on },
+                talk,
+            );
+        }
     }
     ui.add_space(6.0);
 
-    if disclosure(ui, p, "Description", state.description, "").clicked() {
-        state.description = !state.description;
+    let editing = talk.state.editing == Some(Editing::Description);
+    let heading = disclosure(ui, p, "Description", talk.state.description || editing, "");
+    let mut edit = false;
+    if talk.allowed.edit && !editing {
+        let at = Pos2::new(heading.rect.right() - 2.0, heading.rect.center().y);
+        edit = text_button(ui, p, at, "Edit", "Edit description").clicked();
     }
-    if state.description {
+    if edit {
+        talk.state.editing = Some(Editing::Description);
+        talk.state.edit = detail.body.clone();
+        talk.state.focus = true;
+    } else if heading.clicked() && !editing {
+        talk.state.description = !talk.state.description;
+    }
+    if editing {
+        let mut focus = std::mem::take(&mut talk.state.focus);
+        let (save, cancelled) = written_under(
+            ui,
+            p,
+            (description_id(), "Describe this pull request", "Save"),
+            (6, 16),
+            &mut talk.state.edit,
+            (&mut focus, talk.composing, talk.idle),
+        );
+        talk.state.focus = focus;
+        if save {
+            let body = talk.state.edit.trim().to_owned();
+            talk.events.push(Event::Act(Act::Description(body)));
+        }
+        if cancelled {
+            talk.state.editing = None;
+        }
+        ui.add_space(8.0);
+    } else if talk.state.description {
         ui.add_space(2.0);
         if detail.body.trim().is_empty() {
             words(ui, "No description provided.", 12.0, p.muted, 8.0);
         } else {
             padded(ui, 8.0, |ui| {
-                written(ui, p, "pull-request-description", &detail.body, actions);
+                written(
+                    ui,
+                    p,
+                    "pull-request-description",
+                    &detail.body,
+                    talk.actions,
+                );
             });
         }
+        padded(ui, 8.0, |ui| {
+            responses(ui, p, &detail.id, &detail.reactions, None, talk);
+        });
         ui.add_space(8.0);
     }
 
-    if disclosure(ui, p, "Checks", state.checks, &checks_summary(detail)).clicked() {
-        state.checks = !state.checks;
+    if disclosure(ui, p, "Checks", talk.state.checks, &checks_summary(detail)).clicked() {
+        talk.state.checks = !talk.state.checks;
     }
-    if state.checks {
+    if talk.state.checks {
         if detail.checks.is_empty() {
             words(ui, "No checks reported.", 12.0, p.muted, 8.0);
         }
         for check in &detail.checks {
-            check_row(ui, p, check, actions);
+            check_row(ui, p, check, talk.actions);
         }
         if detail.more_checks > 0 {
             words(
@@ -1861,27 +2551,32 @@ fn summary(
         p.muted,
     );
     if open.len() > 1 {
-        order(ui, p, Pos2::new(row.right() - 2.0, row.center().y), state);
+        order(
+            ui,
+            p,
+            Pos2::new(row.right() - 2.0, row.center().y),
+            talk.state,
+        );
     }
     if open.is_empty() {
         words(ui, "No comments yet.", 12.0, p.muted, 8.0);
     }
     // The recent ones, in the order asked for.
-    let hidden = if state.older {
+    let hidden = if talk.state.older {
         0
     } else {
         open.len().saturating_sub(RECENT)
     };
     let mut listed: Vec<&Entry> = open[hidden..].to_vec();
-    if state.newest_first {
+    if talk.state.newest_first {
         listed.reverse();
     }
     for entry in listed {
-        entry_card(ui, p, entry, now, actions);
+        entry_card(ui, p, entry, talk);
         ui.add_space(6.0);
     }
     if open.len() > RECENT {
-        let label = if state.older {
+        let label = if talk.state.older {
             format!("Show only the {RECENT} most recent")
         } else {
             format!("Show {}", count(hidden, "older comment", "older comments"))
@@ -1890,7 +2585,7 @@ fn summary(
         let width = button_width(ui, &label);
         let place = Rect::from_center_size(row.center(), vec2(width, 22.0));
         if button(ui, p, place, &label, "Older comments", Fill::Plain).clicked() {
-            state.older = !state.older;
+            talk.state.older = !talk.state.older;
         }
     }
     if detail.earlier > 0 {
@@ -1912,12 +2607,12 @@ fn summary(
             "resolved conversation",
             "resolved conversations",
         );
-        if disclosure(ui, p, &title, state.resolved, "").clicked() {
-            state.resolved = !state.resolved;
+        if disclosure(ui, p, &title, talk.state.resolved, "").clicked() {
+            talk.state.resolved = !talk.state.resolved;
         }
-        if state.resolved {
+        if talk.state.resolved {
             for entry in resolved {
-                entry_card(ui, p, entry, now, actions);
+                entry_card(ui, p, entry, talk);
                 ui.add_space(6.0);
             }
         }
@@ -1932,15 +2627,9 @@ enum Moment<'a> {
     Ended,
 }
 
-fn timeline(
-    ui: &mut Ui,
-    p: Palette,
-    shown: &Shown,
-    now: i64,
-    state: &mut State,
-    actions: &mut Vec<Action>,
-) {
+fn timeline(ui: &mut Ui, p: Palette, shown: &Shown, talk: &mut Talk) {
     let detail = shown.detail;
+    let now = talk.now;
     let mut moments: Vec<(i64, Moment)> = vec![(detail.opened, Moment::Opened)];
     moments.extend(
         detail
@@ -1959,7 +2648,7 @@ fn timeline(
     }
     // Stable, so that what happened in one second keeps the order read.
     moments.sort_by_key(|(at, _)| *at);
-    if state.newest_first {
+    if talk.state.newest_first {
         moments.reverse();
     }
 
@@ -1976,7 +2665,12 @@ fn timeline(
         theme::regular(11.5),
         p.secondary,
     );
-    order(ui, p, Pos2::new(row.right() - 2.0, row.center().y), state);
+    order(
+        ui,
+        p,
+        Pos2::new(row.right() - 2.0, row.center().y),
+        talk.state,
+    );
 
     const RAIL: f32 = 13.0;
     const INSET: f32 = 30.0;
@@ -1984,7 +2678,7 @@ fn timeline(
     for (index, (at, moment)) in moments.iter().enumerate() {
         let top = ui.cursor().top();
         let left = ui.cursor().left();
-        let line = |ui: &mut Ui, words: String, ink: Color32, trailing: String| {
+        let line = |ui: &mut Ui, words: String, ink: Color32, trailing: String| -> Rect {
             let (_, rect) = ui.allocate_space(vec2(ui.available_width(), ROW));
             let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
             let age = painter.layout_no_wrap(trailing, theme::regular(11.0), p.muted);
@@ -2001,6 +2695,7 @@ fn timeline(
                     right - 8.0 - rect.left(),
                 ),
             );
+            rect
         };
         let age = ago(now - at);
         let mut mark = (Icon::PullRequest, p.secondary);
@@ -2022,16 +2717,40 @@ fn timeline(
                     }
                     Moment::Commit(commit) => {
                         mark = (Icon::Branch, p.muted);
-                        line(
+                        let headline = if commit.headline.is_empty() {
+                            "Untitled commit".to_owned()
+                        } else {
+                            commit.headline.clone()
+                        };
+                        let rect = line(
                             ui,
-                            if commit.headline.is_empty() {
-                                "Untitled commit".to_owned()
-                            } else {
-                                commit.headline.clone()
-                            },
+                            headline.clone(),
                             p.secondary,
                             format!("{} · {age}", commit.short),
                         );
+                        // A commit leads to the files it changes.
+                        let response = ui
+                            .interact(
+                                rect,
+                                Id::new(("pull-request-commit", &commit.oid)),
+                                Sense::click(),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        response.widget_info(|| {
+                            WidgetInfo::labeled(
+                                WidgetType::Button,
+                                true,
+                                format!("Show the files of commit {}", commit.short),
+                            )
+                        });
+                        if response.hovered() {
+                            ui.painter()
+                                .rect_filled(rect.shrink2(vec2(-4.0, 1.0)), 6, p.hover);
+                        }
+                        if response.clicked() {
+                            talk.events.push(Event::Scope(Some(commit.oid.clone())));
+                        }
+                        response.on_hover_text(format!("{headline}\nShow the files it changes"));
                     }
                     Moment::Ended => {
                         let (word, icon, ink) = standing(Some(detail.state), p);
@@ -2051,7 +2770,7 @@ fn timeline(
                             _ => (Icon::Comment, p.secondary),
                         };
                         ui.add_space(2.0);
-                        entry_body(ui, p, entry, now, actions);
+                        entry_body(ui, p, entry, talk);
                         ui.add_space(8.0);
                     }
                 }
@@ -2100,41 +2819,161 @@ fn code(
     state: &mut State,
     events: &mut Vec<Event>,
 ) {
+    let detail = shown.detail;
+    let line = Rect::from_min_size(body.min, vec2(body.width(), 24.0));
+    let below = Rect::from_min_max(line.left_bottom(), body.max);
+    // Which commits are shown is chosen at the trailing edge, whatever
+    // else the line says.
+    let scoped = state
+        .scope
+        .as_ref()
+        .and_then(|oid| detail.history.iter().find(|commit| commit.oid == *oid));
+    let label = scoped.map_or("All commits", |commit| commit.short.as_str());
+    let scope = text_button(
+        ui,
+        p,
+        Pos2::new(line.right() - 2.0, line.center().y),
+        label,
+        "Choose the commits shown",
+    );
+    egui::Popup::menu(&scope).show(|ui| {
+        menu_layout(ui, 250.0);
+        let all = if scoped.is_none() {
+            Icon::Check
+        } else {
+            Icon::Files
+        };
+        if menu_item(ui, p, all, "All commits", "", false) {
+            events.push(Event::Scope(None));
+            ui.close();
+        }
+        if !detail.history.is_empty() {
+            menu_separator(ui, p);
+        }
+        egui::ScrollArea::vertical()
+            .max_height(260.0)
+            .show(ui, |ui| {
+                for commit in detail.history.iter().rev() {
+                    let chosen = scoped.is_some_and(|scoped| scoped.oid == commit.oid);
+                    let icon = if chosen { Icon::Check } else { Icon::Branch };
+                    let chosen = ui
+                        .push_id(&commit.oid, |ui| {
+                            menu_item(ui, p, icon, &commit.headline, &commit.short, false)
+                        })
+                        .inner;
+                    if chosen {
+                        events.push(Event::Scope(Some(commit.oid.clone())));
+                        ui.close();
+                    }
+                }
+            });
+    });
+    let mut right = scope.rect.left() - 4.0;
+
     let (files, more, diff) = match &shown.files {
-        FileList::Reading => return centered_note(ui, body, p, "Reading the changed files…"),
+        FileList::Reading => return centered_note(ui, below, p, "Reading the changed files…"),
         FileList::Failed(failure) => {
             let (title, said) = failure.explain(shown.link.location().0);
-            return centered_note(ui, body, p, &format!("{title}\n{said}"));
+            return centered_note(ui, below, p, &format!("{title}\n{said}"));
         }
         FileList::Listed { files, more, diff } => (*files, *more, *diff),
     };
-    let line = Rect::from_min_size(body.min, vec2(body.width(), 24.0));
+    // The file whose diff is shown is marked as viewed from here.
+    if let Some((file, _)) = diff.filter(|_| scoped.is_none() && detail.in_review()) {
+        let viewed = detail.viewed.contains(&file.path);
+        let label = if viewed { "Viewed ✓" } else { "Viewed" };
+        let response = text_button(
+            ui,
+            p,
+            Pos2::new(right, line.center().y),
+            label,
+            "Mark this file as viewed",
+        );
+        right = response.rect.left() - 4.0;
+        if response
+            .on_hover_text(if viewed {
+                "You marked this file as viewed. Press to take that back."
+            } else {
+                "Mark this file as viewed on the host"
+            })
+            .clicked()
+            && shown.acting.is_none()
+        {
+            events.push(Event::Act(Act::Viewed {
+                path: file.path.clone(),
+                on: !viewed,
+            }));
+        }
+    }
     let total = files.len() + more;
+    let seen = files
+        .iter()
+        .filter(|file| detail.viewed.contains(&file.path))
+        .count();
+    let mut counted = match total {
+        0 => "No file changes".to_owned(),
+        1 => "1 file changed".to_owned(),
+        total => format!("{total} files changed"),
+    };
+    if seen > 0 && scoped.is_none() {
+        counted.push_str(&format!(" · {seen} viewed"));
+    }
     galley_at(
         ui.painter(),
         Pos2::new(line.left() + 6.0, line.center().y),
         elided(
             ui.painter(),
-            &match total {
-                0 => "No file changes".to_owned(),
-                1 => "1 file changed".to_owned(),
-                total => format!("{total} files changed"),
-            },
+            &counted,
             theme::regular(11.5),
             p.secondary,
-            line.width() - 12.0,
+            (right - line.left() - 10.0).max(0.0),
         ),
     );
-    let below = Rect::from_min_max(line.left_bottom(), body.max);
     if files.is_empty() {
-        return centered_note(ui, below, p, "This pull request has no file changes.");
+        let note = if scoped.is_some() {
+            "This commit has no file changes."
+        } else {
+            "This pull request has no file changes."
+        };
+        return centered_note(ui, below, p, note);
     }
+    // Lines of the diff in view that something is said of: a conversation
+    // on the host, or a comment that waits for the review.
+    let url = shown.link.url();
+    let mut marked: Vec<(u32, bool)> = Vec::new();
+    if let Some((file, _)) = diff {
+        marked.extend(
+            state
+                .pending(url)
+                .filter(|comment| comment.path == file.path)
+                .map(|comment| (comment.line, comment.removed)),
+        );
+        marked.extend(detail.entries.iter().filter_map(|entry| match &entry.kind {
+            Kind::Thread {
+                path,
+                line: Some(line),
+                resolved: false,
+                ..
+            } if *path == file.path => Some((*line, false)),
+            _ => None,
+        }));
+    }
+    // A comment is on the whole change: one commit's lines take none.
+    let pick = std::cell::Cell::new(None);
     let mut chosen = Vec::new();
     changes::listing(
         ui,
         below,
         p,
-        changes::Listed { files, more, diff },
+        changes::Listed {
+            files,
+            more,
+            diff,
+            lines: changes::Lines {
+                marked: &marked,
+                pick: scoped.is_none().then_some(&pick),
+            },
+        },
         (state.selected.as_deref(), &mut state.diff_share),
         &mut chosen,
     );
@@ -2143,11 +2982,20 @@ fn code(
         changes::Event::CloseDiff => Some(Event::CloseDiff),
         _ => None,
     }));
+    if let (Some((line, removed)), Some((file, _))) = (pick.get(), diff) {
+        state.line = Some(Target {
+            path: file.path.clone(),
+            line,
+            removed,
+        });
+        state.composer = Some(Composer::Line);
+        state.focus = true;
+    }
 }
 
 /// How tall the field for a comment is in a tab of `width`.
-fn composer_height(ui: &Ui, text: &str, width: f32) -> f32 {
-    34.0 + chat::editor_height(ui, text, width, (3, 8)) + 6.0 + 26.0 + 6.0
+fn composer_height(ui: &Ui, text: &str, width: f32, waiting: usize) -> f32 {
+    34.0 + waiting as f32 * 22.0 + chat::editor_height(ui, text, width, (3, 8)) + 6.0 + 26.0 + 6.0
 }
 
 /// The field for a comment or a review, at the bottom of the tab.
@@ -2164,10 +3012,7 @@ fn composer(
         return;
     };
     let judge = shown.detail.allowed.judge;
-    // Only someone else's pull request is reviewed.
-    if !judge {
-        kind = Composer::Comment;
-    }
+    let url = shown.link.url();
     ui.painter()
         .line_segment([rect.left_top(), rect.right_top()], p.hairline());
     let top = Rect::from_min_size(
@@ -2181,8 +3026,31 @@ fn composer(
         "pull-request-composer-close",
         |ui| icons::button(ui, Icon::Close, "Put the comment away").clicked(),
     );
-    if judge {
-        let segments = Rect::from_min_size(top.min, vec2((top.width() - 34.0).min(190.0), 28.0));
+    let waiting = state.pending(url).count();
+    if let (Composer::Line, Some(target)) = (kind, &state.line) {
+        // The line it is about names the field.
+        let name = target.path.rsplit('/').next().unwrap_or(&target.path);
+        galley_at(
+            ui.painter(),
+            Pos2::new(top.left() + 6.0, top.center().y),
+            elided(
+                ui.painter(),
+                &format!("Comment on {name}:{}", target.line),
+                theme::medium(12.0),
+                p.fg,
+                top.width() - 40.0,
+            ),
+        );
+    } else {
+        if kind == Composer::Line {
+            kind = Composer::Comment;
+        }
+        let review = if waiting > 0 {
+            format!("Review ({waiting})")
+        } else {
+            "Review".to_owned()
+        };
+        let segments = Rect::from_min_size(top.min, vec2((top.width() - 34.0).min(200.0), 28.0));
         place(
             ui,
             segments,
@@ -2194,40 +3062,103 @@ fn composer(
                     p,
                     "pull-request-composer",
                     &mut kind,
-                    &[(Composer::Comment, "Comment"), (Composer::Review, "Review")],
+                    &[(Composer::Comment, "Comment"), (Composer::Review, &review)],
                     segments.width(),
                 )
             },
         );
-    } else {
-        ui.painter().text(
-            Pos2::new(top.left() + 6.0, top.center().y),
-            Align2::LEFT_CENTER,
-            "Comment",
-            theme::medium(12.0),
-            p.fg,
-        );
     }
     state.composer = Some(kind);
     let idle = shown.acting.is_none();
-    let url = shown.link.url();
-    let verdict = if kind == Composer::Review {
+    // Only someone else's pull request is approved or sent back.
+    let verdict = if kind == Composer::Review && judge {
         state.verdict
     } else {
         Verdict::Commented
     };
-    let long = state.draft(url).chars().count() > MAX_COMMENT;
-    // An approval needs no words; anything else says something.
-    let said = !state.draft(url).trim().is_empty();
-    let ready = idle && !long && (said || verdict == Verdict::Approved);
+    // What waits for the review is listed over its field, each with the
+    // control that takes it back.
+    let mut field_top = top.bottom() + 6.0;
+    if kind == Composer::Review {
+        let mut discard = None;
+        for (index, comment) in state.pending(url).enumerate() {
+            let row =
+                Rect::from_min_size(Pos2::new(rect.left(), field_top), vec2(rect.width(), 22.0));
+            field_top = row.bottom();
+            let name = comment.path.rsplit('/').next().unwrap_or(&comment.path);
+            let painter = ui.painter().with_clip_rect(row);
+            let place_of = painter.layout_no_wrap(
+                format!("{name}:{}", comment.line),
+                egui::FontId::monospace(10.5),
+                p.secondary,
+            );
+            let named = galley_at(
+                &painter,
+                Pos2::new(row.left() + 6.0, row.center().y),
+                place_of,
+            );
+            galley_at(
+                &painter,
+                Pos2::new(named.right() + 8.0, row.center().y),
+                elided(
+                    &painter,
+                    comment.body.lines().next().unwrap_or_default(),
+                    theme::regular(11.5),
+                    p.fg,
+                    row.right() - 26.0 - named.right() - 8.0,
+                ),
+            );
+            let cross =
+                Rect::from_min_size(Pos2::new(row.right() - 22.0, row.top()), Vec2::splat(22.0));
+            let response = ui
+                .interact(
+                    cross,
+                    Id::new(("pull-request-pending", index)),
+                    Sense::click(),
+                )
+                .on_hover_cursor(CursorIcon::PointingHand);
+            response.widget_info(|| {
+                WidgetInfo::labeled(WidgetType::Button, true, "Take this comment back")
+            });
+            if response.hovered() {
+                ui.painter().rect_filled(cross.shrink(1.0), 6, p.hover);
+            }
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(cross.center(), Vec2::splat(10.0)),
+                Icon::Close,
+                if response.hovered() { p.fg } else { p.muted },
+            );
+            if response.on_hover_text("Take this comment back").clicked() {
+                discard = Some(index);
+            }
+        }
+        if let Some(index) = discard {
+            state.discard_pending(url, index);
+        }
+    }
+    let on_line = kind == Composer::Line;
+    let text_of = |state: &State| -> String {
+        if on_line {
+            state.note.clone()
+        } else {
+            state.draft(url).to_owned()
+        }
+    };
+    let written = text_of(state);
+    let long = written.chars().count() > MAX_COMMENT;
+    // An approval and a review of single lines need no words of their own.
+    let said = !written.trim().is_empty();
+    let ready = idle
+        && !long
+        && (said || (kind == Composer::Review && (verdict == Verdict::Approved || waiting > 0)));
     // The platform's command key with Enter sends, as in any comment field.
     let focused = ui.memory(|memory| memory.has_focus(composer_id()));
     let mut send = focused
         && !view.composing
-        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
-        && ready;
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
     let field = Rect::from_min_max(
-        Pos2::new(rect.left(), top.bottom() + 6.0),
+        Pos2::new(rect.left(), field_top),
         Pos2::new(rect.right(), rect.bottom() - 32.0 - 6.0),
     );
     let mut focus = std::mem::take(&mut state.focus);
@@ -2238,16 +3169,20 @@ fn composer(
             field,
             chat::Editor {
                 id: composer_id(),
-                text: state.draft_mut(url),
-                hint: if kind == Composer::Review {
-                    "Summarize your review"
+                text: if on_line {
+                    &mut state.note
                 } else {
-                    "Leave a comment"
+                    state.draft_mut(url)
                 },
-                label: if kind == Composer::Review {
-                    "Review"
-                } else {
-                    "Comment"
+                hint: match kind {
+                    Composer::Review => "Summarize your review",
+                    Composer::Line => "Say something about this line",
+                    Composer::Comment => "Leave a comment",
+                },
+                label: match kind {
+                    Composer::Review => "Review",
+                    Composer::Line => "Comment on a line",
+                    Composer::Comment => "Comment",
                 },
                 focus: &mut focus,
                 composing: view.composing,
@@ -2266,6 +3201,7 @@ fn composer(
         (Some(Act::Review(..)), _) => "Submitting…",
         (_, Composer::Comment) => "Comment",
         (_, Composer::Review) => "Submit review",
+        (_, Composer::Line) => "Add to review",
     };
     let width = button_width(ui, label);
     let submit = Rect::from_min_size(Pos2::new(bar.right() - width, bar.top()), vec2(width, 26.0));
@@ -2276,10 +3212,12 @@ fn composer(
         pressed.on_hover_text(
             "This is too long to send from here. Shorten it, or write it on the host.",
         );
+    } else if on_line {
+        pressed.on_hover_text("It is sent when you submit the review");
     } else if ready {
         pressed.on_hover_text(format!("{label} · {}", super::helpers::shortcut("Enter")));
     }
-    if kind == Composer::Review {
+    if kind == Composer::Review && judge {
         let name = match state.verdict {
             Verdict::Approved => "Approve",
             Verdict::ChangesRequested => "Request changes",
@@ -2327,21 +3265,39 @@ fn composer(
         });
     }
     if send && ready {
-        let body = state.draft(url).trim().to_owned();
-        events.push(Event::Act(match kind {
-            Composer::Comment => Act::Comment(body),
-            Composer::Review => Act::Review(verdict, body),
-        }));
+        let body = written.trim().to_owned();
+        match (kind, state.line.take()) {
+            (Composer::Line, Some(target)) => {
+                state.add_pending(
+                    url,
+                    LineComment {
+                        path: target.path,
+                        line: target.line,
+                        removed: target.removed,
+                        body,
+                    },
+                );
+                state.note.clear();
+                // What was added is seen where it will be sent from.
+                state.composer = Some(Composer::Review);
+            }
+            (Composer::Review, _) => {
+                let lines = state.pending(url).cloned().collect();
+                events.push(Event::Act(Act::Review(verdict, body, lines)));
+            }
+            _ => events.push(Event::Act(Act::Comment(body))),
+        }
     }
     if closed {
         state.composer = None;
+        state.line = None;
         ui.memory_mut(|memory| memory.surrender_focus(composer_id()));
     }
 }
 
 /// The control that opens the field for a comment, over the trailing
-/// corner of what is read.
-fn compose_button(ui: &mut Ui, body: Rect, p: Palette, state: &mut State) {
+/// corner of what is read. It counts the comments that wait for a review.
+fn compose_button(ui: &mut Ui, body: Rect, p: Palette, waiting: usize, state: &mut State) {
     let place = Rect::from_min_size(
         Pos2::new(body.right() - 40.0, body.bottom() - 40.0),
         Vec2::splat(32.0),
@@ -2368,11 +3324,99 @@ fn compose_button(ui: &mut Ui, body: Rect, p: Palette, state: &mut State) {
         Icon::Comment,
         p.fg,
     );
+    if waiting > 0 {
+        let centre = place.right_top() + vec2(-4.0, 4.0);
+        painter.circle_filled(centre, 8.0, p.accent);
+        painter.text(
+            centre + vec2(0.0, 0.5),
+            Align2::CENTER_CENTER,
+            waiting.min(99).to_string(),
+            theme::medium(9.5),
+            p.on_accent,
+        );
+    }
     if response.clicked() {
-        state.composer = Some(Composer::Comment);
+        state.composer = Some(if waiting > 0 {
+            Composer::Review
+        } else {
+            Composer::Comment
+        });
         state.focus = true;
     }
-    response.on_hover_text("Comment or review");
+    response.on_hover_text(match waiting {
+        0 => "Comment or review".to_owned(),
+        waiting => format!(
+            "Comment or review · {} for the review",
+            count(waiting, "comment waits", "comments wait")
+        ),
+    });
+}
+
+/// The title as a field, with the controls that save it and put it away.
+/// Returns where it ends.
+fn title_field(
+    ui: &mut Ui,
+    inner: Rect,
+    top: f32,
+    p: Palette,
+    shown: &Shown,
+    state: &mut State,
+    events: &mut Vec<Event>,
+) -> f32 {
+    let idle = shown.acting.is_none();
+    let field = Rect::from_min_size(
+        Pos2::new(inner.left(), top + 2.0),
+        vec2(inner.width(), theme::metrics::CONTROL_HEIGHT),
+    );
+    let ready = idle && !state.edit.trim().is_empty() && state.edit.chars().count() <= 256;
+    let focused = ui.memory(|memory| memory.has_focus(title_id()));
+    let mut save =
+        focused && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    let response = place(
+        ui,
+        field,
+        Layout::top_down(Align::Min),
+        "pull-request-title-edit",
+        |ui| {
+            ui.add_enabled_ui(idle, |ui| {
+                super::helpers::text_field(
+                    ui,
+                    p,
+                    title_id(),
+                    &mut state.edit,
+                    "Title",
+                    "Pull request title",
+                    field.width(),
+                )
+            })
+            .inner
+        },
+    );
+    if std::mem::take(&mut state.focus) {
+        response.request_focus();
+    }
+    let bar = Rect::from_min_size(
+        Pos2::new(inner.left(), field.bottom() + 6.0),
+        vec2(inner.width(), 24.0),
+    );
+    let width = button_width(ui, "Save");
+    let place_of =
+        Rect::from_min_size(Pos2::new(bar.right() - width, bar.top()), vec2(width, 24.0));
+    let fill = if ready { Fill::Accent } else { Fill::Off };
+    save |= button(ui, p, place_of, "Save", "Save the title", fill).clicked();
+    let width = button_width(ui, "Cancel");
+    let place_of = Rect::from_min_size(
+        Pos2::new(place_of.left() - 6.0 - width, bar.top()),
+        vec2(width, 24.0),
+    );
+    if button(ui, p, place_of, "Cancel", "Keep the title", Fill::Plain).clicked() {
+        state.editing = None;
+        ui.memory_mut(|memory| memory.surrender_focus(title_id()));
+    }
+    if save && ready {
+        events.push(Event::Act(Act::Title(state.edit.trim().to_owned())));
+    }
+    bar.bottom() - 4.0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2416,7 +3460,11 @@ fn pull_request(
     );
     events.append(&mut menu_events);
     actions.append(&mut menu_actions);
-    let bottom = heading(ui, inner, header.bottom(), p, detail, view.now);
+    let bottom = if state.editing == Some(Editing::Title) {
+        title_field(ui, inner, header.bottom(), p, shown, state, events)
+    } else {
+        heading(ui, inner, header.bottom(), p, detail, view.now)
+    };
     let segments = Rect::from_min_size(
         Pos2::new(inner.left(), bottom + 10.0),
         vec2(inner.width(), 28.0),
@@ -2445,20 +3493,28 @@ fn pull_request(
     if body.height() < 8.0 {
         return;
     }
-    if state.segment == Segment::Code {
-        // A field that leaves view does not keep the keyboard.
-        if state.composer.take().is_some() {
-            ui.memory_mut(|memory| memory.surrender_focus(composer_id()));
-        }
-        code(ui, body, p, shown, state, events);
-        return;
-    }
+    let url = shown.link.url();
+    let waiting = state.pending(url).count();
     if state.composer.is_some() {
-        let height = composer_height(ui, state.draft(shown.link.url()), body.width())
-            .min((body.height() - 60.0).max(120.0));
+        let text = if state.composer == Some(Composer::Line) {
+            state.note.clone()
+        } else {
+            state.draft(url).to_owned()
+        };
+        let listed = if state.composer == Some(Composer::Review) {
+            waiting
+        } else {
+            0
+        };
+        let height =
+            composer_height(ui, &text, body.width(), listed).min((body.height() - 60.0).max(120.0));
         let field = Rect::from_min_max(Pos2::new(body.left(), body.bottom() - height), body.max);
         body.max.y = field.top() - 6.0;
         composer(ui, field, p, shown, view, state, events);
+    }
+    if state.segment == Segment::Code {
+        code(ui, body, p, shown, state, events);
+        return;
     }
     let mut content = ui.new_child(
         UiBuilder::new()
@@ -2466,22 +3522,136 @@ fn pull_request(
             .max_rect(body),
     );
     content.set_clip_rect(body.intersect(content.clip_rect()));
-    egui::ScrollArea::vertical()
-        // Each part keeps its own place.
-        .id_salt(("pull-request-scroll", state.segment as u8))
-        .auto_shrink([false, false])
-        .show(&mut content, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            match state.segment {
-                Segment::Summary => summary(ui, p, shown, view.now, state, events, actions),
-                _ => timeline(ui, p, shown, view.now, state, actions),
-            }
-            // Room for the control that floats over the corner.
-            ui.add_space(44.0);
-        });
-    if state.composer.is_none() {
-        compose_button(ui, body, p, state);
+    {
+        let segment = state.segment;
+        let mut talk = Talk {
+            allowed: &detail.allowed,
+            idle: shown.acting.is_none(),
+            composing: view.composing,
+            now: view.now,
+            state,
+            events,
+            actions,
+        };
+        egui::ScrollArea::vertical()
+            // Each part keeps its own place.
+            .id_salt(("pull-request-scroll", segment as u8))
+            .auto_shrink([false, false])
+            .show(&mut content, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                match segment {
+                    Segment::Summary => summary(ui, p, shown, &mut talk),
+                    _ => timeline(ui, p, shown, &mut talk),
+                }
+                // Room for the control that floats over the corner.
+                ui.add_space(44.0);
+            });
     }
+    if state.composer.is_none() {
+        compose_button(ui, body, p, waiting, state);
+    }
+}
+
+/// The pull requests open in the tab, a pill each: pressed, it is shown;
+/// its cross, or a middle press, takes it out of the tab.
+fn open_strip(ui: &mut Ui, strip: Rect, p: Palette, view: &View, events: &mut Vec<Event>) {
+    let current = match &view.body {
+        Body::Linked(_) => None,
+        Body::Reading(link) | Body::Failed(link, _) => Some(*link),
+        Body::Shown(shown) => Some(shown.link),
+    };
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .id_salt("pull-request-open")
+            .max_rect(strip)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    row.set_clip_rect(strip.intersect(row.clip_rect()));
+    egui::ScrollArea::horizontal()
+        .id_salt("pull-request-open-pills")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .auto_shrink([false, false])
+        .show(&mut row, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for link in view.opened {
+                let selected = current.is_some_and(|current| current.same(link));
+                let text = format!("#{}", link.number());
+                let galley = ui.painter().layout_no_wrap(
+                    text,
+                    theme::medium(11.5),
+                    if selected { p.fg } else { p.secondary },
+                );
+                let (_, pill) = ui.allocate_space(vec2(galley.size().x + 34.0, 22.0));
+                let cross = Rect::from_min_size(
+                    Pos2::new(pill.right() - 20.0, pill.top() + 2.0),
+                    Vec2::splat(18.0),
+                );
+                let response = ui
+                    .interact(
+                        pill,
+                        Id::new(("pull-request-pill", link.url())),
+                        Sense::click(),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand);
+                response.widget_info(|| {
+                    WidgetInfo::selected(
+                        WidgetType::SelectableLabel,
+                        true,
+                        selected,
+                        format!("Pull request {}", link.label()),
+                    )
+                });
+                let close = ui
+                    .interact(
+                        cross,
+                        Id::new(("pull-request-pill-close", link.url())),
+                        Sense::click(),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand);
+                close.widget_info(|| {
+                    WidgetInfo::labeled(
+                        WidgetType::Button,
+                        true,
+                        format!("Close pull request {} in this tab", link.label()),
+                    )
+                });
+                let painter = ui.painter();
+                let fill = if selected {
+                    Some(theme::tint(p.fg, 0.08))
+                } else if response.hovered() || close.hovered() {
+                    Some(theme::tint(p.fg, 0.045))
+                } else {
+                    None
+                };
+                if let Some(fill) = fill {
+                    painter.rect_filled(pill, 7, fill);
+                }
+                if response.has_focus() {
+                    focus_ring(painter, pill, 7, p);
+                }
+                galley_at(
+                    painter,
+                    Pos2::new(pill.left() + 9.0, pill.center().y + 0.5),
+                    galley,
+                );
+                if close.hovered() {
+                    painter.rect_filled(cross, 5, p.hover);
+                }
+                icons::paint(
+                    painter,
+                    Rect::from_center_size(cross.center(), Vec2::splat(9.0)),
+                    Icon::Close,
+                    if close.hovered() { p.fg } else { p.muted },
+                );
+                if close.clicked() || response.middle_clicked() {
+                    events.push(Event::Close(link.clone()));
+                } else if response.clicked() && !selected {
+                    events.push(Event::Open(link.clone()));
+                }
+                close.on_hover_text("Close in this tab");
+                response.on_hover_text(link.label());
+            }
+        });
 }
 
 /// The tab in `rect`, below the panel's tabs.
@@ -2498,10 +3668,15 @@ pub fn show(
     child.set_clip_rect(rect.expand2(vec2(4.0, 0.0)).intersect(view.window));
     child.multiply_opacity(view.reveal);
     let ui = &mut child;
-    let inner = Rect::from_min_max(
+    let mut inner = Rect::from_min_max(
         Pos2::new(rect.left() + 6.0, rect.top()),
         Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0),
     );
+    if !view.opened.is_empty() {
+        let strip = Rect::from_min_size(inner.min, vec2(inner.width(), OPEN));
+        open_strip(ui, strip, p, view, &mut events);
+        inner.min.y = strip.bottom();
+    }
     match &view.body {
         Body::Linked(links) => linked(ui, inner, p, links, &mut events, actions),
         Body::Reading(link) => {
@@ -2528,6 +3703,10 @@ mod tests {
 
     fn detail() -> Detail {
         Detail {
+            id: "PR_1".into(),
+            auto_merge: None,
+            viewed: Vec::new(),
+            reactions: Vec::new(),
             title: "A tab for pull requests".into(),
             state: Standing::Open,
             author: "ada".into(),
@@ -2682,5 +3861,59 @@ mod tests {
         assert_eq!(state.draft("a"), "Thanks");
         state.sent("a");
         assert_eq!(state.draft("a"), "");
+    }
+
+    #[test]
+    fn comments_on_lines_wait_with_their_pull_request_until_its_review_is_sent() {
+        let comment = |line: u32| LineComment {
+            path: "src/a.rs".into(),
+            line,
+            removed: false,
+            body: "Why?".into(),
+        };
+        let mut state = State::default();
+        state.add_pending("a", comment(1));
+        state.add_pending("b", comment(2));
+        state.add_pending("a", comment(3));
+        // Another pull request shown keeps what waits for each.
+        state.opened();
+        let lines = |state: &State, url: &str| -> Vec<u32> {
+            state.pending(url).map(|comment| comment.line).collect()
+        };
+        assert_eq!(
+            (lines(&state, "a"), lines(&state, "b")),
+            (vec![1, 3], vec![2])
+        );
+        state.discard_pending("a", 1);
+        assert_eq!((lines(&state, "a"), lines(&state, "b")), (vec![1], vec![2]));
+        // A comment alone sends nothing of the review.
+        state.done("a", &Act::Comment("Thanks".into()));
+        assert_eq!(lines(&state, "a"), [1]);
+        state.done(
+            "a",
+            &Act::Review(Verdict::Commented, String::new(), Vec::new()),
+        );
+        assert_eq!((lines(&state, "a"), lines(&state, "b")), (vec![], vec![2]));
+        // What was rewritten is put away once it is saved.
+        state.editing = Some(Editing::Title);
+        state.edit = "New".into();
+        state.done("a", &Act::Title("New".into()));
+        assert!(state.editing.is_none() && state.edit.is_empty());
+    }
+
+    #[test]
+    fn a_pull_request_the_host_merges_by_itself_says_so() {
+        let mut detail = detail();
+        detail.auto_merge = Some(Method::Squash);
+        assert_eq!(
+            stands(&detail, 2000),
+            (
+                Tone::Running,
+                "Merges by itself when it may · Squash and merge".into()
+            )
+        );
+        // What holds it back is still said first.
+        detail.merge = Merge::Conflicts;
+        assert_eq!(stands(&detail, 2000).0, Tone::Bad);
     }
 }

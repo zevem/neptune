@@ -16,8 +16,11 @@ their preparation records remain in Git history.
   the right panel: its title and state, what stands between it and a merge,
   reviewers, labels, description and checks under **Summary**, everything
   that happened to it under **Timeline**, and its changed files with their
-  diffs under **Code**. From there you can merge it, mark it ready or a
-  draft, close or reopen it, comment and review. Ctrl-click (Command-click on
+  diffs under **Code**. From there you can merge it or have the host merge it
+  by itself, mark it ready or a draft, close, reopen or revert it, edit its
+  title and description, change labels and reviewers, comment, react, answer
+  and resolve review conversations, mark files as viewed and review it with
+  comments on single lines. Several pull requests stay open side by side. Ctrl-click (Command-click on
   macOS) a number to open it in the browser as before. It is read with your
   signed-in GitHub CLI (`gh`), only while its tab is in view, and nothing
   read is saved.

@@ -4,7 +4,9 @@
 //! person asks of the pull request there. Nothing read is saved, and none of
 //! it enters diagnostics.
 use super::*;
-use crate::runtime::pull_request::{self as source, Act, Change, ChangedFile, Detail, Failure};
+use crate::runtime::pull_request::{
+    self as source, Act, Change, ChangedFile, Choices, Detail, Failure,
+};
 use crate::runtime::pull_requests::Checks;
 use crate::ui::changes::{DiffBody, File, Status};
 use crate::ui::pull_request::{Body, Event, FileList, Problem, Shown};
@@ -31,6 +33,8 @@ struct Watch {
     link: PullRequest,
     /// Its changed files are in view as well.
     files: bool,
+    /// The commit whose files are shown, in place of all it changes.
+    commit: Option<String>,
     /// Another window is the active one: it is read less often.
     background: bool,
 }
@@ -40,7 +44,10 @@ enum Request {
     Watch(Option<Watch>),
     /// Read what is watched again now, and report it whether it changed.
     Refresh,
-    Act(PullRequest, Act),
+    /// What is asked of a pull request, with the host's name for it.
+    Act(PullRequest, String, Act),
+    /// Read what the pull request's repository offers it.
+    Choices(PullRequest),
 }
 
 enum Reply {
@@ -57,6 +64,10 @@ enum Reply {
         act: Act,
         result: Result<(), String>,
     },
+    Choices {
+        link: PullRequest,
+        read: Result<Choices, Failure>,
+    },
 }
 
 /// The files a pull request changes, each with its diff ready to paint.
@@ -70,12 +81,15 @@ pub(super) struct Files {
 }
 
 type Read<T> = Box<dyn Fn(&PullRequest) -> Result<T, Failure> + Send>;
-type Do = Box<dyn Fn(&PullRequest, &Act) -> Result<(), String> + Send>;
+type ReadFiles =
+    Box<dyn Fn(&PullRequest, Option<&str>) -> Result<Vec<ChangedFile>, Failure> + Send>;
+type Do = Box<dyn Fn(&PullRequest, &str, &Act) -> Result<(), String> + Send>;
 
 /// Where a pull request is read and changed: the GitHub CLI, or a stand-in.
 pub(super) struct Source {
     pub detail: Read<Detail>,
-    pub files: Read<Vec<ChangedFile>>,
+    pub files: ReadFiles,
+    pub choices: Read<Choices>,
     pub act: Do,
 }
 impl Default for Source {
@@ -84,13 +98,15 @@ impl Default for Source {
         if cfg!(test) {
             Self {
                 detail: Box::new(|_| Err(Failure::Unavailable)),
-                files: Box::new(|_| Err(Failure::Unavailable)),
-                act: Box::new(|_, _| Err(String::new())),
+                files: Box::new(|_, _| Err(Failure::Unavailable)),
+                choices: Box::new(|_| Err(Failure::Unavailable)),
+                act: Box::new(|_, _, _| Err(String::new())),
             }
         } else {
             Self {
                 detail: Box::new(source::read),
                 files: Box::new(source::read_files),
+                choices: Box::new(source::read_choices),
                 act: Box::new(source::act),
             }
         }
@@ -104,6 +120,12 @@ pub(super) struct PullRequestTab {
     source: Option<Source>,
     /// What the worker was last told to watch.
     sent: Option<Watch>,
+    /// The pull requests opened in the tab, in the order they were.
+    opened: Vec<PullRequest>,
+    /// What was last read of those not in view, shown at once on return.
+    kept: Vec<(PullRequest, Box<Detail>)>,
+    /// What the repository of the one shown offers it.
+    choices: Option<Choices>,
     /// The pull request the tab shows; without one it lists those linked.
     shown: Option<PullRequest>,
     detail: Option<Result<Box<Detail>, Failure>>,
@@ -123,6 +145,9 @@ impl Default for PullRequestTab {
             worker: None,
             source: Some(Source::default()),
             sent: None,
+            opened: Vec::new(),
+            kept: Vec::new(),
+            choices: None,
             shown: None,
             detail: None,
             files: None,
@@ -178,6 +203,7 @@ fn worker(
     let mut known: Option<(PullRequest, Result<Detail, Failure>)> = None;
     // The pull request and commit whose files were read.
     let mut files_of: Option<(PullRequest, String)> = None;
+    let mut wanted: Vec<PullRequest> = Vec::new();
     let mut next = Instant::now();
     let mut asked = false;
     loop {
@@ -209,7 +235,8 @@ fn worker(
                     asked = true;
                     next = Instant::now();
                 }
-                Ok(Request::Act(link, act)) => acts.push((link, act)),
+                Ok(Request::Act(link, id, act)) => acts.push((link, id, act)),
+                Ok(Request::Choices(link)) => wanted.push(link),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -220,8 +247,12 @@ fn worker(
             }
         }
         let mut reports = Vec::new();
-        for (link, act) in acts {
-            let result = (source.act)(&link, &act);
+        for link in wanted.drain(..) {
+            let read = (source.choices)(&link);
+            reports.push(Reply::Choices { link, read });
+        }
+        for (link, id, act) in acts {
+            let result = (source.act)(&link, &id, &act);
             reports.push(Reply::Done { link, act, result });
             // What it changed is shown as soon as it can be read.
             asked = true;
@@ -246,16 +277,32 @@ fn worker(
                 }
                 asked = false;
             }
-            // Its files are read once for each commit it comes to end with.
+            // Its files are read once for each commit it comes to end with,
+            // or for the one commit chosen.
+            let of_commit = current
+                .commit
+                .clone()
+                .or_else(|| match &known {
+                    Some((_, Ok(detail))) => Some(detail.head_commit.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
             if current.files
                 && let Some((link, Ok(detail))) = &known
                 && link.same(&current.link)
                 && !files_of
                     .as_ref()
-                    .is_some_and(|(of, commit)| of.same(link) && *commit == detail.head_commit)
+                    .is_some_and(|(of, commit)| of.same(link) && *commit == of_commit)
             {
-                let read = (source.files)(link).map(|files| listed(files, detail.files));
-                files_of = Some((link.clone(), detail.head_commit.clone()));
+                let read = (source.files)(link, current.commit.as_deref()).map(|files| {
+                    // One commit's files are all listed, or cut off unseen.
+                    let total = match current.commit {
+                        Some(_) => files.len() as u32,
+                        None => detail.files,
+                    };
+                    listed(files, total)
+                });
+                files_of = Some((link.clone(), of_commit));
                 reports.push(Reply::Files {
                     link: link.clone(),
                     read,
@@ -301,6 +348,36 @@ impl PullRequestTab {
         self.shown.as_ref()
     }
 
+    /// The pull requests opened in the tab.
+    pub(super) fn opened(&self) -> &[PullRequest] {
+        &self.opened
+    }
+
+    /// Shows `link`, or the list without one. What was read of the one that
+    /// leaves view is kept, and what was kept of the one that comes is shown
+    /// at once while it is read again.
+    fn turn_to(&mut self, link: Option<PullRequest>) {
+        /// The most pull requests whose last reading is kept.
+        const KEPT: usize = 8;
+        if let (Some(was), Some(Ok(detail))) = (self.shown.take(), self.detail.take()) {
+            self.kept.retain(|(of, _)| !of.same(&was));
+            if self.kept.len() >= KEPT {
+                self.kept.remove(0);
+            }
+            self.kept.push((was, detail));
+        }
+        self.detail = link.as_ref().and_then(|link| {
+            let place = self.kept.iter().position(|(of, _)| of.same(link))?;
+            Some(Ok(self.kept.remove(place).1))
+        });
+        self.shown = link;
+        self.files = None;
+        self.choices = None;
+        self.refreshing = false;
+        self.acting = None;
+        self.problem = None;
+    }
+
     /// What the tab draws: the pull request in `shown`, or `linked`, the
     /// pull requests of the workspace in view.
     pub(super) fn view<'a>(
@@ -328,6 +405,7 @@ impl PullRequestTab {
                             .map(|place| (&files.files[place], &files.diffs[place])),
                     },
                 },
+                choices: self.choices.as_ref(),
                 refreshing: self.refreshing,
                 acting: self.acting.as_ref(),
                 problem: self
@@ -370,11 +448,7 @@ impl App {
                     self.pull_request.acting = None;
                     self.ui.pull_request.confirm = None;
                     match result {
-                        Ok(()) => {
-                            if matches!(act, Act::Comment(_) | Act::Review(..)) {
-                                self.ui.pull_request.sent(link.url());
-                            }
-                        }
+                        Ok(()) => self.ui.pull_request.done(link.url(), &act),
                         Err(said) => {
                             let said = if said.is_empty() {
                                 "The host refused it. Check that the account signed in to the GitHub CLI may do this, then try again.".to_owned()
@@ -384,6 +458,10 @@ impl App {
                             self.pull_request.problem = Some((act.outcome().1, said));
                         }
                     }
+                }
+                Reply::Choices { link, read } if of(&link) => {
+                    // A list that could not be read offers nothing to choose.
+                    self.pull_request.choices = Some(read.unwrap_or_default());
                 }
                 _ => {}
             }
@@ -404,6 +482,7 @@ impl App {
             .map(|link| Watch {
                 link,
                 files: self.ui.pull_request.segment == ui::pull_request::Segment::Code,
+                commit: self.ui.pull_request.scope.clone(),
                 background: self.window_focused == Some(false),
             });
         if watch != self.pull_request.sent {
@@ -443,9 +522,10 @@ impl App {
     pub(super) fn leave_pull_request(&mut self, ctx: &egui::Context) {
         self.ui.pull_request.focus = false;
         ctx.memory_mut(|memory| {
-            let id = ui::pull_request::composer_id();
-            if memory.has_focus(id) {
-                memory.surrender_focus(id);
+            for id in ui::pull_request::field_ids() {
+                if memory.has_focus(id) {
+                    memory.surrender_focus(id);
+                }
             }
         });
     }
@@ -453,15 +533,27 @@ impl App {
     /// Escape in the tab's field puts the comment away and returns the
     /// keyboard to the terminal. Returns whether the key was the tab's.
     pub(super) fn pull_request_escape(&mut self, ctx: &egui::Context) -> bool {
-        let id = ui::pull_request::composer_id();
         // The toolkit has already taken focus from the field for this key.
-        let held = ctx.memory(|memory| memory.has_focus(id) || memory.had_focus_last_frame(id));
-        if held {
-            self.ui.pull_request.composer = None;
-            self.ui.pull_request.focus = false;
-            ctx.memory_mut(|memory| memory.surrender_focus(id));
+        let held =
+            |id| ctx.memory(|memory| memory.has_focus(id) || memory.had_focus_last_frame(id));
+        let Some(id) = ui::pull_request::field_ids()
+            .into_iter()
+            .find(|id| held(*id))
+        else {
+            return false;
+        };
+        let tab = &mut self.ui.pull_request;
+        if id == ui::pull_request::composer_id() {
+            tab.composer = None;
+            tab.line = None;
+        } else if id == ui::pull_request::reply_id() {
+            tab.replying = None;
+        } else {
+            tab.editing = None;
         }
-        held
+        tab.focus = false;
+        ctx.memory_mut(|memory| memory.surrender_focus(id));
+        true
     }
 
     pub(super) fn pull_request_event(&mut self, ctx: &egui::Context, event: Event) {
@@ -476,27 +568,69 @@ impl App {
                 }
                 if !self
                     .pull_request
+                    .opened
+                    .iter()
+                    .any(|opened| opened.same(&link))
+                {
+                    // The tab holds a handful; the oldest gives way.
+                    if self.pull_request.opened.len() >= ui::pull_request::MAX_OPEN {
+                        self.pull_request.opened.remove(0);
+                    }
+                    self.pull_request.opened.push(link.clone());
+                }
+                if !self
+                    .pull_request
                     .shown
                     .as_ref()
                     .is_some_and(|shown| shown.same(&link))
                 {
-                    self.pull_request.shown = Some(link);
-                    self.pull_request.detail = None;
-                    self.pull_request.files = None;
-                    self.pull_request.refreshing = false;
-                    self.pull_request.acting = None;
-                    self.pull_request.problem = None;
+                    self.pull_request.turn_to(Some(link));
                     self.ui.pull_request.opened();
                 }
                 self.panel_event(ctx, ui::panel::Event::Show(ui::panel::Tab::PullRequest));
             }
             Event::Back => {
-                self.pull_request.shown = None;
-                self.pull_request.detail = None;
-                self.pull_request.files = None;
-                self.pull_request.problem = None;
+                self.pull_request.turn_to(None);
                 self.ui.pull_request.opened();
                 self.leave_pull_request(ctx);
+            }
+            Event::Close(link) => {
+                let Some(place) = self
+                    .pull_request
+                    .opened
+                    .iter()
+                    .position(|opened| opened.same(&link))
+                else {
+                    return;
+                };
+                self.pull_request.opened.remove(place);
+                self.pull_request.kept.retain(|(of, _)| !of.same(&link));
+                // Closing the one in view shows the one that takes its
+                // place, or the list after the last.
+                if self
+                    .pull_request
+                    .shown
+                    .as_ref()
+                    .is_some_and(|shown| shown.same(&link))
+                {
+                    let opened = &self.pull_request.opened;
+                    let next = opened.get(place).or(opened.last()).cloned();
+                    self.pull_request.turn_to(next);
+                    self.pull_request.kept.retain(|(of, _)| !of.same(&link));
+                    self.ui.pull_request.opened();
+                    self.leave_pull_request(ctx);
+                }
+            }
+            Event::Choices => {
+                if let Some(link) = self.pull_request.shown.clone() {
+                    self.pull_request.request(ctx, Request::Choices(link));
+                }
+            }
+            Event::Scope(commit) => {
+                self.ui.pull_request.scope = commit;
+                self.ui.pull_request.selected = None;
+                self.ui.pull_request.segment = ui::pull_request::Segment::Code;
+                self.pull_request.files = None;
             }
             Event::Refresh => {
                 if self.pull_request.shown.is_some() {
@@ -515,10 +649,12 @@ impl App {
                 // One thing is done at a time.
                 if self.pull_request.acting.is_none()
                     && let Some(link) = self.pull_request.shown.clone()
+                    && let Some(Ok(detail)) = &self.pull_request.detail
                 {
+                    let id = detail.id.clone();
                     self.pull_request.problem = None;
                     self.pull_request.acting = Some(act.clone());
-                    if !self.pull_request.request(ctx, Request::Act(link, act)) {
+                    if !self.pull_request.request(ctx, Request::Act(link, id, act)) {
                         self.pull_request.acting = None;
                     }
                 }
@@ -579,6 +715,10 @@ mod tests {
 
     pub(in crate::app) fn detail(title: &str) -> Detail {
         Detail {
+            id: "PR_1".into(),
+            auto_merge: None,
+            viewed: Vec::new(),
+            reactions: Vec::new(),
             title: title.into(),
             state: State::Open,
             author: "ada".into(),
@@ -609,6 +749,7 @@ mod tests {
                 merge: true,
                 judge: true,
                 methods: vec![Method::Squash],
+                ..Allowed::default()
             },
         }
     }
@@ -655,7 +796,7 @@ mod tests {
                 }
                 Ok(detail)
             }),
-            files: Box::new(move |_| {
+            files: Box::new(move |_, _| {
                 lists.lock().unwrap().file_reads += 1;
                 Ok(vec![
                     ChangedFile {
@@ -676,7 +817,13 @@ mod tests {
                     },
                 ])
             }),
-            act: Box::new(move |_, act| {
+            choices: Box::new(|_| {
+                Ok(Choices {
+                    labels: vec!["ui".into(), "bug".into()],
+                    people: vec!["grace".into()],
+                })
+            }),
+            act: Box::new(move |_, _, act| {
                 let mut host = acts.lock().unwrap();
                 match host.refuse.clone() {
                     Some(said) => Err(said),
@@ -826,6 +973,7 @@ mod tests {
             Action::PullRequest(Event::Act(Act::Review(
                 Verdict::Approved,
                 "Looks good".into(),
+                Vec::new(),
             ))),
         );
         settle(&mut app, &ctx, "the refusal", |app| {
@@ -887,6 +1035,89 @@ mod tests {
         assert!(title(&app).is_some());
     }
 
+    #[test]
+    fn several_pull_requests_stay_open_and_what_is_written_under_one_is_put_away_when_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, host) = opened(dir.path());
+        frame(&mut app, &ctx);
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        settle(&mut app, &ctx, "the first", |app| title(app).is_some());
+        app.action(&ctx, Action::PullRequest(Event::Open(link(84))));
+        assert!(app.pull_request.detail.is_none(), "the second is read anew");
+        settle(&mut app, &ctx, "the second", |app| title(app).is_some());
+        let numbers = |app: &App| -> Vec<u64> {
+            app.pull_request
+                .opened()
+                .iter()
+                .map(PullRequest::number)
+                .collect()
+        };
+        assert_eq!(numbers(&app), [83, 84]);
+        // Returning to one shows what was read of it at once.
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        assert!(title(&app).is_some());
+        assert_eq!(numbers(&app), [83, 84], "opened again, it is listed once");
+        // Closing the one in view shows its neighbour; the last, the list.
+        app.action(&ctx, Action::PullRequest(Event::Close(link(83))));
+        assert_eq!(app.pull_request.shown().map(PullRequest::number), Some(84));
+        app.action(&ctx, Action::PullRequest(Event::Close(link(84))));
+        assert!(app.pull_request.shown().is_none() && numbers(&app).is_empty());
+
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        settle(&mut app, &ctx, "the first again", |app| {
+            title(app).is_some()
+        });
+        // The lists a row's control opens are read when asked for.
+        app.action(&ctx, Action::PullRequest(Event::Choices));
+        settle(&mut app, &ctx, "the labels", |app| {
+            app.pull_request.choices.is_some()
+        });
+        assert_eq!(app.pull_request.choices.as_ref().unwrap().people, ["grace"]);
+        // An answer that was posted leaves its field; the host's name for
+        // the pull request went with it.
+        app.ui.pull_request.replying = Some("T_1".into());
+        app.ui.pull_request.reply = "Done".into();
+        let answer = Act::Reply {
+            thread: "T_1".into(),
+            body: "Done".into(),
+        };
+        app.action(&ctx, Action::PullRequest(Event::Act(answer.clone())));
+        settle(&mut app, &ctx, "the reply", |app| {
+            app.pull_request.acting.is_none()
+        });
+        assert_eq!(host.lock().unwrap().acts, [answer]);
+        assert!(app.ui.pull_request.replying.is_none() && app.ui.pull_request.reply.is_empty());
+        // A review takes the comments that waited for it.
+        let line = source::LineComment {
+            path: "src/a.rs".into(),
+            line: 2,
+            removed: false,
+            body: "Why?".into(),
+        };
+        app.ui
+            .pull_request
+            .add_pending(link(83).url(), line.clone());
+        let review = Act::Review(Verdict::Commented, String::new(), vec![line]);
+        app.action(&ctx, Action::PullRequest(Event::Act(review)));
+        settle(&mut app, &ctx, "the review", |app| {
+            app.pull_request.acting.is_none()
+        });
+        assert_eq!(app.ui.pull_request.pending(link(83).url()).count(), 0);
+        // One commit's files are read in place of all of them.
+        app.action(
+            &ctx,
+            Action::PullRequest(Event::Scope(Some("8b45e82f1a2b".into()))),
+        );
+        assert_eq!(app.ui.pull_request.segment, Segment::Code);
+        settle(&mut app, &ctx, "the commit's files", |app| {
+            app.pull_request.files.is_some()
+        });
+        assert_eq!(
+            app.pull_request.sent.as_ref().unwrap().commit.as_deref(),
+            Some("8b45e82f1a2b")
+        );
+    }
+
     /// What a capture shows in place of GitHub: a pull request in review with
     /// a description, reviewers, checks in every outcome, a conversation and
     /// changed files.
@@ -916,12 +1147,14 @@ mod tests {
             files: 5,
             history: vec![
                 Commit {
+                    oid: "1a2b3c4d5e6f".into(),
                     short: "1a2b3c4".into(),
                     headline: "feat(ui): a tab for one pull request".into(),
                     author: "ada".into(),
                     at: now - 25 * 3600,
                 },
                 Commit {
+                    oid: "8b45e82f1a2b".into(),
                     short: "8b45e82".into(),
                     headline: "fix(ui): five names share the narrowest strip".into(),
                     author: "ada".into(),
@@ -955,9 +1188,14 @@ mod tests {
             ],
             entries: vec![
                 Entry {
+                    id: "C_1".into(),
+                    reactions: Vec::new(),
                     author: "linus".into(),
                     at: now - 20 * 3600,
                     kind: Kind::Thread {
+                        id: "T_1".into(),
+                        can_reply: true,
+                        can_resolve: true,
                         path: "src/ui/panel.rs".into(),
                         line: Some(241),
                         resolved: false,
@@ -972,6 +1210,8 @@ mod tests {
                     url: "https://github.com/zevem/neptune/pull/118#discussion_r1".into(),
                 },
                 Entry {
+                    id: "C_2".into(),
+                    reactions: Vec::new(),
                     author: "grace".into(),
                     at: now - 5 * 3600,
                     kind: Kind::Review(Verdict::Approved),
@@ -979,9 +1219,14 @@ mod tests {
                     url: "https://github.com/zevem/neptune/pull/118#pullrequestreview-1".into(),
                 },
                 Entry {
+                    id: "C_3".into(),
+                    reactions: Vec::new(),
                     author: "linus".into(),
                     at: now - 3 * 3600,
                     kind: Kind::Thread {
+                        id: "T_2".into(),
+                        can_reply: true,
+                        can_resolve: true,
                         path: "src/runtime/pull_request.rs".into(),
                         line: Some(52),
                         resolved: true,
@@ -992,6 +1237,8 @@ mod tests {
                     url: "https://github.com/zevem/neptune/pull/118#discussion_r2".into(),
                 },
                 Entry {
+                    id: "C_4".into(),
+                    reactions: Vec::new(),
                     author: "linus".into(),
                     at: now - 2 * 3600,
                     kind: Kind::Review(Verdict::ChangesRequested),
@@ -999,6 +1246,8 @@ mod tests {
                     url: "https://github.com/zevem/neptune/pull/118#pullrequestreview-2".into(),
                 },
                 Entry {
+                    id: "C_5".into(),
+                    reactions: Vec::new(),
                     author: "ada".into(),
                     at: now - 12 * 60,
                     kind: Kind::Comment,
@@ -1011,9 +1260,33 @@ mod tests {
                 merge: true,
                 judge: true,
                 methods: vec![Method::Merge, Method::Squash, Method::Rebase],
+                auto_merge: true,
+                update_branch: true,
+                edit: true,
+                react: true,
+                label: true,
+                request: true,
             },
             ..detail("")
         };
+        pictured.reactions = vec![source::Reaction {
+            emoji: source::Emoji::Rocket,
+            count: 3,
+            mine: true,
+        }];
+        pictured.entries[4].reactions = vec![
+            source::Reaction {
+                emoji: source::Emoji::ThumbsUp,
+                count: 2,
+                mine: false,
+            },
+            source::Reaction {
+                emoji: source::Emoji::Heart,
+                count: 1,
+                mine: true,
+            },
+        ];
+        pictured.viewed = vec!["docs/design.md".into()];
         match state {
             "ready" => {
                 pictured
@@ -1084,6 +1357,64 @@ mod tests {
             app: App,
             state: String,
             staged: bool,
+            /// How far a driven run has come, and what it saw on the way.
+            step: usize,
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        /// What a driven run presses and types, and when, in milliseconds
+        /// from the launch: a number on the terminal's toolbar, the control
+        /// that opens the comment field, a comment sent with the command
+        /// key and Enter, then a second one left with Escape.
+        fn script() -> Vec<(u64, Vec<egui::Event>)> {
+            use egui::{Event as Input, Key, Modifiers, PointerButton, pos2};
+            let command = Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::NONE
+            };
+            let press = |pos, pressed| Input::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            let key = |key, modifiers, pressed| Input::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            };
+            let (number, compose) = (pos2(410.0, 22.0), pos2(968.0, 648.0));
+            let click = |at: u64, pos| {
+                vec![
+                    (at, vec![Input::PointerMoved(pos)]),
+                    (at + 100, vec![press(pos, true)]),
+                    (at + 200, vec![press(pos, false)]),
+                ]
+            };
+            let mut script = click(500, number);
+            script.extend(click(1100, compose));
+            script.push((1500, vec![Input::Text("Looks right".into())]));
+            script.push((
+                1700,
+                vec![
+                    Input::ModifiersChanged(command),
+                    key(Key::Enter, command, true),
+                    key(Key::Enter, command, false),
+                    Input::ModifiersChanged(Modifiers::NONE),
+                ],
+            ));
+            script.extend(click(2000, compose));
+            script.push((2400, vec![Input::Text("Kept".into())]));
+            script.push((
+                2600,
+                vec![
+                    key(Key::Escape, Modifiers::NONE, true),
+                    key(Key::Escape, Modifiers::NONE, false),
+                ],
+            ));
+            script
         }
         impl eframe::App for NativeCapture {
             fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -1129,7 +1460,9 @@ mod tests {
                 if let Ok(width) = std::env::var("NEPTUNE_PR_WIDTH") {
                     self.app.ui.panel.width = width.parse().unwrap();
                 }
-                if matches!(self.state.as_str(), "linked" | "empty") {
+                if self.state == "drive" {
+                    // The panel stays closed: a press on a number opens it.
+                } else if matches!(self.state.as_str(), "linked" | "empty") {
                     self.app
                         .action(ctx, Action::Panel(ui::panel::Event::Show(Tab::PullRequest)));
                 } else {
@@ -1186,11 +1519,45 @@ mod tests {
                             | egui::Event::MouseWheel { .. }
                     )
                 });
+                if self.state != "drive" || !self.staged {
+                    return;
+                }
+                // What the last step led to is noted before the next one.
+                let elapsed = self.app.started.elapsed().as_millis() as u64;
+                let script = script();
+                while let Some((at, events)) = script.get(self.step) {
+                    if elapsed < *at {
+                        break;
+                    }
+                    let tab = &self.app.ui.pull_request;
+                    let composer = ui::pull_request::composer_id();
+                    self.seen.lock().unwrap().push(format!(
+                        "{at}: open={} tab={:?} shown={:?} composer={:?} draft={:?} typing={}",
+                        self.app.ui.panel.open,
+                        self.app.ui.panel.tab,
+                        self.app.pull_request.shown().map(PullRequest::number),
+                        tab.composer,
+                        tab.draft(link(118).url()),
+                        ctx.memory(|memory| memory.has_focus(composer)),
+                    ));
+                    input.events.extend(events.iter().cloned());
+                    self.step += 1;
+                }
             }
             fn on_exit(&mut self) {
                 eframe::App::on_exit(&mut self.app);
+                let tab = &self.app.ui.pull_request;
+                self.seen.lock().unwrap().push(format!(
+                    "end: composer={:?} draft={:?} typing={}",
+                    tab.composer,
+                    tab.draft(link(118).url()),
+                    false,
+                ));
             }
         }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::new(Mutex::new(Vec::<Act>::new()));
+        let (noted, done) = (seen.clone(), asked.clone());
         let pictured_state = state.clone();
         eframe::run_native(
             "Neptune pull request visual QA",
@@ -1211,7 +1578,8 @@ mod tests {
                     app.pull_request.source = Some(Source {
                         detail: Box::new(source::read),
                         files: Box::new(source::read_files),
-                        act: Box::new(|_, _| Err("A capture changes nothing.".into())),
+                        choices: Box::new(source::read_choices),
+                        act: Box::new(|_, _, _| Err("A capture changes nothing.".into())),
                     });
                     app.pull_requests = Default::default();
                 } else {
@@ -1237,6 +1605,7 @@ mod tests {
                             .collect()
                     }));
                     let state = pictured_state.clone();
+                    let driven = state == "drive";
                     app.pull_request.source = Some(Source {
                         detail: Box::new(move |_| match state.as_str() {
                             "reading" => {
@@ -1247,7 +1616,7 @@ mod tests {
                             "signed-out" => Err(Failure::SignedOut),
                             state => Ok(pictured(state)),
                         }),
-                        files: Box::new(|_| {
+                        files: Box::new(|_, _| {
                             let file = |path: &str, change, added, removed, patch: Option<&str>| {
                                 ChangedFile {
                                     path: path.into(),
@@ -1272,16 +1641,66 @@ mod tests {
                                 file("assets/tab.png", Change::Added, 0, 0, None),
                             ])
                         }),
-                        act: Box::new(|_, _| Err("A capture changes nothing.".into())),
+                        choices: Box::new(|_| {
+                            Ok(Choices {
+                                labels: vec!["ui".into(), "right panel".into(), "bug".into()],
+                                people: vec!["grace".into(), "linus".into()],
+                            })
+                        }),
+                        act: Box::new(move |_, _, act| {
+                            // A driven run has its stand-in do what is asked.
+                            if driven {
+                                done.lock().unwrap().push(act.clone());
+                                Ok(())
+                            } else {
+                                Err("A capture changes nothing.".into())
+                            }
+                        }),
                     });
                 }
                 Ok(Box::new(NativeCapture {
                     app,
                     state: pictured_state,
                     staged: false,
+                    step: 0,
+                    seen: noted,
                 }))
             }),
         )
         .unwrap();
+        if state != "drive" {
+            return;
+        }
+        let seen = seen.lock().unwrap();
+        println!("{}", seen.join("\n"));
+        let at = |step: &str| {
+            seen.iter()
+                .find(|line| line.starts_with(step))
+                .unwrap_or_else(|| panic!("the run did not reach {step}"))
+                .clone()
+        };
+        // The pressed number opened the panel on its pull request.
+        assert!(at("500:").contains("open=false"), "{seen:?}");
+        let opened = at("1100:");
+        assert!(
+            opened.contains("open=true tab=PullRequest shown=Some(118) composer=None"),
+            "{opened}"
+        );
+        // The round control opened the field and gave it the keyboard.
+        assert!(at("1500:").contains("composer=Some(Comment)"), "{seen:?}");
+        let typed = at("1700:");
+        assert!(
+            typed.contains("draft=\"Looks right\" typing=true"),
+            "{typed}"
+        );
+        // The command key with Enter sent it: the field is put away empty.
+        assert_eq!(*asked.lock().unwrap(), [Act::Comment("Looks right".into())]);
+        assert!(at("2000:").contains("composer=None draft=\"\""), "{seen:?}");
+        // Escape puts the field away and keeps what was written.
+        assert!(at("2600:").contains("composer=Some(Comment) draft=\"Kept\" typing=true"));
+        assert!(
+            at("end:").contains("composer=None draft=\"Kept\""),
+            "{seen:?}"
+        );
     }
 }

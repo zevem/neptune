@@ -124,6 +124,65 @@ pub struct Check {
     pub url: String,
 }
 
+/// One of the eight reactions the host has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emoji {
+    ThumbsUp,
+    ThumbsDown,
+    Laugh,
+    Hooray,
+    Confused,
+    Heart,
+    Rocket,
+    Eyes,
+}
+impl Emoji {
+    pub const ALL: [Self; 8] = [
+        Self::ThumbsUp,
+        Self::ThumbsDown,
+        Self::Laugh,
+        Self::Hooray,
+        Self::Confused,
+        Self::Heart,
+        Self::Rocket,
+        Self::Eyes,
+    ];
+    /// The host's name for it.
+    fn content(self) -> &'static str {
+        match self {
+            Self::ThumbsUp => "THUMBS_UP",
+            Self::ThumbsDown => "THUMBS_DOWN",
+            Self::Laugh => "LAUGH",
+            Self::Hooray => "HOORAY",
+            Self::Confused => "CONFUSED",
+            Self::Heart => "HEART",
+            Self::Rocket => "ROCKET",
+            Self::Eyes => "EYES",
+        }
+    }
+    /// The reaction in a word, for a face that has no picture of it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::ThumbsUp => "+1",
+            Self::ThumbsDown => "−1",
+            Self::Laugh => "Laugh",
+            Self::Hooray => "Hooray",
+            Self::Confused => "Confused",
+            Self::Heart => "Heart",
+            Self::Rocket => "Rocket",
+            Self::Eyes => "Eyes",
+        }
+    }
+}
+
+/// How many gave one reaction, and whether the person is among them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaction {
+    pub emoji: Emoji,
+    pub count: u32,
+    pub mine: bool,
+}
+
 /// A reply in a review conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -139,6 +198,12 @@ pub enum Kind {
     Review(Verdict),
     /// A conversation on a line of a changed file.
     Thread {
+        /// The host's name for the conversation, which replies and its
+        /// resolving are addressed to.
+        id: String,
+        /// The person may reply to it, and may resolve or reopen it.
+        can_reply: bool,
+        can_resolve: bool,
         path: String,
         line: Option<u32>,
         resolved: bool,
@@ -151,7 +216,8 @@ pub enum Kind {
 /// A commit of the pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
-    /// The first seven characters of its name.
+    /// Its name, and the first seven characters of it.
+    pub oid: String,
     pub short: String,
     pub headline: String,
     pub author: String,
@@ -192,11 +258,23 @@ pub struct Allowed {
     pub judge: bool,
     /// The ways the repository lets a pull request be merged.
     pub methods: Vec<Method>,
+    /// Have the host merge it by itself once it may be.
+    pub auto_merge: bool,
+    /// Bring its branch up to date with the one it merges into.
+    pub update_branch: bool,
+    /// Edit its title and description.
+    pub edit: bool,
+    pub react: bool,
+    pub label: bool,
+    pub request: bool,
 }
 
 /// One thing said on the pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The host's name for it, which reactions are addressed to.
+    pub id: String,
+    pub reactions: Vec<Reaction>,
     pub author: String,
     pub at: i64,
     pub kind: Kind,
@@ -206,6 +284,14 @@ pub struct Entry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detail {
+    /// The host's name for the pull request.
+    pub id: String,
+    /// How the host will merge it by itself, when it was asked to.
+    pub auto_merge: Option<Method>,
+    /// The changed files the person marked as viewed.
+    pub viewed: Vec<String>,
+    /// Reactions to its description.
+    pub reactions: Vec<Reaction>,
     pub title: String,
     pub state: State,
     pub author: String,
@@ -320,14 +406,50 @@ pub fn timestamp(text: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
+/// The reactions to something, as the query asks for them.
+const REACTIONS: &str = "reactionGroups{content viewerHasReacted reactors{totalCount}}";
+
+/// The reactions someone gave, of those the host counts.
+fn reactions(of: &serde_json::Value) -> Vec<Reaction> {
+    of["reactionGroups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| {
+            let emoji = Emoji::ALL
+                .into_iter()
+                .find(|emoji| group["content"] == emoji.content())?;
+            let count = group["reactors"]["totalCount"]
+                .as_u64()?
+                .min(u32::MAX as u64) as u32;
+            (count > 0).then_some(Reaction {
+                emoji,
+                count,
+                mine: group["viewerHasReacted"] == true,
+            })
+        })
+        .collect()
+}
+
+fn method(name: Option<&str>) -> Option<Method> {
+    Some(match name? {
+        "MERGE" => Method::Merge,
+        "SQUASH" => Method::Squash,
+        "REBASE" => Method::Rebase,
+        _ => return None,
+    })
+}
+
 /// `PullRequest::parse` admits only letters, digits and `-_.` in the names
 /// written into the query.
 fn query(link: &PullRequest) -> String {
     let (_, owner, repository) = link.location();
     format!(
         "query{{repository(owner:\"{owner}\",name:\"{repository}\"){{\
-         viewerPermission mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed \
+         viewerPermission mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed \
          pullRequest(number:{number}){{\
+         id viewerCanUpdateBranch viewerCanReact autoMergeRequest{{mergeMethod}} {REACTIONS} \
+         files(first:{MAX_FILES}){{nodes{{path viewerViewedState}}}} \
          title state isDraft body createdAt updatedAt mergedAt closedAt headRefOid \
          viewerCanUpdate viewerDidAuthor \
          author{{login}} mergedBy{{login}} \
@@ -337,15 +459,15 @@ fn query(link: &PullRequest) -> String {
          assignees(first:10){{nodes{{login}}}} \
          reviewRequests(first:20){{nodes{{requestedReviewer{{__typename ...on User{{login}} ...on Team{{name}}}}}}}} \
          latestOpinionatedReviews(first:20){{nodes{{author{{login}} state}}}} \
-         history:commits(last:{MAX_COMMITS}){{nodes{{commit{{abbreviatedOid messageHeadline committedDate \
+         history:commits(last:{MAX_COMMITS}){{nodes{{commit{{oid abbreviatedOid messageHeadline committedDate \
          author{{name user{{login}}}}}}}}}} \
          commits(last:1){{totalCount nodes{{commit{{statusCheckRollup{{contexts(first:{MAX_CHECKS}){{totalCount nodes{{__typename \
          ...on CheckRun{{name status conclusion detailsUrl startedAt completedAt checkSuite{{workflowRun{{workflow{{name}}}}}}}} \
          ...on StatusContext{{context state targetUrl}}}}}}}}}}}}}} \
-         comments(last:{MAX_ENTRIES}){{totalCount nodes{{author{{login}} body createdAt url isMinimized}}}} \
-         reviews(last:{MAX_ENTRIES}){{totalCount nodes{{author{{login}} state body submittedAt url}}}} \
-         reviewThreads(last:{MAX_ENTRIES}){{totalCount nodes{{isResolved isOutdated path line originalLine \
-         comments(first:{MAX_REPLIES}){{nodes{{author{{login}} body createdAt url}}}}}}}}}}}}}}",
+         comments(last:{MAX_ENTRIES}){{totalCount nodes{{id {REACTIONS} author{{login}} body createdAt url isMinimized}}}} \
+         reviews(last:{MAX_ENTRIES}){{totalCount nodes{{id {REACTIONS} author{{login}} state body submittedAt url}}}} \
+         reviewThreads(last:{MAX_ENTRIES}){{totalCount nodes{{id viewerCanResolve viewerCanUnresolve viewerCanReply isResolved isOutdated path line originalLine \
+         comments(first:{MAX_REPLIES}){{nodes{{id {REACTIONS} author{{login}} body createdAt url}}}}}}}}}}}}}}",
         number = link.number()
     )
 }
@@ -507,6 +629,8 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
             continue;
         }
         entries.push(Entry {
+            id: comment["id"].as_str().unwrap_or_default().to_owned(),
+            reactions: reactions(comment),
             author: login(&comment["author"]),
             at: comment["createdAt"]
                 .as_str()
@@ -530,6 +654,8 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
             continue;
         }
         entries.push(Entry {
+            id: review["id"].as_str().unwrap_or_default().to_owned(),
+            reactions: reactions(review),
             author: login(&review["author"]),
             at: review["submittedAt"]
                 .as_str()
@@ -563,10 +689,17 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
         let Some((first, url)) = said.next() else {
             continue;
         };
+        let opening = &thread["comments"]["nodes"][0];
         entries.push(Entry {
+            id: opening["id"].as_str().unwrap_or_default().to_owned(),
+            reactions: reactions(opening),
             author: first.author,
             at: first.at,
             kind: Kind::Thread {
+                id: thread["id"].as_str().unwrap_or_default().to_owned(),
+                can_reply: thread["viewerCanReply"] == true,
+                can_resolve: thread["viewerCanResolve"] == true
+                    || thread["viewerCanUnresolve"] == true,
                 path: thread["path"].as_str().unwrap_or_default().to_owned(),
                 line: thread["line"]
                     .as_u64()
@@ -587,6 +720,7 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
             let commit = &node["commit"];
             let text = |field: &str| commit[field].as_str().unwrap_or_default().to_owned();
             Commit {
+                oid: text("oid"),
                 short: text("abbreviatedOid"),
                 headline: text("messageHeadline"),
                 author: commit["author"]["user"]["login"]
@@ -618,9 +752,25 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
         .filter(|(field, _)| repository[*field] == true)
         .map(|(_, method)| method)
         .collect(),
+        auto_merge: writes && repository["autoMergeAllowed"] == true,
+        update_branch: pull["viewerCanUpdateBranch"] == true,
+        edit: pull["viewerCanUpdate"] == true,
+        react: pull["viewerCanReact"] == true,
+        label: matches!(
+            repository["viewerPermission"].as_str(),
+            Some("ADMIN" | "MAINTAIN" | "WRITE" | "TRIAGE")
+        ),
+        request: writes,
     };
 
     Ok(Detail {
+        id: text("id"),
+        auto_merge: method(pull["autoMergeRequest"]["mergeMethod"].as_str()),
+        viewed: nodes("files")
+            .filter(|file| file["viewerViewedState"] == "VIEWED")
+            .filter_map(|file| file["path"].as_str().map(str::to_owned))
+            .collect(),
+        reactions: reactions(pull),
         title: text("title"),
         state,
         author: login(&pull["author"]),
@@ -716,39 +866,150 @@ pub fn read(link: &PullRequest) -> Result<Detail, Failure> {
 }
 
 /// Reads the files the pull request changes, with their diffs: the first
-/// `MAX_FILES` of them.
-pub fn read_files(link: &PullRequest) -> Result<Vec<ChangedFile>, Failure> {
+/// `MAX_FILES` of them. With a `commit`, the files that one commit changes.
+pub fn read_files(link: &PullRequest, commit: Option<&str>) -> Result<Vec<ChangedFile>, Failure> {
     let (host, owner, repository) = link.location();
-    let path = format!(
-        "repos/{owner}/{repository}/pulls/{}/files?per_page={MAX_FILES}",
-        link.number()
-    );
+    // A commit is named by the host: only its hexadecimal name is passed on.
+    let commit = commit.filter(|oid| oid.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let path = match commit {
+        Some(oid) => format!("repos/{owner}/{repository}/commits/{oid}?per_page={MAX_FILES}"),
+        None => format!(
+            "repos/{owner}/{repository}/pulls/{}/files?per_page={MAX_FILES}",
+            link.number()
+        ),
+    };
     let printed =
         cli(&["api", "--hostname", host, &path], MAX_FILES_RESPONSE).map_err(|_| Failure::NoCli)?;
     if !printed.ok {
         return Err(unanswered(host));
     }
-    parse_files(&printed.bytes)
+    if commit.is_none() {
+        return parse_files(&printed.bytes);
+    }
+    // A commit lists its files inside what it says of itself.
+    let response: serde_json::Value =
+        serde_json::from_slice(&printed.bytes).map_err(|_| Failure::Unavailable)?;
+    parse_files(response["files"].to_string().as_bytes())
+}
+
+/// What a pull request of the repository can be given: its labels and the
+/// people who can be asked to review.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Choices {
+    pub labels: Vec<String>,
+    pub people: Vec<String>,
+}
+
+/// Reads the labels and the people of the pull request's repository, the
+/// first hundred of each.
+pub fn read_choices(link: &PullRequest) -> Result<Choices, Failure> {
+    let (host, owner, repository) = link.location();
+    let named = |what: &str, field: &str| -> Result<Vec<String>, Failure> {
+        let path = format!("repos/{owner}/{repository}/{what}?per_page=100");
+        let printed =
+            cli(&["api", "--hostname", host, &path], MAX_RESPONSE).map_err(|_| Failure::NoCli)?;
+        if !printed.ok {
+            return Err(unanswered(host));
+        }
+        let response: serde_json::Value =
+            serde_json::from_slice(&printed.bytes).map_err(|_| Failure::Unavailable)?;
+        Ok(response
+            .as_array()
+            .ok_or(Failure::Unavailable)?
+            .iter()
+            .filter_map(|item| item[field].as_str().map(str::to_owned))
+            .collect())
+    };
+    Ok(Choices {
+        labels: named("labels", "name")?,
+        people: named("assignees", "login")?,
+    })
+}
+
+/// A comment on a line of a changed file, sent with a review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineComment {
+    pub path: String,
+    /// The line as the pull request leaves it, or as it was for one removed.
+    pub line: u32,
+    pub removed: bool,
+    pub body: String,
 }
 
 /// Something the person asks of the pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
     Merge(Method),
+    /// Have the host merge it by itself once it may be, or no longer.
+    AutoMerge(Option<Method>),
+    /// Bring its branch up to date with the one it merges into.
+    UpdateBranch,
+    /// Open a pull request that takes back what this one merged.
+    Revert,
     Ready,
     Draft,
     Close,
     Reopen,
+    Title(String),
+    Description(String),
     Comment(String),
     /// A review: approval, a request for changes or a comment, with what it
-    /// says.
-    Review(Verdict, String),
+    /// says and what it says of single lines.
+    Review(Verdict, String, Vec<LineComment>),
+    /// An answer in a review conversation.
+    Reply {
+        thread: String,
+        body: String,
+    },
+    Resolve {
+        thread: String,
+        resolved: bool,
+    },
+    React {
+        subject: String,
+        emoji: Emoji,
+        on: bool,
+    },
+    Label {
+        name: String,
+        on: bool,
+    },
+    /// Ask someone to review, or no longer.
+    Request {
+        name: String,
+        on: bool,
+    },
+    /// Mark a changed file as viewed, or no longer.
+    Viewed {
+        path: String,
+        on: bool,
+    },
 }
+
+/// A name as part of an address.
+fn encoded(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            byte => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 impl Act {
     /// What to say when it was done, and when it could not be.
     pub fn outcome(&self) -> (&'static str, &'static str) {
         match self {
             Self::Merge(_) => ("Pull request merged", "Could not merge this pull request"),
+            Self::AutoMerge(Some(_)) => ("Auto-merge turned on", "Could not turn on auto-merge"),
+            Self::AutoMerge(None) => ("Auto-merge turned off", "Could not turn off auto-merge"),
+            Self::UpdateBranch => ("Branch updated", "Could not update the branch"),
+            Self::Revert => (
+                "Revert pull request opened",
+                "Could not open a pull request that reverts this one",
+            ),
             Self::Ready => (
                 "Marked ready for review",
                 "Could not mark this ready for review",
@@ -759,28 +1020,87 @@ impl Act {
                 "Pull request reopened",
                 "Could not reopen this pull request",
             ),
+            Self::Title(_) => ("Title saved", "Could not save the title"),
+            Self::Description(_) => ("Description saved", "Could not save the description"),
             Self::Comment(_) => ("Comment posted", "Could not post the comment"),
-            Self::Review(Verdict::Approved, _) => {
+            Self::Review(Verdict::Approved, ..) => {
                 ("Pull request approved", "Could not submit the review")
             }
-            Self::Review(Verdict::ChangesRequested, _) => {
+            Self::Review(Verdict::ChangesRequested, ..) => {
                 ("Changes requested", "Could not submit the review")
             }
             Self::Review(..) => ("Review submitted", "Could not submit the review"),
+            Self::Reply { .. } => ("Reply posted", "Could not post the reply"),
+            Self::Resolve { resolved: true, .. } => (
+                "Conversation resolved",
+                "Could not resolve the conversation",
+            ),
+            Self::Resolve { .. } => ("Conversation reopened", "Could not reopen the conversation"),
+            Self::React { .. } => ("Reaction saved", "Could not save the reaction"),
+            Self::Label { .. } => ("Labels changed", "Could not change the labels"),
+            Self::Request { .. } => ("Reviewers changed", "Could not change the reviewers"),
+            Self::Viewed { .. } => ("File marked", "Could not mark the file"),
         }
     }
 
-    /// The GitHub CLI command that does it.
-    fn command<'a>(&'a self, url: &'a str) -> Vec<&'a str> {
+    /// Whether the field it was written in is put away once it is done.
+    pub fn writes(&self) -> bool {
+        matches!(
+            self,
+            Self::Comment(_) | Self::Review(..) | Self::Reply { .. }
+        )
+    }
+
+    /// The GitHub CLI command that does it. `id` is the host's name for the
+    /// pull request. What the person wrote is passed as a value of its own,
+    /// never as part of a request's text.
+    fn command(&self, link: &PullRequest, id: &str) -> Vec<String> {
+        let (host, owner, repository) = link.location();
+        let url = link.url();
+        let words = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect();
+        let rest = |verb: &str, path: String, fields: &[(&str, &str)]| {
+            let mut command: Vec<String> = words(&["api", "--hostname", host, "-X", verb]);
+            command.push(format!("repos/{owner}/{repository}/{path}"));
+            for (flag, field) in fields {
+                command.extend([(*flag).to_owned(), (*field).to_owned()]);
+            }
+            command
+        };
+        let mutation = |text: &str, values: &[(&str, &str)]| {
+            let mut command: Vec<String> = words(&["api", "graphql", "--hostname", host, "-f"]);
+            command.push(format!("query=mutation{text}"));
+            for (name, value) in values {
+                command.extend(["-f".to_owned(), format!("{name}={value}")]);
+            }
+            command
+        };
+        let number = link.number();
         match self {
-            Self::Merge(method) => vec!["pr", "merge", url, method.flag()],
-            Self::Ready => vec!["pr", "ready", url],
-            Self::Draft => vec!["pr", "ready", url, "--undo"],
-            Self::Close => vec!["pr", "close", url],
-            Self::Reopen => vec!["pr", "reopen", url],
-            Self::Comment(body) => vec!["pr", "comment", url, "--body", body],
-            Self::Review(verdict, body) => {
-                let mut command = vec![
+            Self::Merge(method) => words(&["pr", "merge", url, method.flag()]),
+            Self::AutoMerge(Some(method)) => words(&["pr", "merge", url, "--auto", method.flag()]),
+            Self::AutoMerge(None) => words(&["pr", "merge", url, "--disable-auto"]),
+            Self::UpdateBranch => rest("PUT", format!("pulls/{number}/update-branch"), &[]),
+            Self::Revert => mutation(
+                "($id:ID!){revertPullRequest(input:{pullRequestId:$id}){clientMutationId}}",
+                &[("id", id)],
+            ),
+            Self::Ready => words(&["pr", "ready", url]),
+            Self::Draft => words(&["pr", "ready", url, "--undo"]),
+            Self::Close => words(&["pr", "close", url]),
+            Self::Reopen => words(&["pr", "reopen", url]),
+            Self::Title(title) => rest(
+                "PATCH",
+                format!("pulls/{number}"),
+                &[("-f", &format!("title={title}"))],
+            ),
+            Self::Description(body) => rest(
+                "PATCH",
+                format!("pulls/{number}"),
+                &[("-f", &format!("body={body}"))],
+            ),
+            Self::Comment(body) => words(&["pr", "comment", url, "--body", body]),
+            Self::Review(verdict, body, lines) if lines.is_empty() => {
+                let mut command: Vec<String> = words(&[
                     "pr",
                     "review",
                     url,
@@ -789,12 +1109,85 @@ impl Act {
                         Verdict::ChangesRequested => "--request-changes",
                         _ => "--comment",
                     },
-                ];
+                ]);
                 if !body.is_empty() {
-                    command.extend(["--body", body]);
+                    command.extend(["--body".to_owned(), body.clone()]);
                 }
                 command
             }
+            // One request carries the review and what it says of each line.
+            Self::Review(verdict, body, lines) => {
+                let event = match verdict {
+                    Verdict::Approved => "APPROVE",
+                    Verdict::ChangesRequested => "REQUEST_CHANGES",
+                    _ => "COMMENT",
+                };
+                let mut command = rest(
+                    "POST",
+                    format!("pulls/{number}/reviews"),
+                    &[("-f", &format!("event={event}"))],
+                );
+                if !body.is_empty() {
+                    command.extend(["-f".to_owned(), format!("body={body}")]);
+                }
+                for line in lines {
+                    let side = if line.removed { "LEFT" } else { "RIGHT" };
+                    command.extend([
+                        "-f".to_owned(),
+                        format!("comments[][path]={}", line.path),
+                        "-F".to_owned(),
+                        format!("comments[][line]={}", line.line),
+                        "-f".to_owned(),
+                        format!("comments[][side]={side}"),
+                        "-f".to_owned(),
+                        format!("comments[][body]={}", line.body),
+                    ]);
+                }
+                command
+            }
+            Self::Reply { thread, body } => mutation(
+                "($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){clientMutationId}}",
+                &[("id", thread), ("body", body)],
+            ),
+            Self::Resolve { thread, resolved } => mutation(
+                if *resolved {
+                    "($id:ID!){resolveReviewThread(input:{threadId:$id}){clientMutationId}}"
+                } else {
+                    "($id:ID!){unresolveReviewThread(input:{threadId:$id}){clientMutationId}}"
+                },
+                &[("id", thread)],
+            ),
+            Self::React { subject, emoji, on } => mutation(
+                &format!(
+                    "($id:ID!){{{}(input:{{subjectId:$id,content:{}}}){{clientMutationId}}}}",
+                    if *on { "addReaction" } else { "removeReaction" },
+                    emoji.content()
+                ),
+                &[("id", subject)],
+            ),
+            Self::Label { name, on: true } => rest(
+                "POST",
+                format!("issues/{number}/labels"),
+                &[("-f", &format!("labels[]={name}"))],
+            ),
+            Self::Label { name, on: false } => rest(
+                "DELETE",
+                format!("issues/{number}/labels/{}", encoded(name)),
+                &[],
+            ),
+            Self::Request { name, on } => rest(
+                if *on { "POST" } else { "DELETE" },
+                format!("pulls/{number}/requested_reviewers"),
+                &[("-f", &format!("reviewers[]={name}"))],
+            ),
+            Self::Viewed { path, on } => mutation(
+                if *on {
+                    "($id:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$id,path:$path}){clientMutationId}}"
+                } else {
+                    "($id:ID!,$path:String!){unmarkFileAsViewed(input:{pullRequestId:$id,path:$path}){clientMutationId}}"
+                },
+                &[("id", id), ("path", path)],
+            ),
         }
     }
 }
@@ -807,7 +1200,10 @@ fn complaint(said: &[u8]) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default();
-    let line = line.strip_prefix("GraphQL: ").unwrap_or(line);
+    // The CLI leads a failure with a mark of its own.
+    let line = ["X ", "✗ ", "GraphQL: ", "gh: "]
+        .into_iter()
+        .fold(line, |line, mark| line.strip_prefix(mark).unwrap_or(line));
     let mut short: String = line.chars().take(280).collect();
     if short.len() < line.len() {
         short.push('…');
@@ -817,8 +1213,11 @@ fn complaint(said: &[u8]) -> String {
 
 /// Does what was asked, as the account signed in to the GitHub CLI. On
 /// failure, what the host said of it; nothing when it said nothing.
-pub fn act(link: &PullRequest, act: &Act) -> Result<(), String> {
-    match cli_complaint(&act.command(link.url())) {
+/// `id` is the host's name for the pull request, as it was read.
+pub fn act(link: &PullRequest, id: &str, act: &Act) -> Result<(), String> {
+    let command = act.command(link, id);
+    let command: Vec<&str> = command.iter().map(String::as_str).collect();
+    match cli_complaint(&command) {
         Ok(done) if done.ok => Ok(()),
         Ok(done) => Err(complaint(&done.bytes)),
         Err(_) => Err("The GitHub CLI (gh) could not be started.".into()),
@@ -847,20 +1246,25 @@ mod tests {
                 "query{repository(owner:\"zevem\",name:\"re.po_2\"){viewerPermission "
             )
         );
-        assert!(query.contains("pullRequest(number:83){title "));
+        assert!(query.contains("pullRequest(number:83){id "));
         assert!(query.contains("comments(last:50)") && query.contains("contexts(first:100)"));
         assert_eq!(query.matches('{').count(), query.matches('}').count());
     }
 
     const RESPONSE: &str = r#"{"data":{"repository":{
         "viewerPermission":"WRITE","mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":true,
-        "pullRequest":{
+        "autoMergeAllowed":true,
+        "pullRequest":{"id":"PR_1","viewerCanUpdateBranch":true,"viewerCanReact":true,
+        "autoMergeRequest":{"mergeMethod":"SQUASH"},
+        "reactionGroups":[{"content":"ROCKET","viewerHasReacted":true,"reactors":{"totalCount":2}},
+            {"content":"EYES","viewerHasReacted":false,"reactors":{"totalCount":0}}],
+        "files":{"nodes":[{"path":"src/a.rs","viewerViewedState":"VIEWED"},{"path":"src/b.rs","viewerViewedState":"UNVIEWED"}]},
         "title":"feat(ui): a tab for pull requests","state":"OPEN","isDraft":false,
         "body":"<!-- Say what it does. -->\r\nWhat it does.\r\n","createdAt":"2026-10-07T03:14:21Z","updatedAt":"2026-10-07T06:00:00Z",
         "mergedAt":null,"closedAt":null,"headRefOid":"8b45e821b3937e7a512707df6e40d0e1b7e9e7ba",
         "viewerCanUpdate":true,"viewerDidAuthor":false,
         "history":{"nodes":[
-            {"commit":{"abbreviatedOid":"1a2b3c4","messageHeadline":"Add the tab","committedDate":"2026-10-07T03:00:00Z","author":{"name":"Ada L","user":{"login":"ada"}}}},
+            {"commit":{"oid":"1a2b3c4d5e","abbreviatedOid":"1a2b3c4","messageHeadline":"Add the tab","committedDate":"2026-10-07T03:00:00Z","author":{"name":"Ada L","user":{"login":"ada"}}}},
             {"commit":{"abbreviatedOid":"8b45e82","messageHeadline":"Fit five tabs","committedDate":"2026-10-07T03:10:00Z","author":{"name":"Robot","user":null}}}]},
         "author":{"login":"ada"},"mergedBy":null,
         "baseRefName":"main","headRefName":"feat/tab","isCrossRepository":true,
@@ -895,9 +1299,11 @@ mod tests {
             {"author":{"login":"linus"},"state":"COMMENTED","body":"","submittedAt":"2026-10-07T04:00:00Z","url":""},
             {"author":{"login":"grace"},"state":"PENDING","body":"draft","submittedAt":null,"url":""}]},
         "reviewThreads":{"totalCount":1,"nodes":[
-            {"isResolved":false,"isOutdated":true,"path":"src/ui/panel.rs","line":null,"originalLine":42,
+            {"id":"T_1","viewerCanResolve":true,"viewerCanUnresolve":false,"viewerCanReply":true,
+             "isResolved":false,"isOutdated":true,"path":"src/ui/panel.rs","line":null,"originalLine":42,
              "comments":{"nodes":[
-                {"author":{"login":"linus"},"body":"Why five?","createdAt":"2026-10-07T04:00:00Z","url":"https://github.com/t/1"},
+                {"id":"C_1","reactionGroups":[{"content":"THUMBS_UP","viewerHasReacted":false,"reactors":{"totalCount":1}}],
+                 "author":{"login":"linus"},"body":"Why five?","createdAt":"2026-10-07T04:00:00Z","url":"https://github.com/t/1"},
                 {"author":{"login":"ada"},"body":"One more tab.","createdAt":"2026-10-07T04:10:00Z","url":"https://github.com/t/2"}]}}]}
     }}}}"#;
 
@@ -975,6 +1381,9 @@ mod tests {
         assert_eq!(
             detail.entries[0].kind,
             Kind::Thread {
+                id: "T_1".into(),
+                can_reply: true,
+                can_resolve: true,
                 path: "src/ui/panel.rs".into(),
                 line: Some(42),
                 resolved: false,
@@ -1006,8 +1415,31 @@ mod tests {
                 merge: true,
                 judge: true,
                 methods: vec![Method::Squash, Method::Rebase],
+                auto_merge: true,
+                update_branch: true,
+                edit: true,
+                react: true,
+                label: true,
+                request: true,
             }
         );
+        // What the host names is kept for what is asked of it later.
+        assert_eq!(
+            (detail.id.as_str(), detail.auto_merge),
+            ("PR_1", Some(Method::Squash))
+        );
+        assert_eq!(detail.viewed, ["src/a.rs"]);
+        assert_eq!(
+            detail.reactions,
+            [Reaction {
+                emoji: Emoji::Rocket,
+                count: 2,
+                mine: true
+            }]
+        );
+        assert_eq!(detail.entries[0].id, "C_1");
+        assert_eq!(detail.entries[0].reactions[0].emoji, Emoji::ThumbsUp);
+        assert_eq!(detail.history[0].oid, "1a2b3c4d5e");
     }
 
     #[test]
@@ -1031,23 +1463,33 @@ mod tests {
 
     #[test]
     fn what_is_asked_becomes_one_command_and_a_failure_one_line() {
-        let url = "https://github.com/zevem/neptune/pull/83";
+        let link = PullRequest::parse("https://github.com/zevem/neptune/pull/83").unwrap();
+        let url = link.url();
+        let command = |act: Act| act.command(&link, "PR_1");
         assert_eq!(
-            Act::Merge(Method::Squash).command(url),
+            command(Act::Merge(Method::Squash)),
             ["pr", "merge", url, "--squash"]
         );
-        assert_eq!(Act::Draft.command(url), ["pr", "ready", url, "--undo"]);
         assert_eq!(
-            Act::Comment("Thanks".into()).command(url),
+            command(Act::AutoMerge(Some(Method::Rebase))),
+            ["pr", "merge", url, "--auto", "--rebase"]
+        );
+        assert_eq!(command(Act::Draft), ["pr", "ready", url, "--undo"]);
+        assert_eq!(
+            command(Act::Comment("Thanks".into())),
             ["pr", "comment", url, "--body", "Thanks"]
         );
         // An approval needs no words; what is written goes with it.
         assert_eq!(
-            Act::Review(Verdict::Approved, String::new()).command(url),
+            command(Act::Review(Verdict::Approved, String::new(), Vec::new())),
             ["pr", "review", url, "--approve"]
         );
         assert_eq!(
-            Act::Review(Verdict::ChangesRequested, "Not yet".into()).command(url),
+            command(Act::Review(
+                Verdict::ChangesRequested,
+                "Not yet".into(),
+                Vec::new()
+            )),
             [
                 "pr",
                 "review",
@@ -1057,11 +1499,139 @@ mod tests {
                 "Not yet"
             ]
         );
+        // What is said of single lines goes in the same request.
+        let lines = vec![LineComment {
+            path: "src/a.rs".into(),
+            line: 7,
+            removed: true,
+            body: "Why?".into(),
+        }];
+        assert_eq!(
+            command(Act::Review(Verdict::Commented, String::new(), lines))[2..],
+            [
+                "github.com",
+                "-X",
+                "POST",
+                "repos/zevem/neptune/pulls/83/reviews",
+                "-f",
+                "event=COMMENT",
+                "-f",
+                "comments[][path]=src/a.rs",
+                "-F",
+                "comments[][line]=7",
+                "-f",
+                "comments[][side]=LEFT",
+                "-f",
+                "comments[][body]=Why?",
+            ]
+        );
+        // What the person wrote is a value of its own, whatever it holds.
+        let reply = command(Act::Reply {
+            thread: "T_1".into(),
+            body: "\"){evil}".into(),
+        });
+        assert!(
+            reply[5].starts_with(
+                "query=mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply("
+            )
+        );
+        assert_eq!(reply[6..], ["-f", "id=T_1", "-f", "body=\"){evil}"]);
+        let react = command(Act::React {
+            subject: "C_1".into(),
+            emoji: Emoji::Rocket,
+            on: false,
+        });
+        assert!(react[5].contains("removeReaction(input:{subjectId:$id,content:ROCKET})"));
+        assert_eq!(
+            command(Act::Label {
+                name: "needs review/ui".into(),
+                on: false
+            })[3..],
+            [
+                "-X",
+                "DELETE",
+                "repos/zevem/neptune/issues/83/labels/needs%20review%2Fui"
+            ]
+        );
+        assert_eq!(
+            command(Act::Request {
+                name: "grace".into(),
+                on: true
+            })[3..],
+            [
+                "-X",
+                "POST",
+                "repos/zevem/neptune/pulls/83/requested_reviewers",
+                "-f",
+                "reviewers[]=grace"
+            ]
+        );
+        assert_eq!(
+            command(Act::Title("A = b".into()))[3..],
+            [
+                "-X",
+                "PATCH",
+                "repos/zevem/neptune/pulls/83",
+                "-f",
+                "title=A = b"
+            ]
+        );
+        let viewed = command(Act::Viewed {
+            path: "src/a.rs".into(),
+            on: true,
+        });
+        assert!(viewed[5].contains("markFileAsViewed"));
+        assert_eq!(viewed[6..], ["-f", "id=PR_1", "-f", "path=src/a.rs"]);
         assert_eq!(
             complaint(b"\nGraphQL: Pull request is not mergeable (mergePullRequest)\nmore\n"),
             "Pull request is not mergeable (mergePullRequest)"
         );
+        assert_eq!(
+            complaint(b"X Pull request zevem/neptune#117 is closed.\n"),
+            "Pull request zevem/neptune#117 is closed."
+        );
         assert_eq!(complaint(b""), "");
+    }
+
+    /// The real GitHub CLI against a real pull request named by
+    /// `NEPTUNE_PR_LIVE`: it is read, one of its files is marked as viewed
+    /// and unmarked again, which only the signed-in account sees, and a
+    /// change the host must refuse is refused in the host's words.
+    #[test]
+    #[ignore = "Uses the signed-in GitHub CLI; needs NEPTUNE_PR_LIVE"]
+    fn the_github_cli_reads_marks_and_reports_a_refusal() {
+        let url = std::env::var("NEPTUNE_PR_LIVE").expect("Name a merged pull request");
+        let link = PullRequest::parse(&url).unwrap();
+        let detail = read(&link).unwrap();
+        assert!(!detail.title.is_empty() && !detail.id.is_empty());
+        let files = read_files(&link, None).unwrap();
+        let path = files[0].path.clone();
+        let was = detail.viewed.contains(&path);
+        let mark = |on| {
+            act(
+                &link,
+                &detail.id,
+                &Act::Viewed {
+                    path: path.clone(),
+                    on,
+                },
+            )
+        };
+        assert_eq!(mark(!was), Ok(()));
+        assert_eq!(read(&link).unwrap().viewed.contains(&path), !was);
+        assert_eq!(mark(was), Ok(()));
+        assert_eq!(read(&link).unwrap().viewed.contains(&path), was);
+        // One commit's files and the repository's lists are read as well.
+        let commit = &detail.history.last().unwrap().oid;
+        assert!(!read_files(&link, Some(commit)).unwrap().is_empty());
+        let choices = read_choices(&link).unwrap();
+        assert!(!choices.people.is_empty());
+        // A merged pull request cannot be made a draft: the host says so.
+        if detail.state == State::Merged {
+            let refused = act(&link, &detail.id, &Act::Draft).unwrap_err();
+            println!("refused: {refused}");
+            assert!(!refused.is_empty());
+        }
     }
 
     #[test]

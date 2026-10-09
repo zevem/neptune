@@ -463,6 +463,7 @@ mod tests {
                     },
                     pull_request: &pull_request::View {
                         body: pull_request::Body::Linked(&[]),
+                        opened: &[],
                         now: 0,
                         composing: false,
                         reveal: 1.0,

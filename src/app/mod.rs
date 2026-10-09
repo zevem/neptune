@@ -1215,6 +1215,7 @@ impl eframe::App for App {
             let selected_file = self.ui.pull_request.selected.clone();
             let pull_request = ui::pull_request::View {
                 body: self.pull_request.view(&linked, selected_file.as_deref()),
+                opened: self.pull_request.opened(),
                 now: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |since| since.as_secs() as i64),
