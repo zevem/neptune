@@ -10,6 +10,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 - [Dev servers and ports](#dev-servers-and-ports)
 - [Closing terminals safely](#closing-terminals-safely)
 - [Coding agent sessions](#coding-agent-sessions)
+- [Subscription usage](#subscription-usage)
 - [Projects](#projects)
 - [Notifications](#notifications)
 - [Command-line options](#command-line-options)
@@ -160,6 +161,40 @@ rows opens every picture on the list at once, with a small copy of each at the
 foot of the window to click. The folder control on a row shows
 the file in your file manager and the cross dismisses it from the list without touching the file. See
 [attached files](agent-sessions.md#attached-files).
+
+## Subscription usage
+
+The bottom-right bar shows the percentage used of the most consumed allowance
+for your local Codex, Claude Code and Cursor subscriptions. Hover for the
+window's name. Click it, or choose **Subscription usage**
+in the command palette, for one line per reported window under its provider:
+the percentage **Used** and the time it **Resets in**. The header shows how old
+the readings are, and its **Refresh** button checks the accounts again. Checks
+also run every five minutes; opening the dropdown does not resize your
+terminals. A failed check keeps the last reading marked **Stale** with its age,
+and a reset time that has passed reads **due** until the next refresh rather
+than assuming the quota is available.
+
+Sign in through the provider's CLI first: `codex login`, `claude auth login`,
+or `agent login` for Cursor. Codex and Claude use their own read-only account
+protocols, with no prompt or agent turn. Cursor reads the same current-period
+dashboard percentages as its CLI, including bonus allowance. Missing CLIs,
+unsupported logins and failed checks are explained in the dropdown; API-key
+logins may not report subscription limits.
+
+The accounts are those signed in on the computer running Neptune, including
+when the terminal in view is connected over SSH. Codex and Claude honor their
+CLI's `CODEX_HOME` and `CLAUDE_CONFIG_DIR` environment settings. Cursor uses
+`CURSOR_AUTH_TOKEN` or its saved CLI `auth.json` in the platform's configuration
+directory; an explicit `CURSOR_API_KEY` never falls back to a different saved
+account. `CURSOR_API_ENDPOINT` may select another HTTPS endpoint with an
+explicit token or file login. On macOS, **Allow Cursor Keychain** grants this
+run permission to read the default CLI login; macOS may ask for access. This
+permission lasts until Neptune closes. A file-based login can instead use
+`AGENT_CLI_CREDENTIAL_STORE=file`.
+
+Only bounded quota metadata is kept in memory. Neptune does not scan agent
+transcripts, store credentials or usage history, or redeem reset credits.
 
 ## Projects
 

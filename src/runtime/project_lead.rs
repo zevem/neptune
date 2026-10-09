@@ -1038,7 +1038,7 @@ fn woke(shared: &Shared) {
 }
 /// Signals the process and everything it started.
 #[cfg(unix)]
-fn signal(pid: u32, name: &str) {
+pub(super) fn signal(pid: u32, name: &str) {
     let _ = Command::new("kill")
         .args([name, "--", &format!("-{pid}")])
         .stdin(Stdio::null())
@@ -1047,7 +1047,7 @@ fn signal(pid: u32, name: &str) {
         .status();
 }
 #[cfg(not(unix))]
-fn signal(_: u32, _: &str) {}
+pub(super) fn signal(_: u32, _: &str) {}
 fn keep_tail(mut stderr: impl Read, shared: &Shared) {
     let mut chunk = [0; 1024];
     while let Ok(read @ 1..) = stderr.read(&mut chunk) {
@@ -1336,9 +1336,19 @@ fn leads(search: &Search) -> Vec<AgentKind> {
         .filter(|kind| find(*kind, search).is_some())
         .collect()
 }
+/// Find a local CLI for a read-only account probe, on a worker.
+pub(super) fn executable(kind: AgentKind, stop: &AtomicBool) -> Option<PathBuf> {
+    find_cancelled(kind, &Search::from_env(), Some(stop))
+}
 /// The installed CLI: on `PATH`, then where CLIs are commonly installed,
 /// then where the person's login shell finds it.
 fn find(kind: AgentKind, search: &Search) -> Option<PathBuf> {
+    find_cancelled(kind, search, None)
+}
+fn find_cancelled(kind: AgentKind, search: &Search, stop: Option<&AtomicBool>) -> Option<PathBuf> {
+    if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+        return None;
+    }
     let shims = search.shims.as_deref();
     if let Ok(found) = agents::resolve_in(kind, &search.path, shims) {
         return Some(found);
@@ -1374,7 +1384,12 @@ fn find(kind: AgentKind, search: &Search) -> Option<PathBuf> {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < until => thread::sleep(POLL),
+            Ok(None)
+                if Instant::now() < until
+                    && stop.is_none_or(|stop| !stop.load(Ordering::Acquire)) =>
+            {
+                thread::sleep(POLL)
+            }
             _ => {
                 signal(child.id(), "-KILL");
                 let _ = child.kill();
@@ -2765,6 +2780,40 @@ exec sleep 30"#;
             let found = installed(Arc::new(|| {}));
             let found = found.recv_timeout(Duration::from_secs(30)).unwrap();
             assert!(found.iter().all(|kind| LEADS.contains(kind)));
+        }
+
+        #[test]
+        fn usage_discovery_cancels_and_reaps_the_owned_login_shell() {
+            let folder = tempfile::tempdir().unwrap();
+            let shell = folder.path().join("login");
+            let pid = folder.path().join("pid");
+            executable(
+                &shell,
+                &format!("#!/bin/sh\necho $$ > '{}'\n/bin/sleep 30\n", pid.display()),
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::clone(&stop);
+            let marker = pid.clone();
+            let cancelled = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !marker.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                cancel.store(true, Ordering::Release);
+            });
+            let search = Search {
+                path: OsString::new(),
+                shims: None,
+                known: Vec::new(),
+                shell: Some(shell),
+                patience: Duration::from_secs(5),
+            };
+            assert_eq!(
+                find_cancelled(AgentKind::Claude, &search, Some(&stop)),
+                None
+            );
+            cancelled.join().unwrap();
+            gone(std::fs::read_to_string(pid).unwrap().trim());
         }
     }
 }

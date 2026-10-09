@@ -9,4 +9,5 @@ pub mod project_store;
 pub mod pull_requests;
 pub mod sessions;
 pub mod updates;
+pub mod usage;
 pub mod worktrees;

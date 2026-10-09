@@ -160,8 +160,20 @@ icon buttons keep a 28-point target around a 16-point glyph.
   the sidebar is hidden the toolbar also carries the window controls, the
   sidebar toggle and "New workspace". In narrow windows the command field
   collapses to an icon and search takes the title's room.
-- **Right panel.** A panel at the trailing edge, below the toolbar and in the
-  window material. Toggling it slides it in from the trailing edge over 160
+- **Subscription footer.** A 44-point strip below the content, sharing the
+  window material. Its trailing control shows each available local AI
+  subscription's most consumed allowance and a small track; it collapses
+  to **AI usage** when there is little room or no reading yet. Clicking opens
+  one upward popover, at most 316 points wide. Providers are headed groups on
+  one shared grid, a 22-point line per window: name, track, percentage used
+  and time to reset under **Used** and **Resets in** captions. The header
+  carries the readings' age and an icon-only Refresh. It scrolls only when the
+  window is too short. Failures retain visibly stale readings, in the footer
+  and the group's heading. Painted text keeps accessible labels that name the
+  provider. The popover never resizes the shell, and checking runs on one
+  sleeping worker.
+- **Right panel.** A panel at the trailing edge, below the toolbar and above
+  the footer, in the window material. Toggling it slides it in from the trailing edge over 160
   ms with a matching fade, from the button, the shortcut or the command
   palette alike. As with the sidebar, the terminals follow its edge, each shell
   is resized once to the size it will rest at, and a toggle reversed midway
