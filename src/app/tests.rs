@@ -71,6 +71,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         attached: Default::default(),
         explorer: Default::default(),
         changes: Default::default(),
+        pull_request: Default::default(),
         file_drag: Default::default(),
         paste_chord: Default::default(),
         worktrees: Default::default(),

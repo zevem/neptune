@@ -385,7 +385,7 @@ impl App {
                     self.search_task = None;
                 } else if self.explorer_escape(ctx) {
                     // A name being typed, a search or its field was left.
-                } else if self.project_escape(ctx) {
+                } else if self.project_escape(ctx) || self.pull_request_escape(ctx) {
                     // A message being written keeps its text; the keyboard
                     // returns to the terminal.
                 } else if self.ui.error.is_some() && self.controller.model().active_pane().is_none()

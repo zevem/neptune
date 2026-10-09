@@ -90,6 +90,24 @@ and `NEPTUNE_PREVIEW_IMAGE` names a picture of your own by absolute path. The
 pointer is placed by the test: resting a real pointer, and leaving the path,
 need a hand-driven native check.
 
+The pull request tab is captured likewise, with a pull request written in
+the test in place of GitHub:
+
+```sh
+NEPTUNE_PR_CAPTURE="$PWD/artifacts/native-pull-request.png" \
+  cargo test -p neptune-terminal --lib app::pull_request::tests::capture_pull_request_native --locked -- --ignored --nocapture
+```
+
+`NEPTUNE_PR_STATE` names what is shown: `summary` (the default), `ready`,
+`merged`, `draft`, `conflicts`, `checks`, `confirm`, `close`, `problem`,
+`timeline`, `code`, `diff`, `comment`, `review`, `reading`, `missing`,
+`signed-out`, `linked` or `empty`. `NEPTUNE_PR_NARROW=1` uses a 640×400 window,
+`NEPTUNE_PR_WIDTH` sets the panel's width and `NEPTUNE_PR_THEME` names a theme.
+`NEPTUNE_PR_LIVE` names a pull request by its address and reads it with the
+signed-in GitHub CLI instead; a capture never changes a pull request. Pressing
+a number, typing a comment and every change sent to a host need a hand-driven
+native check.
+
 The integrated shell regression needs a POSIX shell. X11 injection verifies
 Linux/X11 input, not Wayland, macOS or Windows input. Inspection events verify
 application routing; clipboard, IME and real OS keyboard behavior need native

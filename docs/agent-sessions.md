@@ -106,7 +106,8 @@ An agent started through the adapters is also given Neptune's tools. One is
 after it creates a pull request and when it starts work on an existing one,
 including every pull request of a stack. The terminal's tab then shows the pull
 request's number beside its close control; clicking the number opens the pull
-request in the default browser. A terminal alone in view has no tab, so the
+request in the right panel's [Pull request tab](usage.md#pull-requests), and
+Ctrl-click (Command-click on macOS) in the default browser. A terminal alone in view has no tab, so the
 toolbar shows its numbers after the title. One or two pull requests are shown
 side by side, the newest nearest the close control. With more, or where two do
 not fit beside the title, one number carries a chevron and opens a list
@@ -151,7 +152,9 @@ holds no token of its own, and nothing it reads is saved. Without `gh`, without
 a sign-in for the pull request's host (`gh auth login`, with `--hostname` for
 GitHub Enterprise), without a network or for a host that is not GitHub, the
 number looks as it did before and its tooltip says the status is unavailable.
-Titles, comments and other contents of a pull request are not requested.
+Titles, comments and other contents of a pull request are requested only for
+the one you open in the [Pull request tab](usage.md#pull-requests), while that
+tab is in view.
 
 A state is read when its link first comes into view and again every 15 seconds
 while checks are running, every minute while the pull request is otherwise in

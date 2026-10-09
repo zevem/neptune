@@ -377,51 +377,91 @@ fn program() -> std::path::PathBuf {
     "gh".into()
 }
 
-/// The response of one GraphQL request made by the GitHub CLI, which prints
-/// what it could read even when part of the request failed.
-fn gh(host: &str, query: &str) -> Option<Vec<u8>> {
+/// What the GitHub CLI printed, and whether it said it succeeded.
+pub(super) struct Printed {
+    pub ok: bool,
+    pub bytes: Vec<u8>,
+}
+
+/// Runs the GitHub CLI without a prompt, reading at most `limit` bytes of what
+/// it prints and ending it at the time limit. An error when it could not be
+/// started, as where it is not installed.
+pub(super) fn cli(args: &[&str], limit: u64) -> std::io::Result<Printed> {
+    run_cli(args, limit, false)
+}
+
+/// The same for a command that changes something: what is read is what the
+/// CLI says went wrong, which is the host's own words.
+pub(super) fn cli_complaint(args: &[&str]) -> std::io::Result<Printed> {
+    run_cli(args, 4096, true)
+}
+
+fn run_cli(args: &[&str], limit: u64, complaint: bool) -> std::io::Result<Printed> {
     use std::process::{Command, Stdio};
+    let pipe = |read: bool| if read { Stdio::piped() } else { Stdio::null() };
     let mut command = Command::new(program());
     command
-        .args(["api", "graphql", "--hostname", host, "-f"])
-        .arg(format!("query={query}"))
+        .args(args)
+        // A command given an address must not act on a repository it is
+        // started in.
+        .current_dir(std::env::temp_dir())
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("NO_COLOR", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdout(pipe(!complaint))
+        .stderr(pipe(complaint));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let mut child = command.spawn().ok()?;
-    let mut output = child.stdout.take()?;
+    let mut child = command.spawn()?;
+    let mut output: Box<dyn Read + Send> = if complaint {
+        Box::new(child.stderr.take().ok_or(std::io::ErrorKind::BrokenPipe)?)
+    } else {
+        Box::new(child.stdout.take().ok_or(std::io::ErrorKind::BrokenPipe)?)
+    };
     std::thread::scope(|scope| {
         let reader = scope.spawn(move || {
             let mut response = Vec::new();
             (&mut output)
-                .take(MAX_RESPONSE)
+                .take(limit)
                 .read_to_end(&mut response)
-                .ok()
                 .map(|_| response)
         });
         let deadline = Instant::now() + LOOKUP_TIMEOUT;
-        loop {
+        let ok = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status.success(),
                 Ok(None) if Instant::now() < deadline && !reader.is_finished() => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break;
+                    break false;
                 }
             }
-        }
-        reader.join().ok().flatten()
+        };
+        let bytes = reader
+            .join()
+            .map_err(|_| std::io::ErrorKind::Other)?
+            .map_err(|error| error.kind())?;
+        Ok(Printed { ok, bytes })
     })
+}
+
+/// The response of one GraphQL request made by the GitHub CLI, which prints
+/// what it could read even when part of the request failed.
+fn gh(host: &str, query: &str) -> Option<Vec<u8>> {
+    let query = format!("query={query}");
+    cli(
+        &["api", "graphql", "--hostname", host, "-f", &query],
+        MAX_RESPONSE,
+    )
+    .ok()
+    .map(|printed| printed.bytes)
 }
 
 #[cfg(test)]

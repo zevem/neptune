@@ -17,6 +17,7 @@ pub mod panel;
 pub(crate) mod ports;
 pub mod preferences;
 pub mod project;
+pub mod pull_request;
 pub mod search;
 pub mod theme_browser;
 mod theme_editor;
@@ -129,6 +130,8 @@ pub struct UiState {
     pub worktree: worktrees::State,
     /// The project tab: what is being written to a lead, or for a new one.
     pub project: project::State,
+    /// The pull request tab: the part in view and what is being written.
+    pub pull_request: pull_request::State,
 }
 #[derive(Clone)]
 pub enum Action {
@@ -183,6 +186,7 @@ pub enum Action {
     Changes(changes::Event),
     Worktree(worktrees::Event),
     Project(project::Event),
+    PullRequest(pull_request::Event),
     Find,
     CopyHints(PaneId),
     SearchChanged,

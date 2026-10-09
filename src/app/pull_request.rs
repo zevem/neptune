@@ -1,0 +1,1287 @@
+//! The pull request the panel's tab shows. A worker reads it through the
+//! person's GitHub CLI when it is opened and again as it ages, only while
+//! the tab is in view, and reports only what changed. It also does what the
+//! person asks of the pull request there. Nothing read is saved, and none of
+//! it enters diagnostics.
+use super::*;
+use crate::runtime::pull_request::{self as source, Act, Change, ChangedFile, Detail, Failure};
+use crate::runtime::pull_requests::Checks;
+use crate::ui::changes::{DiffBody, File, Status};
+use crate::ui::pull_request::{Body, Event, FileList, Problem, Shown};
+use neptune_model::PullRequest;
+
+/// A slow host is asked less often: the GitHub CLI gets at most this share
+/// of the worker's time.
+const WORK_SHARE: u32 = 10;
+/// A window in the background is read this many times less often.
+const BACKGROUND: u32 = 5;
+
+/// How long what was read stands before it is read again.
+fn refresh_after(read: &Result<Detail, Failure>) -> Duration {
+    Duration::from_secs(match read {
+        Ok(detail) if !detail.in_review() => 10 * 60,
+        Ok(detail) if detail.checks() == Checks::Pending => 15,
+        _ => 60,
+    })
+}
+
+/// What the tab shows this frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Watch {
+    link: PullRequest,
+    /// Its changed files are in view as well.
+    files: bool,
+    /// Another window is the active one: it is read less often.
+    background: bool,
+}
+
+enum Request {
+    /// Nothing while the tab is out of view or the window is minimized.
+    Watch(Option<Watch>),
+    /// Read what is watched again now, and report it whether it changed.
+    Refresh,
+    Act(PullRequest, Act),
+}
+
+enum Reply {
+    Detail {
+        link: PullRequest,
+        read: Result<Box<Detail>, Failure>,
+    },
+    Files {
+        link: PullRequest,
+        read: Result<Files, Failure>,
+    },
+    Done {
+        link: PullRequest,
+        act: Act,
+        result: Result<(), String>,
+    },
+}
+
+/// The files a pull request changes, each with its diff ready to paint.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Files {
+    files: Vec<File>,
+    /// The diff of each file, in their order.
+    diffs: Vec<DiffBody>,
+    /// Files beyond those read.
+    more: usize,
+}
+
+type Read<T> = Box<dyn Fn(&PullRequest) -> Result<T, Failure> + Send>;
+type Do = Box<dyn Fn(&PullRequest, &Act) -> Result<(), String> + Send>;
+
+/// Where a pull request is read and changed: the GitHub CLI, or a stand-in.
+pub(super) struct Source {
+    pub detail: Read<Detail>,
+    pub files: Read<Vec<ChangedFile>>,
+    pub act: Do,
+}
+impl Default for Source {
+    fn default() -> Self {
+        // Tests of the application do not run the person's GitHub CLI.
+        if cfg!(test) {
+            Self {
+                detail: Box::new(|_| Err(Failure::Unavailable)),
+                files: Box::new(|_| Err(Failure::Unavailable)),
+                act: Box::new(|_, _| Err(String::new())),
+            }
+        } else {
+            Self {
+                detail: Box::new(source::read),
+                files: Box::new(source::read_files),
+                act: Box::new(source::act),
+            }
+        }
+    }
+}
+
+pub(super) struct PullRequestTab {
+    replies: (mpsc::Sender<Reply>, mpsc::Receiver<Reply>),
+    worker: Option<mpsc::Sender<Request>>,
+    /// Taken by the worker, which starts with the first pull request opened.
+    source: Option<Source>,
+    /// What the worker was last told to watch.
+    sent: Option<Watch>,
+    /// The pull request the tab shows; without one it lists those linked.
+    shown: Option<PullRequest>,
+    detail: Option<Result<Box<Detail>, Failure>>,
+    files: Option<Result<Files, Failure>>,
+    /// The person asked for it to be read again, and it has not been yet.
+    refreshing: bool,
+    /// What is being done to it.
+    acting: Option<Act>,
+    /// Why the last thing asked of it was not done.
+    problem: Option<(&'static str, String)>,
+}
+
+impl Default for PullRequestTab {
+    fn default() -> Self {
+        Self {
+            replies: mpsc::channel(),
+            worker: None,
+            source: Some(Source::default()),
+            sent: None,
+            shown: None,
+            detail: None,
+            files: None,
+            refreshing: false,
+            acting: None,
+            problem: None,
+        }
+    }
+}
+
+fn listed(files: Vec<ChangedFile>, total: u32) -> Files {
+    let more = (total as usize).saturating_sub(files.len());
+    let (files, diffs) = files
+        .into_iter()
+        .map(|file| {
+            let body = match &file.patch {
+                Some(patch) => super::git::parse_diff(patch.as_bytes()),
+                None if file.change == Change::Renamed && file.added + file.removed == 0 => {
+                    DiffBody::Same
+                }
+                None => DiffBody::Note(
+                    "GitHub shows no diff for this file: it is not text, or it changed too much.",
+                ),
+            };
+            let listed = File {
+                path: file.path,
+                from: file.from,
+                status: match file.change {
+                    Change::Modified => Status::Modified,
+                    Change::Added => Status::Added,
+                    Change::Deleted => Status::Deleted,
+                    Change::Renamed => Status::Renamed,
+                },
+                added: Some(file.added),
+                removed: Some(file.removed),
+            };
+            (listed, body)
+        })
+        .unzip();
+    Files { files, diffs, more }
+}
+
+/// Reads what is watched: at once when it is new or asked for, then as it
+/// ages. Requests made while the GitHub CLI ran are taken together, newest
+/// last, and what the person asked to be done comes before the next read.
+fn worker(
+    source: Source,
+    requests: mpsc::Receiver<Request>,
+    replies: mpsc::Sender<Reply>,
+    wake: egui::Context,
+) {
+    let mut watch: Option<Watch> = None;
+    let mut known: Option<(PullRequest, Result<Detail, Failure>)> = None;
+    // The pull request and commit whose files were read.
+    let mut files_of: Option<(PullRequest, String)> = None;
+    let mut next = Instant::now();
+    let mut asked = false;
+    loop {
+        let mut request = match &watch {
+            None => requests
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            Some(_) => requests.recv_timeout(next.saturating_duration_since(Instant::now())),
+        };
+        let mut acts = Vec::new();
+        loop {
+            match request {
+                Ok(Request::Watch(new)) => {
+                    let link = |watch: &Option<Watch>| {
+                        watch.as_ref().map(|watch| watch.link.url().to_owned())
+                    };
+                    let front = |watch: &Option<Watch>| {
+                        watch.as_ref().is_some_and(|watch| !watch.background)
+                    };
+                    // Another pull request, one that returns to view and a
+                    // window that returns to the front are read at once.
+                    if link(&new) != link(&watch) || (front(&new) && !front(&watch)) {
+                        next = Instant::now();
+                    }
+                    watch = new;
+                }
+                Ok(Request::Refresh) => {
+                    files_of = None;
+                    asked = true;
+                    next = Instant::now();
+                }
+                Ok(Request::Act(link, act)) => acts.push((link, act)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            match requests.try_recv() {
+                Ok(newer) => request = Ok(newer),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        let mut reports = Vec::new();
+        for (link, act) in acts {
+            let result = (source.act)(&link, &act);
+            reports.push(Reply::Done { link, act, result });
+            // What it changed is shown as soon as it can be read.
+            asked = true;
+            next = Instant::now();
+        }
+        if let Some(current) = &watch {
+            if Instant::now() >= next {
+                let started = Instant::now();
+                let read = (source.detail)(&current.link);
+                let slower = if current.background { BACKGROUND } else { 1 };
+                next = Instant::now()
+                    + (refresh_after(&read) * slower).max(started.elapsed() * WORK_SHARE);
+                let same = known
+                    .as_ref()
+                    .is_some_and(|(link, was)| link.same(&current.link) && *was == read);
+                if asked || !same {
+                    reports.push(Reply::Detail {
+                        link: current.link.clone(),
+                        read: read.clone().map(Box::new),
+                    });
+                    known = Some((current.link.clone(), read));
+                }
+                asked = false;
+            }
+            // Its files are read once for each commit it comes to end with.
+            if current.files
+                && let Some((link, Ok(detail))) = &known
+                && link.same(&current.link)
+                && !files_of
+                    .as_ref()
+                    .is_some_and(|(of, commit)| of.same(link) && *commit == detail.head_commit)
+            {
+                let read = (source.files)(link).map(|files| listed(files, detail.files));
+                files_of = Some((link.clone(), detail.head_commit.clone()));
+                reports.push(Reply::Files {
+                    link: link.clone(),
+                    read,
+                });
+            }
+        }
+        if reports.is_empty() {
+            continue;
+        }
+        for report in reports {
+            if replies.send(report).is_err() {
+                return;
+            }
+        }
+        wake.request_repaint();
+    }
+}
+
+impl PullRequestTab {
+    fn request(&mut self, ctx: &egui::Context, request: Request) -> bool {
+        if self.worker.is_none() {
+            let Some(source) = self.source.take() else {
+                return false;
+            };
+            let (sender, requests) = mpsc::channel();
+            let replies = self.replies.0.clone();
+            let wake = ctx.clone();
+            let spawned = std::thread::Builder::new()
+                .name("neptune-pull-request".into())
+                .spawn(move || worker(source, requests, replies, wake));
+            if spawned.is_err() {
+                return false;
+            }
+            self.worker = Some(sender);
+        }
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| worker.send(request).is_ok())
+    }
+
+    /// The pull request the tab shows, if it shows one.
+    pub(super) fn shown(&self) -> Option<&PullRequest> {
+        self.shown.as_ref()
+    }
+
+    /// What the tab draws: the pull request in `shown`, or `linked`, the
+    /// pull requests of the workspace in view.
+    pub(super) fn view<'a>(
+        &'a self,
+        linked: &'a [ui::helpers::LinkedPullRequest],
+        selected: Option<&str>,
+    ) -> Body<'a> {
+        let Some(link) = &self.shown else {
+            return Body::Linked(linked);
+        };
+        match &self.detail {
+            None => Body::Reading(link),
+            Some(Err(failure)) => Body::Failed(link, *failure),
+            Some(Ok(detail)) => Body::Shown(Shown {
+                link,
+                detail,
+                files: match &self.files {
+                    None => FileList::Reading,
+                    Some(Err(failure)) => FileList::Failed(*failure),
+                    Some(Ok(files)) => FileList::Listed {
+                        files: &files.files,
+                        more: files.more,
+                        diff: selected
+                            .and_then(|path| files.files.iter().position(|file| file.path == path))
+                            .map(|place| (&files.files[place], &files.diffs[place])),
+                    },
+                },
+                refreshing: self.refreshing,
+                acting: self.acting.as_ref(),
+                problem: self
+                    .problem
+                    .as_ref()
+                    .map(|(title, said)| Problem { title, said }),
+            }),
+        }
+    }
+}
+
+impl App {
+    /// What the worker reported, taken whether or not anything shows it.
+    pub(super) fn poll_pull_request(&mut self, ctx: &egui::Context) {
+        while let Ok(reply) = self.pull_request.replies.1.try_recv() {
+            let of = |link: &PullRequest| {
+                self.pull_request
+                    .shown
+                    .as_ref()
+                    .is_some_and(|shown| shown.same(link))
+            };
+            match reply {
+                Reply::Detail { link, read } if of(&link) => {
+                    self.pull_request.refreshing = false;
+                    // What was read stays in view while one read fails.
+                    if read.is_ok() || !matches!(self.pull_request.detail, Some(Ok(_))) {
+                        self.pull_request.detail = Some(read);
+                    }
+                }
+                Reply::Files { link, read } if of(&link) => {
+                    if let Ok(files) = &read
+                        && let Some(selected) = &self.ui.pull_request.selected
+                        && !files.files.iter().any(|file| file.path == *selected)
+                    {
+                        self.ui.pull_request.selected = None;
+                    }
+                    self.pull_request.files = Some(read);
+                }
+                Reply::Done { link, act, result } if of(&link) => {
+                    self.pull_request.acting = None;
+                    self.ui.pull_request.confirm = None;
+                    match result {
+                        Ok(()) => {
+                            if matches!(act, Act::Comment(_) | Act::Review(..)) {
+                                self.ui.pull_request.sent(link.url());
+                            }
+                        }
+                        Err(said) => {
+                            let said = if said.is_empty() {
+                                "The host refused it. Check that the account signed in to the GitHub CLI may do this, then try again.".to_owned()
+                            } else {
+                                said
+                            };
+                            self.pull_request.problem = Some((act.outcome().1, said));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Tells the worker what this frame shows. A pull request is read only
+    /// while its tab is in view, less often while another window is the
+    /// active one, and not at all while this one is minimized.
+    pub(super) fn sync_pull_request(&mut self, ctx: &egui::Context, tab: bool) {
+        let minimized = ctx.input(|input| input.viewport().minimized == Some(true));
+        let watch = self
+            .pull_request
+            .shown
+            .clone()
+            .filter(|_| tab && !minimized)
+            .map(|link| Watch {
+                link,
+                files: self.ui.pull_request.segment == ui::pull_request::Segment::Code,
+                background: self.window_focused == Some(false),
+            });
+        if watch != self.pull_request.sent {
+            // Nothing is started for a tab that shows no pull request.
+            if watch.is_some() || self.pull_request.worker.is_some() {
+                self.pull_request
+                    .request(ctx, Request::Watch(watch.clone()));
+            }
+            self.pull_request.sent = watch;
+        }
+    }
+
+    /// The pull requests linked by the terminals of the workspace in view,
+    /// newest first, each once.
+    pub(super) fn linked_pull_requests(&self) -> Vec<ui::helpers::LinkedPullRequest> {
+        let model = self.controller.model();
+        let mut linked: Vec<ui::helpers::LinkedPullRequest> = Vec::new();
+        for link in model
+            .active_workspace()
+            .and_then(|id| model.workspace(id))
+            .into_iter()
+            .flat_map(|workspace| workspace.panes())
+            .flat_map(|pane| pane.pull_requests().iter().rev())
+        {
+            if !linked.iter().any(|known| known.link.same(link)) {
+                linked.push(ui::helpers::LinkedPullRequest {
+                    link: link.clone(),
+                    lookup: self.pull_requests.lookup(link),
+                });
+            }
+        }
+        linked
+    }
+
+    /// The tab is no longer the one in view: its field must not keep the
+    /// keyboard. What was typed in it stays.
+    pub(super) fn leave_pull_request(&mut self, ctx: &egui::Context) {
+        self.ui.pull_request.focus = false;
+        ctx.memory_mut(|memory| {
+            let id = ui::pull_request::composer_id();
+            if memory.has_focus(id) {
+                memory.surrender_focus(id);
+            }
+        });
+    }
+
+    /// Escape in the tab's field puts the comment away and returns the
+    /// keyboard to the terminal. Returns whether the key was the tab's.
+    pub(super) fn pull_request_escape(&mut self, ctx: &egui::Context) -> bool {
+        let id = ui::pull_request::composer_id();
+        // The toolkit has already taken focus from the field for this key.
+        let held = ctx.memory(|memory| memory.has_focus(id) || memory.had_focus_last_frame(id));
+        if held {
+            self.ui.pull_request.composer = None;
+            self.ui.pull_request.focus = false;
+            ctx.memory_mut(|memory| memory.surrender_focus(id));
+        }
+        held
+    }
+
+    pub(super) fn pull_request_event(&mut self, ctx: &egui::Context, event: Event) {
+        match event {
+            Event::Open(link) => {
+                // A window without room for the panel has the browser.
+                if !self.ui.panel.available {
+                    if let Some(link) = crate::platform::links::WebLink::new(link.url()) {
+                        self.action(ctx, Action::OpenLink(link));
+                    }
+                    return;
+                }
+                if !self
+                    .pull_request
+                    .shown
+                    .as_ref()
+                    .is_some_and(|shown| shown.same(&link))
+                {
+                    self.pull_request.shown = Some(link);
+                    self.pull_request.detail = None;
+                    self.pull_request.files = None;
+                    self.pull_request.refreshing = false;
+                    self.pull_request.acting = None;
+                    self.pull_request.problem = None;
+                    self.ui.pull_request.opened();
+                }
+                self.panel_event(ctx, ui::panel::Event::Show(ui::panel::Tab::PullRequest));
+            }
+            Event::Back => {
+                self.pull_request.shown = None;
+                self.pull_request.detail = None;
+                self.pull_request.files = None;
+                self.pull_request.problem = None;
+                self.ui.pull_request.opened();
+                self.leave_pull_request(ctx);
+            }
+            Event::Refresh => {
+                if self.pull_request.shown.is_some() {
+                    self.pull_request.refreshing = true;
+                    // One that failed to be read is read anew.
+                    if matches!(self.pull_request.detail, Some(Err(_))) {
+                        self.pull_request.detail = None;
+                    }
+                    if matches!(self.pull_request.files, Some(Err(_))) {
+                        self.pull_request.files = None;
+                    }
+                    self.pull_request.request(ctx, Request::Refresh);
+                }
+            }
+            Event::Act(act) => {
+                // One thing is done at a time.
+                if self.pull_request.acting.is_none()
+                    && let Some(link) = self.pull_request.shown.clone()
+                {
+                    self.pull_request.problem = None;
+                    self.pull_request.acting = Some(act.clone());
+                    if !self.pull_request.request(ctx, Request::Act(link, act)) {
+                        self.pull_request.acting = None;
+                    }
+                }
+            }
+            Event::DismissProblem => self.pull_request.problem = None,
+            Event::Select(path) => self.ui.pull_request.selected = Some(path),
+            Event::CloseDiff => self.ui.pull_request.selected = None,
+            Event::Copy(text) => crate::platform::clipboard::copy(ctx, text),
+        }
+        ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::pull_request::{Allowed, Method, Verdict};
+    use crate::runtime::pull_requests::State;
+    use crate::ui::{
+        changes::LineKind,
+        panel::{Event as Panel, Tab},
+        pull_request::Segment,
+    };
+    use std::sync::Mutex;
+
+    const WINDOW: Vec2 = Vec2::new(900.0, 640.0);
+
+    fn frame(app: &mut App, ctx: &egui::Context) {
+        let mut host = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW)),
+                ..Default::default()
+            },
+            |ui| {
+                app.poll_pull_request(ui.ctx());
+                eframe::App::ui(app, ui, &mut host);
+            },
+        );
+        output.textures_delta.clear();
+    }
+
+    fn settle(app: &mut App, ctx: &egui::Context, what: &str, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            frame(app, ctx);
+            if done(app) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn link(number: u64) -> PullRequest {
+        PullRequest::parse(&format!("https://github.com/zevem/neptune/pull/{number}")).unwrap()
+    }
+
+    pub(in crate::app) fn detail(title: &str) -> Detail {
+        Detail {
+            title: title.into(),
+            state: State::Open,
+            author: "ada".into(),
+            body: "What it does.".into(),
+            base: "main".into(),
+            head: "feat/tab".into(),
+            opened: 1_791_342_861,
+            updated: 1_791_342_861,
+            ended: None,
+            merged_by: String::new(),
+            commits: 1,
+            history: Vec::new(),
+            head_commit: "8b45e82".into(),
+            added: 3,
+            removed: 1,
+            files: 2,
+            merge: source::Merge::Ready,
+            decision: None,
+            reviewers: Vec::new(),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            checks: Vec::new(),
+            more_checks: 0,
+            entries: Vec::new(),
+            earlier: 0,
+            allowed: Allowed {
+                update: true,
+                merge: true,
+                judge: true,
+                methods: vec![Method::Squash],
+            },
+        }
+    }
+
+    /// What the stand-in for the GitHub CLI was asked, and what it answers.
+    #[derive(Default)]
+    struct Host {
+        title: String,
+        reads: usize,
+        file_reads: usize,
+        acts: Vec<Act>,
+        refuse: Option<String>,
+        missing: bool,
+    }
+
+    fn opened(root: &std::path::Path) -> (App, egui::Context, Arc<Mutex<Host>>) {
+        let (mut app, _sender) = super::super::tests::fixture(root);
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        app.startup = None;
+        app.controller
+            .dispatch(Command::AddWorkspace {
+                group: None,
+                cwd: root.into(),
+                name: "Work".into(),
+                remote: None,
+            })
+            .unwrap();
+        let host = Arc::new(Mutex::new(Host {
+            title: "A tab for pull requests".into(),
+            ..Host::default()
+        }));
+        let (reads, lists, acts) = (host.clone(), host.clone(), host.clone());
+        app.pull_request.source = Some(Source {
+            detail: Box::new(move |_| {
+                let mut host = reads.lock().unwrap();
+                host.reads += 1;
+                if host.missing {
+                    return Err(Failure::NotFound);
+                }
+                let mut detail = detail(&host.title);
+                if host.acts.contains(&Act::Merge(Method::Squash)) {
+                    detail.state = State::Merged;
+                }
+                Ok(detail)
+            }),
+            files: Box::new(move |_| {
+                lists.lock().unwrap().file_reads += 1;
+                Ok(vec![
+                    ChangedFile {
+                        path: "src/a.rs".into(),
+                        from: None,
+                        change: Change::Modified,
+                        added: 1,
+                        removed: 1,
+                        patch: Some("@@ -1,2 +1,2 @@\n one\n-two\n+2\n".into()),
+                    },
+                    ChangedFile {
+                        path: "logo.png".into(),
+                        from: None,
+                        change: Change::Added,
+                        added: 0,
+                        removed: 0,
+                        patch: None,
+                    },
+                ])
+            }),
+            act: Box::new(move |_, act| {
+                let mut host = acts.lock().unwrap();
+                match host.refuse.clone() {
+                    Some(said) => Err(said),
+                    None => {
+                        host.acts.push(act.clone());
+                        Ok(())
+                    }
+                }
+            }),
+        });
+        (app, ctx, host)
+    }
+
+    fn title(app: &App) -> Option<String> {
+        match &app.pull_request.detail {
+            Some(Ok(detail)) => Some(detail.title.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_pull_request_opens_in_its_tab_and_is_read_only_while_in_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, host) = opened(dir.path());
+        frame(&mut app, &ctx);
+        // The tab without a pull request starts nothing.
+        app.action(&ctx, Action::Panel(Panel::Show(Tab::PullRequest)));
+        frame(&mut app, &ctx);
+        assert!(app.pull_request.worker.is_none());
+        assert!(matches!(app.pull_request.view(&[], None), Body::Linked([])));
+
+        app.action(&ctx, Action::Panel(Panel::Toggle));
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        assert!(app.ui.panel.open && app.ui.panel.tab == Tab::PullRequest);
+        assert!(matches!(app.pull_request.view(&[], None), Body::Reading(_)));
+        settle(&mut app, &ctx, "the pull request", |app| {
+            title(app).as_deref() == Some("A tab for pull requests")
+        });
+        assert_eq!(host.lock().unwrap().reads, 1);
+        assert_eq!(
+            host.lock().unwrap().file_reads,
+            0,
+            "its files are not in view"
+        );
+
+        // Its files are read when their part is shown, once for a commit.
+        app.ui.pull_request.segment = Segment::Code;
+        settle(&mut app, &ctx, "its files", |app| {
+            app.pull_request.files.is_some()
+        });
+        app.action(&ctx, Action::PullRequest(Event::Select("src/a.rs".into())));
+        let selected = app.ui.pull_request.selected.clone();
+        let Body::Shown(shown) = app.pull_request.view(&[], selected.as_deref()) else {
+            panic!("the pull request is shown");
+        };
+        let FileList::Listed { files, more, diff } = shown.files else {
+            panic!("its files are listed");
+        };
+        assert_eq!((files.len(), more), (2, 0));
+        let Some((file, DiffBody::Lines { lines, .. })) = diff else {
+            panic!("the chosen file has a diff");
+        };
+        assert_eq!(file.path, "src/a.rs");
+        let changed: Vec<_> = lines
+            .iter()
+            .filter(|line| matches!(line.kind, LineKind::Added | LineKind::Removed))
+            .map(|line| (line.kind, line.text.as_str()))
+            .collect();
+        assert_eq!(
+            changed,
+            [(LineKind::Removed, "two"), (LineKind::Added, "2")]
+        );
+        let Body::Shown(shown) = app.pull_request.view(&[], Some("logo.png")) else {
+            panic!("the pull request is shown");
+        };
+        assert!(matches!(
+            shown.files,
+            FileList::Listed {
+                diff: Some((_, DiffBody::Note(_))),
+                ..
+            }
+        ));
+
+        // Asked for again, it is read again and its files with it.
+        host.lock().unwrap().title = "Renamed".into();
+        app.action(&ctx, Action::PullRequest(Event::Refresh));
+        assert!(app.pull_request.refreshing);
+        settle(&mut app, &ctx, "the new title", |app| {
+            title(app).as_deref() == Some("Renamed") && !app.pull_request.refreshing
+        });
+        settle(&mut app, &ctx, "its files again", |_| {
+            host.lock().unwrap().file_reads == 2
+        });
+
+        // Out of view it is not read, and what was read is kept.
+        app.action(&ctx, Action::Panel(Panel::Show(Tab::Agents)));
+        frame(&mut app, &ctx);
+        assert!(app.pull_request.sent.is_none());
+        assert_eq!(title(&app).as_deref(), Some("Renamed"));
+        let reads = host.lock().unwrap().reads;
+        app.action(&ctx, Action::Panel(Panel::Show(Tab::PullRequest)));
+        settle(&mut app, &ctx, "a read on return", |_| {
+            host.lock().unwrap().reads > reads
+        });
+
+        // The way back shows those linked, and another one starts afresh.
+        app.action(&ctx, Action::PullRequest(Event::Back));
+        assert!(app.pull_request.shown().is_none() && app.pull_request.detail.is_none());
+        app.action(&ctx, Action::PullRequest(Event::Open(link(84))));
+        assert!(app.pull_request.detail.is_none());
+        assert_eq!(app.ui.pull_request.segment, Segment::Summary);
+    }
+
+    #[test]
+    fn what_is_asked_of_a_pull_request_is_done_once_and_a_refusal_is_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, host) = opened(dir.path());
+        frame(&mut app, &ctx);
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        settle(&mut app, &ctx, "the pull request", |app| {
+            title(app).is_some()
+        });
+
+        // A comment that was posted leaves the field; the composer closes.
+        app.ui.pull_request.composer = Some(ui::pull_request::Composer::Comment);
+        *app.ui.pull_request.draft_mut(link(83).url()) = "Thanks".into();
+        app.action(
+            &ctx,
+            Action::PullRequest(Event::Act(Act::Comment("Thanks".into()))),
+        );
+        assert!(app.pull_request.acting.is_some());
+        // A second request waits for the first.
+        app.action(&ctx, Action::PullRequest(Event::Act(Act::Close)));
+        settle(&mut app, &ctx, "the comment", |app| {
+            app.pull_request.acting.is_none()
+        });
+        assert_eq!(host.lock().unwrap().acts, [Act::Comment("Thanks".into())]);
+        assert!(app.ui.pull_request.composer.is_none());
+        assert_eq!(app.ui.pull_request.draft(link(83).url()), "");
+
+        // A refusal says what the host said, and keeps what was written.
+        host.lock().unwrap().refuse = Some("Review cannot be requested from the author".into());
+        app.ui.pull_request.composer = Some(ui::pull_request::Composer::Review);
+        *app.ui.pull_request.draft_mut(link(83).url()) = "Looks good".into();
+        app.action(
+            &ctx,
+            Action::PullRequest(Event::Act(Act::Review(
+                Verdict::Approved,
+                "Looks good".into(),
+            ))),
+        );
+        settle(&mut app, &ctx, "the refusal", |app| {
+            app.pull_request.problem.is_some()
+        });
+        assert_eq!(
+            app.pull_request.problem,
+            Some((
+                "Could not submit the review",
+                "Review cannot be requested from the author".into()
+            ))
+        );
+        assert_eq!(app.ui.pull_request.draft(link(83).url()), "Looks good");
+        assert!(app.ui.pull_request.composer.is_some());
+        app.action(&ctx, Action::PullRequest(Event::DismissProblem));
+        assert!(app.pull_request.problem.is_none());
+
+        // Merged, it is read again at once and shows where it stands.
+        host.lock().unwrap().refuse = None;
+        app.action(
+            &ctx,
+            Action::PullRequest(Event::Act(Act::Merge(Method::Squash))),
+        );
+        settle(
+            &mut app,
+            &ctx,
+            "the merge",
+            |app| matches!(&app.pull_request.detail, Some(Ok(detail)) if detail.state == State::Merged),
+        );
+    }
+
+    #[test]
+    fn a_pull_request_that_cannot_be_read_says_why_and_is_read_anew_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, host) = opened(dir.path());
+        host.lock().unwrap().missing = true;
+        frame(&mut app, &ctx);
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        settle(&mut app, &ctx, "the failure", |app| {
+            app.pull_request.detail.is_some()
+        });
+        assert!(matches!(
+            app.pull_request.view(&[], None),
+            Body::Failed(_, Failure::NotFound)
+        ));
+        // Trying again reads it anew.
+        host.lock().unwrap().missing = false;
+        app.action(&ctx, Action::PullRequest(Event::Refresh));
+        assert!(app.pull_request.detail.is_none());
+        settle(&mut app, &ctx, "the pull request", |app| {
+            title(app).is_some()
+        });
+        // One read that fails afterwards leaves what was read in view.
+        host.lock().unwrap().missing = true;
+        app.action(&ctx, Action::PullRequest(Event::Refresh));
+        settle(&mut app, &ctx, "the failed read", |app| {
+            !app.pull_request.refreshing
+        });
+        assert!(title(&app).is_some());
+    }
+
+    /// What a capture shows in place of GitHub: a pull request in review with
+    /// a description, reviewers, checks in every outcome, a conversation and
+    /// changed files.
+    fn pictured(state: &str) -> Detail {
+        use source::{Check, Commit, Decision, Entry, Kind, Outcome, Reply, Reviewer};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let check = |name: &str, workflow: &str, outcome, seconds| Check {
+            name: name.into(),
+            workflow: workflow.into(),
+            outcome,
+            seconds,
+            url: "https://github.com/zevem/neptune/actions/runs/1".into(),
+        };
+        let mut pictured = Detail {
+            title: "feat(ui): read a pull request in the right panel without leaving the terminal"
+                .into(),
+            body: "## Problem\n\nA linked pull request opened the browser, away from the terminal that works on it.\n\n## Change\n\n- A **Pull request** tab in the right panel\n- Clicking a number on a terminal's tab opens it there\n- `Ctrl`+click still opens the browser\n\n```sh\ngh pr checkout 118\n```\n\nSee [the design guide](https://neptune.rs/docs/design) for the layout.".into(),
+            head: "feat/pull-request-panel".into(),
+            opened: now - 26 * 3600,
+            updated: now - 9 * 60,
+            commits: 4,
+            added: 2841,
+            removed: 96,
+            files: 5,
+            history: vec![
+                Commit {
+                    short: "1a2b3c4".into(),
+                    headline: "feat(ui): a tab for one pull request".into(),
+                    author: "ada".into(),
+                    at: now - 25 * 3600,
+                },
+                Commit {
+                    short: "8b45e82".into(),
+                    headline: "fix(ui): five names share the narrowest strip".into(),
+                    author: "ada".into(),
+                    at: now - 40 * 60,
+                },
+            ],
+            decision: Some(Decision::ReviewRequired),
+            reviewers: vec![
+                Reviewer {
+                    name: "grace".into(),
+                    verdict: Verdict::Approved,
+                },
+                Reviewer {
+                    name: "linus".into(),
+                    verdict: Verdict::ChangesRequested,
+                },
+                Reviewer {
+                    name: "desktop-team".into(),
+                    verdict: Verdict::Awaited,
+                },
+            ],
+            labels: vec!["ui".into(), "right panel".into(), "needs-design-review".into()],
+            assignees: vec!["ada".into()],
+            checks: vec![
+                check("Windows build", "CI", Outcome::Failed, Some(312)),
+                check("Native visual review", "CI", Outcome::Running, None),
+                check("Fast validation", "CI", Outcome::Passed, Some(15)),
+                check("Linux build and tests", "CI", Outcome::Passed, Some(642)),
+                check("macOS build and tests", "CI", Outcome::Passed, Some(3900)),
+                check("Website downloads", "CI", Outcome::Skipped, None),
+            ],
+            entries: vec![
+                Entry {
+                    author: "linus".into(),
+                    at: now - 20 * 3600,
+                    kind: Kind::Thread {
+                        path: "src/ui/panel.rs".into(),
+                        line: Some(241),
+                        resolved: false,
+                        outdated: false,
+                        replies: vec![Reply {
+                            author: "ada".into(),
+                            at: now - 19 * 3600,
+                            body: "It is cut to `PR` only where the strip has no room.".into(),
+                        }],
+                    },
+                    body: "Does the fifth name still fit at the narrowest width?".into(),
+                    url: "https://github.com/zevem/neptune/pull/118#discussion_r1".into(),
+                },
+                Entry {
+                    author: "grace".into(),
+                    at: now - 5 * 3600,
+                    kind: Kind::Review(Verdict::Approved),
+                    body: "Reads well. The checks row is a nice touch.".into(),
+                    url: "https://github.com/zevem/neptune/pull/118#pullrequestreview-1".into(),
+                },
+                Entry {
+                    author: "linus".into(),
+                    at: now - 3 * 3600,
+                    kind: Kind::Thread {
+                        path: "src/runtime/pull_request.rs".into(),
+                        line: Some(52),
+                        resolved: true,
+                        outdated: true,
+                        replies: Vec::new(),
+                    },
+                    body: "Bound this response.".into(),
+                    url: "https://github.com/zevem/neptune/pull/118#discussion_r2".into(),
+                },
+                Entry {
+                    author: "linus".into(),
+                    at: now - 2 * 3600,
+                    kind: Kind::Review(Verdict::ChangesRequested),
+                    body: "The Windows build has to pass first.".into(),
+                    url: "https://github.com/zevem/neptune/pull/118#pullrequestreview-2".into(),
+                },
+                Entry {
+                    author: "ada".into(),
+                    at: now - 12 * 60,
+                    kind: Kind::Comment,
+                    body: "Pushed a fix for the Windows build:\n\n1. `cli` no longer assumes a POSIX path\n2. the test uses the bundled fonts".into(),
+                    url: "https://github.com/zevem/neptune/pull/118#issuecomment-1".into(),
+                },
+            ],
+            allowed: Allowed {
+                update: true,
+                merge: true,
+                judge: true,
+                methods: vec![Method::Merge, Method::Squash, Method::Rebase],
+            },
+            ..detail("")
+        };
+        match state {
+            "ready" => {
+                pictured
+                    .checks
+                    .retain(|check| check.outcome == source::Outcome::Passed);
+                pictured.decision = Some(Decision::Approved);
+                pictured.reviewers.truncate(1);
+            }
+            "merged" => {
+                pictured.state = State::Merged;
+                pictured.merged_by = "grace".into();
+                pictured.ended = Some(now - 2 * 86_400);
+            }
+            "draft" => pictured.state = State::Draft,
+            "conflicts" => pictured.merge = source::Merge::Conflicts,
+            _ => {}
+        }
+        pictured
+    }
+
+    /// A real GPU/native capture of the pull request tab in isolated storage,
+    /// with a pull request written here in place of GitHub.
+    /// `NEPTUNE_PR_STATE` names what is shown: `summary` (the default),
+    /// `ready`, `merged`, `draft`, `conflicts`, `checks`, `confirm`, `close`,
+    /// `problem`, `timeline`, `code`, `diff`, `comment`, `review`, `reading`,
+    /// `missing`, `signed-out`, `linked` and `empty`. `NEPTUNE_PR_NARROW=1`
+    /// uses a 640×400 window, `NEPTUNE_PR_WIDTH` sets the panel's width and
+    /// `NEPTUNE_PR_THEME` names a theme. `NEPTUNE_PR_LIVE` names a pull
+    /// request by its address and reads it with the person's GitHub CLI
+    /// instead. The desktop's pointer and keyboard are kept out of it:
+    /// presses, typing and scrolling need a hand-driven native check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Manual native visual QA; needs a desktop and NEPTUNE_PR_CAPTURE"]
+    fn capture_pull_request_native() {
+        use ui::pull_request::{Composer, Confirm};
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let output = PathBuf::from(
+            std::env::var("NEPTUNE_PR_CAPTURE").expect("Set a task-owned capture path"),
+        );
+        let state = std::env::var("NEPTUNE_PR_STATE").unwrap_or_default();
+        let size = if std::env::var_os("NEPTUNE_PR_NARROW").is_some() {
+            [640.0, 400.0]
+        } else {
+            [1000.0, 680.0]
+        };
+        let data = tempfile::tempdir().unwrap();
+        let data_path = data.path().to_path_buf();
+        let theme = std::env::var("NEPTUNE_PR_THEME").unwrap_or_else(|_| "graphite".into());
+        std::fs::write(
+            data_path.join("config.toml"),
+            format!("shell = \"/bin/sh\"\ntheme = \"{theme}\"\n"),
+        )
+        .unwrap();
+        let project = data_path.join("orbit");
+        std::fs::create_dir_all(&project).unwrap();
+        let options = eframe::NativeOptions {
+            renderer: eframe::Renderer::Wgpu,
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size(size)
+                .with_decorations(false),
+            event_loop_builder: Some(Box::new(|builder| {
+                builder.with_any_thread(true);
+            })),
+            ..Default::default()
+        };
+        struct NativeCapture {
+            app: App,
+            state: String,
+            staged: bool,
+        }
+        impl eframe::App for NativeCapture {
+            fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+                eframe::App::logic(&mut self.app, ctx, frame);
+                let Some(pane) = self.app.controller.model().active_pane() else {
+                    return;
+                };
+                if self.staged || self.app.sessions.get(pane).is_none() {
+                    return;
+                }
+                self.staged = true;
+                let live = std::env::var("NEPTUNE_PR_LIVE").ok();
+                let shown = live
+                    .as_deref()
+                    .map_or_else(|| link(118), |url| PullRequest::parse(url).unwrap());
+                // The terminal runs an agent that linked two pull requests.
+                let generation = self.app.sessions.generation(pane).unwrap();
+                let cwd = self.app.controller.model().pane(pane).unwrap().cwd().into();
+                self.app.dispatch(
+                    ctx,
+                    Command::PaneAgentChanged {
+                        pane,
+                        generation,
+                        agent: Some(neptune_model::AgentSession {
+                            kind: neptune_model::AgentKind::Claude,
+                            session_id: None,
+                            cwd,
+                        }),
+                    },
+                );
+                if self.state != "empty" {
+                    for pull_request in [link(112), shown.clone()] {
+                        self.app.dispatch(
+                            ctx,
+                            Command::PanePullRequestLinked {
+                                pane,
+                                generation,
+                                pull_request,
+                            },
+                        );
+                    }
+                }
+                if let Ok(width) = std::env::var("NEPTUNE_PR_WIDTH") {
+                    self.app.ui.panel.width = width.parse().unwrap();
+                }
+                if matches!(self.state.as_str(), "linked" | "empty") {
+                    self.app
+                        .action(ctx, Action::Panel(ui::panel::Event::Show(Tab::PullRequest)));
+                } else {
+                    self.app
+                        .action(ctx, Action::PullRequest(Event::Open(shown.clone())));
+                }
+                // Shown at rest, not on its way in.
+                self.app.ui.panel.slide = None;
+                let tab = &mut self.app.ui.pull_request;
+                match self.state.as_str() {
+                    "checks" => (tab.description, tab.checks) = (false, true),
+                    "confirm" => tab.confirm = Some(Confirm::Merge(Method::Squash)),
+                    "close" => tab.confirm = Some(Confirm::Close),
+                    "timeline" => tab.segment = Segment::Timeline,
+                    "code" | "diff" => tab.segment = Segment::Code,
+                    "comment" => {
+                        tab.composer = Some(Composer::Comment);
+                        *tab.draft_mut(shown.url()) =
+                            "Thanks, the Windows build passes here now.".into();
+                    }
+                    "review" => {
+                        tab.composer = Some(Composer::Review);
+                        tab.verdict = Verdict::Approved;
+                    }
+                    _ => {}
+                }
+                if self.state == "diff" {
+                    tab.selected = Some("src/ui/panel.rs".into());
+                }
+                if self.state == "problem" {
+                    self.app.pull_request.problem = Some((
+                        "Could not merge this pull request",
+                        "Pull request is not mergeable: the base branch requires all checks to pass."
+                            .into(),
+                    ));
+                }
+            }
+            fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+                eframe::App::ui(&mut self.app, ui, frame);
+            }
+            fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+                eframe::App::raw_input_hook(&mut self.app, ctx, input);
+                // The desktop's own pointer and keyboard have no part in the capture.
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::PointerMoved(_)
+                            | egui::Event::MouseMoved(_)
+                            | egui::Event::PointerButton { .. }
+                            | egui::Event::PointerGone
+                            | egui::Event::MouseWheel { .. }
+                    )
+                });
+            }
+            fn on_exit(&mut self) {
+                eframe::App::on_exit(&mut self.app);
+            }
+        }
+        let pictured_state = state.clone();
+        eframe::run_native(
+            "Neptune pull request visual QA",
+            options,
+            Box::new(move |cc| {
+                let mut app = App::new(
+                    cc,
+                    Launch {
+                        cwd: Some(project),
+                        data_root: Some(data_path),
+                        screenshot: Some(output),
+                        ..Default::default()
+                    },
+                    window_state::LoadReport::default(),
+                );
+                app.file_drag = crate::platform::file_drag::FileDragSource::detached();
+                if std::env::var_os("NEPTUNE_PR_LIVE").is_some() {
+                    app.pull_request.source = Some(Source {
+                        detail: Box::new(source::read),
+                        files: Box::new(source::read_files),
+                        act: Box::new(|_, _| Err("A capture changes nothing.".into())),
+                    });
+                    app.pull_requests = Default::default();
+                } else {
+                    use crate::runtime::pull_requests::{Checks, Status, Watcher};
+                    app.pull_requests = Watcher::with(Box::new(|_, links| {
+                        links
+                            .iter()
+                            .map(|link| {
+                                Some(if link.number() == 112 {
+                                    Status {
+                                        state: State::Merged,
+                                        checks: Checks::Passing,
+                                        unresolved: 0,
+                                    }
+                                } else {
+                                    Status {
+                                        state: State::Open,
+                                        checks: Checks::Failing,
+                                        unresolved: 1,
+                                    }
+                                })
+                            })
+                            .collect()
+                    }));
+                    let state = pictured_state.clone();
+                    app.pull_request.source = Some(Source {
+                        detail: Box::new(move |_| match state.as_str() {
+                            "reading" => {
+                                std::thread::sleep(Duration::from_secs(30));
+                                Err(Failure::Unavailable)
+                            }
+                            "missing" => Err(Failure::NotFound),
+                            "signed-out" => Err(Failure::SignedOut),
+                            state => Ok(pictured(state)),
+                        }),
+                        files: Box::new(|_| {
+                            let file = |path: &str, change, added, removed, patch: Option<&str>| {
+                                ChangedFile {
+                                    path: path.into(),
+                                    from: None,
+                                    change,
+                                    added,
+                                    removed,
+                                    patch: patch.map(str::to_owned),
+                                }
+                            };
+                            Ok(vec![
+                                file("docs/design.md", Change::Modified, 12, 3, Some("@@ -1 +1 @@\n-a\n+b\n")),
+                                file("src/app/pull_request.rs", Change::Added, 640, 0, Some("@@ -0,0 +1 @@\n+//! The pull request the panel's tab shows.\n")),
+                                file(
+                                    "src/ui/panel.rs",
+                                    Change::Modified,
+                                    41,
+                                    9,
+                                    Some("@@ -238,9 +238,15 @@ pub fn show(\n     child.multiply_opacity(view.reveal);\n-    let tabs = [Tab::Files, Tab::Agents, Tab::Changes, Tab::Project];\n+    let tabs = [\n+        Tab::Files,\n+        Tab::Agents,\n+        Tab::Changes,\n+        Tab::Project,\n+        Tab::PullRequest,\n+    ];\n     let waiting = |item| match item {\n         Tab::Agents => view.waiting,\n"),
+                                ),
+                                file("src/ui/pull_request.rs", Change::Added, 2140, 0, None),
+                                file("assets/tab.png", Change::Added, 0, 0, None),
+                            ])
+                        }),
+                        act: Box::new(|_, _| Err("A capture changes nothing.".into())),
+                    });
+                }
+                Ok(Box::new(NativeCapture {
+                    app,
+                    state: pictured_state,
+                    staged: false,
+                }))
+            }),
+        )
+        .unwrap();
+    }
+}

@@ -11,6 +11,16 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Read a pull request without leaving the terminal. Click a pull request's
+  number on a terminal's tab and it opens in the new **Pull request** tab of
+  the right panel: its title and state, what stands between it and a merge,
+  reviewers, labels, description and checks under **Summary**, everything
+  that happened to it under **Timeline**, and its changed files with their
+  diffs under **Code**. From there you can merge it, mark it ready or a
+  draft, close or reopen it, comment and review. Ctrl-click (Command-click on
+  macOS) a number to open it in the browser as before. It is read with your
+  signed-in GitHub CLI (`gh`), only while its tab is in view, and nothing
+  read is saved.
 - Put an agent in charge of a piece of work with Projects. The new Project
   tab of the right panel starts a **lead**, your installed Claude Code or
   Codex, in the workspace in view: tell it what you want done and it plans,

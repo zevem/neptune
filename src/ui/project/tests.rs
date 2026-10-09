@@ -857,10 +857,14 @@ fn the_list_of_agents_says_each_ones_cli_branch_pull_request_and_one_of_six_stat
     // The rows are in the order of the pills: who waits, who works, the rest.
     assert!(row("13 api-tests").top() < row("12 auth-refactor").top());
     assert!(row("12 auth-refactor").top() < row("14 docs").top());
-    // The pull request opens its page; the rest of the row, the terminal.
+    // The pull request opens in its tab; the rest of the row, the terminal.
     let opened = press(&mut state, row("214").center());
     assert!(
-        matches!(opened.as_slice(), [Action::OpenLink(link)] if link.as_str().ends_with("/pull/214")),
+        matches!(
+            opened.as_slice(),
+            [Action::PullRequest(crate::ui::pull_request::Event::Open(link))]
+                if link.number() == 214
+        ),
         "the chip did not open its pull request"
     );
     listed(&mut state, 300.0);

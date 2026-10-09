@@ -556,6 +556,15 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         ),
         command(
             "View",
+            Icon::PullRequest,
+            "Show pull request",
+            "",
+            [Action::Panel(super::panel::Event::Show(
+                super::panel::Tab::PullRequest,
+            ))],
+        ),
+        command(
+            "View",
             Icon::Bell,
             "Notifications",
             view.config.keybindings.hint(Binding::Notifications),

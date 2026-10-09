@@ -612,12 +612,44 @@ fn contents(
         centered_note(ui, body, p, &note);
         return;
     }
-    let total = repository.files.len() + usize::from(repository.more > 0);
+    listing(
+        ui,
+        body,
+        p,
+        Listed {
+            files: repository.files,
+            more: repository.more,
+            diff: repository.diff,
+        },
+        (state.selected.as_deref(), &mut state.diff_share),
+        events,
+    );
+}
+
+/// Changed files and the diff of the chosen one.
+pub(super) struct Listed<'a> {
+    pub files: &'a [File],
+    /// Files beyond the most a list shows.
+    pub more: usize,
+    pub diff: Option<(&'a File, &'a DiffBody)>,
+}
+
+/// The files in `body`, a row each, over the diff of the chosen one. The
+/// pull request tab lists its files the same way.
+pub(super) fn listing(
+    ui: &mut Ui,
+    body: Rect,
+    p: Palette,
+    listed: Listed,
+    (selected, diff_share): (Option<&str>, &mut f32),
+    events: &mut Vec<Event>,
+) {
+    let total = listed.files.len() + usize::from(listed.more > 0);
     // The diff takes the bottom of the panel; the divider above resizes it.
     // A list shorter than its share keeps only its rows, and the diff has
     // the room that leaves.
-    let diff_height = repository.diff.map_or(0.0, |_| {
-        (body.height() * state.diff_share)
+    let diff_height = listed.diff.map_or(0.0, |_| {
+        (body.height() * *diff_share)
             .clamp(96.0, (body.height() - 80.0).max(96.0))
             .max(body.height() - total as f32 * ROW - 6.0)
             .min(body.height())
@@ -636,21 +668,21 @@ fn contents(
         .show_rows(&mut rows, ROW, total, |ui, range| {
             for index in range {
                 let (_, rect) = ui.allocate_space(vec2(ui.available_width(), ROW));
-                let Some(file) = repository.files.get(index) else {
+                let Some(file) = listed.files.get(index) else {
                     ui.painter().text(
                         Pos2::new(rect.left() + 26.0, rect.center().y),
                         Align2::LEFT_CENTER,
-                        format!("{} more files are not listed", repository.more),
+                        format!("{} more files are not listed", listed.more),
                         theme::regular(11.5),
                         p.muted,
                     );
                     continue;
                 };
-                let selected = state.selected.as_deref() == Some(file.path.as_str());
+                let selected = selected == Some(file.path.as_str());
                 file_row(ui, rect, p, file, selected, events);
             }
         });
-    if let Some(shown) = repository.diff {
+    if let Some(shown) = listed.diff {
         let surface = Rect::from_min_max(Pos2::new(body.left(), list.bottom() + 6.0), body.max);
         diff(ui, surface, p, shown, events);
         let handle = Rect::from_min_max(
@@ -662,10 +694,10 @@ fn contents(
             && let Some(pointer) = resize.interact_pointer_pos()
             && body.height() > 0.0
         {
-            state.diff_share = ((body.bottom() - pointer.y) / body.height()).clamp(0.2, 0.85);
+            *diff_share = ((body.bottom() - pointer.y) / body.height()).clamp(0.2, 0.85);
         }
         if resize.double_clicked() {
-            state.diff_share = State::default().diff_share;
+            *diff_share = State::default().diff_share;
         }
     }
 }

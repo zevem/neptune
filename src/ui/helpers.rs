@@ -207,7 +207,8 @@ impl PullRequestChip {
     }
 }
 
-/// Pull request numbers that open their pull request, laid out leading from
+/// Pull request numbers that open their pull request in the panel's tab, or
+/// in the browser when pressed as a terminal's link is, laid out leading from
 /// a trailing edge. Each carries its state: a colour and icon once merged,
 /// closed or a draft, and while in review a mark for its checks and a count of
 /// unresolved comments. Interaction is claimed first so the surface beneath
@@ -349,8 +350,15 @@ impl<'a> PullRequestChips<'a> {
         actions: &mut Vec<super::Action>,
     ) {
         use crate::icons::{self, Icon};
+        // The press that opens a terminal's link in the browser does so here.
+        let outside = painter
+            .ctx()
+            .input(|input| input.modifiers.ctrl || input.modifiers.mac_cmd);
         let open = |link: &neptune_model::PullRequest, actions: &mut Vec<super::Action>| {
-            if let Some(link) = crate::platform::links::WebLink::new(link.url()) {
+            if !outside {
+                let shown = super::pull_request::Event::Open(link.clone());
+                actions.push(super::Action::PullRequest(shown));
+            } else if let Some(link) = crate::platform::links::WebLink::new(link.url()) {
                 actions.push(super::Action::OpenLink(link));
             }
         };
@@ -412,6 +420,11 @@ impl<'a> PullRequestChips<'a> {
                     ),
                     Lookup::Checking => {}
                 }
+                text.push_str(if cfg!(target_os = "macos") {
+                    "\n⌘-click opens it in the browser"
+                } else {
+                    "\nCtrl+click opens it in the browser"
+                });
                 if response.on_hover_text(text).clicked() {
                     open(&linked.link, actions);
                 }
@@ -699,5 +712,60 @@ mod tests {
         assert_eq!(shown(&reordered), Some(p.secondary));
         // With none in review, the newest stands for them.
         assert_eq!(shown(&narrower), Some(p.muted));
+    }
+
+    #[test]
+    fn a_pressed_number_opens_its_tab_and_the_browser_when_pressed_as_a_link_is() {
+        use eframe::egui::{Event, Modifiers, PointerButton, RawInput, pos2};
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let p = crate::theme::Palette::new(crate::config::Theme::Graphite);
+        let links = [LinkedPullRequest {
+            link: neptune_model::PullRequest::parse("https://github.com/zevem/neptune/pull/83")
+                .unwrap(),
+            lookup: Lookup::Checking,
+        }];
+        let press = |modifiers: Modifiers| {
+            let mut actions = Vec::new();
+            let mut at = pos2(390.0, 20.0);
+            let button = |pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers,
+            };
+            for events in [
+                vec![Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+            ] {
+                let mut events = events;
+                events.insert(0, Event::ModifiersChanged(modifiers));
+                let input = RawInput {
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    let chips =
+                        PullRequestChips::layout(ui, ui.id(), &links, (200.0, 400.0, 20.0), p);
+                    at = pos2((chips.left + 400.0) * 0.5, 20.0);
+                    let painter = ui.painter().clone();
+                    chips.paint(&painter, p, &mut actions);
+                });
+                output.textures_delta.clear();
+            }
+            actions
+        };
+        assert!(matches!(
+            press(Modifiers::NONE).as_slice(),
+            [crate::ui::Action::PullRequest(crate::ui::pull_request::Event::Open(link))]
+                if link.number() == 83
+        ));
+        for modifiers in [Modifiers::CTRL, Modifiers::MAC_CMD] {
+            assert!(matches!(
+                press(modifiers).as_slice(),
+                [crate::ui::Action::OpenLink(link)] if link.as_str().ends_with("/pull/83")
+            ));
+        }
     }
 }
