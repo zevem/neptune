@@ -36,8 +36,6 @@ pub const HEADER: f32 = 30.0;
 pub const ROW: f32 = 26.0;
 /// A linked pull request in the list.
 pub const LINKED_ROW: f32 = 46.0;
-/// The strip of the pull requests open in the tab.
-pub const OPEN: f32 = 28.0;
 /// The comments shown before the older ones are asked for.
 const RECENT: usize = 10;
 /// The most drafts kept, one for each pull request written to.
@@ -148,6 +146,8 @@ pub struct State {
     pub hide_whitespace: bool,
     /// Diffs set what was beside what is.
     pub split: bool,
+    /// A diff's long lines go on underneath themselves.
+    pub wrap: bool,
     /// The review conversation being answered, and the answer.
     pub replying: Option<String>,
     pub reply: String,
@@ -185,6 +185,7 @@ impl Default for State {
             rewriting: None,
             hide_whitespace: false,
             split: false,
+            wrap: false,
             replying: None,
             reply: String::new(),
             line: None,
@@ -206,6 +207,7 @@ impl State {
             method: self.method,
             hide_whitespace: self.hide_whitespace,
             split: self.split,
+            wrap: self.wrap,
             drafts: std::mem::take(&mut self.drafts),
             pending: std::mem::take(&mut self.pending),
             ..Self::default()
@@ -304,6 +306,8 @@ pub enum Event {
     Open(PullRequest),
     /// Leave it for the list of those linked.
     Back,
+    /// Show the list of those linked, whatever tab is in view.
+    Listed,
     /// Take it out of the tab.
     Close(PullRequest),
     /// Read what its repository offers: labels and people to ask.
@@ -318,6 +322,9 @@ pub enum Event {
         words: String,
         agent: bool,
     },
+    /// Start an agent of its own on a task about the pull request, from
+    /// the agent of the terminal in front.
+    Start(String),
     Refresh,
     Act(Act),
     DismissProblem,
@@ -1199,25 +1206,32 @@ fn more_menu(
     // Words for the agent of the terminal in front, written at its prompt
     // for the person to send.
     let url = shown.link.url();
-    let mut hand = vec![
-        (
-            "Ask an agent about this…",
-            format!("About pull request {url}: "),
-        ),
-        (
-            "Have an agent explain it",
-            format!(
-                "Explain pull request {url}: walk through the diff and say what to read closely."
-            ),
-        ),
-    ];
+    if menu_item(
+        ui,
+        p,
+        Icon::Agents,
+        "Ask the agent here about this…",
+        "",
+        false,
+    ) {
+        events.push(Event::Hand {
+            words: format!("About pull request {url}: "),
+            agent: true,
+        });
+        ui.close();
+    }
+    // Work that stands by itself goes to an agent started for it.
+    let mut hand = vec![(
+        "Start an agent to explain it",
+        format!("Explain pull request {url}: walk through the diff and say what to read closely."),
+    )];
     if detail.in_review()
         && (detail.unresolved() > 0
             || detail.checks() == Checks::Failing
             || detail.decision == Some(Decision::ChangesRequested))
     {
         hand.push((
-            "Have an agent fix the findings",
+            "Start an agent to fix the findings",
             format!(
                 "Address the unresolved review comments and the failing checks of pull request {url}."
             ),
@@ -1225,7 +1239,7 @@ fn more_menu(
     }
     if detail.state == Standing::Open && detail.merge == Merge::Conflicts {
         hand.push((
-            "Have an agent resolve the conflicts",
+            "Start an agent to resolve the conflicts",
             format!(
                 "Resolve the merge conflicts of pull request {url} with {}.",
                 detail.base
@@ -1234,7 +1248,7 @@ fn more_menu(
     }
     for (label, words) in hand {
         if menu_item(ui, p, Icon::Agents, label, "", false) {
-            events.push(Event::Hand { words, agent: true });
+            events.push(Event::Start(words));
             ui.close();
         }
     }
@@ -3229,6 +3243,15 @@ fn code(
             state.split = !state.split;
             ui.close();
         }
+        let icon = if state.wrap {
+            Icon::Check
+        } else {
+            Icon::TextSize
+        };
+        if menu_item(ui, p, icon, "Wrap lines", "", false) {
+            state.wrap = !state.wrap;
+            ui.close();
+        }
         menu_separator(ui, p);
         let all = if scoped.is_none() {
             Icon::Check
@@ -3377,6 +3400,7 @@ fn code(
                 open,
                 slot: Some(&slot),
                 split: state.split,
+                wrap: state.wrap,
             },
         },
         (state.selected.as_deref(), &mut state.diff_share),
@@ -3967,14 +3991,52 @@ fn pull_request(
     }
 }
 
-/// The pull requests open in the tab, a pill each: pressed, it is shown;
-/// its cross, or a middle press, takes it out of the tab.
-fn open_strip(ui: &mut Ui, strip: Rect, p: Palette, view: &View, events: &mut Vec<Event>) {
+/// How wide the tabs of the open pull requests are together, with the tab
+/// that lists the linked ones; nothing while none is open.
+pub(super) fn tabs_width(ui: &Ui, view: &View) -> f32 {
+    if view.opened.is_empty() {
+        return 0.0;
+    }
+    let numbers: f32 = view
+        .opened
+        .iter()
+        .map(|link| {
+            ui.painter()
+                .layout_no_wrap(
+                    format!("#{}", link.number()),
+                    theme::medium(11.5),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x
+                + 30.0
+                + 2.0
+        })
+        .sum();
+    numbers + LISTED
+}
+/// The tab that lists the linked pull requests, which is an icon.
+const LISTED: f32 = 26.0;
+
+/// The open pull requests as tabs of the panel's strip, each its number:
+/// pressed, it is shown; its cross, or a middle press, closes it. They
+/// scroll sideways where the strip has no room for all of them. The last
+/// tab lists the linked pull requests. `in_view` is whether the panel shows
+/// this tab.
+pub(super) fn tabs(
+    ui: &mut Ui,
+    strip: Rect,
+    p: Palette,
+    view: &View,
+    in_view: bool,
+    actions: &mut Vec<Action>,
+) {
     let current = match &view.body {
         Body::Linked(_) => None,
         Body::Reading(link) | Body::Failed(link, _) => Some(*link),
         Body::Shown(shown) => Some(shown.link),
     };
+    let mut events = Vec::new();
     let mut row = ui.new_child(
         UiBuilder::new()
             .id_salt("pull-request-open")
@@ -3983,22 +4045,22 @@ fn open_strip(ui: &mut Ui, strip: Rect, p: Palette, view: &View, events: &mut Ve
     );
     row.set_clip_rect(strip.intersect(row.clip_rect()));
     egui::ScrollArea::horizontal()
-        .id_salt("pull-request-open-pills")
+        .id_salt("pull-request-open-tabs")
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, false])
         .show(&mut row, |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = 2.0;
             for link in view.opened {
-                let selected = current.is_some_and(|current| current.same(link));
+                let selected = in_view && current.is_some_and(|current| current.same(link));
                 let text = format!("#{}", link.number());
                 let galley = ui.painter().layout_no_wrap(
                     text,
                     theme::medium(11.5),
                     if selected { p.fg } else { p.secondary },
                 );
-                let (_, pill) = ui.allocate_space(vec2(galley.size().x + 34.0, 22.0));
-                let cross = Rect::from_min_size(
-                    Pos2::new(pill.right() - 20.0, pill.top() + 2.0),
+                let (_, pill) = ui.allocate_space(vec2(galley.size().x + 30.0, strip.height()));
+                let cross = Rect::from_center_size(
+                    Pos2::new(pill.right() - 11.0, pill.center().y),
                     Vec2::splat(18.0),
                 );
                 let response = ui
@@ -4027,26 +4089,26 @@ fn open_strip(ui: &mut Ui, strip: Rect, p: Palette, view: &View, events: &mut Ve
                     WidgetInfo::labeled(
                         WidgetType::Button,
                         true,
-                        format!("Close pull request {} in this tab", link.label()),
+                        format!("Close the tab of pull request {}", link.label()),
                     )
                 });
                 let painter = ui.painter();
                 let fill = if selected {
-                    Some(theme::tint(p.fg, 0.08))
+                    0.08
                 } else if response.hovered() || close.hovered() {
-                    Some(theme::tint(p.fg, 0.045))
+                    0.045
                 } else {
-                    None
+                    0.0
                 };
-                if let Some(fill) = fill {
-                    painter.rect_filled(pill, 7, fill);
+                if fill > 0.0 {
+                    painter.rect_filled(pill, 7, theme::tint(p.fg, fill));
                 }
                 if response.has_focus() {
-                    focus_ring(painter, pill, 7, p);
+                    focus_ring(painter, pill.shrink(2.0), 7, p);
                 }
                 galley_at(
                     painter,
-                    Pos2::new(pill.left() + 9.0, pill.center().y + 0.5),
+                    Pos2::new(pill.left() + 8.0, pill.center().y),
                     galley,
                 );
                 if close.hovered() {
@@ -4058,15 +4120,58 @@ fn open_strip(ui: &mut Ui, strip: Rect, p: Palette, view: &View, events: &mut Ve
                     Icon::Close,
                     if close.hovered() { p.fg } else { p.muted },
                 );
+                // The one that comes into view is scrolled to, once.
+                let shown = Id::new("pull-request-tab-shown");
+                if selected
+                    && ui.data(|data| data.get_temp::<String>(shown)).as_deref() != Some(link.url())
+                {
+                    ui.data_mut(|data| data.insert_temp(shown, link.url().to_owned()));
+                    ui.scroll_to_rect(pill, None);
+                }
                 if close.clicked() || response.middle_clicked() {
                     events.push(Event::Close(link.clone()));
                 } else if response.clicked() && !selected {
                     events.push(Event::Open(link.clone()));
                 }
-                close.on_hover_text("Close in this tab");
+                close.on_hover_text("Close this tab");
                 response.on_hover_text(link.label());
             }
+            // The linked pull requests, behind the last tab.
+            let selected = in_view && current.is_none();
+            let (_, place) = ui.allocate_space(vec2(LISTED - 2.0, strip.height()));
+            let response = ui
+                .interact(place, Id::new("pull-request-listed-tab"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            response.widget_info(|| {
+                WidgetInfo::selected(
+                    WidgetType::SelectableLabel,
+                    true,
+                    selected,
+                    "Linked pull requests",
+                )
+            });
+            let fill = if selected {
+                0.08
+            } else if response.hovered() {
+                0.045
+            } else {
+                0.0
+            };
+            if fill > 0.0 {
+                ui.painter().rect_filled(place, 7, theme::tint(p.fg, fill));
+            }
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(place.center(), Vec2::splat(13.0)),
+                Icon::PullRequest,
+                if selected { p.fg } else { p.secondary },
+            );
+            if response.clicked() && !selected {
+                events.push(Event::Listed);
+            }
+            response.on_hover_text("Linked pull requests");
         });
+    actions.extend(events.into_iter().map(Action::PullRequest));
 }
 
 /// The tab in `rect`, below the panel's tabs.
@@ -4083,15 +4188,10 @@ pub fn show(
     child.set_clip_rect(rect.expand2(vec2(4.0, 0.0)).intersect(view.window));
     child.multiply_opacity(view.reveal);
     let ui = &mut child;
-    let mut inner = Rect::from_min_max(
+    let inner = Rect::from_min_max(
         Pos2::new(rect.left() + 6.0, rect.top()),
         Pos2::new(rect.right() - 8.0, rect.bottom() - 8.0),
     );
-    if !view.opened.is_empty() {
-        let strip = Rect::from_min_size(inner.min, vec2(inner.width(), OPEN));
-        open_strip(ui, strip, p, view, &mut events);
-        inner.min.y = strip.bottom();
-    }
     match &view.body {
         Body::Linked(links) => linked(ui, inner, p, links, &mut events, actions),
         Body::Reading(link) => {

@@ -656,6 +656,19 @@ impl App {
         }
     }
 
+    /// Starts an agent with `task` from the agent in `parent`, as that
+    /// agent would itself. Returns its terminal.
+    pub(super) fn start_from(
+        &mut self,
+        ctx: &egui::Context,
+        parent: PaneId,
+        generation: u64,
+        task: Task,
+        cwd: std::path::PathBuf,
+    ) -> Result<PaneId, String> {
+        self.spawn_agent(ctx, Starter::Pane(parent), generation, task, cwd, None)
+    }
+
     fn spawn_agent(
         &mut self,
         ctx: &egui::Context,

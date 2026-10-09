@@ -170,7 +170,11 @@ icon buttons keep a 28-point target around a 16-point glyph.
   34-point strip at its top holds five tabs, "Files", "Agents", "Changes",
   "Project" and "Pull request", of equal width unless the panel is too narrow
   for a name, where they are set closer and each takes what its name needs;
-  near its narrowest the last is named "PR". They are drawn like terminal tabs: the one in view takes a faint fill. They
+  near its narrowest the last is named "PR". Each pull request that is open
+  takes the last tab's place with a tab of its own at the strip's trailing
+  end: its number and a cross, then an icon tab that lists the linked ones.
+  They take the room the names leave, scroll sideways past it, and always
+  keep room for one. They are drawn like terminal tabs: the one in view takes a faint fill. They
   are chosen with the pointer or the command palette, never with Tab or the
   arrow keys. The Agents tab counts the agents waiting for input in a pill in
   the attention colour, and the Project tab counts what its project needs the
@@ -263,9 +267,7 @@ icon buttons keep a 28-point target around a 16-point glyph.
   material floats over the bottom trailing corner and opens the field for a
   comment or review at the bottom of the tab, under a hairline, with its
   one accent button; a field that leaves view gives up the keyboard and
-  keeps its text. The pull requests opened in the tab are pills on a 28-point
-  strip above all this, in the terminal tabs' language, each with a cross.
-  Rows that can be added to end in a "+" that opens a menu with what is in
+  keeps its text. Rows that can be added to end in a "+" that opens a menu with what is in
   use ticked. Under a comment its reactions are pills of a small outline picture and a count
   (the person's own in the accent tint) with a "+" for another, and a review
   conversation trails "Reply" and "Resolve"; a reply and an edited
@@ -274,7 +276,8 @@ icon buttons keep a 28-point target around a 16-point glyph.
   accent bar at its leading edge, and the lines of the open diff take a
   press that opens a field for a comment in the diff, under that line, on
   the elevated material. Side by side, what was takes the leading half of
-  the diff and what is the trailing one. Without a pull request the tab lists the linked ones as
+  the diff and what is the trailing one; wrapped, a long line goes on
+  under itself, set in from the numbers. Without a pull request the tab lists the linked ones as
   46-point rows of an icon, `owner/repo#N` and the state in words. Reading
   and every change run off the UI thread; a pull request in view is drawn
   again every 30 seconds for its ages, and otherwise only when what was

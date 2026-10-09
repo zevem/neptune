@@ -101,15 +101,16 @@ NEPTUNE_PR_CAPTURE="$PWD/artifacts/native-pull-request.png" \
 `NEPTUNE_PR_STATE` names what is shown: `summary` (the default), `ready`,
 `merged`, `draft`, `conflicts`, `checks`, `confirm`, `close`, `problem`,
 `timeline`, `code`, `diff`, `comment`, `review`, `reading`, `missing`,
-`signed-out`, `linked`, `empty`, `split` (the diff side by side), `line` (a
-comment being written under a line of the diff) or `drive`. `drive` presses a number on the
+`signed-out`, `linked`, `empty`, `split` (the diff side by side), `wrap` (its long lines wrapped), `line` (a
+comment being written under a line of the diff), `tabs` (two pull requests
+open), `hover` (the card of a linked number) or `drive`. `drive` presses a number on the
 toolbar, opens the comment field, types, sends with the command key and Enter
 and leaves a second comment with Escape, through the application's own input
-path, and fails unless each step did what it should. `press` does the same for a
-label and a reviewer from their lists, the description and a comment rewritten
+path, and fails unless each step did what it should. `press` does the same for the
+title rewritten from the menu, a label and a reviewer from their lists, the description and a comment rewritten
 in place, a reaction, an answer to a review conversation and its reopening,
-hiding whitespace, a comment written under a line of a diff and sent with a
-review, and a pill's cross. `NEPTUNE_PR_NARROW=1` uses a 640×400 window,
+hiding whitespace, the diff side by side and wrapped, a comment written under a line of a diff and sent with a
+review, and a tab's cross. `NEPTUNE_PR_NARROW=1` uses a 640×400 window,
 `NEPTUNE_PR_WIDTH` sets the panel's width and `NEPTUNE_PR_THEME` names a theme.
 `NEPTUNE_PR_LIVE` names a pull request by its address and reads it with the
 signed-in GitHub CLI instead; a capture never changes a pull request. Pressing

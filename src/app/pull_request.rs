@@ -655,8 +655,46 @@ impl App {
         }
     }
 
+    /// Starts an agent in a terminal of its own with `task`, from the agent
+    /// of the terminal in front and in its folder, and shows its terminal.
+    fn start_agent_on(&mut self, ctx: &egui::Context, task: String) {
+        use neptune_model::AgentKind;
+        let model = self.controller.model();
+        let front = model
+            .active_pane()
+            .and_then(|id| model.pane(id))
+            .and_then(|pane| Some((pane, pane.agent()?)));
+        let Some((pane, agent)) = front else {
+            self.ui.error = Some(
+                "The terminal in front runs no agent. Focus one that runs Claude Code or Codex, which starts the new agent, then try again."
+                    .into(),
+            );
+            return;
+        };
+        let (parent, generation) = (pane.id(), pane.generation());
+        let cwd = agent.cwd.clone();
+        let task = crate::runtime::agents::Task {
+            // The CLIs Neptune starts with a task; the one in use if it is one.
+            kind: match agent.kind {
+                AgentKind::Codex => AgentKind::Codex,
+                _ => AgentKind::Claude,
+            },
+            prompt: task,
+            model: None,
+            effort: None,
+            ultracode: false,
+            resume: None,
+            title: None,
+            worktree: None,
+        };
+        match self.start_from(ctx, parent, generation, task, cwd) {
+            Ok(started) => self.action(ctx, Action::Focus(started)),
+            Err(why) => self.ui.error = Some(why),
+        }
+    }
+
     pub(super) fn pull_request_event(&mut self, ctx: &egui::Context, event: Event) {
-        match event {
+        match event.clone() {
             Event::Open(link) => {
                 // A window without room for the panel has the browser.
                 if !self.ui.panel.available {
@@ -688,10 +726,14 @@ impl App {
                 }
                 self.panel_event(ctx, ui::panel::Event::Show(ui::panel::Tab::PullRequest));
             }
-            Event::Back => {
+            Event::Back | Event::Listed => {
+                let listed = event == Event::Listed;
                 self.pull_request.turn_to(None);
                 self.ui.pull_request.opened();
                 self.leave_pull_request(ctx);
+                if listed {
+                    self.panel_event(ctx, ui::panel::Event::Show(ui::panel::Tab::PullRequest));
+                }
             }
             Event::Close(link) => {
                 let Some(place) = self
@@ -730,6 +772,7 @@ impl App {
                 self.pull_request.files = None;
             }
             Event::Hand { words, agent } => self.hand_to_terminal(ctx, &words, agent),
+            Event::Start(task) => self.start_agent_on(ctx, task),
             Event::Scope(commit) => {
                 self.ui.pull_request.scope = commit;
                 self.ui.pull_request.selected = None;
@@ -1163,6 +1206,12 @@ mod tests {
         app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
         assert!(title(&app).is_some());
         assert_eq!(numbers(&app), [83, 84], "opened again, it is listed once");
+        // The tab of the linked ones shows the list and keeps the others open.
+        app.action(&ctx, Action::Panel(Panel::Show(Tab::Files)));
+        app.action(&ctx, Action::PullRequest(Event::Listed));
+        assert!(app.pull_request.shown().is_none() && app.ui.panel.tab == Tab::PullRequest);
+        assert_eq!(numbers(&app), [83, 84]);
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
         // Closing the one in view shows its neighbour; the last, the list.
         app.action(&ctx, Action::PullRequest(Event::Close(link(83))));
         assert_eq!(app.pull_request.shown().map(PullRequest::number), Some(84));
@@ -1237,6 +1286,15 @@ mod tests {
         };
         // A shell takes a command, not a question for an agent.
         assert!(hand(&mut app, true).is_some_and(|said| said.contains("runs no agent")));
+        // Nor does it start an agent: one is started by another.
+        app.ui.error = None;
+        app.action(&ctx, Action::PullRequest(Event::Start("Explain it".into())));
+        assert!(
+            app.ui
+                .error
+                .take()
+                .is_some_and(|said| said.contains("runs no agent"))
+        );
         assert_eq!(hand(&mut app, false), None);
         let pane = app.controller.model().active_pane().unwrap();
         let generation = app.controller.model().pane(pane).unwrap().generation();
@@ -1567,9 +1625,11 @@ mod tests {
         enum Where {
             /// The middle of the control with this name.
             Control(egui::Id),
-            /// The first row of the menu that control opened, wherever the
-            /// menu found room.
-            Menu(egui::Id),
+            /// A row of the menu that control opened, wherever the menu
+            /// found room.
+            Menu(egui::Id, usize),
+            /// The same for a control known by where it is.
+            MenuAt(Pos2, usize),
             At(Pos2),
         }
         #[derive(Clone)]
@@ -1578,6 +1638,8 @@ mod tests {
             Type(&'static str),
             /// The command key with Enter.
             Send,
+            /// Enter alone.
+            Enter,
         }
         /// What the second driven run does, and when: it changes a label,
         /// takes a reaction back, answers and reopens a review conversation,
@@ -1594,14 +1656,20 @@ mod tests {
             let reviewers = egui::Id::new(("pull-request-add", "Reviewers"));
             let words = |name: &str| egui::Id::new(("pull-request-words", name));
             let shown_as = words("Choose what the code part shows");
-            let (timeline, code) = (Pos2::new(849.0, 222.0), Pos2::new(944.0, 222.0));
+            let (timeline, code) = (Pos2::new(849.0, 194.0), Pos2::new(944.0, 194.0));
+            let more = Pos2::new(978.0, 93.0);
             let control = |id| Step::Click(Where::Control(id));
             let steps = vec![
+                // The title rewritten from the menu of the trailing control.
+                Step::Click(Where::At(more)),
+                Step::Click(Where::MenuAt(more, 1)),
+                Step::Type(" v2"),
+                Step::Enter,
                 // A label from its list, and someone asked to review.
                 control(labels),
-                Step::Click(Where::Menu(labels)),
+                Step::Click(Where::Menu(labels, 0)),
                 control(reviewers),
-                Step::Click(Where::Menu(reviewers)),
+                Step::Click(Where::Menu(reviewers, 0)),
                 // The description rewritten in place.
                 control(words("Edit description")),
                 Step::Type(" More."),
@@ -1625,9 +1693,14 @@ mod tests {
                 // the diff, and the review that carries it sent.
                 Step::Click(Where::At(code)),
                 control(shown_as),
-                Step::Click(Where::Menu(shown_as)),
-                Step::Click(Where::At(Pos2::new(850.0, 331.0))),
-                Step::Click(Where::At(Pos2::new(900.0, 560.0))),
+                Step::Click(Where::Menu(shown_as, 0)),
+                // What was beside what is, and long lines wrapped.
+                control(shown_as),
+                Step::Click(Where::Menu(shown_as, 1)),
+                control(shown_as),
+                Step::Click(Where::Menu(shown_as, 2)),
+                Step::Click(Where::At(Pos2::new(850.0, 303.0))),
+                Step::Click(Where::At(Pos2::new(900.0, 532.0))),
                 Step::Type("Why?"),
                 Step::Send,
                 control(egui::Id::new((
@@ -1666,30 +1739,33 @@ mod tests {
                 self.step += 1;
                 match step {
                     Step::Click(target) => {
+                        // A row of the menu that floats near `anchor`:
+                        // below the control first, then above it.
+                        let menu = |anchor: Pos2, row: usize| {
+                            let floats = |pos: Pos2| {
+                                ctx.layer_id_at(pos)
+                                    .is_some_and(|layer| layer.order == egui::Order::Foreground)
+                            };
+                            let below = (4..240).step_by(4).map(|down| down as f32);
+                            let above = (4..240).step_by(4).map(|up| -(up as f32));
+                            below
+                                .chain(above)
+                                .flat_map(|dy| {
+                                    [-150.0, -100.0, -60.0, 0.0, 60.0]
+                                        .map(|dx| anchor + Vec2::new(dx, dy + dy.signum() * 10.0))
+                                })
+                                .find(|pos| floats(*pos))
+                                .map(|edge| edge + Vec2::new(0.0, 12.0 + 28.0 * row as f32))
+                        };
                         let found = match target {
                             Where::At(pos) => Some(*pos),
                             Where::Control(id) => {
                                 ctx.read_response(*id).map(|found| found.rect.center())
                             }
-                            Where::Menu(id) => ctx.read_response(*id).and_then(|found| {
-                                let anchor = found.rect.center();
-                                let floats = |pos: Pos2| {
-                                    ctx.layer_id_at(pos)
-                                        .is_some_and(|layer| layer.order == egui::Order::Foreground)
-                                };
-                                // Below the control first, then above it.
-                                let below = (4..240).step_by(4).map(|down| down as f32);
-                                let above = (4..240).step_by(4).map(|up| -(up as f32));
-                                below
-                                    .chain(above)
-                                    .flat_map(|dy| {
-                                        [-150.0, -100.0, -60.0, 0.0, 60.0].map(|dx| {
-                                            anchor + Vec2::new(dx, dy + dy.signum() * 10.0)
-                                        })
-                                    })
-                                    .find(|pos| floats(*pos))
-                                    .map(|edge| edge + Vec2::new(0.0, 12.0))
-                            }),
+                            Where::Menu(id, row) => ctx
+                                .read_response(*id)
+                                .and_then(|found| menu(found.rect.center(), *row)),
+                            Where::MenuAt(anchor, row) => menu(*anchor, *row),
                         };
                         let Some(pos) = found else {
                             if part == 0 {
@@ -1712,6 +1788,16 @@ mod tests {
                     }
                     Step::Type(text) if part == 0 && !text.is_empty() => {
                         input.events.push(Input::Text((*text).into()));
+                    }
+                    Step::Enter if part == 0 => {
+                        let key = |pressed| Input::Key {
+                            key: Key::Enter,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: Modifiers::NONE,
+                        };
+                        input.events.extend([key(true), key(false)]);
                     }
                     Step::Send if part == 0 => {
                         let command = Modifiers {
@@ -1836,12 +1922,19 @@ mod tests {
                 if let Ok(width) = std::env::var("NEPTUNE_PR_WIDTH") {
                     self.app.ui.panel.width = width.parse().unwrap();
                 }
-                if self.state == "drive" {
+                if matches!(self.state.as_str(), "drive" | "hover") {
                     // The panel stays closed: a press on a number opens it.
                 } else if matches!(self.state.as_str(), "linked" | "empty") {
                     self.app
                         .action(ctx, Action::Panel(ui::panel::Event::Show(Tab::PullRequest)));
                 } else {
+                    self.app
+                        .action(ctx, Action::PullRequest(Event::Open(shown.clone())));
+                }
+                if self.state == "tabs" {
+                    // A second one open beside it, the first in view again.
+                    self.app
+                        .action(ctx, Action::PullRequest(Event::Open(link(112))));
                     self.app
                         .action(ctx, Action::PullRequest(Event::Open(shown.clone())));
                 }
@@ -1853,7 +1946,7 @@ mod tests {
                     "confirm" => tab.confirm = Some(Confirm::Merge(Method::Squash)),
                     "close" => tab.confirm = Some(Confirm::Close),
                     "timeline" => tab.segment = Segment::Timeline,
-                    "code" | "diff" | "split" | "line" => tab.segment = Segment::Code,
+                    "code" | "diff" | "split" | "line" | "wrap" => tab.segment = Segment::Code,
                     "comment" => {
                         tab.composer = Some(Composer::Comment);
                         *tab.draft_mut(shown.url()) =
@@ -1865,10 +1958,11 @@ mod tests {
                     }
                     _ => {}
                 }
-                if matches!(self.state.as_str(), "diff" | "split" | "line") {
+                if matches!(self.state.as_str(), "diff" | "split" | "line" | "wrap") {
                     tab.selected = Some("src/ui/panel.rs".into());
                 }
                 tab.split = self.state == "split";
+                tab.wrap = self.state == "wrap";
                 if self.state == "line" {
                     tab.line = Some(ui::pull_request::Target {
                         path: "src/ui/panel.rs".into(),
@@ -1905,6 +1999,13 @@ mod tests {
                             | egui::Event::MouseWheel { .. }
                     )
                 });
+                // The pointer rests on a linked number, for its card.
+                if self.state == "hover" && self.staged && self.step == 0 {
+                    self.step = 1;
+                    input
+                        .events
+                        .push(egui::Event::PointerMoved(Pos2::new(410.0, 22.0)));
+                }
                 if self.state == "press" && self.staged {
                     self.press(ctx, input);
                 }
@@ -1936,9 +2037,11 @@ mod tests {
             fn on_exit(&mut self) {
                 eframe::App::on_exit(&mut self.app);
                 self.seen.lock().unwrap().push(format!(
-                    "closed: shown={:?} plain={}",
+                    "closed: shown={:?} plain={} split={} wrap={}",
                     self.app.pull_request.shown().map(PullRequest::number),
                     self.app.ui.pull_request.hide_whitespace,
+                    self.app.ui.pull_request.split,
+                    self.app.ui.pull_request.wrap,
                 ));
                 let tab = &self.app.ui.pull_request;
                 self.seen.lock().unwrap().push(format!(
@@ -1985,7 +2088,10 @@ mod tests {
                                 let preview = crate::runtime::pull_requests::Preview {
                                     title: format!("Pull request {}", link.number()),
                                     author: "ada".into(),
-                                    opened: 0,
+                                    opened: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map_or(0, |since| since.as_secs() as i64)
+                                        - 26 * 3600,
                                 };
                                 let status = if link.number() == 112 {
                                     Status {
@@ -2079,6 +2185,7 @@ mod tests {
                     .all(|line| !line.contains("nothing to press"))
             );
             let [
+                retitled,
                 label,
                 request,
                 describe,
@@ -2089,8 +2196,12 @@ mod tests {
                 review,
             ] = &asked[..]
             else {
-                panic!("eight things were asked of the pull request: {asked:?}");
+                panic!("nine things were asked of the pull request: {asked:?}");
             };
+            assert!(
+                matches!(retitled, Act::Title(title) if title.ends_with(" v2")),
+                "{retitled:?}"
+            );
             assert!(matches!(label, Act::Label { .. }), "{label:?}");
             assert!(matches!(request, Act::Request { .. }), "{request:?}");
             assert!(
@@ -2139,7 +2250,7 @@ mod tests {
                 seen.lock()
                     .unwrap()
                     .iter()
-                    .any(|line| line.contains("closed: shown=None plain=true"))
+                    .any(|line| line.contains("closed: shown=None plain=true split=true wrap=true"))
             );
             return;
         }

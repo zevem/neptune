@@ -253,13 +253,47 @@ pub fn show(
     let mut child = ui.new_child(UiBuilder::new().id_salt("right-panel").max_rect(rect));
     child.set_clip_rect(rect.expand2(vec2(4.0, 0.0)).intersect(view.window));
     child.multiply_opacity(view.reveal);
-    let tabs = [
-        Tab::Files,
-        Tab::Agents,
-        Tab::Changes,
-        Tab::Project,
-        Tab::PullRequest,
-    ];
+    // A pull request that is open is a tab of its own, with its number;
+    // with none open one tab stands for them.
+    let mut tabs = vec![Tab::Files, Tab::Agents, Tab::Changes, Tab::Project];
+    let opened = pull_request::tabs_width(&child, view.pull_request);
+    if opened == 0.0 {
+        tabs.push(Tab::PullRequest);
+    }
+    // The numbers take what the names leave them, set close, and scroll
+    // past that; one of them always has room.
+    let strip = {
+        let names: f32 = tabs
+            .iter()
+            .map(|item| {
+                child
+                    .painter()
+                    .layout_no_wrap(
+                        item.label().to_owned(),
+                        theme::medium(Fit::TIGHT.font),
+                        p.fg,
+                    )
+                    .size()
+                    .x
+                    + Fit::TIGHT.padding
+                    + Fit::TIGHT.gap
+            })
+            .sum();
+        let numbers = opened
+            .min((strip.width() - names - 2.0).max(72.0))
+            .min((strip.width() * 0.5).floor());
+        if numbers > 0.0 {
+            let zone = Rect::from_min_max(
+                Pos2::new(strip.right() - numbers, strip.top() + 3.0),
+                Pos2::new(strip.right(), strip.bottom() - 3.0),
+            );
+            let in_view = state.tab == Tab::PullRequest;
+            pull_request::tabs(&mut child, zone, p, view.pull_request, in_view, actions);
+            Rect::from_min_max(strip.min, Pos2::new(zone.left() - 2.0, strip.bottom()))
+        } else {
+            strip
+        }
+    };
     let waiting = |item| match item {
         Tab::Agents => view.waiting,
         Tab::Project => view.needs,
@@ -273,20 +307,23 @@ pub fn show(
     let mut fit = Fit::ROOMY;
     let (needed, room) = loop {
         let room = strip.width() - fit.gap * (tabs.len() - 1) as f32;
-        let needed = tabs.map(|item| {
-            let width = |text: String, size| {
-                child
-                    .painter()
-                    .layout_no_wrap(text, theme::medium(size), p.fg)
-                    .size()
-                    .x
-            };
-            let badge = match waiting(item) {
-                0 => 0.0,
-                count => width(count.to_string(), 10.5) + 12.0,
-            };
-            width(fit.name(item).to_owned(), fit.font) + badge + fit.padding
-        });
+        let needed: Vec<f32> = tabs
+            .iter()
+            .map(|item| {
+                let width = |text: String, size| {
+                    child
+                        .painter()
+                        .layout_no_wrap(text, theme::medium(size), p.fg)
+                        .size()
+                        .x
+                };
+                let badge = match waiting(*item) {
+                    0 => 0.0,
+                    count => width(count.to_string(), 10.5) + 12.0,
+                };
+                width(fit.name(*item).to_owned(), fit.font) + badge + fit.padding
+            })
+            .collect();
         if needed.iter().sum::<f32>() <= room {
             break (needed, room);
         }
@@ -714,6 +751,137 @@ mod tests {
             assert!(pair[0].right() < pair[1].left(), "{labels:?}");
         }
         assert!(labels[4].right() <= panel(state.width).right());
+    }
+
+    #[test]
+    fn open_pull_requests_are_tabs_of_their_own_that_show_and_close_them() {
+        let ctx = context();
+        let mut state = State {
+            open: true,
+            tab: Tab::PullRequest,
+            ..State::default()
+        };
+        let link = |number: u64| {
+            neptune_model::PullRequest::parse(&format!(
+                "https://github.com/zevem/neptune/pull/{number}"
+            ))
+            .unwrap()
+        };
+        let opened = [link(118), link(112)];
+        let frame = |state: &mut State, events: Vec<Input>| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(WINDOW),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let p = Palette::for_config(&crate::config::Config::default());
+                    let files = explorer::View {
+                        root: None,
+                        notice: "",
+                        rows: &[],
+                        search: None,
+                        preview: None,
+                        reveal: 1.0,
+                        window: WINDOW,
+                    };
+                    let view = View {
+                        files: &files,
+                        agents: &agents::View {
+                            rows: &[],
+                            window: WINDOW,
+                            reveal: 1.0,
+                        },
+                        changes: &changes::View {
+                            repository: None,
+                            notice: "",
+                            reveal: 1.0,
+                            window: WINDOW,
+                        },
+                        project: &project::View {
+                            body: project::Body::Nothing,
+                            composing: false,
+                            window: WINDOW,
+                            reveal: 1.0,
+                        },
+                        pull_request: &pull_request::View {
+                            body: pull_request::Body::Reading(&opened[0]),
+                            opened: &opened,
+                            now: 0,
+                            composing: false,
+                            reveal: 1.0,
+                            window: WINDOW,
+                        },
+                        needs: 0,
+                        waiting: 0,
+                        window: WINDOW,
+                        reveal: 1.0,
+                    };
+                    show(
+                        ui,
+                        panel(state.width),
+                        p,
+                        &view,
+                        state,
+                        Contents {
+                            files: &mut explorer::State::default(),
+                            changes: &mut changes::State::default(),
+                            project: &mut project::State::default(),
+                            pull_request: &mut pull_request::State::default(),
+                        },
+                        &mut actions,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            (actions, output)
+        };
+        // Each is named by its number, where one tab stood for them.
+        let (_, output) = frame(&mut state, Vec::new());
+        let named = texts(&output);
+        for expected in ["Files", "Project", "#118", "#112"] {
+            assert!(
+                named.iter().any(|text| text == expected),
+                "{expected} in {named:?}"
+            );
+        }
+        assert!(
+            !named
+                .iter()
+                .any(|text| text == "Pull request" || text == "PR")
+        );
+        let at = |wanted: &str| -> Rect {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == wanted => {
+                        Some(text.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // The other one's number shows it; its cross closes it.
+        let other = at("#112");
+        let mut actions = Vec::new();
+        for events in click(other.center()) {
+            actions.extend(frame(&mut state, events).0);
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::PullRequest(pull_request::Event::Open(link))] if link.number() == 112
+        ));
+        let mut actions = Vec::new();
+        for events in click(Pos2::new(other.right() + 11.0, other.center().y)) {
+            actions.extend(frame(&mut state, events).0);
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::PullRequest(pull_request::Event::Close(link))] if link.number() == 112
+        ));
     }
 
     fn texts_contain(output: &egui::FullOutput, part: &str) -> bool {
