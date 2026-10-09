@@ -791,6 +791,9 @@ impl App {
     /// terminal can take over without dropping keys.
     fn release_closed_overlay_focus(&mut self, ctx: &egui::Context) {
         let open = self.ui.overlay != OverlayState::None;
+        if open {
+            self.ui.explorer.source_selection.reset();
+        }
         if self.overlay_was_open && !open {
             ctx.memory_mut(|memory| {
                 if let Some(id) = memory.focused() {
