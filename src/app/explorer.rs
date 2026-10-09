@@ -1347,7 +1347,7 @@ impl App {
                                         ..
                                     } = &preview.body
                                     {
-                                        document.retain_state_from(previous);
+                                        document.retain_state_from(previous, MAX_DOCUMENT_IMAGES);
                                     }
                                     document
                                 }),

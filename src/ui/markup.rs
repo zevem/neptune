@@ -106,7 +106,7 @@ impl Document {
 
     /// Unchanged blocks keep their controls and image layout on a file reload.
     /// State is released when its preview is replaced or closed.
-    pub fn retain_state_from(&mut self, previous: &Self) {
+    pub fn retain_state_from(&mut self, previous: &Self, image_limit: usize) {
         for (&index, controls) in &self.code_controls {
             if previous.blocks.get(index) == self.blocks.get(index)
                 && let Some(old) = previous.code_controls.get(&index)
@@ -117,9 +117,15 @@ impl Document {
         }
         // Keep layout stable while unchanged images are being read again.
         // A failed replacement removes its cached picture on the UI thread.
-        for (&index, picture) in &previous.pictures {
-            if self.blocks.get(index).is_some()
-                && self.blocks.get(index) == previous.blocks.get(index)
+        for (index, block) in self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block.block, Block::Image(_)))
+            .take(image_limit)
+        {
+            if Some(block) == previous.blocks.get(index)
+                && let Some(picture) = previous.pictures.get(&index)
             {
                 self.pictures.insert(index, picture.clone());
             }
@@ -2143,7 +2149,7 @@ mod tests {
         before.code_controls[&0].wrap.set(false);
         before.code_controls[&0].copied_until.set(1.2);
         let mut after = Document::new(document_blocks("```sh\nfirst\n```"));
-        after.retain_state_from(&before);
+        after.retain_state_from(&before, 16);
         assert_eq!(
             after.code_controls.len(),
             1,
@@ -2152,7 +2158,7 @@ mod tests {
         assert!(!after.code_controls[&0].wrap.get());
         assert_eq!(after.code_controls[&0].copied_until.get(), 1.2);
         let mut changed = Document::new(document_blocks("```sh\nchanged\n```"));
-        changed.retain_state_from(&before);
+        changed.retain_state_from(&before, 16);
         assert!(changed.code_controls[&0].wrap.get());
         assert_eq!(changed.code_controls[&0].copied_until.get(), 0.0);
     }
@@ -2175,7 +2181,7 @@ mod tests {
             },
         );
         let mut after = Document::new(document_blocks("![Logo](logo.png)"));
-        after.retain_state_from(&before);
+        after.retain_state_from(&before, 16);
         assert_eq!(after.pictures[&0].texture.id(), id);
         assert_eq!(after.pictures[&0].pixels, [96, 96]);
         assert!(
@@ -2183,8 +2189,17 @@ mod tests {
             "the retained picture is still refreshed"
         );
         let mut changed = Document::new(document_blocks("![Logo](replacement.png)"));
-        changed.retain_state_from(&before);
+        changed.retain_state_from(&before, 16);
         assert!(changed.pictures.is_empty());
+        let mut beyond_limit = Document::new(document_blocks("Paragraph\n\n![Logo](logo.png)"));
+        beyond_limit.pictures.insert(1, before.pictures[&0].clone());
+        let mut newly_inserted =
+            Document::new(document_blocks("![New](new.png)\n\n![Logo](logo.png)"));
+        newly_inserted.retain_state_from(&beyond_limit, 1);
+        assert!(
+            newly_inserted.pictures.is_empty(),
+            "an image beyond the new document's limit is released"
+        );
     }
 
     #[test]
