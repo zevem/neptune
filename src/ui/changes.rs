@@ -535,12 +535,26 @@ fn diff(
         return;
     }
     // Side by side, both halves stay in view: each is as wide as half the
-    // surface and cuts a line that is longer.
+    // surface, and a sideways scroll moves the text of both together.
     let width = if lines_of.split { 0.0 } else { side };
     let mut ui = ui.new_child(UiBuilder::new().id_salt("changes-diff-text").max_rect(area));
     ui.set_clip_rect(area.intersect(ui.clip_rect()));
     ui.spacing_mut().item_spacing = Vec2::ZERO;
+    let shift = if lines_of.split {
+        let id = ui.id().with(("diff-sideways", &file.path));
+        let hidden = (side - (area.width() * 0.5).floor()).max(0.0);
+        let mut shift = ui.data(|data| data.get_temp::<f32>(id)).unwrap_or(0.0);
+        if ui.rect_contains_pointer(area) {
+            shift -= ui.input(|input| input.smooth_scroll_delta.x);
+        }
+        let shift = shift.clamp(0.0, hidden);
+        ui.data_mut(|data| data.insert_temp(id, shift));
+        shift
+    } else {
+        0.0
+    };
     egui::ScrollArea::both()
+        .scroll([!lines_of.split, true])
         // Each file keeps its own place.
         .id_salt(("changes-diff-lines", &file.path))
         .auto_shrink([false, false])
@@ -683,7 +697,20 @@ fn diff(
                             }
                         }
                         text(numbers, Align2::LEFT_CENTER, sign, ink);
-                        text(gutter, Align2::LEFT_CENTER, &line.text, p.fg);
+                        // The line moves under its number and sign.
+                        let written = Rect::from_min_max(
+                            Pos2::new(part.left() + gutter, part.top()),
+                            part.max,
+                        );
+                        painter
+                            .with_clip_rect(written.intersect(ui.clip_rect()))
+                            .text(
+                                Pos2::new(written.left() - shift, part.center().y),
+                                Align2::LEFT_CENTER,
+                                &line.text,
+                                font.clone(),
+                                p.fg,
+                            );
                     }
                 }
             },

@@ -174,7 +174,8 @@ icon buttons keep a 28-point target around a 16-point glyph.
   takes the last tab's place with a tab of its own at the strip's trailing
   end: its number and a cross, then an icon tab that lists the linked ones.
   They take the room the names leave, scroll sideways past it, and always
-  keep room for one. They are drawn like terminal tabs: the one in view takes a faint fill. They
+  keep room for one; names that would be cut beside them become the icons
+  their commands have in the palette, named under the pointer. They are drawn like terminal tabs: the one in view takes a faint fill. They
   are chosen with the pointer or the command palette, never with Tab or the
   arrow keys. The Agents tab counts the agents waiting for input in a pill in
   the attention colour, and the Project tab counts what its project needs the

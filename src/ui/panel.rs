@@ -17,6 +17,8 @@ pub const WIDTH: RangeInclusive<f32> = 220.0..=560.0;
 pub const MIN_STAGE: f32 = 240.0;
 /// The strip of tabs above the panel's content.
 pub const TABS: f32 = 34.0;
+/// A tab's icon, where it stands for its name.
+const ICON: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tab {
@@ -36,6 +38,18 @@ impl Tab {
             Self::Changes => "Changes",
             Self::Project => "Project",
             Self::PullRequest => "Pull request",
+        }
+    }
+
+    /// The icon that stands for it where the strip has no room for names:
+    /// the one its command has in the palette.
+    fn icon(self) -> Icon {
+        match self {
+            Self::Files => Icon::Files,
+            Self::Agents => Icon::Terminal,
+            Self::Changes => Icon::Branch,
+            Self::Project => Icon::Agents,
+            Self::PullRequest => Icon::PullRequest,
         }
     }
 
@@ -147,6 +161,8 @@ struct Fit {
     gap: f32,
     /// A name too long for the strip is cut to its short form.
     short: bool,
+    /// Each tab is its icon, named under the pointer.
+    icons: bool,
 }
 impl Fit {
     const ROOMY: Self = Self {
@@ -154,6 +170,7 @@ impl Fit {
         padding: 16.0,
         gap: 4.0,
         short: false,
+        icons: false,
     };
     /// For a panel short of room, where the names are set closer.
     const TIGHT: Self = Self {
@@ -161,6 +178,7 @@ impl Fit {
         padding: 8.0,
         gap: 2.0,
         short: false,
+        icons: false,
     };
     /// For a panel near its narrowest, where five names share the strip.
     const SHORT: Self = Self {
@@ -168,6 +186,15 @@ impl Fit {
         padding: 6.0,
         gap: 2.0,
         short: true,
+        icons: false,
+    };
+    /// For a strip that open pull requests leave no room for names in.
+    const ICONS: Self = Self {
+        font: 11.5,
+        padding: 6.0,
+        gap: 2.0,
+        short: true,
+        icons: true,
     };
 
     fn name(self, tab: Tab) -> &'static str {
@@ -208,19 +235,30 @@ fn tab(
     let badge = (waiting > 0)
         .then(|| painter.layout_no_wrap(waiting.to_string(), theme::medium(10.5), p.attention));
     let badge_width = badge.as_ref().map_or(0.0, |badge| badge.size().x + 12.0);
-    let title = elided(
-        &painter,
-        fit.name(tab),
-        theme::medium(fit.font),
-        if selected { p.fg } else { p.secondary },
-        (rect.width() - fit.padding - badge_width).max(0.0),
-    );
-    let width = title.size().x + badge_width;
-    let named = galley_at(
-        &painter,
-        Pos2::new(rect.center().x - width * 0.5, rect.center().y),
-        title,
-    );
+    let ink = if selected { p.fg } else { p.secondary };
+    let named = if fit.icons {
+        let width = ICON + badge_width;
+        let glyph = Rect::from_min_size(
+            Pos2::new(rect.center().x - width * 0.5, rect.center().y - ICON * 0.5),
+            vec2(ICON, ICON),
+        );
+        icons::paint(&painter, glyph, tab.icon(), ink);
+        glyph
+    } else {
+        let title = elided(
+            &painter,
+            fit.name(tab),
+            theme::medium(fit.font),
+            ink,
+            (rect.width() - fit.padding - badge_width).max(0.0),
+        );
+        let width = title.size().x + badge_width;
+        galley_at(
+            &painter,
+            Pos2::new(rect.center().x - width * 0.5, rect.center().y),
+            title,
+        )
+    };
     if let Some(badge) = badge {
         let pill = Rect::from_min_max(
             Pos2::new(named.right() + 5.0, rect.center().y - 7.5),
@@ -232,7 +270,11 @@ fn tab(
         painter.rect_filled(pill, 7.5, theme::tint(p.attention, 0.18));
         painter.galley(pill.center() - badge.size() * 0.5, badge, p.attention);
     }
-    response.clicked()
+    let chosen = response.clicked();
+    if fit.icons {
+        response.on_hover_text(tab.label());
+    }
+    chosen
 }
 
 /// The panel in `rect`, which slides past the window's trailing edge while a
@@ -303,7 +345,10 @@ pub fn show(
     // narrow for that, each takes what its name needs and a share of the
     // rest; in one too narrow for that as well, names are set closer, and
     // then the longest is cut to its short form.
-    let mut fits = [Fit::ROOMY, Fit::TIGHT, Fit::SHORT].into_iter();
+    // Beside open pull requests, names that still do not fit give way to
+    // icons rather than be cut.
+    let last = if opened > 0.0 { Fit::ICONS } else { Fit::SHORT };
+    let mut fits = [Fit::ROOMY, Fit::TIGHT, Fit::SHORT, last].into_iter();
     let mut fit = Fit::ROOMY;
     let (needed, room) = loop {
         let room = strip.width() - fit.gap * (tabs.len() - 1) as f32;
@@ -321,7 +366,11 @@ pub fn show(
                     0 => 0.0,
                     count => width(count.to_string(), 10.5) + 12.0,
                 };
-                width(fit.name(*item).to_owned(), fit.font) + badge + fit.padding
+                if fit.icons {
+                    ICON + badge + fit.padding * 2.0
+                } else {
+                    width(fit.name(*item).to_owned(), fit.font) + badge + fit.padding
+                }
             })
             .collect();
         if needed.iter().sum::<f32>() <= room {

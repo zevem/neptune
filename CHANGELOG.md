@@ -20,8 +20,8 @@ their preparation records remain in Git history.
   by itself, mark it ready or a draft, close, reopen or revert it, edit its
   title and description, change labels and reviewers, comment, react, answer
   and resolve review conversations, mark files as viewed, review it with
-  comments on single lines, approve waiting workflow runs, walk a stack and
-  hand it to the agent in the terminal in front. Each pull request you open is a tab of its own in the panel's strip. Ctrl-click (Command-click on
+  comments on single lines, approve waiting workflow runs, walk a stack,
+  check it out in a worktree of its own and hand it to an agent. Each pull request you open is a tab of its own in the panel's strip. Ctrl-click (Command-click on
   macOS) a number to open it in the browser as before. It is read with your
   signed-in GitHub CLI (`gh`), only while its tab is in view, and nothing
   read is saved.

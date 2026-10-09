@@ -909,9 +909,13 @@ pub fn read(link: &PullRequest) -> Result<Detail, Failure> {
     }
 }
 
-/// The open pull requests around this one in a stack: the one whose branch
-/// it merges into, when that is not the main branch, and those that merge
-/// into its own. Nothing where they could not be read. Branch names are
+/// The most pull requests followed in each direction of a stack.
+const MAX_STACK: usize = 5;
+
+/// The open pull requests of the stack this one is in, from the one nearest
+/// the main branch to the last stacked on top, without itself: those it is
+/// stacked on, when it does not merge into the main branch, and those
+/// stacked on it. Nothing where they could not be read. Branch names are
 /// passed as values of their own, never as part of the request's text.
 fn read_stack(link: &PullRequest, detail: &Detail) -> Vec<Neighbour> {
     if !detail.in_review() {
@@ -920,29 +924,84 @@ fn read_stack(link: &PullRequest, detail: &Detail) -> Vec<Neighbour> {
     let (host, owner, repository) = link.location();
     let query = format!(
         "query=query($base:String!,$head:String!){{repository(owner:\"{owner}\",name:\"{repository}\"){{\
-         below:pullRequests(headRefName:$base,states:OPEN,first:1){{nodes{{number title}}}} \
-         above:pullRequests(baseRefName:$head,states:OPEN,first:5){{nodes{{number title}}}}}}}}"
+         defaultBranchRef{{name}} \
+         below:pullRequests(headRefName:$base,states:OPEN,first:1){{nodes{{number title baseRefName headRefName}}}} \
+         above:pullRequests(baseRefName:$head,states:OPEN,first:5){{nodes{{number title baseRefName headRefName}}}}}}}}"
     );
-    let head = detail.head.rsplit(':').next().unwrap_or_default();
-    let printed = cli(
-        &[
-            "api",
-            "graphql",
-            "--hostname",
-            host,
-            "-f",
-            &query,
-            "-f",
-            &format!("base={}", detail.base),
-            "-f",
-            &format!("head={head}"),
-        ],
-        MAX_RESPONSE,
-    );
-    let Ok(printed) = printed else {
+    let around = |base: &str, head: &str| -> Option<serde_json::Value> {
+        let printed = cli(
+            &[
+                "api",
+                "graphql",
+                "--hostname",
+                host,
+                "-f",
+                &query,
+                "-f",
+                &format!("base={base}"),
+                "-f",
+                &format!("head={head}"),
+            ],
+            MAX_RESPONSE,
+        )
+        .ok()?;
+        serde_json::from_slice(&printed.bytes).ok()
+    };
+    let own = link.number();
+    let head = detail
+        .head
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let Some(first) = around(&detail.base, &head) else {
         return Vec::new();
     };
-    parse_stack(&printed.bytes, detail.stacked, link.number())
+    let mut stack = parse_stack(&first.to_string().into_bytes(), detail.stacked, own);
+    let branches = |response: &serde_json::Value, field: &str| -> Option<(String, String)> {
+        let node = &response["data"]["repository"][field]["nodes"][0];
+        Some((
+            node["baseRefName"].as_str()?.to_owned(),
+            node["headRefName"].as_str()?.to_owned(),
+        ))
+    };
+    let main = first["data"]["repository"]["defaultBranchRef"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    // Further down, towards the main branch.
+    let mut below = branches(&first, "below").filter(|_| detail.stacked);
+    for _ in 1..MAX_STACK {
+        let Some((base, _)) = below.take().filter(|(base, _)| *base != main) else {
+            break;
+        };
+        let Some(next) = around(&base, "") else { break };
+        let found = parse_stack(&next.to_string().into_bytes(), true, own);
+        let Some(near) = found.into_iter().find(|near| near.below) else {
+            break;
+        };
+        if stack.iter().any(|known| known.number == near.number) {
+            break;
+        }
+        stack.insert(0, near);
+        below = branches(&next, "below");
+    }
+    // Further up, along the first pull request stacked on each.
+    let mut above = branches(&first, "above");
+    for _ in 1..MAX_STACK {
+        let Some((_, head)) = above.take() else { break };
+        let Some(next) = around("", &head) else { break };
+        let found = parse_stack(&next.to_string().into_bytes(), false, own);
+        let Some(near) = found.into_iter().find(|near| !near.below) else {
+            break;
+        };
+        if stack.iter().any(|known| known.number == near.number) {
+            break;
+        }
+        stack.push(near);
+        above = branches(&next, "above");
+    }
+    stack
 }
 
 fn parse_stack(response: &[u8], stacked: bool, own: u64) -> Vec<Neighbour> {

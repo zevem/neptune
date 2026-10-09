@@ -325,6 +325,8 @@ pub enum Event {
     /// Start an agent of its own on a task about the pull request, from
     /// the agent of the terminal in front.
     Start(String),
+    /// Check the pull request out in a worktree of its own, with a tab.
+    Worktree,
     Refresh,
     Act(Act),
     DismissProblem,
@@ -1251,6 +1253,17 @@ fn more_menu(
             events.push(Event::Start(words));
             ui.close();
         }
+    }
+    if menu_item(
+        ui,
+        p,
+        Icon::Branch,
+        "Check out in a new worktree",
+        "",
+        false,
+    ) {
+        events.push(Event::Worktree);
+        ui.close();
     }
     if menu_item(
         ui,

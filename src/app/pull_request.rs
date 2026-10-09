@@ -773,6 +773,24 @@ impl App {
             }
             Event::Hand { words, agent } => self.hand_to_terminal(ctx, &words, agent),
             Event::Start(task) => self.start_agent_on(ctx, task),
+            Event::Worktree => {
+                let model = self.controller.model();
+                let front = model.active_pane().and_then(|id| model.pane(id));
+                let (Some(pane), Some(link)) = (front, self.pull_request.shown.clone()) else {
+                    self.ui.error = Some("Open a terminal in the repository first.".into());
+                    return;
+                };
+                // The CLI in use there runs in the new tab; Claude Code
+                // where the terminal runs none.
+                let agent = pane
+                    .agent()
+                    .map_or(neptune_model::AgentKind::Claude, |agent| agent.kind);
+                let (_, owner, repository) = link.location();
+                let of = (format!("{owner}/{repository}"), link.number());
+                if let Err(why) = self.checkout_worktree(ctx, pane.id(), of, agent) {
+                    self.ui.error = Some(why.into());
+                }
+            }
             Event::Scope(commit) => {
                 self.ui.pull_request.scope = commit;
                 self.ui.pull_request.selected = None;
@@ -1558,6 +1576,16 @@ mod tests {
                 pictured.ended = Some(now - 2 * 86_400);
             }
             "draft" => pictured.state = State::Draft,
+            "awaiting" => {
+                pictured.checks = vec![Check {
+                    name: "Build".into(),
+                    workflow: "CI".into(),
+                    outcome: Outcome::Awaiting,
+                    seconds: None,
+                    url: "https://github.com/zevem/neptune/actions/runs/77/job/1".into(),
+                }];
+                pictured.decision = None;
+            }
             "conflicts" => pictured.merge = source::Merge::Conflicts,
             _ => {}
         }
