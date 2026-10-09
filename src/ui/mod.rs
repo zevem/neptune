@@ -21,6 +21,7 @@ pub mod search;
 pub mod theme_browser;
 mod theme_editor;
 pub mod updates;
+pub mod usage;
 pub mod workspace;
 pub mod worktrees;
 use crate::{config::Config, terminal::Cache};
@@ -208,6 +209,10 @@ pub enum Action {
     SetName(WorkspaceId, String),
     Preferences(Config),
     CheckUpdates,
+    Usage,
+    RefreshUsage,
+    /// Allow this run to read Cursor's macOS Keychain login.
+    EnableCursorUsage,
     ReviewUpdate,
     DownloadUpdate(String),
     OpenUpdate(String),

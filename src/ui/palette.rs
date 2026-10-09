@@ -69,6 +69,13 @@ fn command(
 /// and each captures its target when the palette is drawn.
 fn commands(view: &PaletteView) -> Vec<Command> {
     let mut list = Vec::new();
+    list.push(command(
+        "Application",
+        Icon::Agents,
+        "Subscription usage",
+        "",
+        [Action::Usage],
+    ));
     if let Some(pane) = view.pane {
         for port in view.ports {
             if matches!(

@@ -365,11 +365,7 @@ impl App {
                     });
                 // A menu or list open over a sheet that holds them is left
                 // before the sheet is.
-                if matches!(
-                    self.ui.overlay,
-                    OverlayState::Settings | OverlayState::Project
-                ) && egui::Popup::is_any_open(ctx)
-                {
+                if egui::Popup::is_any_open(ctx) {
                     egui::Popup::close_all(ctx);
                 } else if self.ui.pane_drag.is_some() {
                     self.cancel_pane_drag(ctx);
