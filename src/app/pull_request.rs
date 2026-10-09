@@ -1225,6 +1225,37 @@ mod tests {
     }
 
     #[test]
+    fn words_for_an_agent_go_to_a_terminal_that_runs_one_and_a_command_to_a_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, _) = opened(dir.path());
+        frame(&mut app, &ctx);
+        let hand = |app: &mut App, agent| {
+            app.ui.error = None;
+            let words = "About pull request https://github.com/zevem/neptune/pull/83: ".into();
+            app.action(&ctx, Action::PullRequest(Event::Hand { words, agent }));
+            app.ui.error.clone()
+        };
+        // A shell takes a command, not a question for an agent.
+        assert!(hand(&mut app, true).is_some_and(|said| said.contains("runs no agent")));
+        assert_eq!(hand(&mut app, false), None);
+        let pane = app.controller.model().active_pane().unwrap();
+        let generation = app.controller.model().pane(pane).unwrap().generation();
+        app.controller
+            .dispatch(Command::PaneAgentChanged {
+                pane,
+                generation,
+                agent: Some(neptune_model::AgentSession {
+                    kind: neptune_model::AgentKind::Claude,
+                    session_id: None,
+                    cwd: dir.path().into(),
+                }),
+            })
+            .unwrap();
+        assert_eq!(hand(&mut app, true), None);
+        assert!(hand(&mut app, false).is_some_and(|said| said.contains("shell")));
+    }
+
+    #[test]
     fn changes_that_are_only_white_space_are_left_out_when_asked() {
         use crate::ui::changes::LineKind;
         let diff = |patch: &str, plain| {
@@ -1553,62 +1584,64 @@ mod tests {
         /// writes a comment on a line of a diff, sends the review that
         /// carries it and closes the pull request's pill.
         fn presses() -> Vec<(u64, Step)> {
+            use ui::pull_request as tab;
             let shown = pictured("press");
             let reacted = shown.entries[4].id.clone();
             let source::Kind::Thread { id: thread, .. } = &shown.entries[2].kind else {
                 panic!("the third entry is a review conversation");
             };
             let labels = egui::Id::new(("pull-request-add", "Labels"));
+            let reviewers = egui::Id::new(("pull-request-add", "Reviewers"));
+            let words = |name: &str| egui::Id::new(("pull-request-words", name));
+            let shown_as = words("Choose what the code part shows");
             let (timeline, code) = (Pos2::new(849.0, 222.0), Pos2::new(944.0, 222.0));
-            vec![
-                (300, Step::Click(Where::Control(labels))),
-                (900, Step::Click(Where::Menu(labels))),
-                (1500, Step::Click(Where::At(timeline))),
-                (
-                    2000,
-                    Step::Click(Where::Control(egui::Id::new((
-                        "pull-request-reaction",
-                        reacted.as_str(),
-                        "Heart",
-                    )))),
-                ),
-                (
-                    2600,
-                    Step::Click(Where::Control(egui::Id::new((
-                        "pull-request-answer",
-                        thread.as_str(),
-                    )))),
-                ),
-                (3000, Step::Type("On it")),
-                (3200, Step::Send),
-                (
-                    3800,
-                    Step::Click(Where::Control(egui::Id::new((
-                        "pull-request-resolve",
-                        thread.as_str(),
-                    )))),
-                ),
-                (4400, Step::Click(Where::At(code))),
-                (5000, Step::Click(Where::At(Pos2::new(850.0, 331.0)))),
-                (5600, Step::Click(Where::At(Pos2::new(900.0, 560.0)))),
-                (6000, Step::Type("Why?")),
-                (6200, Step::Send),
-                (
-                    6800,
-                    Step::Click(Where::Control(egui::Id::new((
-                        "pull-request-button",
-                        "Send what was written",
-                    )))),
-                ),
-                (
-                    7400,
-                    Step::Click(Where::Control(egui::Id::new((
-                        "pull-request-pill-close",
-                        link(118).url(),
-                    )))),
-                ),
-                (8000, Step::Type("")),
-            ]
+            let control = |id| Step::Click(Where::Control(id));
+            let steps = vec![
+                // A label from its list, and someone asked to review.
+                control(labels),
+                Step::Click(Where::Menu(labels)),
+                control(reviewers),
+                Step::Click(Where::Menu(reviewers)),
+                // The description rewritten in place.
+                control(words("Edit description")),
+                Step::Type(" More."),
+                Step::Send,
+                Step::Click(Where::At(timeline)),
+                // A reaction taken back and a comment rewritten.
+                control(egui::Id::new((
+                    "pull-request-reaction",
+                    reacted.as_str(),
+                    "Heart",
+                ))),
+                control(egui::Id::new(("pull-request-rewrite", reacted.as_str()))),
+                Step::Type(" Again."),
+                control(tab::rewrite_id().with("send")),
+                // A review conversation answered and reopened.
+                control(egui::Id::new(("pull-request-answer", thread.as_str()))),
+                Step::Type("On it"),
+                Step::Send,
+                control(egui::Id::new(("pull-request-resolve", thread.as_str()))),
+                // White space left out, a line of a diff commented on in
+                // the diff, and the review that carries it sent.
+                Step::Click(Where::At(code)),
+                control(shown_as),
+                Step::Click(Where::Menu(shown_as)),
+                Step::Click(Where::At(Pos2::new(850.0, 331.0))),
+                Step::Click(Where::At(Pos2::new(900.0, 560.0))),
+                Step::Type("Why?"),
+                Step::Send,
+                control(egui::Id::new((
+                    "pull-request-button",
+                    "Send what was written",
+                ))),
+                control(egui::Id::new(("pull-request-pill-close", link(118).url()))),
+                Step::Type(""),
+            ];
+            steps
+                .into_iter()
+                .enumerate()
+                .map(|(place, step)| (300 + place as u64 * 550, step))
+                .collect()
         }
         impl NativeCapture {
             /// The second driven run: each press is a pointer move, a press
@@ -1820,7 +1853,7 @@ mod tests {
                     "confirm" => tab.confirm = Some(Confirm::Merge(Method::Squash)),
                     "close" => tab.confirm = Some(Confirm::Close),
                     "timeline" => tab.segment = Segment::Timeline,
-                    "code" | "diff" => tab.segment = Segment::Code,
+                    "code" | "diff" | "split" | "line" => tab.segment = Segment::Code,
                     "comment" => {
                         tab.composer = Some(Composer::Comment);
                         *tab.draft_mut(shown.url()) =
@@ -1832,8 +1865,18 @@ mod tests {
                     }
                     _ => {}
                 }
-                if self.state == "diff" {
+                if matches!(self.state.as_str(), "diff" | "split" | "line") {
                     tab.selected = Some("src/ui/panel.rs".into());
+                }
+                tab.split = self.state == "split";
+                if self.state == "line" {
+                    tab.line = Some(ui::pull_request::Target {
+                        path: "src/ui/panel.rs".into(),
+                        line: 241,
+                        removed: false,
+                    });
+                    tab.composer = Some(Composer::Line);
+                    tab.note = "Does `PR` still fit beside a count?".into();
                 }
                 if self.state == "problem" {
                     self.app.pull_request.problem = Some((
@@ -1893,8 +1936,9 @@ mod tests {
             fn on_exit(&mut self) {
                 eframe::App::on_exit(&mut self.app);
                 self.seen.lock().unwrap().push(format!(
-                    "closed: shown={:?}",
-                    self.app.pull_request.shown().map(PullRequest::number)
+                    "closed: shown={:?} plain={}",
+                    self.app.pull_request.shown().map(PullRequest::number),
+                    self.app.ui.pull_request.hide_whitespace,
                 ));
                 let tab = &self.app.ui.pull_request;
                 self.seen.lock().unwrap().push(format!(
@@ -2034,10 +2078,29 @@ mod tests {
                     .iter()
                     .all(|line| !line.contains("nothing to press"))
             );
-            let [label, react, reply, resolve, review] = &asked[..] else {
-                panic!("five things were asked of the pull request: {asked:?}");
+            let [
+                label,
+                request,
+                describe,
+                react,
+                rewrite,
+                reply,
+                resolve,
+                review,
+            ] = &asked[..]
+            else {
+                panic!("eight things were asked of the pull request: {asked:?}");
             };
             assert!(matches!(label, Act::Label { .. }), "{label:?}");
+            assert!(matches!(request, Act::Request { .. }), "{request:?}");
+            assert!(
+                matches!(describe, Act::Description(body) if body.ends_with("More.")),
+                "{describe:?}"
+            );
+            assert!(
+                matches!(rewrite, Act::Edit { body, said: source::Said::Comment, .. } if body.ends_with("Again.")),
+                "{rewrite:?}"
+            );
             assert!(
                 matches!(
                     react,
@@ -2076,7 +2139,7 @@ mod tests {
                 seen.lock()
                     .unwrap()
                     .iter()
-                    .any(|line| line.contains("closed: shown=None"))
+                    .any(|line| line.contains("closed: shown=None plain=true"))
             );
             return;
         }

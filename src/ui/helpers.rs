@@ -414,37 +414,74 @@ impl<'a> PullRequestChips<'a> {
             }
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             if !self.menu {
-                let mut text = format!("Open pull request {}", linked.link.label());
-                // What it is, before it is opened.
-                if let Some(preview) = linked
+                // A card that says what it is before it is opened: its
+                // title, where it lives, who opened it and when, how it
+                // stands, and the other way to open it.
+                let stands = match linked.lookup {
+                    Lookup::Known(status) => status.describe(),
+                    Lookup::Unavailable => {
+                        "Status unavailable. Neptune reads it with the GitHub CLI (gh), signed in."
+                            .to_owned()
+                    }
+                    Lookup::Checking => String::new(),
+                };
+                let said = linked
                     .preview
                     .as_ref()
-                    .filter(|said| !said.title.is_empty())
-                {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |since| since.as_secs() as i64);
-                    text = format!(
-                        "{}\n{} · {} · opened {}",
-                        preview.title,
-                        linked.link.label(),
-                        preview.author,
-                        super::pull_request::ago(now - preview.opened)
-                    );
-                }
-                match linked.lookup {
-                    Lookup::Known(status) => text = format!("{text}\n{}", status.describe()),
-                    Lookup::Unavailable => text.push_str(
-                        "\nStatus unavailable. Neptune reads it with the GitHub CLI (gh), signed in.",
-                    ),
-                    Lookup::Checking => {}
-                }
-                text.push_str(if cfg!(target_os = "macos") {
-                    "\n⌘-click opens it in the browser"
+                    .filter(|said| !said.title.is_empty());
+                let hint = if cfg!(target_os = "macos") {
+                    "Click to read it here · ⌘-click for the browser"
                 } else {
-                    "\nCtrl+click opens it in the browser"
+                    "Click to read it here · Ctrl+click for the browser"
+                };
+                let (icon, ink) = (chip.icon, chip.ink);
+                let response = response.on_hover_ui(|ui| {
+                    use crate::theme;
+                    ui.set_max_width(300.0);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    let label = |ui: &mut egui::Ui, text: String, font, color| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).font(font).color(color))
+                                .wrap()
+                                .selectable(false),
+                        );
+                    };
+                    match said {
+                        Some(said) => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |since| since.as_secs() as i64);
+                            label(ui, said.title.clone(), theme::medium(12.5), p.fg);
+                            label(
+                                ui,
+                                format!(
+                                    "{} · {} · opened {}",
+                                    linked.link.label(),
+                                    said.author,
+                                    super::pull_request::ago(now - said.opened)
+                                ),
+                                theme::regular(11.5),
+                                p.secondary,
+                            );
+                        }
+                        None => label(
+                            ui,
+                            format!("Pull request {}", linked.link.label()),
+                            theme::medium(12.5),
+                            p.fg,
+                        ),
+                    }
+                    if !stands.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let (_, mark) = ui.allocate_space(Vec2::splat(13.0));
+                            icons::paint(ui.painter(), mark, icon, ink);
+                            label(ui, stands.clone(), theme::regular(11.5), ink);
+                        });
+                    }
+                    label(ui, hint.to_owned(), theme::regular(11.0), p.muted);
                 });
-                if response.on_hover_text(text).clicked() {
+                if response.clicked() {
                     open(&linked.link, actions);
                 }
                 continue;

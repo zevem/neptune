@@ -266,13 +266,15 @@ icon buttons keep a 28-point target around a 16-point glyph.
   keeps its text. The pull requests opened in the tab are pills on a 28-point
   strip above all this, in the terminal tabs' language, each with a cross.
   Rows that can be added to end in a "+" that opens a menu with what is in
-  use ticked. Under a comment its reactions are pills of a word and a count
+  use ticked. Under a comment its reactions are pills of a small outline picture and a count
   (the person's own in the accent tint) with a "+" for another, and a review
   conversation trails "Reply" and "Resolve"; a reply and an edited
   description are written in a field in place, with "Cancel" and one
   accent button. In Code a line something is said of carries a two-point
   accent bar at its leading edge, and the lines of the open diff take a
-  press that writes a comment on them. Without a pull request the tab lists the linked ones as
+  press that opens a field for a comment in the diff, under that line, on
+  the elevated material. Side by side, what was takes the leading half of
+  the diff and what is the trailing one. Without a pull request the tab lists the linked ones as
   46-point rows of an icon, `owner/repo#N` and the state in words. Reading
   and every change run off the UI thread; a pull request in view is drawn
   again every 30 seconds for its ages, and otherwise only when what was

@@ -146,6 +146,8 @@ pub struct State {
     pub rewriting: Option<String>,
     /// Changes that are only white space are left out of the diffs.
     pub hide_whitespace: bool,
+    /// Diffs set what was beside what is.
+    pub split: bool,
     /// The review conversation being answered, and the answer.
     pub replying: Option<String>,
     pub reply: String,
@@ -182,6 +184,7 @@ impl Default for State {
             edit: String::new(),
             rewriting: None,
             hide_whitespace: false,
+            split: false,
             replying: None,
             reply: String::new(),
             line: None,
@@ -202,6 +205,7 @@ impl State {
             newest_first: self.newest_first,
             method: self.method,
             hide_whitespace: self.hide_whitespace,
+            split: self.split,
             drafts: std::mem::take(&mut self.drafts),
             pending: std::mem::take(&mut self.pending),
             ..Self::default()
@@ -554,6 +558,20 @@ fn verdict_ink(verdict: Verdict, p: Palette) -> Color32 {
         Verdict::Approved => p.green,
         Verdict::ChangesRequested => p.red,
         _ => p.secondary,
+    }
+}
+
+/// The picture of a reaction.
+fn emoji_icon(emoji: Emoji) -> Icon {
+    match emoji {
+        Emoji::ThumbsUp => Icon::ThumbUp,
+        Emoji::ThumbsDown => Icon::ThumbDown,
+        Emoji::Laugh => Icon::Smile,
+        Emoji::Hooray => Icon::Party,
+        Emoji::Confused => Icon::Unsure,
+        Emoji::Heart => Icon::Heart,
+        Emoji::Rocket => Icon::Rocket,
+        Emoji::Eyes => Icon::Eyes,
     }
 }
 
@@ -2141,14 +2159,15 @@ fn responses(
     let live = react && talk.idle;
     let mut left = row.left();
     for reaction in given {
+        // Its picture and how many gave it; in words for a screen reader.
         let text = format!("{} {}", reaction.emoji.word(), reaction.count);
         let ink = if reaction.mine { p.accent } else { p.secondary };
-        let galley = ui
-            .painter()
-            .layout_no_wrap(text.clone(), theme::regular(11.0), ink);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(reaction.count.to_string(), theme::regular(11.0), ink);
         let pill = Rect::from_min_size(
             Pos2::new(left, row.top() + 1.0),
-            vec2(galley.size().x + 14.0, 20.0),
+            vec2(galley.size().x + 31.0, 20.0),
         );
         if pill.right() > right - 4.0 {
             break;
@@ -2177,9 +2196,18 @@ fn responses(
         if response.has_focus() {
             focus_ring(painter, pill, 10, p);
         }
+        icons::paint(
+            painter,
+            Rect::from_center_size(
+                Pos2::new(pill.left() + 14.0, pill.center().y),
+                Vec2::splat(13.0),
+            ),
+            emoji_icon(reaction.emoji),
+            ink,
+        );
         galley_at(
             painter,
-            Pos2::new(pill.left() + 7.0, pill.center().y + 0.5),
+            Pos2::new(pill.left() + 24.0, pill.center().y + 0.5),
             galley,
         );
         if live && response.clicked() {
@@ -2238,8 +2266,8 @@ fn responses(
                 let mine = given
                     .iter()
                     .any(|reaction| reaction.emoji == emoji && reaction.mine);
-                let icon = if mine { Icon::Check } else { Icon::Plus };
-                if menu_item(ui, p, icon, emoji.word(), "", false) {
+                let given = if mine { "Yours" } else { "" };
+                if menu_item(ui, p, emoji_icon(emoji), emoji.word(), given, false) {
                     talk.events.push(Event::Act(Act::React {
                         subject: subject.to_owned(),
                         emoji,
@@ -2267,6 +2295,8 @@ fn written_under(
     talk: (&mut bool, bool, bool),
 ) -> (bool, bool) {
     let (focus, composing, idle) = talk;
+    // A field that was just opened is brought into view with its buttons.
+    let opened = *focus;
     ui.add_space(8.0);
     let height = chat::editor_height(ui, text, ui.available_width(), rows);
     let (_, field) = ui.allocate_space(vec2(ui.available_width(), height));
@@ -2296,6 +2326,9 @@ fn written_under(
     });
     ui.add_space(6.0);
     let (_, bar) = ui.allocate_space(vec2(ui.available_width(), 24.0));
+    if opened {
+        ui.scroll_to_rect(bar.expand2(vec2(0.0, 8.0)), Some(Align::BOTTOM));
+    }
     let width = button_width(ui, send_label);
     let place = Rect::from_min_size(Pos2::new(bar.right() - width, bar.top()), vec2(width, 24.0));
     let fill = if ready { Fill::Accent } else { Fill::Off };
@@ -3051,11 +3084,114 @@ fn timeline(ui: &mut Ui, p: Palette, shown: &Shown, talk: &mut Talk) {
     }
 }
 
+/// The rows of a diff a comment's field takes under its line.
+const LINE_BOX: usize = 7;
+
+/// The field for a comment on a line, in the room the diff made under it.
+fn line_box(
+    ui: &mut Ui,
+    (room, surface): (Rect, Rect),
+    p: Palette,
+    shown: &Shown,
+    composing: bool,
+    state: &mut State,
+) {
+    let Some(target) = state.line.clone() else {
+        return;
+    };
+    let mut ui = ui.new_child(UiBuilder::new().id_salt("pull-request-line").max_rect(room));
+    ui.set_clip_rect(surface.intersect(ui.clip_rect()));
+    let ui = &mut ui;
+    let card = room.shrink2(vec2(8.0, 4.0));
+    let painter = ui.painter();
+    painter.rect_filled(card, theme::metrics::ROW_RADIUS, p.elevated);
+    painter.rect_stroke(
+        card,
+        theme::metrics::ROW_RADIUS,
+        Stroke::new(1.0, p.border),
+        StrokeKind::Inside,
+    );
+    let inner = card.shrink(6.0);
+    let field = Rect::from_min_max(inner.min, Pos2::new(inner.right(), inner.bottom() - 30.0));
+    let idle = shown.acting.is_none();
+    let ready = idle && !state.note.trim().is_empty() && state.note.chars().count() <= MAX_COMMENT;
+    let focused = ui.memory(|memory| memory.has_focus(composer_id()));
+    let mut add = focused
+        && !composing
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+    let mut focus = std::mem::take(&mut state.focus);
+    chat::editor(
+        ui,
+        p,
+        field,
+        chat::Editor {
+            id: composer_id(),
+            text: &mut state.note,
+            hint: "Say something about this line",
+            label: "Comment on a line",
+            focus: &mut focus,
+            composing,
+            trailing: 0.0,
+            newline: true,
+        },
+    );
+    state.focus = focus;
+    let top = inner.bottom() - 24.0;
+    let width = button_width(ui, "Add to review");
+    let place = Rect::from_min_size(Pos2::new(inner.right() - width, top), vec2(width, 24.0));
+    let fill = if ready { Fill::Accent } else { Fill::Off };
+    let pressed = button(
+        ui,
+        p,
+        place,
+        "Add to review",
+        "Add this comment to the review",
+        fill,
+    );
+    add |= pressed.clicked();
+    pressed.on_hover_text("It is sent when you submit the review");
+    let width = button_width(ui, "Cancel");
+    let place = Rect::from_min_size(
+        Pos2::new(place.left() - 6.0 - width, top),
+        vec2(width, 24.0),
+    );
+    let cancelled = button(
+        ui,
+        p,
+        place,
+        "Cancel",
+        "Put the line comment away",
+        Fill::Plain,
+    )
+    .clicked();
+    if add && ready {
+        state.add_pending(
+            shown.link.url(),
+            LineComment {
+                path: target.path,
+                line: target.line,
+                removed: target.removed,
+                body: state.note.trim().to_owned(),
+            },
+        );
+        state.note.clear();
+        state.line = None;
+        // What was added is seen where it will be sent from.
+        state.composer = Some(Composer::Review);
+    } else if cancelled {
+        state.line = None;
+        state.composer = None;
+        ui.memory_mut(|memory| memory.surrender_focus(composer_id()));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn code(
     ui: &mut Ui,
     body: Rect,
     p: Palette,
     shown: &Shown,
+    composing: bool,
     state: &mut State,
     events: &mut Vec<Event>,
 ) {
@@ -3074,7 +3210,7 @@ fn code(
         p,
         Pos2::new(line.right() - 2.0, line.center().y),
         label,
-        "Choose the commits shown",
+        "Choose what the code part shows",
     );
     egui::Popup::menu(&scope).show(|ui| {
         menu_layout(ui, 250.0);
@@ -3082,6 +3218,15 @@ fn code(
         let icon = if quiet { Icon::Check } else { Icon::Eraser };
         if menu_item(ui, p, icon, "Hide whitespace changes", "", false) {
             events.push(Event::Whitespace(!quiet));
+            ui.close();
+        }
+        let icon = if state.split {
+            Icon::Check
+        } else {
+            Icon::SplitVertical
+        };
+        if menu_item(ui, p, icon, "Side by side", "", false) {
+            state.split = !state.split;
             ui.close();
         }
         menu_separator(ui, p);
@@ -3207,6 +3352,16 @@ fn code(
     }
     // A comment is on the whole change: one commit's lines take none.
     let pick = std::cell::Cell::new(None);
+    // The field for a comment stands in the diff, under its line.
+    let slot = std::cell::Cell::new(None);
+    let open = state
+        .line
+        .as_ref()
+        .filter(|target| {
+            state.composer == Some(Composer::Line)
+                && diff.is_some_and(|(file, _)| file.path == target.path)
+        })
+        .map(|target| ((target.line, target.removed), LINE_BOX));
     let mut chosen = Vec::new();
     changes::listing(
         ui,
@@ -3219,6 +3374,9 @@ fn code(
             lines: changes::Lines {
                 marked: &marked,
                 pick: scoped.is_none().then_some(&pick),
+                open,
+                slot: Some(&slot),
+                split: state.split,
             },
         },
         (state.selected.as_deref(), &mut state.diff_share),
@@ -3237,6 +3395,8 @@ fn code(
         });
         state.composer = Some(Composer::Line);
         state.focus = true;
+    } else if let Some(room) = slot.get() {
+        line_box(ui, room, p, shown, composing, state);
     }
 }
 
@@ -3742,7 +3902,15 @@ fn pull_request(
     }
     let url = shown.link.url();
     let waiting = state.pending(url).count();
-    if state.composer.is_some() {
+    // A comment on a line is written in the diff, under that line; where
+    // its diff is not in view it is written here like the others.
+    let in_diff = state.composer == Some(Composer::Line)
+        && state.segment == Segment::Code
+        && state
+            .line
+            .as_ref()
+            .is_some_and(|target| state.selected.as_deref() == Some(target.path.as_str()));
+    if state.composer.is_some() && !in_diff {
         let text = if state.composer == Some(Composer::Line) {
             state.note.clone()
         } else {
@@ -3760,7 +3928,7 @@ fn pull_request(
         composer(ui, field, p, shown, view, state, events);
     }
     if state.segment == Segment::Code {
-        code(ui, body, p, shown, state, events);
+        code(ui, body, p, shown, view.composing, state, events);
         return;
     }
     let mut content = ui.new_child(
