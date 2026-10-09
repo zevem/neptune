@@ -670,6 +670,7 @@ impl App {
                             .map(|link| ui::helpers::LinkedPullRequest {
                                 link: link.clone(),
                                 lookup: self.pull_requests.lookup(link),
+                                preview: self.pull_requests.preview(link),
                             })
                             .collect(),
                         attached: self.attached_files(pane),

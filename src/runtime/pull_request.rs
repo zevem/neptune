@@ -105,6 +105,8 @@ pub struct Reviewer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Outcome {
     Failed,
+    /// A workflow of a first-time contributor waits to be allowed to run.
+    Awaiting,
     Running,
     Passed,
     Cancelled,
@@ -269,12 +271,23 @@ pub struct Allowed {
     pub request: bool,
 }
 
+/// A pull request next to this one in a stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Neighbour {
+    pub number: u64,
+    pub title: String,
+    /// This one is stacked on it; otherwise it is stacked on this one.
+    pub below: bool,
+}
+
 /// One thing said on the pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The host's name for it, which reactions are addressed to.
     pub id: String,
     pub reactions: Vec<Reaction>,
+    /// The person may rewrite it.
+    pub can_edit: bool,
     pub author: String,
     pub at: i64,
     pub kind: Kind,
@@ -292,6 +305,10 @@ pub struct Detail {
     pub viewed: Vec<String>,
     /// Reactions to its description.
     pub reactions: Vec<Reaction>,
+    /// It merges into another pull request's branch, not the main one.
+    pub stacked: bool,
+    /// The open pull requests it is stacked on and those stacked on it.
+    pub stack: Vec<Neighbour>,
     pub title: String,
     pub state: State,
     pub author: String,
@@ -360,6 +377,21 @@ impl Detail {
     }
     pub fn in_review(&self) -> bool {
         matches!(self.state, State::Open | State::Draft)
+    }
+    /// The workflow runs that wait to be allowed to run, each once.
+    pub fn awaiting_runs(&self) -> Vec<u64> {
+        let mut runs: Vec<u64> = self
+            .checks
+            .iter()
+            .filter(|check| check.outcome == Outcome::Awaiting)
+            .filter_map(|check| {
+                let after = check.url.split("/actions/runs/").nth(1)?;
+                after.split('/').next()?.parse().ok()
+            })
+            .collect();
+        runs.sort_unstable();
+        runs.dedup();
+        runs
     }
 }
 
@@ -446,7 +478,7 @@ fn query(link: &PullRequest) -> String {
     let (_, owner, repository) = link.location();
     format!(
         "query{{repository(owner:\"{owner}\",name:\"{repository}\"){{\
-         viewerPermission mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed \
+         defaultBranchRef{{name}} viewerPermission mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed \
          pullRequest(number:{number}){{\
          id viewerCanUpdateBranch viewerCanReact autoMergeRequest{{mergeMethod}} {REACTIONS} \
          files(first:{MAX_FILES}){{nodes{{path viewerViewedState}}}} \
@@ -464,10 +496,10 @@ fn query(link: &PullRequest) -> String {
          commits(last:1){{totalCount nodes{{commit{{statusCheckRollup{{contexts(first:{MAX_CHECKS}){{totalCount nodes{{__typename \
          ...on CheckRun{{name status conclusion detailsUrl startedAt completedAt checkSuite{{workflowRun{{workflow{{name}}}}}}}} \
          ...on StatusContext{{context state targetUrl}}}}}}}}}}}}}} \
-         comments(last:{MAX_ENTRIES}){{totalCount nodes{{id {REACTIONS} author{{login}} body createdAt url isMinimized}}}} \
-         reviews(last:{MAX_ENTRIES}){{totalCount nodes{{id {REACTIONS} author{{login}} state body submittedAt url}}}} \
+         comments(last:{MAX_ENTRIES}){{totalCount nodes{{id viewerCanUpdate {REACTIONS} author{{login}} body createdAt url isMinimized}}}} \
+         reviews(last:{MAX_ENTRIES}){{totalCount nodes{{id viewerCanUpdate {REACTIONS} author{{login}} state body submittedAt url}}}} \
          reviewThreads(last:{MAX_ENTRIES}){{totalCount nodes{{id viewerCanResolve viewerCanUnresolve viewerCanReply isResolved isOutdated path line originalLine \
-         comments(first:{MAX_REPLIES}){{nodes{{id {REACTIONS} author{{login}} body createdAt url}}}}}}}}}}}}}}",
+         comments(first:{MAX_REPLIES}){{nodes{{id viewerCanUpdate {REACTIONS} author{{login}} body createdAt url}}}}}}}}}}}}}}",
         number = link.number()
     )
 }
@@ -517,6 +549,7 @@ fn check(node: &serde_json::Value) -> Option<Check> {
     }
     let outcome = match (node["status"].as_str()?, node["conclusion"].as_str()) {
         ("COMPLETED", Some("SUCCESS")) => Outcome::Passed,
+        ("COMPLETED", Some("ACTION_REQUIRED")) => Outcome::Awaiting,
         ("COMPLETED", Some("SKIPPED" | "NEUTRAL" | "STALE")) => Outcome::Skipped,
         ("COMPLETED", Some("CANCELLED")) => Outcome::Cancelled,
         ("COMPLETED", _) => Outcome::Failed,
@@ -631,6 +664,7 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
         entries.push(Entry {
             id: comment["id"].as_str().unwrap_or_default().to_owned(),
             reactions: reactions(comment),
+            can_edit: comment["viewerCanUpdate"] == true,
             author: login(&comment["author"]),
             at: comment["createdAt"]
                 .as_str()
@@ -656,6 +690,7 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
         entries.push(Entry {
             id: review["id"].as_str().unwrap_or_default().to_owned(),
             reactions: reactions(review),
+            can_edit: review["viewerCanUpdate"] == true,
             author: login(&review["author"]),
             at: review["submittedAt"]
                 .as_str()
@@ -693,6 +728,7 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
         entries.push(Entry {
             id: opening["id"].as_str().unwrap_or_default().to_owned(),
             reactions: reactions(opening),
+            can_edit: opening["viewerCanUpdate"] == true,
             author: first.author,
             at: first.at,
             kind: Kind::Thread {
@@ -771,6 +807,10 @@ fn parse(response: &[u8]) -> Result<Detail, Failure> {
             .filter_map(|file| file["path"].as_str().map(str::to_owned))
             .collect(),
         reactions: reactions(pull),
+        stacked: repository["defaultBranchRef"]["name"]
+            .as_str()
+            .is_some_and(|main| main != pull["baseRefName"]),
+        stack: Vec::new(),
         title: text("title"),
         state,
         author: login(&pull["author"]),
@@ -861,8 +901,74 @@ pub fn read(link: &PullRequest) -> Result<Detail, Failure> {
     match parse(&printed.bytes) {
         // The CLI prints what GitHub answered even where it reports a failure.
         Err(Failure::Unavailable) if !printed.ok => Err(unanswered(host)),
+        Ok(mut detail) => {
+            detail.stack = read_stack(link, &detail);
+            Ok(detail)
+        }
         read => read,
     }
+}
+
+/// The open pull requests around this one in a stack: the one whose branch
+/// it merges into, when that is not the main branch, and those that merge
+/// into its own. Nothing where they could not be read. Branch names are
+/// passed as values of their own, never as part of the request's text.
+fn read_stack(link: &PullRequest, detail: &Detail) -> Vec<Neighbour> {
+    if !detail.in_review() {
+        return Vec::new();
+    }
+    let (host, owner, repository) = link.location();
+    let query = format!(
+        "query=query($base:String!,$head:String!){{repository(owner:\"{owner}\",name:\"{repository}\"){{\
+         below:pullRequests(headRefName:$base,states:OPEN,first:1){{nodes{{number title}}}} \
+         above:pullRequests(baseRefName:$head,states:OPEN,first:5){{nodes{{number title}}}}}}}}"
+    );
+    let head = detail.head.rsplit(':').next().unwrap_or_default();
+    let printed = cli(
+        &[
+            "api",
+            "graphql",
+            "--hostname",
+            host,
+            "-f",
+            &query,
+            "-f",
+            &format!("base={}", detail.base),
+            "-f",
+            &format!("head={head}"),
+        ],
+        MAX_RESPONSE,
+    );
+    let Ok(printed) = printed else {
+        return Vec::new();
+    };
+    parse_stack(&printed.bytes, detail.stacked, link.number())
+}
+
+fn parse_stack(response: &[u8], stacked: bool, own: u64) -> Vec<Neighbour> {
+    let response: serde_json::Value = serde_json::from_slice(response).unwrap_or_default();
+    let repository = &response["data"]["repository"];
+    let neighbours = |field: &str, below: bool| {
+        repository[field]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(move |node| {
+                Some(Neighbour {
+                    number: node["number"].as_u64().filter(|number| *number != own)?,
+                    title: node["title"].as_str()?.to_owned(),
+                    below,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut stack = if stacked {
+        neighbours("below", true)
+    } else {
+        Vec::new()
+    };
+    stack.extend(neighbours("above", false));
+    stack
 }
 
 /// Reads the files the pull request changes, with their diffs: the first
@@ -984,6 +1090,23 @@ pub enum Act {
         path: String,
         on: bool,
     },
+    /// Rewrite something the person said: a comment, a review, or a
+    /// comment on a line.
+    Edit {
+        subject: String,
+        said: Said,
+        body: String,
+    },
+    /// Let the workflow runs that wait for it run.
+    ApproveRuns(Vec<u64>),
+}
+
+/// What kind of thing was said, which the host rewrites each its own way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said {
+    Comment,
+    Review,
+    Line,
 }
 
 /// A name as part of an address.
@@ -1040,6 +1163,8 @@ impl Act {
             Self::Label { .. } => ("Labels changed", "Could not change the labels"),
             Self::Request { .. } => ("Reviewers changed", "Could not change the reviewers"),
             Self::Viewed { .. } => ("File marked", "Could not mark the file"),
+            Self::Edit { .. } => ("Comment saved", "Could not save the comment"),
+            Self::ApproveRuns(_) => ("Workflows approved", "Could not approve the workflows"),
         }
     }
 
@@ -1047,7 +1172,7 @@ impl Act {
     pub fn writes(&self) -> bool {
         matches!(
             self,
-            Self::Comment(_) | Self::Review(..) | Self::Reply { .. }
+            Self::Comment(_) | Self::Review(..) | Self::Reply { .. } | Self::Edit { .. }
         )
     }
 
@@ -1188,6 +1313,44 @@ impl Act {
                 },
                 &[("id", id), ("path", path)],
             ),
+            Self::Edit {
+                subject,
+                said,
+                body,
+            } => mutation(
+                match said {
+                    Said::Comment => {
+                        "($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){clientMutationId}}"
+                    }
+                    Said::Review => {
+                        "($id:ID!,$body:String!){updatePullRequestReview(input:{pullRequestReviewId:$id,body:$body}){clientMutationId}}"
+                    }
+                    Said::Line => {
+                        "($id:ID!,$body:String!){updatePullRequestReviewComment(input:{pullRequestReviewCommentId:$id,body:$body}){clientMutationId}}"
+                    }
+                },
+                &[("id", subject), ("body", body)],
+            ),
+            // One request for each run: see `commands`.
+            Self::ApproveRuns(runs) => rest(
+                "POST",
+                format!(
+                    "actions/runs/{}/approve",
+                    runs.first().copied().unwrap_or_default()
+                ),
+                &[],
+            ),
+        }
+    }
+
+    /// Every command it takes, in order.
+    fn commands(&self, link: &PullRequest, id: &str) -> Vec<Vec<String>> {
+        match self {
+            Self::ApproveRuns(runs) => runs
+                .iter()
+                .map(|run| Self::ApproveRuns(vec![*run]).command(link, id))
+                .collect(),
+            act => vec![act.command(link, id)],
         }
     }
 }
@@ -1215,13 +1378,15 @@ fn complaint(said: &[u8]) -> String {
 /// failure, what the host said of it; nothing when it said nothing.
 /// `id` is the host's name for the pull request, as it was read.
 pub fn act(link: &PullRequest, id: &str, act: &Act) -> Result<(), String> {
-    let command = act.command(link, id);
-    let command: Vec<&str> = command.iter().map(String::as_str).collect();
-    match cli_complaint(&command) {
-        Ok(done) if done.ok => Ok(()),
-        Ok(done) => Err(complaint(&done.bytes)),
-        Err(_) => Err("The GitHub CLI (gh) could not be started.".into()),
+    for command in act.commands(link, id) {
+        let command: Vec<&str> = command.iter().map(String::as_str).collect();
+        match cli_complaint(&command) {
+            Ok(done) if done.ok => {}
+            Ok(done) => return Err(complaint(&done.bytes)),
+            Err(_) => return Err("The GitHub CLI (gh) could not be started.".into()),
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1243,7 +1408,7 @@ mod tests {
         let query = query(&link);
         assert!(
             query.starts_with(
-                "query{repository(owner:\"zevem\",name:\"re.po_2\"){viewerPermission "
+                "query{repository(owner:\"zevem\",name:\"re.po_2\"){defaultBranchRef{name} viewerPermission "
             )
         );
         assert!(query.contains("pullRequest(number:83){id "));
@@ -1252,7 +1417,7 @@ mod tests {
     }
 
     const RESPONSE: &str = r#"{"data":{"repository":{
-        "viewerPermission":"WRITE","mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":true,
+        "defaultBranchRef":{"name":"main"},"viewerPermission":"WRITE","mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":true,
         "autoMergeAllowed":true,
         "pullRequest":{"id":"PR_1","viewerCanUpdateBranch":true,"viewerCanReact":true,
         "autoMergeRequest":{"mergeMethod":"SQUASH"},
@@ -1287,6 +1452,8 @@ mod tests {
              "detailsUrl":"","startedAt":"2026-10-07T03:19:15Z","completedAt":null,"checkSuite":null},
             {"__typename":"CheckRun","name":"Build","status":"COMPLETED","conclusion":"FAILURE",
              "detailsUrl":"","startedAt":null,"completedAt":null,"checkSuite":null},
+            {"__typename":"CheckRun","name":"Fork","status":"COMPLETED","conclusion":"ACTION_REQUIRED",
+             "detailsUrl":"https://github.com/zevem/neptune/actions/runs/77/job/5","startedAt":null,"completedAt":null,"checkSuite":null},
             {"__typename":"CheckRun","name":"Docs","status":"COMPLETED","conclusion":"SKIPPED",
              "detailsUrl":"","startedAt":null,"completedAt":null,"checkSuite":null},
             {"__typename":"StatusContext","context":"deploy/preview","state":"SUCCESS","targetUrl":"https://preview.example"}
@@ -1354,14 +1521,17 @@ mod tests {
             checks,
             [
                 ("Build", Outcome::Failed, None),
+                ("Fork", Outcome::Awaiting, None),
                 ("Lint", Outcome::Running, None),
                 ("deploy/preview", Outcome::Passed, None),
                 ("Test", Outcome::Passed, Some(90)),
                 ("Docs", Outcome::Skipped, None),
             ]
         );
-        assert_eq!(detail.checks[3].workflow, "CI");
-        assert_eq!(detail.more_checks, 99);
+        assert_eq!(detail.checks[4].workflow, "CI");
+        assert_eq!(detail.more_checks, 98);
+        assert_eq!(detail.awaiting_runs(), [77]);
+        assert!(!detail.stacked, "it merges into the main branch");
         assert_eq!(detail.checks(), Checks::Failing);
         // Oldest first; a hidden comment, a review still being written and one
         // that only carries its line comments are left out.
@@ -1586,6 +1756,32 @@ mod tests {
             complaint(b"\nGraphQL: Pull request is not mergeable (mergePullRequest)\nmore\n"),
             "Pull request is not mergeable (mergePullRequest)"
         );
+        let edit = command(Act::Edit {
+            subject: "C_1".into(),
+            said: Said::Line,
+            body: "Better".into(),
+        });
+        assert!(edit[5].contains("updatePullRequestReviewComment"));
+        assert_eq!(edit[6..], ["-f", "id=C_1", "-f", "body=Better"]);
+        // Each waiting run is allowed by a request of its own.
+        let runs = Act::ApproveRuns(vec![77, 78]).commands(&link, "PR_1");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs[1][3..],
+            ["-X", "POST", "repos/zevem/neptune/actions/runs/78/approve"]
+        );
+        let stack = br#"{"data":{"repository":{
+            "below":{"nodes":[{"number":82,"title":"Base work"}]},
+            "above":{"nodes":[{"number":83,"title":"Itself"},{"number":84,"title":"Next"}]}}}}"#;
+        let numbers = |stacked| -> Vec<(u64, bool)> {
+            parse_stack(stack, stacked, 83)
+                .iter()
+                .map(|near| (near.number, near.below))
+                .collect()
+        };
+        assert_eq!(numbers(true), [(82, true), (84, false)]);
+        // One that merges into the main branch is stacked on nothing.
+        assert_eq!(numbers(false), [(84, false)]);
         assert_eq!(
             complaint(b"X Pull request zevem/neptune#117 is closed.\n"),
             "Pull request zevem/neptune#117 is closed."

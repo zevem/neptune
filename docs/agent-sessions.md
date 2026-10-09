@@ -147,12 +147,13 @@ Where a tab is short of room the marks are given up before the number is.
 Neptune reads this through the [GitHub CLI](https://cli.github.com) (`gh`), as
 the account signed in to it: one request for each host names the linked pull
 requests of the workspace in view and asks for their state, the combined state
-of their checks and whether each review conversation is resolved. Neptune
+of their checks, whether each review conversation is resolved, and the title,
+author and age that resting the pointer on a number shows. Neptune
 holds no token of its own, and nothing it reads is saved. Without `gh`, without
 a sign-in for the pull request's host (`gh auth login`, with `--hostname` for
 GitHub Enterprise), without a network or for a host that is not GitHub, the
 number looks as it did before and its tooltip says the status is unavailable.
-Titles, comments and other contents of a pull request are requested only for
+Comments and other contents of a pull request are requested only for
 the one you open in the [Pull request tab](usage.md#pull-requests), while that
 tab is in view.
 

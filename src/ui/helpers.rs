@@ -1,6 +1,6 @@
 //! Label and window helpers, plus the shared controls of the visual system.
 pub use super::controls::*;
-use crate::runtime::pull_requests::{Checks, Lookup, State, unresolved_label};
+use crate::runtime::pull_requests::{Checks, Lookup, Preview, State, unresolved_label};
 use eframe::egui::{self, Rect, Sense, Vec2};
 pub fn compact_path(path: &std::path::Path) -> String {
     let text = path.display().to_string();
@@ -155,6 +155,8 @@ pub fn path_label(path: &std::path::Path, max: usize) -> String {
 pub struct LinkedPullRequest {
     pub link: neptune_model::PullRequest,
     pub lookup: Lookup,
+    /// Its title, author and age, once its state was read.
+    pub preview: Option<Preview>,
 }
 impl LinkedPullRequest {
     /// Its state in the chip's icon and colour. A merged pull request has its
@@ -413,6 +415,23 @@ impl<'a> PullRequestChips<'a> {
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             if !self.menu {
                 let mut text = format!("Open pull request {}", linked.link.label());
+                // What it is, before it is opened.
+                if let Some(preview) = linked
+                    .preview
+                    .as_ref()
+                    .filter(|said| !said.title.is_empty())
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_secs() as i64);
+                    text = format!(
+                        "{}\n{} · {} · opened {}",
+                        preview.title,
+                        linked.link.label(),
+                        preview.author,
+                        super::pull_request::ago(now - preview.opened)
+                    );
+                }
                 match linked.lookup {
                     Lookup::Known(status) => text = format!("{text}\n{}", status.describe()),
                     Lookup::Unavailable => text.push_str(
@@ -651,6 +670,7 @@ mod tests {
                 checks,
                 unresolved,
             }),
+            preview: None,
         };
         let failing = linked(7, State::Open, Checks::Failing, 2);
         let merged = linked(8, State::Merged, Checks::Failing, 3);
@@ -724,6 +744,7 @@ mod tests {
             link: neptune_model::PullRequest::parse("https://github.com/zevem/neptune/pull/83")
                 .unwrap(),
             lookup: Lookup::Checking,
+            preview: None,
         }];
         let press = |modifiers: Modifiers| {
             let mut actions = Vec::new();

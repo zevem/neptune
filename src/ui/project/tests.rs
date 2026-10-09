@@ -442,6 +442,7 @@ fn members() -> Vec<Member> {
                     checks: Checks::Failing,
                     unresolved: 2,
                 }),
+                preview: None,
             }],
             can_background: true,
         },

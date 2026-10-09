@@ -18,7 +18,7 @@ use crate::{
     runtime::{
         pull_request::{
             Act, Allowed, Check, Choices, Commit, Decision, Detail, Emoji, Entry, Failure, Kind,
-            LineComment, MAX_COMMENT, Merge, Method, Outcome, Reaction, Reply, Verdict,
+            LineComment, MAX_COMMENT, Merge, Method, Outcome, Reaction, Reply, Said, Verdict,
         },
         pull_requests::{Checks, Lookup, State as Standing},
     },
@@ -47,8 +47,17 @@ const DRAFTS: usize = 8;
 pub const MAX_OPEN: usize = 8;
 
 /// The fields of the tab, which give the keyboard back when it leaves view.
-pub fn field_ids() -> [Id; 4] {
-    [composer_id(), reply_id(), title_id(), description_id()]
+pub fn field_ids() -> [Id; 5] {
+    [
+        composer_id(),
+        reply_id(),
+        title_id(),
+        description_id(),
+        rewrite_id(),
+    ]
+}
+pub fn rewrite_id() -> Id {
+    Id::new("pull-request-rewrite")
 }
 pub fn reply_id() -> Id {
     Id::new("pull-request-reply")
@@ -101,6 +110,8 @@ pub enum Confirm {
     Merge(Method),
     AutoMerge(Method),
     Revert,
+    /// Let the workflow runs that wait for approval run.
+    Runs,
     Close,
 }
 
@@ -130,6 +141,11 @@ pub struct State {
     pub editing: Option<Editing>,
     /// The title or description as it is being rewritten.
     pub edit: String,
+    /// The comment being rewritten, by the host's name for it; its text is
+    /// in `edit`.
+    pub rewriting: Option<String>,
+    /// Changes that are only white space are left out of the diffs.
+    pub hide_whitespace: bool,
     /// The review conversation being answered, and the answer.
     pub replying: Option<String>,
     pub reply: String,
@@ -164,6 +180,8 @@ impl Default for State {
             scope: None,
             editing: None,
             edit: String::new(),
+            rewriting: None,
+            hide_whitespace: false,
             replying: None,
             reply: String::new(),
             line: None,
@@ -183,6 +201,7 @@ impl State {
             diff_share: self.diff_share,
             newest_first: self.newest_first,
             method: self.method,
+            hide_whitespace: self.hide_whitespace,
             drafts: std::mem::take(&mut self.drafts),
             pending: std::mem::take(&mut self.pending),
             ..Self::default()
@@ -230,6 +249,10 @@ impl State {
             }
             Act::Title(_) | Act::Description(_) => {
                 self.editing = None;
+                self.edit.clear();
+            }
+            Act::Edit { .. } => {
+                self.rewriting = None;
                 self.edit.clear();
             }
             _ => {}
@@ -283,6 +306,14 @@ pub enum Event {
     Choices,
     /// Show the files of one commit, or of all of them.
     Scope(Option<String>),
+    /// Leave changes that are only white space out of the diffs, or not.
+    Whitespace(bool),
+    /// Hand words to the terminal in front: a question for its agent, or a
+    /// command. They are written at its prompt, not sent.
+    Hand {
+        words: String,
+        agent: bool,
+    },
     Refresh,
     Act(Act),
     DismissProblem,
@@ -412,6 +443,11 @@ pub fn checks_summary(detail: &Detail) -> String {
         "No checks reported".into()
     } else if failed > 0 {
         format!("{failed} of {total} failing")
+    } else if of(Outcome::Awaiting) > 0 {
+        format!(
+            "{} awaiting approval",
+            count(of(Outcome::Awaiting), "check", "checks")
+        )
     } else if running > 0 {
         format!("{running} of {total} running")
     } else if passed + of(Outcome::Skipped) == total {
@@ -464,6 +500,18 @@ pub fn stands(detail: &Detail, now: i64) -> (Tone, String) {
                 (Tone::Bad, format!("Conflicts with {}", detail.base))
             } else if detail.decision == Some(Decision::ChangesRequested) {
                 (Tone::Bad, "Changes requested".into())
+            } else if !detail.awaiting_runs().is_empty() {
+                (
+                    Tone::Running,
+                    format!(
+                        "{} to run",
+                        count(
+                            detail.awaiting_runs().len(),
+                            "workflow awaits approval",
+                            "workflows await approval"
+                        )
+                    ),
+                )
             } else if detail.checks() == Checks::Failing {
                 (Tone::Bad, checks_stand(detail, Outcome::Failed, "failing"))
             } else if detail.checks() == Checks::Pending {
@@ -543,6 +591,7 @@ fn outcome_mark(painter: &egui::Painter, centre: Pos2, p: Palette, outcome: Outc
         Outcome::Failed => icons::paint(painter, glyph, Icon::Close, p.red),
         Outcome::Cancelled => icons::paint(painter, glyph, Icon::Close, p.muted),
         Outcome::Skipped => icons::paint(painter, glyph, Icon::Minus, p.muted),
+        Outcome::Awaiting => icons::paint(painter, glyph, Icon::Warning, p.attention),
         Outcome::Running => {
             painter.circle_stroke(centre, 3.5, Stroke::new(1.5, p.yellow));
         }
@@ -555,6 +604,7 @@ fn outcome_words(check: &Check) -> String {
         (Outcome::Passed, None) => "Passed".into(),
         (Outcome::Failed, _) => "Failed".into(),
         (Outcome::Running, _) => "Running".into(),
+        (Outcome::Awaiting, _) => "Awaiting approval".into(),
         (Outcome::Cancelled, _) => "Cancelled".into(),
         (Outcome::Skipped, _) => "Skipped".into(),
     }
@@ -1128,6 +1178,64 @@ fn more_menu(
     if led {
         menu_separator(ui, p);
     }
+    // Words for the agent of the terminal in front, written at its prompt
+    // for the person to send.
+    let url = shown.link.url();
+    let mut hand = vec![
+        (
+            "Ask an agent about this…",
+            format!("About pull request {url}: "),
+        ),
+        (
+            "Have an agent explain it",
+            format!(
+                "Explain pull request {url}: walk through the diff and say what to read closely."
+            ),
+        ),
+    ];
+    if detail.in_review()
+        && (detail.unresolved() > 0
+            || detail.checks() == Checks::Failing
+            || detail.decision == Some(Decision::ChangesRequested))
+    {
+        hand.push((
+            "Have an agent fix the findings",
+            format!(
+                "Address the unresolved review comments and the failing checks of pull request {url}."
+            ),
+        ));
+    }
+    if detail.state == Standing::Open && detail.merge == Merge::Conflicts {
+        hand.push((
+            "Have an agent resolve the conflicts",
+            format!(
+                "Resolve the merge conflicts of pull request {url} with {}.",
+                detail.base
+            ),
+        ));
+    }
+    for (label, words) in hand {
+        if menu_item(ui, p, Icon::Agents, label, "", false) {
+            events.push(Event::Hand { words, agent: true });
+            ui.close();
+        }
+    }
+    if menu_item(
+        ui,
+        p,
+        Icon::Terminal,
+        "Check out in the terminal",
+        "",
+        false,
+    ) {
+        // Led by a space, which keeps it out of the shell's history.
+        events.push(Event::Hand {
+            words: format!(" gh pr checkout {url}"),
+            agent: false,
+        });
+        ui.close();
+    }
+    menu_separator(ui, p);
     if menu_item(ui, p, Icon::ArrowUpRight, &on_host(shown.link), "", false) {
         open(shown.link.url(), actions);
         ui.close();
@@ -1316,6 +1424,22 @@ fn standing_card(
                 format!("Open a pull request that reverts #{number}?"),
             )
         }
+        (None, Some(Confirm::Runs)) => {
+            buttons.push(("Cancel".into(), Fill::Plain, None, Some(None)));
+            buttons.push((
+                "Approve and run".into(),
+                Fill::Accent,
+                Some(Event::Act(Act::ApproveRuns(detail.awaiting_runs()))),
+                None,
+            ));
+            (
+                Tone::Quiet,
+                format!(
+                    "Let {} from #{number} run? Read its changes first.",
+                    count(detail.awaiting_runs().len(), "workflow", "workflows")
+                ),
+            )
+        }
         (None, Some(Confirm::Close)) => {
             buttons.push(("Cancel".into(), Fill::Plain, None, Some(None)));
             buttons.push((
@@ -1340,6 +1464,16 @@ fn standing_card(
                     Some(Event::Act(Act::Reopen)),
                     None,
                 )),
+                Standing::Open | Standing::Draft
+                    if allowed.merge && !detail.awaiting_runs().is_empty() =>
+                {
+                    buttons.push((
+                        "Approve workflows".into(),
+                        Fill::Plain,
+                        None,
+                        Some(Some(Confirm::Runs)),
+                    ));
+                }
                 Standing::Open
                     if detail.merge == Merge::Behind && allowed.update_branch && !allowed.merge =>
                 {
@@ -1744,6 +1878,7 @@ fn check_row(ui: &mut Ui, p: Palette, check: &Check, actions: &mut Vec<Action>) 
         Outcome::Passed => "Passed",
         Outcome::Failed => "Failed",
         Outcome::Running => "Running",
+        Outcome::Awaiting => "Awaiting approval",
         Outcome::Cancelled => "Cancelled",
         Outcome::Skipped => "Skipped",
     };
@@ -1951,17 +2086,30 @@ fn responses(
     subject: &str,
     given: &[Reaction],
     thread: Option<Thread>,
+    rewrite: Option<&str>,
     talk: &mut Talk,
 ) {
     let react = talk.allowed.react && !subject.is_empty();
     let answers = thread.is_some_and(|thread| thread.can_reply || thread.can_resolve);
-    if given.is_empty() && !react && !answers {
+    if given.is_empty() && !react && !answers && rewrite.is_none() {
         return;
     }
     ui.add_space(6.0);
     let (_, row) = ui.allocate_space(vec2(ui.available_width(), 22.0));
     let fill = if talk.idle { Fill::Plain } else { Fill::Off };
     let mut right = row.right();
+    if let Some(body) = rewrite {
+        let width = button_width(ui, "Edit");
+        let place = Rect::from_min_size(Pos2::new(right - width, row.top()), vec2(width, 22.0));
+        right = place.left() - 4.0;
+        let id = Id::new(("pull-request-rewrite", subject));
+        if button_with(ui, p, place, "Edit", "Edit this comment", id, fill).clicked() {
+            talk.state.rewriting = Some(subject.to_owned());
+            talk.state.editing = None;
+            talk.state.edit = body.to_owned();
+            talk.state.focus = true;
+        }
+    }
     if let Some(thread) = thread {
         if thread.can_resolve {
             let label = if thread.resolved { "Reopen" } else { "Resolve" };
@@ -2243,7 +2391,35 @@ fn entry_body(ui: &mut Ui, p: Palette, entry: &Entry, talk: &mut Talk) {
             reply_under(ui, p, (&entry.url, index), reply, talk);
         }
     }
-    responses(ui, p, &entry.id, &entry.reactions, thread, talk);
+    let rewriting = talk.state.rewriting.as_deref() == Some(entry.id.as_str());
+    let rewrite = (entry.can_edit && !rewriting).then_some(entry.body.as_str());
+    responses(ui, p, &entry.id, &entry.reactions, thread, rewrite, talk);
+    if rewriting {
+        let mut focus = std::mem::take(&mut talk.state.focus);
+        let (save, cancelled) = written_under(
+            ui,
+            p,
+            (rewrite_id(), "Rewrite this comment", "Save"),
+            (2, 10),
+            &mut talk.state.edit,
+            (&mut focus, talk.composing, talk.idle),
+        );
+        talk.state.focus = focus;
+        if save {
+            talk.events.push(Event::Act(Act::Edit {
+                subject: entry.id.clone(),
+                said: match entry.kind {
+                    Kind::Comment => Said::Comment,
+                    Kind::Review(_) => Said::Review,
+                    Kind::Thread { .. } => Said::Line,
+                },
+                body: talk.state.edit.trim().to_owned(),
+            }));
+        }
+        if cancelled {
+            talk.state.rewriting = None;
+        }
+    }
     if let Some(thread) = thread
         && talk.state.replying.as_deref() == Some(thread.id)
     {
@@ -2376,6 +2552,70 @@ fn summary(ui: &mut Ui, p: Palette, shown: &Shown, talk: &mut Talk) {
     }
     ui.add_space(2.0);
     branches(ui, p, detail, talk.events);
+    // Its neighbours in a stack, each a way to it.
+    for near in &detail.stack {
+        let (_, row) = ui.allocate_space(vec2(ui.available_width(), 24.0));
+        let label = if near.below {
+            "Stacked on"
+        } else {
+            "Next in stack"
+        };
+        let painter = ui.painter().with_clip_rect(row.intersect(ui.clip_rect()));
+        painter.text(
+            Pos2::new(row.left() + 6.0, row.center().y + 1.0),
+            Align2::LEFT_CENTER,
+            label,
+            theme::regular(11.5),
+            p.muted,
+        );
+        let place = Rect::from_min_max(Pos2::new(row.left() + 88.0, row.top() + 2.0), row.max);
+        let response = ui
+            .interact(
+                place,
+                Id::new(("pull-request-stack", near.number)),
+                Sense::click(),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Button,
+                true,
+                format!("{label} pull request {}: {}", near.number, near.title),
+            )
+        });
+        if response.hovered() {
+            painter.rect_filled(place, 6, p.hover);
+        }
+        if response.has_focus() {
+            focus_ring(&painter, place.shrink(2.0), 6, p);
+        }
+        let number =
+            painter.layout_no_wrap(format!("#{}", near.number), theme::medium(12.0), p.accent);
+        let numbered = galley_at(
+            &painter,
+            Pos2::new(place.left() + 6.0, row.center().y + 1.0),
+            number,
+        );
+        galley_at(
+            &painter,
+            Pos2::new(numbered.right() + 6.0, row.center().y + 1.0),
+            elided(
+                &painter,
+                &near.title,
+                theme::regular(12.0),
+                p.fg,
+                place.right() - numbered.right() - 12.0,
+            ),
+        );
+        if response.clicked() {
+            let (host, owner, repository) = shown.link.location();
+            let url = format!("https://{host}/{owner}/{repository}/pull/{}", near.number);
+            if let Some(link) = PullRequest::parse(&url) {
+                talk.events.push(Event::Open(link));
+            }
+        }
+        response.on_hover_text(&near.title);
+    }
 
     let reviewers: Vec<Chip> = detail
         .reviewers
@@ -2497,7 +2737,7 @@ fn summary(ui: &mut Ui, p: Palette, shown: &Shown, talk: &mut Talk) {
             });
         }
         padded(ui, 8.0, |ui| {
-            responses(ui, p, &detail.id, &detail.reactions, None, talk);
+            responses(ui, p, &detail.id, &detail.reactions, None, None, talk);
         });
         ui.add_space(8.0);
     }
@@ -2838,6 +3078,13 @@ fn code(
     );
     egui::Popup::menu(&scope).show(|ui| {
         menu_layout(ui, 250.0);
+        let quiet = state.hide_whitespace;
+        let icon = if quiet { Icon::Check } else { Icon::Eraser };
+        if menu_item(ui, p, icon, "Hide whitespace changes", "", false) {
+            events.push(Event::Whitespace(!quiet));
+            ui.close();
+        }
+        menu_separator(ui, p);
         let all = if scoped.is_none() {
             Icon::Check
         } else {
@@ -3707,6 +3954,8 @@ mod tests {
             auto_merge: None,
             viewed: Vec::new(),
             reactions: Vec::new(),
+            stacked: false,
+            stack: Vec::new(),
             title: "A tab for pull requests".into(),
             state: Standing::Open,
             author: "ada".into(),
@@ -3797,6 +4046,17 @@ mod tests {
             stands(&detail, 2000),
             (Tone::Running, "1 of 5 checks running".into())
         );
+        // Workflows that wait to be allowed are said before those that run.
+        let mut waiting = detail.clone();
+        waiting.checks.push(Check {
+            url: "https://github.com/zevem/neptune/actions/runs/77/job/1".into(),
+            ..check(Outcome::Awaiting)
+        });
+        assert_eq!(
+            stands(&waiting, 2000),
+            (Tone::Running, "1 workflow awaits approval to run".into())
+        );
+        assert_eq!(checks_summary(&waiting), "1 check awaiting approval");
         detail.checks.push(check(Outcome::Failed));
         assert_eq!(
             stands(&detail, 2000),
@@ -3899,6 +4159,15 @@ mod tests {
         state.edit = "New".into();
         state.done("a", &Act::Title("New".into()));
         assert!(state.editing.is_none() && state.edit.is_empty());
+        state.rewriting = Some("C_1".into());
+        state.edit = "Better".into();
+        let rewritten = Act::Edit {
+            subject: "C_1".into(),
+            said: Said::Comment,
+            body: "Better".into(),
+        };
+        state.done("a", &rewritten);
+        assert!(state.rewriting.is_none() && state.edit.is_empty());
     }
 
     #[test]

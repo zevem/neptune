@@ -19,8 +19,9 @@ their preparation records remain in Git history.
   diffs under **Code**. From there you can merge it or have the host merge it
   by itself, mark it ready or a draft, close, reopen or revert it, edit its
   title and description, change labels and reviewers, comment, react, answer
-  and resolve review conversations, mark files as viewed and review it with
-  comments on single lines. Several pull requests stay open side by side. Ctrl-click (Command-click on
+  and resolve review conversations, mark files as viewed, review it with
+  comments on single lines, approve waiting workflow runs, walk a stack and
+  hand it to the agent in the terminal in front. Several pull requests stay open side by side. Ctrl-click (Command-click on
   macOS) a number to open it in the browser as before. It is read with your
   signed-in GitHub CLI (`gh`), only while its tab is in view, and nothing
   read is saved.

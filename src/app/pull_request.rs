@@ -35,6 +35,8 @@ struct Watch {
     files: bool,
     /// The commit whose files are shown, in place of all it changes.
     commit: Option<String>,
+    /// Changes that are only white space are left out of the diffs.
+    plain: bool,
     /// Another window is the active one: it is read less often.
     background: bool,
 }
@@ -158,12 +160,73 @@ impl Default for PullRequestTab {
     }
 }
 
-fn listed(files: Vec<ChangedFile>, total: u32) -> Files {
+/// Takes changes that are only white space out of a diff: a run of removed
+/// lines followed by as many added ones that say the same without their
+/// white space reads as lines that did not change.
+fn without_whitespace(body: DiffBody) -> DiffBody {
+    use crate::ui::changes::LineKind;
+    let DiffBody::Lines {
+        mut lines,
+        widest,
+        truncated,
+    } = body
+    else {
+        return body;
+    };
+    let bare = |text: &str| -> String { text.split_whitespace().collect() };
+    let mut at = 0;
+    while at < lines.len() {
+        let run = |from: usize, kind| {
+            lines[from..]
+                .iter()
+                .take_while(|line| line.kind == kind)
+                .count()
+        };
+        let removed = run(at, LineKind::Removed);
+        let added = run(at + removed, LineKind::Added);
+        if removed == 0 {
+            at += added.max(1);
+            continue;
+        }
+        let same = removed == added
+            && (0..removed)
+                .all(|i| bare(&lines[at + i].text) == bare(&lines[at + removed + i].text));
+        if same {
+            // The lines as they are now stay, numbered on both sides.
+            for i in 0..removed {
+                let old = lines[at + i].old;
+                let now = &mut lines[at + removed + i];
+                now.kind = LineKind::Context;
+                now.old = old;
+            }
+            lines.drain(at..at + removed);
+            at += removed;
+        } else {
+            at += removed + added;
+        }
+    }
+    let changed = lines
+        .iter()
+        .any(|line| matches!(line.kind, LineKind::Added | LineKind::Removed));
+    if !changed {
+        return DiffBody::Note("Only white space changed in this file.");
+    }
+    DiffBody::Lines {
+        lines,
+        widest,
+        truncated,
+    }
+}
+
+fn listed(files: Vec<ChangedFile>, total: u32, plain: bool) -> Files {
     let more = (total as usize).saturating_sub(files.len());
     let (files, diffs) = files
         .into_iter()
         .map(|file| {
             let body = match &file.patch {
+                Some(patch) if plain => {
+                    without_whitespace(super::git::parse_diff(patch.as_bytes()))
+                }
                 Some(patch) => super::git::parse_diff(patch.as_bytes()),
                 None if file.change == Change::Renamed && file.added + file.removed == 0 => {
                     DiffBody::Same
@@ -287,6 +350,8 @@ fn worker(
                     _ => None,
                 })
                 .unwrap_or_default();
+            // Read anew when white space is to be left out, or shown again.
+            let of_commit = format!("{of_commit} {}", current.plain);
             if current.files
                 && let Some((link, Ok(detail))) = &known
                 && link.same(&current.link)
@@ -300,7 +365,7 @@ fn worker(
                         Some(_) => files.len() as u32,
                         None => detail.files,
                     };
-                    listed(files, total)
+                    listed(files, total, current.plain)
                 });
                 files_of = Some((link.clone(), of_commit));
                 reports.push(Reply::Files {
@@ -483,6 +548,7 @@ impl App {
                 link,
                 files: self.ui.pull_request.segment == ui::pull_request::Segment::Code,
                 commit: self.ui.pull_request.scope.clone(),
+                plain: self.ui.pull_request.hide_whitespace,
                 background: self.window_focused == Some(false),
             });
         if watch != self.pull_request.sent {
@@ -511,6 +577,7 @@ impl App {
                 linked.push(ui::helpers::LinkedPullRequest {
                     link: link.clone(),
                     lookup: self.pull_requests.lookup(link),
+                    preview: self.pull_requests.preview(link),
                 });
             }
         }
@@ -548,12 +615,44 @@ impl App {
             tab.line = None;
         } else if id == ui::pull_request::reply_id() {
             tab.replying = None;
+        } else if id == ui::pull_request::rewrite_id() {
+            tab.rewriting = None;
         } else {
             tab.editing = None;
         }
         tab.focus = false;
         ctx.memory_mut(|memory| memory.surrender_focus(id));
         true
+    }
+
+    /// Writes `words` at the prompt of the terminal in front, for the person
+    /// to send: a question for the agent that runs there, or a command.
+    fn hand_to_terminal(&mut self, ctx: &egui::Context, words: &str, agent: bool) {
+        let model = self.controller.model();
+        let pane = model.active_pane().and_then(|id| model.pane(id));
+        let runs_agent = pane
+            .is_some_and(|pane| pane.agent().is_some() || self.agents.host(pane.id()).is_some());
+        let remote = model
+            .active_workspace()
+            .and_then(|id| model.workspace(id))
+            .is_some_and(|workspace| workspace.remote().is_some());
+        let Some(pane) = pane.map(|pane| pane.id()) else {
+            self.ui.error = Some("Open a terminal first.".into());
+            return;
+        };
+        if agent && !runs_agent {
+            self.ui.error = Some(
+                "The terminal in front runs no agent. Focus one that does, then try again.".into(),
+            );
+        } else if !agent && (runs_agent || remote) {
+            self.ui.error = Some(
+                "Focus a terminal with a shell on this computer to check the pull request out."
+                    .into(),
+            );
+        } else {
+            self.paste_text(pane, words);
+            self.action(ctx, Action::Focus(pane));
+        }
     }
 
     pub(super) fn pull_request_event(&mut self, ctx: &egui::Context, event: Event) {
@@ -626,6 +725,11 @@ impl App {
                     self.pull_request.request(ctx, Request::Choices(link));
                 }
             }
+            Event::Whitespace(hide) => {
+                self.ui.pull_request.hide_whitespace = hide;
+                self.pull_request.files = None;
+            }
+            Event::Hand { words, agent } => self.hand_to_terminal(ctx, &words, agent),
             Event::Scope(commit) => {
                 self.ui.pull_request.scope = commit;
                 self.ui.pull_request.selected = None;
@@ -719,6 +823,8 @@ mod tests {
             auto_merge: None,
             viewed: Vec::new(),
             reactions: Vec::new(),
+            stacked: false,
+            stack: Vec::new(),
             title: title.into(),
             state: State::Open,
             author: "ada".into(),
@@ -1118,6 +1224,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn changes_that_are_only_white_space_are_left_out_when_asked() {
+        use crate::ui::changes::LineKind;
+        let diff = |patch: &str, plain| {
+            let files = vec![ChangedFile {
+                path: "a.rs".into(),
+                from: None,
+                change: Change::Modified,
+                added: 0,
+                removed: 0,
+                patch: Some(patch.into()),
+            }];
+            listed(files, 1, plain).diffs.remove(0)
+        };
+        let kinds = |body: &DiffBody| -> Vec<(LineKind, String)> {
+            match body {
+                DiffBody::Lines { lines, .. } => lines
+                    .iter()
+                    .filter(|line| line.kind != LineKind::Hunk)
+                    .map(|line| (line.kind, line.text.clone()))
+                    .collect(),
+                other => panic!("no lines: {other:?}"),
+            }
+        };
+        let patch = "@@ -1,3 +1,3 @@\n-if a {\n-b\n+    if a {\n+c\n same\n";
+        // The pair that says something else is kept; as written, all are.
+        assert_eq!(kinds(&diff(patch, false)).len(), 5);
+        assert_eq!(
+            kinds(&diff(patch, true)),
+            [
+                (LineKind::Removed, "if a {".into()),
+                (LineKind::Removed, "b".into()),
+                (LineKind::Added, "    if a {".into()),
+                (LineKind::Added, "c".into()),
+                (LineKind::Context, "same".into()),
+            ],
+            "a run that differs in a line is shown whole"
+        );
+        let indented = "@@ -1,2 +1,2 @@\n-a\n-b\n+  a\n+\tb\n";
+        assert!(matches!(diff(indented, true), DiffBody::Note(_)));
+        let mixed = "@@ -1,3 +1,3 @@\n-a\n+  a\n keep\n-old\n+new\n";
+        assert_eq!(
+            kinds(&diff(mixed, true)),
+            [
+                (LineKind::Context, "  a".into()),
+                (LineKind::Context, "keep".into()),
+                (LineKind::Removed, "old".into()),
+                (LineKind::Added, "new".into()),
+            ]
+        );
+    }
+
     /// What a capture shows in place of GitHub: a pull request in review with
     /// a description, reviewers, checks in every outcome, a conversation and
     /// changed files.
@@ -1190,6 +1348,7 @@ mod tests {
                 Entry {
                     id: "C_1".into(),
                     reactions: Vec::new(),
+                    can_edit: true,
                     author: "linus".into(),
                     at: now - 20 * 3600,
                     kind: Kind::Thread {
@@ -1212,6 +1371,7 @@ mod tests {
                 Entry {
                     id: "C_2".into(),
                     reactions: Vec::new(),
+                    can_edit: true,
                     author: "grace".into(),
                     at: now - 5 * 3600,
                     kind: Kind::Review(Verdict::Approved),
@@ -1221,6 +1381,7 @@ mod tests {
                 Entry {
                     id: "C_3".into(),
                     reactions: Vec::new(),
+                    can_edit: true,
                     author: "linus".into(),
                     at: now - 3 * 3600,
                     kind: Kind::Thread {
@@ -1239,6 +1400,7 @@ mod tests {
                 Entry {
                     id: "C_4".into(),
                     reactions: Vec::new(),
+                    can_edit: true,
                     author: "linus".into(),
                     at: now - 2 * 3600,
                     kind: Kind::Review(Verdict::ChangesRequested),
@@ -1248,6 +1410,7 @@ mod tests {
                 Entry {
                     id: "C_5".into(),
                     reactions: Vec::new(),
+                    can_edit: true,
                     author: "ada".into(),
                     at: now - 12 * 60,
                     kind: Kind::Comment,
@@ -1287,6 +1450,11 @@ mod tests {
             },
         ];
         pictured.viewed = vec!["docs/design.md".into()];
+        pictured.stack = vec![source::Neighbour {
+            number: 119,
+            title: "feat(ui): comment on a line of a diff".into(),
+            below: false,
+        }];
         match state {
             "ready" => {
                 pictured
@@ -1360,6 +1528,181 @@ mod tests {
             /// How far a driven run has come, and what it saw on the way.
             step: usize,
             seen: Arc<Mutex<Vec<String>>>,
+            /// When the second driven run began pressing.
+            began: Option<Instant>,
+        }
+        /// Where a press of the second driven run lands.
+        #[derive(Clone)]
+        enum Where {
+            /// The middle of the control with this name.
+            Control(egui::Id),
+            /// The first row of the menu that control opened, wherever the
+            /// menu found room.
+            Menu(egui::Id),
+            At(Pos2),
+        }
+        #[derive(Clone)]
+        enum Step {
+            Click(Where),
+            Type(&'static str),
+            /// The command key with Enter.
+            Send,
+        }
+        /// What the second driven run does, and when: it changes a label,
+        /// takes a reaction back, answers and reopens a review conversation,
+        /// writes a comment on a line of a diff, sends the review that
+        /// carries it and closes the pull request's pill.
+        fn presses() -> Vec<(u64, Step)> {
+            let shown = pictured("press");
+            let reacted = shown.entries[4].id.clone();
+            let source::Kind::Thread { id: thread, .. } = &shown.entries[2].kind else {
+                panic!("the third entry is a review conversation");
+            };
+            let labels = egui::Id::new(("pull-request-add", "Labels"));
+            let (timeline, code) = (Pos2::new(849.0, 222.0), Pos2::new(944.0, 222.0));
+            vec![
+                (300, Step::Click(Where::Control(labels))),
+                (900, Step::Click(Where::Menu(labels))),
+                (1500, Step::Click(Where::At(timeline))),
+                (
+                    2000,
+                    Step::Click(Where::Control(egui::Id::new((
+                        "pull-request-reaction",
+                        reacted.as_str(),
+                        "Heart",
+                    )))),
+                ),
+                (
+                    2600,
+                    Step::Click(Where::Control(egui::Id::new((
+                        "pull-request-answer",
+                        thread.as_str(),
+                    )))),
+                ),
+                (3000, Step::Type("On it")),
+                (3200, Step::Send),
+                (
+                    3800,
+                    Step::Click(Where::Control(egui::Id::new((
+                        "pull-request-resolve",
+                        thread.as_str(),
+                    )))),
+                ),
+                (4400, Step::Click(Where::At(code))),
+                (5000, Step::Click(Where::At(Pos2::new(850.0, 331.0)))),
+                (5600, Step::Click(Where::At(Pos2::new(900.0, 560.0)))),
+                (6000, Step::Type("Why?")),
+                (6200, Step::Send),
+                (
+                    6800,
+                    Step::Click(Where::Control(egui::Id::new((
+                        "pull-request-button",
+                        "Send what was written",
+                    )))),
+                ),
+                (
+                    7400,
+                    Step::Click(Where::Control(egui::Id::new((
+                        "pull-request-pill-close",
+                        link(118).url(),
+                    )))),
+                ),
+                (8000, Step::Type("")),
+            ]
+        }
+        impl NativeCapture {
+            /// The second driven run: each press is a pointer move, a press
+            /// and a release on frames of their own, where the control is
+            /// this frame.
+            fn press(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+                use egui::{Event as Input, Key, Modifiers, PointerButton};
+                let began = *self.began.get_or_insert_with(Instant::now);
+                let elapsed = began.elapsed().as_millis() as u64;
+                let script = presses();
+                // The capture waits until everything was pressed.
+                if self.step / 3 < script.len() {
+                    self.app.started = Instant::now() - Duration::from_secs(1);
+                }
+                let Some((at, step)) = script.get(self.step / 3) else {
+                    return;
+                };
+                let part = (self.step % 3) as u64;
+                if elapsed < at + part * 90 {
+                    return;
+                }
+                self.step += 1;
+                match step {
+                    Step::Click(target) => {
+                        let found = match target {
+                            Where::At(pos) => Some(*pos),
+                            Where::Control(id) => {
+                                ctx.read_response(*id).map(|found| found.rect.center())
+                            }
+                            Where::Menu(id) => ctx.read_response(*id).and_then(|found| {
+                                let anchor = found.rect.center();
+                                let floats = |pos: Pos2| {
+                                    ctx.layer_id_at(pos)
+                                        .is_some_and(|layer| layer.order == egui::Order::Foreground)
+                                };
+                                // Below the control first, then above it.
+                                let below = (4..240).step_by(4).map(|down| down as f32);
+                                let above = (4..240).step_by(4).map(|up| -(up as f32));
+                                below
+                                    .chain(above)
+                                    .flat_map(|dy| {
+                                        [-150.0, -100.0, -60.0, 0.0, 60.0].map(|dx| {
+                                            anchor + Vec2::new(dx, dy + dy.signum() * 10.0)
+                                        })
+                                    })
+                                    .find(|pos| floats(*pos))
+                                    .map(|edge| edge + Vec2::new(0.0, 12.0))
+                            }),
+                        };
+                        let Some(pos) = found else {
+                            if part == 0 {
+                                self.seen
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("{at}: nothing to press"));
+                            }
+                            return;
+                        };
+                        input.events.push(match part {
+                            0 => Input::PointerMoved(pos),
+                            part => Input::PointerButton {
+                                pos,
+                                button: PointerButton::Primary,
+                                pressed: part == 1,
+                                modifiers: Modifiers::NONE,
+                            },
+                        });
+                    }
+                    Step::Type(text) if part == 0 && !text.is_empty() => {
+                        input.events.push(Input::Text((*text).into()));
+                    }
+                    Step::Send if part == 0 => {
+                        let command = Modifiers {
+                            ctrl: true,
+                            command: true,
+                            ..Modifiers::NONE
+                        };
+                        let key = |pressed| Input::Key {
+                            key: Key::Enter,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: command,
+                        };
+                        input.events.extend([
+                            Input::ModifiersChanged(command),
+                            key(true),
+                            key(false),
+                            Input::ModifiersChanged(Modifiers::NONE),
+                        ]);
+                    }
+                    _ => {}
+                }
+            }
         }
         /// What a driven run presses and types, and when, in milliseconds
         /// from the launch: a number on the terminal's toolbar, the control
@@ -1519,6 +1862,9 @@ mod tests {
                             | egui::Event::MouseWheel { .. }
                     )
                 });
+                if self.state == "press" && self.staged {
+                    self.press(ctx, input);
+                }
                 if self.state != "drive" || !self.staged {
                     return;
                 }
@@ -1546,6 +1892,10 @@ mod tests {
             }
             fn on_exit(&mut self) {
                 eframe::App::on_exit(&mut self.app);
+                self.seen.lock().unwrap().push(format!(
+                    "closed: shown={:?}",
+                    self.app.pull_request.shown().map(PullRequest::number)
+                ));
                 let tab = &self.app.ui.pull_request;
                 self.seen.lock().unwrap().push(format!(
                     "end: composer={:?} draft={:?} typing={}",
@@ -1588,7 +1938,12 @@ mod tests {
                         links
                             .iter()
                             .map(|link| {
-                                Some(if link.number() == 112 {
+                                let preview = crate::runtime::pull_requests::Preview {
+                                    title: format!("Pull request {}", link.number()),
+                                    author: "ada".into(),
+                                    opened: 0,
+                                };
+                                let status = if link.number() == 112 {
                                     Status {
                                         state: State::Merged,
                                         checks: Checks::Passing,
@@ -1600,12 +1955,13 @@ mod tests {
                                         checks: Checks::Failing,
                                         unresolved: 1,
                                     }
-                                })
+                                };
+                                Some((status, preview))
                             })
                             .collect()
                     }));
                     let state = pictured_state.clone();
-                    let driven = state == "drive";
+                    let driven = matches!(state.as_str(), "drive" | "press");
                     app.pull_request.source = Some(Source {
                         detail: Box::new(move |_| match state.as_str() {
                             "reading" => {
@@ -1664,10 +2020,66 @@ mod tests {
                     staged: false,
                     step: 0,
                     seen: noted,
+                    began: None,
                 }))
             }),
         )
         .unwrap();
+        if state == "press" {
+            let asked = asked.lock().unwrap();
+            println!("{asked:#?}\n{:?}", seen.lock().unwrap());
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .all(|line| !line.contains("nothing to press"))
+            );
+            let [label, react, reply, resolve, review] = &asked[..] else {
+                panic!("five things were asked of the pull request: {asked:?}");
+            };
+            assert!(matches!(label, Act::Label { .. }), "{label:?}");
+            assert!(
+                matches!(
+                    react,
+                    Act::React {
+                        emoji: source::Emoji::Heart,
+                        on: false,
+                        ..
+                    }
+                ),
+                "{react:?}"
+            );
+            assert!(
+                matches!(reply, Act::Reply { body, .. } if body == "On it"),
+                "{reply:?}"
+            );
+            assert!(
+                matches!(
+                    resolve,
+                    Act::Resolve {
+                        resolved: false,
+                        ..
+                    }
+                ),
+                "{resolve:?}"
+            );
+            let Act::Review(Verdict::Commented, body, lines) = review else {
+                panic!("the last thing asked was a review: {review:?}");
+            };
+            assert!(body.is_empty());
+            assert!(
+                matches!(&lines[..], [line] if line.path == "src/ui/panel.rs" && line.body == "Why?"),
+                "{lines:?}"
+            );
+            // Its pill closed, the tab lists the linked pull requests again.
+            assert!(
+                seen.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.contains("closed: shown=None"))
+            );
+            return;
+        }
         if state != "drive" {
             return;
         }

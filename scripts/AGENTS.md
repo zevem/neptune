@@ -104,7 +104,10 @@ NEPTUNE_PR_CAPTURE="$PWD/artifacts/native-pull-request.png" \
 `signed-out`, `linked`, `empty` or `drive`. `drive` presses a number on the
 toolbar, opens the comment field, types, sends with the command key and Enter
 and leaves a second comment with Escape, through the application's own input
-path, and fails unless each step did what it should. `NEPTUNE_PR_NARROW=1` uses a 640×400 window,
+path, and fails unless each step did what it should. `press` does the same for a
+label from its list, a reaction, an answer to a review conversation and its
+reopening, a comment on a line of a diff sent with a review, and a pill's
+cross. `NEPTUNE_PR_NARROW=1` uses a 640×400 window,
 `NEPTUNE_PR_WIDTH` sets the panel's width and `NEPTUNE_PR_THEME` names a theme.
 `NEPTUNE_PR_LIVE` names a pull request by its address and reads it with the
 signed-in GitHub CLI instead; a capture never changes a pull request. Pressing
