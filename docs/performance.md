@@ -251,6 +251,51 @@ records 2.021 seconds, 31.7 MiB/s and 88.166 ms cleanup. This run overlapped nat
 verification on the host, so it is transport correctness evidence and is not an
 uncontended throughput baseline.
 
+## Retained-memory growth probe
+
+[`measure-memory.py`](../scripts/measure-memory.py) exercises the real Linux/X11
+desktop in fresh storage. Each case uses one `/bin/sh` session, 10,000 history
+rows, a 1180×760 logical-point window and cursor blinking disabled. Build only
+the two native inspection targets:
+
+```sh
+cargo build -p neptune-terminal --release --features inspection --locked --bin neptune --bin neptune-inspect
+python3 scripts/measure-memory.py --repeats 3 --output artifacts/memory
+```
+
+The terminal case parses six batches of 30,000 synthetic lines, verifying a
+shell-created completion marker and parsed-byte counters before each sample.
+The explorer case creates 20 folders with 10,000 empty files each, opens and
+collapses every folder, samples after each four folders, closes the panel and
+verifies reopening. It captures the actual native Files screen, including a
+640×400 window. Fixtures and captures contain only synthetic content. Runs retain
+failures and verify complete session teardown before marking a case passed.
+Use `--scenarios explorer-close` to measure hiding the panel with a 10,000-item
+folder still expanded, separately from repeated folder browsing.
+
+Each sample reports the median of five Linux `/proc` readings after a settling
+interval: RSS, proportional set size (PSS), private clean plus dirty memory and
+the process's lifetime peak RSS. These are process observations; they exclude
+shell/child memory and GPU memory, and allocator retention can keep RSS high
+after objects are released. A steady plateau after filling history is distinct
+from growth proportional to the number of folders visited. Collapsed explorer
+branches release their listings, hidden trees release their rendered rows, and
+late listing replies cannot restore either cache.
+
+For comparisons, retain the original release executables and use `--app` and
+`--client` to select them. Reuse the synthetic directory printed under the first
+run's output with `--fixture PATH` so both versions see identical paths and
+files. Compare repeated cases with the same settings, display, fixture, script
+and settling interval. Stop task-owned compilation and other probes while
+sampling, and record competing work on the host.
+Binary, script and lockfile hashes, compiler, platform and sample records are
+saved in `report.json`; raw diagnostics exclude terminal contents. The probe's
+accounting adapter has a focused check:
+
+```sh
+python3 -m unittest discover -s scripts -p test_measure_memory.py
+```
+
 ## Remaining measurements
 
 PTY-to-screen throughput, native input-to-screen latency, GPU presentation-time
