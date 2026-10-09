@@ -15,6 +15,7 @@ use eframe::egui::{
     TextFormat, Ui, WidgetInfo, WidgetType, text::LayoutJob, vec2,
 };
 use std::{
+    cell::Cell,
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
@@ -57,6 +58,7 @@ pub struct Image {
     pub link: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Picture {
     pub texture: egui::TextureHandle,
     pub pixels: [u32; 2],
@@ -66,6 +68,21 @@ pub struct Document {
     pub blocks: Vec<Placed>,
     pub pictures: HashMap<usize, Picture>,
     pub loading_images: bool,
+    code_controls: HashMap<usize, CodeControls>,
+}
+
+struct CodeControls {
+    wrap: Cell<bool>,
+    copied_until: Cell<f64>,
+}
+
+impl Default for CodeControls {
+    fn default() -> Self {
+        Self {
+            wrap: Cell::new(true),
+            copied_until: Cell::new(0.0),
+        }
+    }
 }
 
 impl Document {
@@ -73,10 +90,39 @@ impl Document {
         let loading_images = blocks
             .iter()
             .any(|block| matches!(block.block, Block::Image(_)));
+        let code_controls = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block.block, Block::Code(_)))
+            .map(|(index, _)| (index, CodeControls::default()))
+            .collect();
         Self {
             blocks,
             pictures: HashMap::new(),
             loading_images,
+            code_controls,
+        }
+    }
+
+    /// Unchanged blocks keep their controls and image layout on a file reload.
+    /// State is released when its preview is replaced or closed.
+    pub fn retain_state_from(&mut self, previous: &Self) {
+        for (&index, controls) in &self.code_controls {
+            if previous.blocks.get(index) == self.blocks.get(index)
+                && let Some(old) = previous.code_controls.get(&index)
+            {
+                controls.wrap.set(old.wrap.get());
+                controls.copied_until.set(old.copied_until.get());
+            }
+        }
+        // Keep layout stable while unchanged images are being read again.
+        // A failed replacement removes its cached picture on the UI thread.
+        for (&index, picture) in &previous.pictures {
+            if self.blocks.get(index).is_some()
+                && self.blocks.get(index) == previous.blocks.get(index)
+            {
+                self.pictures.insert(index, picture.clone());
+            }
         }
     }
 }
@@ -324,6 +370,19 @@ struct Fence {
 }
 
 pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
+    parse_blocks(text, lines, false)
+}
+
+fn code_line(text: &str, indent: usize, verbatim: bool) -> &str {
+    let text = undent(text, indent);
+    if verbatim {
+        text.trim_end_matches('\r')
+    } else {
+        text.trim_end()
+    }
+}
+
+fn parse_blocks(text: &str, lines: Lines, verbatim_code: bool) -> Vec<Placed> {
     let source: Vec<&str> = text.lines().collect();
     let mut blocks: Vec<Placed> = Vec::new();
     // Whether the last block is still open to continuation lines.
@@ -352,7 +411,7 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
                     if !code.is_empty() {
                         code.push('\n');
                     }
-                    code.push_str(undent(rest, fenced.indent).trim_end());
+                    code.push_str(code_line(rest, fenced.indent, verbatim_code));
                 }
                 continue;
             }
@@ -434,7 +493,7 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
             }
             // Set in by four under where it would start: code, to the
             // first line that is not.
-            let mut code = undent(rest, strip).trim_end().to_owned();
+            let mut code = code_line(rest, strip, verbatim_code).to_owned();
             let mut blank = 0;
             while let Some(next) = source.get(at) {
                 let (depth, next) = quoted(next, DEEPEST);
@@ -445,7 +504,7 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
                     blank += 1;
                 } else if column(next) >= strip {
                     code.extend(std::iter::repeat_n('\n', blank + 1));
-                    code.push_str(undent(next, strip).trim_end());
+                    code.push_str(code_line(next, strip, verbatim_code));
                     blank = 0;
                 } else {
                     break;
@@ -467,7 +526,7 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
 /// Other HTML stays literal; this parser never executes markup.
 pub fn document_blocks(text: &str) -> Vec<Placed> {
     let mut result = Vec::new();
-    for placed in blocks(text, Lines::Joined) {
+    for placed in parse_blocks(text, Lines::Joined, true) {
         let text = match &placed.block {
             Block::Text(text)
             | Block::Bullet(text)
@@ -1746,8 +1805,8 @@ fn render_blocks(
                 .inner
             }
             Block::Code(code) => {
-                if document.is_some() {
-                    return code_block(ui, p, ink, code, index);
+                if let Some((_, document, _)) = document {
+                    return code_block(ui, p, ink, code, index, &document.code_controls[&index]);
                 }
                 Frame::new()
                     .fill(p.control)
@@ -1884,12 +1943,17 @@ fn render_blocks(
     last
 }
 
-fn code_block(ui: &mut Ui, p: Palette, ink: Color32, code: &str, index: usize) -> Rect {
+fn code_block(
+    ui: &mut Ui,
+    p: Palette,
+    ink: Color32,
+    code: &str,
+    index: usize,
+    controls: &CodeControls,
+) -> Rect {
     let id = ui.id().with(("document-code", index));
-    let mut wrap = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(true);
-    let copied = ui
-        .data(|data| data.get_temp::<f64>(id.with("copied")))
-        .unwrap_or(0.0);
+    let mut wrap = controls.wrap.get();
+    let copied = controls.copied_until.get();
     let now = ui.input(|input| input.time);
     let rect = Frame::new()
         .fill(p.control)
@@ -1917,7 +1981,7 @@ fn code_block(ui: &mut Ui, p: Palette, ink: Color32, code: &str, index: usize) -
                     .clicked()
                     {
                         crate::platform::clipboard::copy(ui.ctx(), code.to_owned());
-                        ui.data_mut(|data| data.insert_temp(id.with("copied"), now + 1.2));
+                        controls.copied_until.set(now + 1.2);
                         ui.ctx()
                             .request_repaint_after(std::time::Duration::from_millis(1200));
                     }
@@ -1950,7 +2014,7 @@ fn code_block(ui: &mut Ui, p: Palette, ink: Color32, code: &str, index: usize) -
         })
         .response
         .rect;
-    ui.data_mut(|data| data.insert_temp(id, wrap));
+    controls.wrap.set(wrap);
     rect
 }
 
@@ -2072,6 +2136,56 @@ fn grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_controls_belong_to_the_current_document_and_survive_unchanged_reload() {
+        let before = Document::new(document_blocks("```sh\nfirst\n```\n\n```sh\nsecond\n```"));
+        before.code_controls[&0].wrap.set(false);
+        before.code_controls[&0].copied_until.set(1.2);
+        let mut after = Document::new(document_blocks("```sh\nfirst\n```"));
+        after.retain_state_from(&before);
+        assert_eq!(
+            after.code_controls.len(),
+            1,
+            "removed blocks retain no controls"
+        );
+        assert!(!after.code_controls[&0].wrap.get());
+        assert_eq!(after.code_controls[&0].copied_until.get(), 1.2);
+        let mut changed = Document::new(document_blocks("```sh\nchanged\n```"));
+        changed.retain_state_from(&before);
+        assert!(changed.code_controls[&0].wrap.get());
+        assert_eq!(changed.code_controls[&0].copied_until.get(), 0.0);
+    }
+
+    #[test]
+    fn unchanged_images_keep_their_layout_while_a_reload_is_pending() {
+        let ctx = egui::Context::default();
+        let mut before = Document::new(document_blocks("![Logo](logo.png)"));
+        let texture = ctx.load_texture(
+            "reload-test",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let id = texture.id();
+        before.pictures.insert(
+            0,
+            Picture {
+                texture,
+                pixels: [96, 96],
+            },
+        );
+        let mut after = Document::new(document_blocks("![Logo](logo.png)"));
+        after.retain_state_from(&before);
+        assert_eq!(after.pictures[&0].texture.id(), id);
+        assert_eq!(after.pictures[&0].pixels, [96, 96]);
+        assert!(
+            after.loading_images,
+            "the retained picture is still refreshed"
+        );
+        let mut changed = Document::new(document_blocks("![Logo](replacement.png)"));
+        changed.retain_state_from(&before);
+        assert!(changed.pictures.is_empty());
+    }
 
     #[test]
     fn document_images_parse_markdown_and_html_without_interpreting_code() {

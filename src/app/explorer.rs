@@ -114,6 +114,10 @@ enum Reply {
         pixels: [u32; 2],
         image: egui::ColorImage,
     },
+    PictureFailed {
+        request: u64,
+        index: usize,
+    },
     PicturesFinished {
         request: u64,
     },
@@ -172,6 +176,8 @@ pub(super) struct Explorer {
     files: Option<mpsc::Sender<Request>>,
     previews: Option<mpsc::Sender<(u64, PathBuf)>>,
     preview_requests: u64,
+    preview_current: Arc<AtomicU64>,
+    preview_paused: bool,
     preview: Option<Preview>,
     search: Search,
 }
@@ -192,6 +198,8 @@ impl Default for Explorer {
             files: None,
             previews: None,
             preview_requests: 0,
+            preview_current: Arc::new(AtomicU64::new(0)),
+            preview_paused: false,
             preview: None,
             search: Search::default(),
         }
@@ -409,6 +417,7 @@ fn preview_worker(
     requests: mpsc::Receiver<(u64, PathBuf)>,
     replies: mpsc::Sender<Reply>,
     wake: egui::Context,
+    current: Arc<AtomicU64>,
 ) {
     let mut pending = None;
     loop {
@@ -419,7 +428,13 @@ fn preview_worker(
             newest = newer;
         }
         let (request, path) = newest;
+        if current.load(Ordering::Relaxed) != request {
+            continue;
+        }
         let (size, loaded) = read_preview(&path);
+        if current.load(Ordering::Relaxed) != request {
+            continue;
+        }
         let images: Vec<_> = match &loaded {
             Loaded::Text {
                 markdown: Some(blocks),
@@ -456,6 +471,9 @@ fn preview_worker(
         // file request cancels the remaining work for this document.
         let deadline = Instant::now() + Duration::from_secs(8);
         for (index, source) in images {
+            if current.load(Ordering::Relaxed) != request {
+                break;
+            }
             match requests.try_recv() {
                 Ok(newer) => {
                     pending = Some(newer);
@@ -467,20 +485,26 @@ fn preview_worker(
             if Instant::now() >= deadline {
                 break;
             }
-            if let Some((pixels, image)) = document_picture(&source, &path) {
-                if replies
-                    .send(Reply::Picture {
-                        request,
-                        index,
-                        pixels,
-                        image,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                wake.request_repaint();
+            let picture = document_picture(&source, &path);
+            if current.load(Ordering::Relaxed) != request {
+                break;
             }
+            let reply = match picture {
+                Some((pixels, image)) => Reply::Picture {
+                    request,
+                    index,
+                    pixels,
+                    image,
+                },
+                None => Reply::PictureFailed { request, index },
+            };
+            if replies.send(reply).is_err() {
+                return;
+            }
+            wake.request_repaint();
+        }
+        if current.load(Ordering::Relaxed) != request {
+            continue;
         }
         if replies.send(Reply::PicturesFinished { request }).is_err() {
             return;
@@ -532,18 +556,11 @@ fn read_preview(path: &Path) -> (Option<u64>, Loaded) {
     if let Err(error) = read {
         return (size, Loaded::Failed(reason(&error)));
     }
-    let mut loaded = text_preview(&bytes);
-    if path
+    let markdown = path
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-        && let Loaded::Text {
-            lines, markdown, ..
-        } = &mut loaded
-    {
-        *markdown = Some(ui::markup::document_blocks(&lines.join("\n")));
-    }
-    (size, loaded)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    (size, text_preview(&bytes, markdown))
 }
 
 /// A line of a file as it is painted: tabs become spaces, control characters
@@ -578,7 +595,7 @@ pub(super) fn display_line(line: &str) -> (String, usize) {
 }
 
 /// Text as lines ready to paint, or `Binary` for anything else.
-fn text_preview(bytes: &[u8]) -> Loaded {
+fn text_preview(bytes: &[u8], markdown: bool) -> Loaded {
     if bytes.iter().take(8 * 1024).any(|byte| *byte == 0) {
         return Loaded::Binary;
     }
@@ -598,6 +615,9 @@ fn text_preview(bytes: &[u8]) -> Loaded {
         lines.truncate(PREVIEW_LINES);
         truncated = true;
     }
+    // Code-copy controls need the original bounded text, including tabs and
+    // long command lines. Source rows are sanitized separately for display.
+    let markdown = markdown.then(|| ui::markup::document_blocks(&lines.join("\n")));
     let mut widest = 0;
     let lines = lines
         .into_iter()
@@ -612,7 +632,7 @@ fn text_preview(bytes: &[u8]) -> Loaded {
         lines,
         widest,
         truncated,
-        markdown: None,
+        markdown,
     }
 }
 
@@ -995,9 +1015,10 @@ impl Explorer {
             let (sender, requests) = mpsc::channel();
             let replies = self.replies.0.clone();
             let wake = ctx.clone();
+            let current = self.preview_current.clone();
             if std::thread::Builder::new()
                 .name("neptune-explorer-preview".into())
-                .spawn(move || preview_worker(requests, replies, wake))
+                .spawn(move || preview_worker(requests, replies, wake, current))
                 .is_ok()
             {
                 self.previews = Some(sender);
@@ -1005,6 +1026,8 @@ impl Explorer {
         }
         self.preview_requests += 1;
         let request = self.preview_requests;
+        self.preview_current.store(request, Ordering::Relaxed);
+        self.preview_paused = false;
         match &mut self.preview {
             Some(preview) if preview.path == path && !reset => preview.request = request,
             _ => {
@@ -1024,6 +1047,14 @@ impl Explorer {
             .is_some_and(|previews| previews.send((request, path)).is_ok());
         if !sent && let Some(preview) = &mut self.preview {
             preview.body = Body::Failed("Could not read the file".into());
+        }
+    }
+
+    fn cancel_preview_work(&mut self) {
+        self.preview_current.store(0, Ordering::Relaxed);
+        self.preview_paused = self.preview.is_some();
+        if let Some(preview) = &mut self.preview {
+            preview.request = 0;
         }
     }
 
@@ -1309,7 +1340,17 @@ impl App {
                                 lines,
                                 widest,
                                 truncated,
-                                markdown: markdown.map(ui::markup::Document::new),
+                                markdown: markdown.map(|blocks| {
+                                    let mut document = ui::markup::Document::new(blocks);
+                                    if let Body::Text {
+                                        markdown: Some(previous),
+                                        ..
+                                    } = &preview.body
+                                    {
+                                        document.retain_state_from(previous);
+                                    }
+                                    document
+                                }),
                             },
                             Loaded::Image { pixels, image } => Body::Image {
                                 pixels,
@@ -1350,6 +1391,17 @@ impl App {
                         );
                     }
                 }
+                Reply::PictureFailed { request, index } => {
+                    if let Some(preview) = &mut self.explorer.preview
+                        && preview.request == request
+                        && let Body::Text {
+                            markdown: Some(document),
+                            ..
+                        } = &mut preview.body
+                    {
+                        document.pictures.remove(&index);
+                    }
+                }
                 Reply::PicturesFinished { request } => {
                     if let Some(preview) = &mut self.explorer.preview
                         && preview.request == request
@@ -1367,6 +1419,12 @@ impl App {
 
     /// Brings the panel's data up to date for a frame that shows it.
     pub(super) fn sync_explorer(&mut self, ctx: &egui::Context) {
+        if self.explorer.preview_paused
+            && let Some(preview) = &self.explorer.preview
+        {
+            let path = preview.path.clone();
+            self.explorer.show_preview(ctx, path, false);
+        }
         let model = self.controller.model();
         let workspace = model.active_workspace().and_then(|id| model.workspace(id));
         let (root, notice) = match workspace {
@@ -1443,6 +1501,7 @@ impl App {
 
     /// The panel left view: nothing is read again until it returns.
     pub(super) fn rest_explorer(&mut self, ctx: &egui::Context) {
+        self.explorer.cancel_preview_work();
         if self.explorer.watched_file.take().is_some() {
             self.explorer.request(ctx, Request::WatchFile(None));
         }
@@ -1663,7 +1722,19 @@ impl App {
                 self.explorer.show_preview(ctx, path, false);
             }
             Event::FollowLink { path, anchor } => {
-                self.explorer_event(ctx, Event::Select(path));
+                let loaded = self.explorer.preview.as_ref().is_some_and(|preview| {
+                    preview.path == path
+                        && matches!(
+                            &preview.body,
+                            Body::Text {
+                                markdown: Some(_),
+                                ..
+                            }
+                        )
+                });
+                if !loaded {
+                    self.explorer_event(ctx, Event::Select(path));
+                }
                 self.ui.explorer.markdown_preview = true;
                 self.ui.explorer.markdown_anchor = anchor;
             }
@@ -1679,6 +1750,7 @@ impl App {
             Event::ClosePreview => {
                 self.ui.explorer.source_selection.reset();
                 self.explorer.preview = None;
+                self.explorer.cancel_preview_work();
             }
             Event::BeginCreate { parent, folder } => {
                 let Some(root) = self.explorer.root.clone() else {
@@ -2263,6 +2335,112 @@ mod tests {
     }
 
     #[test]
+    fn markdown_code_keeps_original_tabs_and_long_commands_within_file_limits() {
+        let command = format!("printf 'literal\ttab' {}", "argument ".repeat(160));
+        let source = format!("```sh\n{command}\n```\n");
+        let Loaded::Text {
+            lines,
+            markdown: Some(blocks),
+            truncated,
+            ..
+        } = text_preview(source.as_bytes(), true)
+        else {
+            panic!("Markdown document");
+        };
+        assert!(truncated);
+        assert!(lines[1].ends_with('…'));
+        assert!(matches!(&blocks[0].block, ui::markup::Block::Code(code) if code == &command));
+
+        let source = format!(
+            "{}\n```sh\nnot included\n```",
+            "paragraph\n".repeat(PREVIEW_LINES)
+        );
+        let Loaded::Text {
+            markdown: Some(blocks),
+            truncated,
+            ..
+        } = text_preview(source.as_bytes(), true)
+        else {
+            panic!("bounded Markdown document");
+        };
+        assert!(truncated);
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| matches!(block.block, ui::markup::Block::Code(_)))
+        );
+    }
+
+    #[test]
+    fn cancelling_a_preview_skips_pending_images_and_allows_the_next_file() {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let next = dir.path().join("next.txt");
+        std::fs::write(&next, "next file").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::fs::write(
+            &path,
+            format!("![One](http://{address}/one.png)\n\n![Two](http://{address}/two.png)"),
+        )
+        .unwrap();
+        let current = Arc::new(AtomicU64::new(1));
+        let cancellation = current.clone();
+        let (cancelled, wait) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("image request did not arrive: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).unwrap();
+            cancellation.store(0, Ordering::Relaxed);
+            cancelled.send(()).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let (send, requests) = mpsc::channel();
+        let (replies, receive) = mpsc::channel();
+        let running = current.clone();
+        let worker = std::thread::spawn(move || {
+            preview_worker(requests, replies, egui::Context::default(), running)
+        });
+        send.send((1, path)).unwrap();
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Reply::Preview { request: 1, .. }
+        ));
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        current.store(2, Ordering::Relaxed);
+        send.send((2, next)).unwrap();
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Reply::Preview { request: 2, .. }
+        ));
+        drop(send);
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert!(receive.try_iter().next().is_none());
+    }
+
+    #[test]
     fn markdown_image_worker_reports_text_before_bounded_pictures() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("README.md");
@@ -2278,8 +2456,14 @@ mod tests {
         let (send, requests) = mpsc::channel();
         let (replies, receive) = mpsc::channel();
         send.send((9, path)).unwrap();
-        let worker =
-            std::thread::spawn(move || preview_worker(requests, replies, egui::Context::default()));
+        let worker = std::thread::spawn(move || {
+            preview_worker(
+                requests,
+                replies,
+                egui::Context::default(),
+                Arc::new(AtomicU64::new(9)),
+            )
+        });
         assert!(matches!(
             receive.recv_timeout(Duration::from_secs(5)).unwrap(),
             Reply::Preview {
@@ -2354,27 +2538,30 @@ mod tests {
             widest,
             truncated,
             ..
-        } = text_preview(b"fn main() {\r\n\tprintln!(\"hi\");\n}\n")
+        } = text_preview(b"fn main() {\r\n\tprintln!(\"hi\");\n}\n", false)
         else {
             panic!("source is text");
         };
         assert_eq!(lines, ["fn main() {", "    println!(\"hi\");", "}"]);
         assert_eq!(widest, 19);
         assert!(!truncated);
-        assert!(matches!(text_preview(b"\x7fELF\0\0\0"), Loaded::Binary));
         assert!(matches!(
-            text_preview(b""),
+            text_preview(b"\x7fELF\0\0\0", false),
+            Loaded::Binary
+        ));
+        assert!(matches!(
+            text_preview(b"", false),
             Loaded::Text { lines, .. } if lines.is_empty()
         ));
         let long = "x\n".repeat(PREVIEW_BYTES);
         assert!(matches!(
-            text_preview(&long.as_bytes()[..PREVIEW_BYTES + 1]),
+            text_preview(&long.as_bytes()[..PREVIEW_BYTES + 1], false),
             Loaded::Text { lines, truncated: true, .. } if lines.len() == PREVIEW_LINES
         ));
 
         let minified = "x".repeat(PREVIEW_BYTES + 1);
         assert!(matches!(
-            text_preview(minified.as_bytes()),
+            text_preview(minified.as_bytes(), false),
             Loaded::Text { lines, truncated: true, .. } if lines.len() == 1
         ));
 
@@ -2681,6 +2868,46 @@ mod tests {
     }
 
     #[test]
+    fn hiding_and_closing_cancel_preview_work_and_files_resume_on_return() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        std::fs::write(&path, "# Heading\n\n[Top](#heading)").unwrap();
+        let (mut app, _) = super::super::tests::fixture(root.path());
+        let ctx = egui::Context::default();
+        app.explorer.show_preview(&ctx, path.clone(), false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.explorer.preview.as_ref().unwrap().revision == 0 {
+            assert!(Instant::now() < deadline);
+            app.poll_explorer(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let request = app.explorer.preview_requests;
+        act(
+            &mut app,
+            &ctx,
+            Event::FollowLink {
+                path,
+                anchor: Some("heading".into()),
+            },
+        );
+        assert_eq!(
+            app.explorer.preview_requests, request,
+            "same-file anchors use the loaded document"
+        );
+        app.rest_explorer(&ctx);
+        assert_eq!(app.explorer.preview_current.load(Ordering::Relaxed), 0);
+        assert!(app.explorer.preview_paused);
+        assert_eq!(app.explorer.preview.as_ref().unwrap().request, 0);
+        app.sync_explorer(&ctx);
+        assert!(app.explorer.preview_requests > request);
+        assert!(!app.explorer.preview_paused);
+        act(&mut app, &ctx, Event::ClosePreview);
+        assert!(app.explorer.preview.is_none());
+        assert!(!app.explorer.preview_paused);
+        assert_eq!(app.explorer.preview_current.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn late_markdown_pictures_cannot_update_a_replacement_or_closed_preview() {
         let root = tempfile::tempdir().unwrap();
         let (mut app, _sender) = super::super::tests::fixture(root.path());
@@ -2717,6 +2944,34 @@ mod tests {
         app.explorer.replies.0.send(reply(2)).unwrap();
         app.poll_explorer(&ctx);
         assert_eq!(pictures(&app), 1);
+        app.explorer
+            .replies
+            .0
+            .send(Reply::PictureFailed {
+                request: 1,
+                index: 0,
+            })
+            .unwrap();
+        app.poll_explorer(&ctx);
+        assert_eq!(
+            pictures(&app),
+            1,
+            "a stale failure cannot remove a current picture"
+        );
+        app.explorer
+            .replies
+            .0
+            .send(Reply::PictureFailed {
+                request: 2,
+                index: 0,
+            })
+            .unwrap();
+        app.poll_explorer(&ctx);
+        assert_eq!(
+            pictures(&app),
+            0,
+            "a failed refresh removes its retained picture"
+        );
         app.explorer_event(&ctx, Event::ClosePreview);
         app.explorer.replies.0.send(reply(2)).unwrap();
         app.poll_explorer(&ctx);

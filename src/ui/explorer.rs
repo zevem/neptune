@@ -800,7 +800,7 @@ fn preview(
     if let Some(document) = markdown.filter(|_| state.markdown_preview) {
         let mut child = ui.new_child(
             UiBuilder::new()
-                .id_salt(("explorer-markdown", view.path, view.revision))
+                .id_salt(("explorer-markdown", view.path))
                 .max_rect(body.shrink2(vec2(10.0, 4.0))),
         );
         child.set_clip_rect(body.intersect(ui.clip_rect()));
@@ -838,7 +838,7 @@ fn preview(
                 ) {
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("The rest of the file is not shown")
+                        egui::RichText::new("The source preview is truncated")
                             .color(p.muted)
                             .size(11.0),
                     );
@@ -1843,6 +1843,56 @@ mod location_tests {
         assert!(state.markdown_preview);
         assert!(painted(&output, "Heading").is_some());
         assert!(painted(&output, "Some bold text.").is_some());
+    }
+
+    #[test]
+    fn markdown_scroll_survives_a_file_revision_change() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let lines: Vec<String> = (0..80)
+            .map(|index| format!("Paragraph {index}\n"))
+            .collect();
+        let document = super::super::markup::Document::new(super::super::markup::document_blocks(
+            &lines.join("\n"),
+        ));
+        let mut view = PreviewView {
+            path: Path::new("/tmp/scroll.md"),
+            name: "scroll.md",
+            revision: 1,
+            size: None,
+            body: PreviewBody::Text {
+                lines: &lines,
+                widest: 15,
+                truncated: false,
+                markdown: Some(&document),
+            },
+        };
+        let mut state = State::default();
+        frame(&ctx, &view, &mut state, Vec::new());
+        frame(
+            &ctx,
+            &view,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(Pos2::new(140.0, 180.0)),
+                egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -220.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..12 {
+            frame(&ctx, &view, &mut state, Vec::new());
+        }
+        let before = frame(&ctx, &view, &mut state, Vec::new());
+        let paragraph = painted(&before, "Paragraph 10").unwrap();
+        view.revision = 2;
+        let after = frame(&ctx, &view, &mut state, Vec::new());
+        let reloaded = painted(&after, "Paragraph 10").unwrap();
+        assert!((reloaded.top() - paragraph.top()).abs() < 2.0);
+        assert!(paragraph.top() < 160.0, "the preview actually scrolled");
     }
 
     #[test]
