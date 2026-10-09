@@ -820,6 +820,19 @@ fn invalid_name(kind: EditKind, text: &str) -> Option<&'static str> {
 }
 
 impl Explorer {
+    /// A listing is useful only while its branch is open under the current
+    /// root. Worker replies can arrive after collapse, navigation or hiding.
+    fn needs_listing(&self, dir: &Path) -> bool {
+        let Some(root) = self.root.as_deref() else {
+            return false;
+        };
+        dir.starts_with(root)
+            && dir
+                .ancestors()
+                .take_while(|ancestor| *ancestor != root)
+                .all(|ancestor| self.expanded.contains(ancestor))
+    }
+
     fn files(&mut self, ctx: &egui::Context) -> Option<&mpsc::Sender<Request>> {
         if self.files.is_none() {
             let (sender, requests) = mpsc::channel();
@@ -962,6 +975,10 @@ impl Explorer {
             };
             tree.folder(root, 0);
         }
+        // Keep expansion choices, but release the entries of collapsed
+        // branches. Reopening them already asks the worker for a fresh listing.
+        let visible: HashSet<&Path> = shown.iter().map(PathBuf::as_path).collect();
+        self.dirs.retain(|dir, _| visible.contains(dir.as_path()));
         self.rows = rows;
         self.dirty = false;
         (shown, missing)
@@ -1120,8 +1137,10 @@ impl App {
             match reply {
                 Reply::Listed { dir, listing } => {
                     self.explorer.requested.remove(&dir);
-                    self.explorer.dirs.insert(dir, listing);
-                    self.explorer.dirty = true;
+                    if self.explorer.needs_listing(&dir) {
+                        self.explorer.dirs.insert(dir, listing);
+                        self.explorer.dirty = true;
+                    }
                 }
                 Reply::Applied { op, result } => self.applied(ctx, op, result),
                 Reply::Changed(path) => {
@@ -1269,7 +1288,9 @@ impl App {
             self.explorer.request(ctx, Request::Watch(Vec::new()));
             // What is shown next is read afresh.
             self.explorer.root = None;
-            self.explorer.dirs.clear();
+            self.explorer.dirs = HashMap::new();
+            self.explorer.rows = Vec::new();
+            self.explorer.requested = HashSet::new();
             self.explorer.cancel_search();
             self.explorer.dirty = true;
         }
@@ -1610,6 +1631,132 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_fixture(root: &Path) -> (App, egui::Context, mpsc::Receiver<Request>) {
+        let (mut app, _) = super::super::tests::fixture(root);
+        app.startup = None;
+        app.controller
+            .dispatch(Command::AddWorkspace {
+                group: None,
+                cwd: root.into(),
+                name: "Memory fixture".into(),
+                remote: None,
+            })
+            .unwrap();
+        // Exercise the real reply/rebuild boundary without filesystem timing.
+        let (files, requests) = mpsc::channel();
+        app.explorer.files = Some(files);
+        let ctx = egui::Context::default();
+        app.sync_explorer(&ctx);
+        (app, ctx, requests)
+    }
+
+    fn cached_listing(app: &mut App, ctx: &egui::Context, dir: &Path, entries: Arc<[Entry]>) {
+        app.explorer
+            .replies
+            .0
+            .send(Reply::Listed {
+                dir: dir.into(),
+                listing: Listing::Loaded { entries, more: 0 },
+            })
+            .unwrap();
+        app.poll_explorer(ctx);
+        app.sync_explorer(ctx);
+    }
+
+    #[test]
+    fn collapsed_folders_release_listings_and_reopening_reads_them_again() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, ctx, requests) = cache_fixture(root.path());
+        let folders: Arc<[Entry]> = (0..32)
+            .map(|index| Entry {
+                name: format!("folder-{index}"),
+                path: root.path().join(format!("folder-{index}")),
+                dir: true,
+                link: false,
+            })
+            .collect();
+        cached_listing(&mut app, &ctx, root.path(), folders.clone());
+        for folder in folders.iter() {
+            app.explorer_event(&ctx, Event::Expand(folder.path.clone(), true));
+            let entries: Arc<[Entry]> = (0..1000)
+                .map(|index| Entry {
+                    name: format!("file-{index}"),
+                    path: folder.path.join(format!("file-{index}")),
+                    dir: false,
+                    link: false,
+                })
+                .collect();
+            let released = Arc::downgrade(&entries);
+            cached_listing(&mut app, &ctx, &folder.path, entries);
+            assert_eq!(app.explorer.rows.len(), 1032);
+            app.explorer_event(&ctx, Event::Expand(folder.path.clone(), false));
+            app.sync_explorer(&ctx);
+            assert!(released.upgrade().is_none(), "collapsed listing retained");
+            assert_eq!(app.explorer.dirs.len(), 1);
+            assert_eq!(app.explorer.rows.len(), 32);
+        }
+        let folder = &folders[0].path;
+        app.explorer_event(&ctx, Event::Expand(folder.clone(), true));
+        app.sync_explorer(&ctx);
+        assert!(!app.explorer.dirs.contains_key(folder));
+        assert!(
+            requests
+                .try_iter()
+                .any(|request| matches!(request, Request::List(path) if &path == folder))
+        );
+        cached_listing(&mut app, &ctx, folder, Arc::from([]));
+        assert!(app.explorer.dirs.contains_key(folder));
+    }
+
+    #[test]
+    fn late_listings_do_not_restore_collapsed_or_hidden_folder_allocations() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, ctx, _requests) = cache_fixture(root.path());
+        let folder = root.path().join("folder");
+        cached_listing(
+            &mut app,
+            &ctx,
+            root.path(),
+            Arc::from([Entry {
+                name: "folder".into(),
+                path: folder.clone(),
+                dir: true,
+                link: false,
+            }]),
+        );
+        app.explorer_event(&ctx, Event::Expand(folder.clone(), true));
+        app.explorer_event(&ctx, Event::Expand(folder.clone(), false));
+        app.sync_explorer(&ctx);
+        app.explorer
+            .replies
+            .0
+            .send(Reply::Listed {
+                dir: folder.clone(),
+                listing: Listing::Loaded {
+                    entries: Arc::from([]),
+                    more: 0,
+                },
+            })
+            .unwrap();
+        app.poll_explorer(&ctx);
+        assert!(!app.explorer.dirs.contains_key(&folder));
+        app.rest_explorer(&ctx);
+        app.explorer
+            .replies
+            .0
+            .send(Reply::Listed {
+                dir: root.path().into(),
+                listing: Listing::Loaded {
+                    entries: Arc::from([]),
+                    more: 0,
+                },
+            })
+            .unwrap();
+        app.poll_explorer(&ctx);
+        assert!(app.explorer.dirs.is_empty());
+        assert_eq!(app.explorer.rows.capacity(), 0);
+    }
 
     fn names(path: &str) -> Vec<String> {
         path.split('/').map(str::to_owned).collect()
