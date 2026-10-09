@@ -4275,7 +4275,7 @@ fn a_copy_chord_copies_the_text_selected_in_a_panel_before_it_reaches_the_termin
                 app.shortcuts(ui.ctx());
                 seen = shortcut_events(ui.ctx());
                 // What the terminal in front would write for them.
-                let events = App::terminal_events(ui.ctx());
+                let events = app.terminal_events(ui.ctx());
                 let normalized = crate::input::normalize_events(&events, ui.input(|i| i.modifiers));
                 written = crate::input::route_events(
                     crate::input::RoutingContext::TerminalPane(1),

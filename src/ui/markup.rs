@@ -1,8 +1,8 @@
 //! The Markdown release notes and a lead's replies are written in, laid out
 //! natively: headings, lists, quotes, tables, rules, fenced code and the marks
-//! inside a line. It is styling only: nothing here loads a picture or runs
-//! anything a text names, and a link leads somewhere only when the person
-//! presses it. What is not finished, such as a mark without its pair or half
+//! inside a line. File documents can also draw pictures decoded by their
+//! worker; links lead somewhere only when pressed. Nothing executes markup.
+//! What is not finished, such as a mark without its pair or half
 //! a table, stays the text it is.
 use super::{Action, helpers::focus_ring, helpers::place};
 use crate::{
@@ -14,7 +14,12 @@ use eframe::egui::{
     self, Align, Color32, CursorIcon, FontId, Frame, Id, Layout, Margin, Pos2, Rect, Sense, Stroke,
     TextFormat, Ui, WidgetInfo, WidgetType, text::LayoutJob, vec2,
 };
-use std::{ops::Range, path::PathBuf};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 /// The height of a line of body text.
 pub const LINE: f32 = 19.0;
@@ -38,9 +43,94 @@ pub enum Block {
     Task(bool, String),
     /// A fenced or indented block, its lines as written.
     Code(String),
+    Image(Image),
     Rule,
     Table(Table),
     Text(String),
+}
+/// A document image; decoding is owned by the file-preview worker.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Image {
+    pub source: String,
+    pub alt: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub link: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct Picture {
+    pub texture: egui::TextureHandle,
+    pub pixels: [u32; 2],
+}
+
+pub struct Document {
+    pub blocks: Vec<Placed>,
+    pub pictures: HashMap<usize, Picture>,
+    pub loading_images: bool,
+    code_controls: HashMap<usize, CodeControls>,
+}
+
+struct CodeControls {
+    wrap: Cell<bool>,
+    copied_until: Cell<f64>,
+}
+
+impl Default for CodeControls {
+    fn default() -> Self {
+        Self {
+            wrap: Cell::new(true),
+            copied_until: Cell::new(0.0),
+        }
+    }
+}
+
+impl Document {
+    pub fn new(blocks: Vec<Placed>) -> Self {
+        let loading_images = blocks
+            .iter()
+            .any(|block| matches!(block.block, Block::Image(_)));
+        let code_controls = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block.block, Block::Code(_)))
+            .map(|(index, _)| (index, CodeControls::default()))
+            .collect();
+        Self {
+            blocks,
+            pictures: HashMap::new(),
+            loading_images,
+            code_controls,
+        }
+    }
+
+    /// Unchanged blocks keep their controls and image layout on a file reload.
+    /// State is released when its preview is replaced or closed.
+    pub fn retain_state_from(&mut self, previous: &Self, image_limit: usize) {
+        for (&index, controls) in &self.code_controls {
+            if previous.blocks.get(index) == self.blocks.get(index)
+                && let Some(old) = previous.code_controls.get(&index)
+            {
+                controls.wrap.set(old.wrap.get());
+                controls.copied_until.set(old.copied_until.get());
+            }
+        }
+        // Keep layout stable while unchanged images are being read again.
+        // A failed replacement removes its cached picture on the UI thread.
+        for (index, block) in self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block.block, Block::Image(_)))
+            .take(image_limit)
+        {
+            if Some(block) == previous.blocks.get(index)
+                && let Some(picture) = previous.pictures.get(&index)
+            {
+                self.pictures.insert(index, picture.clone());
+            }
+        }
+    }
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Table {
@@ -286,6 +376,19 @@ struct Fence {
 }
 
 pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
+    parse_blocks(text, lines, false)
+}
+
+fn code_line(text: &str, indent: usize, verbatim: bool) -> &str {
+    let text = undent(text, indent);
+    if verbatim {
+        text.trim_end_matches('\r')
+    } else {
+        text.trim_end()
+    }
+}
+
+fn parse_blocks(text: &str, lines: Lines, verbatim_code: bool) -> Vec<Placed> {
     let source: Vec<&str> = text.lines().collect();
     let mut blocks: Vec<Placed> = Vec::new();
     // Whether the last block is still open to continuation lines.
@@ -314,7 +417,7 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
                     if !code.is_empty() {
                         code.push('\n');
                     }
-                    code.push_str(undent(rest, fenced.indent).trim_end());
+                    code.push_str(code_line(rest, fenced.indent, verbatim_code));
                 }
                 continue;
             }
@@ -396,7 +499,7 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
             }
             // Set in by four under where it would start: code, to the
             // first line that is not.
-            let mut code = undent(rest, strip).trim_end().to_owned();
+            let mut code = code_line(rest, strip, verbatim_code).to_owned();
             let mut blank = 0;
             while let Some(next) = source.get(at) {
                 let (depth, next) = quoted(next, DEEPEST);
@@ -407,7 +510,7 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
                     blank += 1;
                 } else if column(next) >= strip {
                     code.extend(std::iter::repeat_n('\n', blank + 1));
-                    code.push_str(undent(next, strip).trim_end());
+                    code.push_str(code_line(next, strip, verbatim_code));
                     blank = 0;
                 } else {
                     break;
@@ -423,6 +526,170 @@ pub fn blocks(text: &str, lines: Lines) -> Vec<Placed> {
         }
     }
     blocks
+}
+
+/// File documents also show Markdown images and HTML `img` elements.
+/// Other HTML stays literal; this parser never executes markup.
+pub fn document_blocks(text: &str) -> Vec<Placed> {
+    let mut result = Vec::new();
+    for placed in parse_blocks(text, Lines::Joined, true) {
+        let text = match &placed.block {
+            Block::Text(text)
+            | Block::Bullet(text)
+            | Block::Numbered(_, text)
+            | Block::Task(_, text)
+            | Block::Heading(_, text) => text,
+            _ => {
+                result.push(placed);
+                continue;
+            }
+        };
+        let listed = matches!(
+            placed.block,
+            Block::Bullet(_) | Block::Numbered(..) | Block::Task(..)
+        );
+        let part = |text: &str, first: bool| {
+            let block = match (&placed.block, first) {
+                (Block::Bullet(_), true) => Block::Bullet(text.into()),
+                (Block::Numbered(number, _), true) => Block::Numbered(number.clone(), text.into()),
+                (Block::Task(done, _), true) => Block::Task(*done, text.into()),
+                (Block::Heading(level, _), true) => Block::Heading(*level, text.into()),
+                _ => Block::Text(text.into()),
+            };
+            Placed {
+                quote: placed.quote,
+                inset: placed.inset + u8::from(listed && !first),
+                block,
+            }
+        };
+        let (mut start, mut at) = (0, 0);
+        while at < text.len() {
+            if text.as_bytes()[at] == b'`' {
+                let run = run_of(text.as_bytes(), at);
+                if let Some(end) = code_end(text.as_bytes(), at + run, run) {
+                    at = end + run;
+                    continue;
+                }
+            }
+            if text.as_bytes()[at] == b'\\' {
+                at += 1;
+                at += text[at..].chars().next().map_or(0, char::len_utf8);
+                continue;
+            }
+            if let Some((image, end)) = image_at(text, at) {
+                if !text[start..at].trim().is_empty() {
+                    result.push(part(text[start..at].trim(), start == 0));
+                }
+                result.push(Placed {
+                    quote: placed.quote,
+                    inset: placed.inset + u8::from(listed),
+                    block: Block::Image(image),
+                });
+                at = end;
+                start = end;
+            } else {
+                at += text[at..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+        if start == 0 {
+            result.push(placed);
+        } else if !text[start..].trim().is_empty() {
+            result.push(part(text[start..].trim(), false));
+        }
+    }
+    result
+}
+
+fn image_at(text: &str, at: usize) -> Option<(Image, usize)> {
+    let rest = &text[at..];
+    if rest.starts_with("[![") {
+        let outer = link_at(text, at)?;
+        let (mut image, end) = image_at(text, at + 1)?;
+        if end != outer.label {
+            return None;
+        }
+        image.link = Some(outer.to);
+        return Some((image, outer.end));
+    }
+    if rest.starts_with("![") {
+        let found = link_at(text, at + 1)?;
+        return Some((
+            Image {
+                source: found.to,
+                alt: unescaped(&text[at + 2..found.label]),
+                width: None,
+                height: None,
+                link: None,
+            },
+            found.end,
+        ));
+    }
+    if !rest.get(..4)?.eq_ignore_ascii_case("<img")
+        || !rest.as_bytes().get(4)?.is_ascii_whitespace()
+    {
+        return None;
+    }
+    let mut attributes = HashMap::new();
+    let mut rest = &rest[4..];
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('>') || rest.starts_with("/>") {
+            break;
+        }
+        let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '=' | '>' | '/'))?;
+        if end == 0 {
+            return None;
+        }
+        let name = rest[..end].to_ascii_lowercase();
+        rest = rest[end..].trim_start();
+        if let Some(value) = rest.strip_prefix('=') {
+            rest = value.trim_start();
+            let (value, after) = if rest.starts_with(['\'', '"']) {
+                let quote = rest.as_bytes()[0] as char;
+                let end = rest[1..].find(quote)? + 1;
+                (&rest[1..end], &rest[end + 1..])
+            } else {
+                let end = rest.find(|c: char| c.is_whitespace() || c == '>')?;
+                (&rest[..end], &rest[end..])
+            };
+            attributes.insert(name, html_value(value));
+            rest = after;
+        }
+    }
+    let dimension = |key| {
+        attributes
+            .get(key)
+            .and_then(|value: &String| value.parse::<u32>().ok())
+            .filter(|value| (1..=16_384).contains(value))
+    };
+    let image = Image {
+        source: attributes.get("src")?.clone(),
+        alt: attributes.get("alt").cloned().unwrap_or_default(),
+        width: dimension("width"),
+        height: dimension("height"),
+        link: None,
+    };
+    let end = text.len() - rest.len() + if rest.starts_with("/>") { 2 } else { 1 };
+    Some((image, end))
+}
+
+fn html_value(mut text: &str) -> String {
+    let mut value = String::with_capacity(text.len());
+    while let Some(at) = text.find('&') {
+        value.push_str(&text[..at]);
+        text = &text[at..];
+        if let Some((entity, character)) =
+            ENTITIES.iter().find(|(entity, _)| text.starts_with(entity))
+        {
+            value.push(*character);
+            text = &text[entity.len()..];
+        } else {
+            value.push('&');
+            text = &text[1..];
+        }
+    }
+    value.push_str(text);
+    value
 }
 
 /// How a run of text inside a line is set.
@@ -979,6 +1246,85 @@ fn inline(text: &str, unpaired: bool) -> Inline {
 enum Target {
     Web(WebLink),
     File(PathBuf),
+    Document(PathBuf, Option<String>),
+}
+
+impl Target {
+    fn action(&self) -> Action {
+        match self {
+            Self::Web(link) => Action::OpenLink(link.clone()),
+            Self::File(path) => Action::Explorer(super::explorer::Event::Open(path.clone())),
+            Self::Document(path, anchor) => Action::Explorer(super::explorer::Event::FollowLink {
+                path: path.clone(),
+                anchor: anchor.clone(),
+            }),
+        }
+    }
+}
+
+fn target_at(link: &str, document: Option<&Path>) -> Option<Target> {
+    let Some(document) = document else {
+        return target(link);
+    };
+    if let Some(web) = WebLink::new(link) {
+        return Some(Target::Web(web));
+    }
+    if link.len() > 4096 || link.chars().any(char::is_control) {
+        return None;
+    }
+    let (name, anchor) = link.split_once('#').map_or((link, None), |(name, anchor)| {
+        (name, Some(anchor.to_owned()))
+    });
+    let path = if name.is_empty() {
+        document.to_path_buf()
+    } else if name
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+    {
+        let Target::File(path) = target(name)? else {
+            return None;
+        };
+        path
+    } else {
+        // A URL scheme is not a relative file, including script/data URLs.
+        if name.contains(':') && !Path::new(name).is_absolute() {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(name.len());
+        let mut source = name.bytes();
+        while let Some(byte) = source.next() {
+            bytes.push(if byte == b'%' {
+                let digits = [source.next()?, source.next()?];
+                u8::from_str_radix(std::str::from_utf8(&digits).ok()?, 16).ok()?
+            } else {
+                byte
+            });
+        }
+        let name = String::from_utf8(bytes).ok()?;
+        if name.chars().any(char::is_control) {
+            return None;
+        }
+        document.parent()?.join(name)
+    };
+    Some(Target::Document(path, anchor))
+}
+
+pub fn picture_path(source: &str, document: &Path) -> Option<PathBuf> {
+    match target_at(source, Some(document))? {
+        Target::Document(path, _) => Some(path),
+        _ => None,
+    }
+}
+
+fn heading_anchor(text: &str) -> String {
+    inline(text, false)
+        .spans
+        .into_iter()
+        .flat_map(|span| span.text.chars().collect::<Vec<_>>())
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || matches!(c, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .map(|c| if c.is_whitespace() { '-' } else { c })
+        .collect()
 }
 
 fn target(link: &str) -> Option<Target> {
@@ -1101,10 +1447,14 @@ struct Laid {
 /// it. A link that can be pressed, which is what `live` asks for, is
 /// underlined.
 fn lay(text: &str, face: &Face, live: bool) -> Laid {
+    lay_at(text, face, live, None)
+}
+
+fn lay_at(text: &str, face: &Face, live: bool, document: Option<&Path>) -> Laid {
     let Inline { spans, links } = inline(text, true);
     let pressed: Vec<bool> = links
         .iter()
-        .map(|link| live && target(link).is_some())
+        .map(|link| live && target_at(link, document).is_some())
         .collect();
     let mut ranges = vec![None::<Range<usize>>; links.len()];
     let mut job = LayoutJob::default();
@@ -1183,6 +1533,7 @@ pub fn plain(text: &str) -> String {
                 }
             }
             Block::Rule => {}
+            Block::Image(image) => add(&mut words, &image.alt),
         }
     }
     words.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -1206,7 +1557,7 @@ fn label(
     ui: &mut Ui,
     laid: Laid,
     salt: impl std::hash::Hash + std::fmt::Debug + Copy,
-    actions: Option<(&mut Vec<Action>, Palette)>,
+    actions: Option<(&mut Vec<Action>, Palette, Option<&Path>)>,
 ) -> Rect {
     let Laid { mut job, links } = laid;
     job.wrap.max_width = ui.available_width();
@@ -1219,9 +1570,11 @@ fn label(
         Align::Center => rect.center_top(),
         Align::Max => rect.right_top(),
     };
-    if let Some((actions, p)) = actions.filter(|_| !links.is_empty() && ui.is_rect_visible(rect)) {
+    if let Some((actions, p, document)) =
+        actions.filter(|_| !links.is_empty() && ui.is_rect_visible(rect))
+    {
         for (index, (range, link)) in links.iter().enumerate() {
-            let target = target(link);
+            let target = target_at(link, document);
             let words = || -> String {
                 let text = galley.job.text.chars();
                 text.skip(range.start).take(range.len()).collect()
@@ -1264,12 +1617,7 @@ fn label(
                     .on_hover_text(link.as_str())
                     .clicked()
                 {
-                    actions.push(match target {
-                        Target::Web(link) => Action::OpenLink(link.clone()),
-                        Target::File(path) => {
-                            Action::Explorer(super::explorer::Event::Open(path.clone()))
-                        }
-                    });
+                    actions.push(target.action());
                 }
             }
         }
@@ -1308,7 +1656,7 @@ pub fn width(ui: &Ui, text: &str, lines: Lines, limit: f32) -> f32 {
                     marker + line(text, Face::body(ink), room - marker)
                 }
                 // A fenced block and a table fill their column.
-                Block::Code(_) | Block::Table(_) => room,
+                Block::Code(_) | Block::Table(_) | Block::Image(_) => room,
                 Block::Rule => 0.0,
                 Block::Text(text) => line(text, Face::body(ink), room),
             },
@@ -1346,7 +1694,41 @@ fn render(
     text: &str,
     lines: Lines,
     ink: Color32,
+    actions: Option<&mut Vec<Action>>,
+) -> Option<Rect> {
+    render_blocks(ui, p, &blocks(text, lines), lines, ink, actions, None)
+}
+
+/// Draws a document already parsed by a file-preview worker.
+pub fn show_document(
+    ui: &mut Ui,
+    p: Palette,
+    document: &Document,
+    path: &Path,
+    anchor: Option<&str>,
+    actions: &mut Vec<Action>,
+) -> Option<Rect> {
+    // Files have headings of their own; the small section labels of release
+    // notes would flatten a document's hierarchy. Paragraphs are already joined.
+    render_blocks(
+        ui,
+        p,
+        &document.blocks,
+        Lines::Kept,
+        p.fg,
+        Some(actions),
+        Some((path, document, anchor)),
+    )
+}
+
+fn render_blocks(
+    ui: &mut Ui,
+    p: Palette,
+    blocks: &[Placed],
+    lines: Lines,
+    ink: Color32,
     mut actions: Option<&mut Vec<Action>>,
+    document: Option<(&Path, &Document, Option<&str>)>,
 ) -> Option<Rect> {
     let marker = |ui: &mut Ui, block: &Block| {
         let (_, marker) = ui.allocate_space(vec2(16.0, LINE));
@@ -1388,7 +1770,7 @@ fn render(
     // How many quotes the block above stood in, and where it ended: their
     // bars run on through the room between two blocks.
     let mut above = (0_u8, 0.0_f32);
-    for (index, placed) in blocks(text, lines).iter().enumerate() {
+    for (index, placed) in blocks.iter().enumerate() {
         let gap = if index == 0 { 0.0 } else { 6.0 };
         ui.add_space(match &placed.block {
             Block::Heading(level, _) if index > 0 => {
@@ -1406,21 +1788,32 @@ fn render(
             _ => gap,
         });
         let (left, top) = (ui.cursor().left(), ui.cursor().top());
-        let links = actions.as_deref_mut().map(|actions| (actions, p));
+        let base = document.map(|(path, _, _)| path);
+        let links = actions.as_deref_mut().map(|actions| (actions, p, base));
         let block = |ui: &mut Ui| match &placed.block {
             Block::Heading(level, text) => {
                 let face = Face::heading(*level, lines, ink, p.secondary);
-                label(ui, lay(text, &face, links.is_some()), index, links)
+                let rect = label(ui, lay_at(text, &face, links.is_some(), base), index, links);
+                if document
+                    .and_then(|(_, _, anchor)| anchor)
+                    .is_some_and(|anchor| anchor == heading_anchor(text))
+                {
+                    ui.scroll_to_rect(rect, Some(Align::Min));
+                }
+                rect
             }
             Block::Bullet(text) | Block::Numbered(_, text) | Block::Task(_, text) => {
                 ui.horizontal_top(|ui| {
                     marker(ui, &placed.block);
-                    let laid = lay(text, &Face::body(ink), links.is_some());
+                    let laid = lay_at(text, &Face::body(ink), links.is_some(), base);
                     label(ui, laid, index, links)
                 })
                 .inner
             }
             Block::Code(code) => {
+                if let Some((_, document, _)) = document {
+                    return code_block(ui, p, ink, code, index, &document.code_controls[&index]);
+                }
                 Frame::new()
                     .fill(p.control)
                     .corner_radius(theme::metrics::CONTROL_RADIUS)
@@ -1440,6 +1833,79 @@ fn render(
                     .response
                     .rect
             }
+            Block::Image(image) => {
+                let picture = document.and_then(|(_, document, _)| document.pictures.get(&index));
+                let rect = if let Some(picture) = picture {
+                    let mut size = vec2(picture.pixels[0] as f32, picture.pixels[1] as f32);
+                    match (image.width, image.height) {
+                        (Some(width), Some(height)) => size = vec2(width as f32, height as f32),
+                        (Some(width), None) => size *= width as f32 / size.x,
+                        (None, Some(height)) => size *= height as f32 / size.y,
+                        _ => {}
+                    }
+                    size *= (ui.available_width() / size.x).min(1.0);
+                    let response =
+                        ui.add(egui::Image::new(&picture.texture).fit_to_exact_size(size));
+                    response
+                        .widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, &image.alt));
+                    ui.painter().rect_stroke(
+                        response.rect,
+                        0,
+                        Stroke::new(
+                            1.0,
+                            if p.dark {
+                                Color32::from_white_alpha(25)
+                            } else {
+                                Color32::from_black_alpha(25)
+                            },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    response.on_hover_text(&image.alt).rect
+                } else {
+                    let loading = document.is_some_and(|(_, document, _)| document.loading_images);
+                    let status = if loading {
+                        "Loading image…"
+                    } else {
+                        "Image unavailable"
+                    };
+                    let caption = if image.alt.is_empty() {
+                        status.to_owned()
+                    } else {
+                        format!("{status} · {}", image.alt)
+                    };
+                    ui.label(egui::RichText::new(caption).color(p.muted))
+                        .on_hover_text(if loading {
+                            "Pictures load in the background"
+                        } else {
+                            "Could not load this picture or the document's image limit was reached"
+                        })
+                        .rect
+                };
+                if let Some((actions, _, _)) = links
+                    && let Some(target) =
+                        image.link.as_deref().and_then(|link| target_at(link, base))
+                {
+                    let response = ui.interact(
+                        rect,
+                        ui.id().with(("document-image-link", index)),
+                        Sense::click(),
+                    );
+                    response
+                        .widget_info(|| WidgetInfo::labeled(WidgetType::Link, true, &image.alt));
+                    if response.has_focus() {
+                        focus_ring(ui.painter(), rect, 3, p);
+                    }
+                    if response
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(image.link.as_deref().unwrap_or_default())
+                        .clicked()
+                    {
+                        actions.push(target.action());
+                    }
+                }
+                rect
+            }
             Block::Rule => {
                 let (_, rule) = ui.allocate_space(vec2(ui.available_width(), 1.0));
                 ui.painter()
@@ -1448,7 +1914,7 @@ fn render(
             }
             Block::Table(table) => grid(ui, p, ink, table, index, links),
             Block::Text(text) => {
-                let laid = lay(text, &Face::body(ink), links.is_some());
+                let laid = lay_at(text, &Face::body(ink), links.is_some(), base);
                 label(ui, laid, index, links)
             }
         };
@@ -1483,6 +1949,81 @@ fn render(
     last
 }
 
+fn code_block(
+    ui: &mut Ui,
+    p: Palette,
+    ink: Color32,
+    code: &str,
+    index: usize,
+    controls: &CodeControls,
+) -> Rect {
+    let id = ui.id().with(("document-code", index));
+    let mut wrap = controls.wrap.get();
+    let copied = controls.copied_until.get();
+    let now = ui.input(|input| input.time);
+    let rect = Frame::new()
+        .fill(p.control)
+        .corner_radius(theme::metrics::CONTROL_RADIUS)
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Code")
+                        .font(theme::regular(11.0))
+                        .color(p.muted),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if icons::button(
+                        ui,
+                        if copied > now {
+                            Icon::Check
+                        } else {
+                            Icon::Copy
+                        },
+                        "Copy code block",
+                    )
+                    .clicked()
+                    {
+                        crate::platform::clipboard::copy(ui.ctx(), code.to_owned());
+                        controls.copied_until.set(now + 1.2);
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(1200));
+                    }
+                    let surface = ui.painter().add(egui::Shape::Noop);
+                    let response = icons::button(ui, Icon::Wrap, "Toggle code line wrapping");
+                    if wrap {
+                        ui.painter().set(
+                            surface,
+                            egui::Shape::rect_filled(response.rect.shrink(1.0), 7, p.pressed),
+                        );
+                    }
+                    if response.clicked() {
+                        wrap = !wrap;
+                    }
+                });
+            });
+            let text = egui::RichText::new(code)
+                .font(FontId::monospace(12.0))
+                .color(ink);
+            if wrap {
+                ui.add(egui::Label::new(text).wrap());
+            } else {
+                egui::ScrollArea::horizontal()
+                    .id_salt(id.with("scroll"))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
+                    });
+            }
+        })
+        .response
+        .rect;
+    controls.wrap.set(wrap);
+    rect
+}
+
 /// A table: its header in the medium weight over a line, its rows parted
 /// by hairlines. A column is as wide as its longest cell while the table
 /// fits; where it does not, cells wrap, and a table too wide even so is
@@ -1493,7 +2034,7 @@ fn grid(
     ink: Color32,
     table: &Table,
     salt: usize,
-    mut actions: Option<(&mut Vec<Action>, Palette)>,
+    mut actions: Option<(&mut Vec<Action>, Palette, Option<&Path>)>,
 ) -> Rect {
     /// The room around a cell's text.
     const PAD: egui::Vec2 = vec2(8.0, 4.0);
@@ -1501,9 +2042,10 @@ fn grid(
     const NARROW: f32 = 56.0;
     const WRAPPED: f32 = 120.0;
     let live = actions.is_some();
+    let document = actions.as_ref().and_then(|(_, _, path)| *path);
     let rows = || std::iter::once(&table.head).chain(&table.rows);
     let cell = |head: bool, text: &str, width: f32, align: Align| {
-        let mut laid = lay(text, &Face::cell(head, ink), live);
+        let mut laid = lay_at(text, &Face::cell(head, ink), live, document);
         laid.job.wrap.max_width = width;
         laid.job.halign = align;
         laid
@@ -1568,7 +2110,9 @@ fn grid(
                     ("markup-cell", salt, row, column),
                     |ui| {
                         let laid = cell(row == 0, &cells[column], widths[column], align);
-                        let links = actions.as_mut().map(|(actions, p)| (&mut **actions, *p));
+                        let links = actions
+                            .as_mut()
+                            .map(|(actions, p, path)| (&mut **actions, *p, *path));
                         label(ui, laid, (salt, row, column), links);
                     },
                 );
@@ -1598,6 +2142,135 @@ fn grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_controls_belong_to_the_current_document_and_survive_unchanged_reload() {
+        let before = Document::new(document_blocks("```sh\nfirst\n```\n\n```sh\nsecond\n```"));
+        before.code_controls[&0].wrap.set(false);
+        before.code_controls[&0].copied_until.set(1.2);
+        let mut after = Document::new(document_blocks("```sh\nfirst\n```"));
+        after.retain_state_from(&before, 16);
+        assert_eq!(
+            after.code_controls.len(),
+            1,
+            "removed blocks retain no controls"
+        );
+        assert!(!after.code_controls[&0].wrap.get());
+        assert_eq!(after.code_controls[&0].copied_until.get(), 1.2);
+        let mut changed = Document::new(document_blocks("```sh\nchanged\n```"));
+        changed.retain_state_from(&before, 16);
+        assert!(changed.code_controls[&0].wrap.get());
+        assert_eq!(changed.code_controls[&0].copied_until.get(), 0.0);
+    }
+
+    #[test]
+    fn unchanged_images_keep_their_layout_while_a_reload_is_pending() {
+        let ctx = egui::Context::default();
+        let mut before = Document::new(document_blocks("![Logo](logo.png)"));
+        let texture = ctx.load_texture(
+            "reload-test",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let id = texture.id();
+        before.pictures.insert(
+            0,
+            Picture {
+                texture,
+                pixels: [96, 96],
+            },
+        );
+        let mut after = Document::new(document_blocks("![Logo](logo.png)"));
+        after.retain_state_from(&before, 16);
+        assert_eq!(after.pictures[&0].texture.id(), id);
+        assert_eq!(after.pictures[&0].pixels, [96, 96]);
+        assert!(
+            after.loading_images,
+            "the retained picture is still refreshed"
+        );
+        let mut changed = Document::new(document_blocks("![Logo](replacement.png)"));
+        changed.retain_state_from(&before, 16);
+        assert!(changed.pictures.is_empty());
+        let mut beyond_limit = Document::new(document_blocks("Paragraph\n\n![Logo](logo.png)"));
+        beyond_limit.pictures.insert(1, before.pictures[&0].clone());
+        let mut newly_inserted =
+            Document::new(document_blocks("![New](new.png)\n\n![Logo](logo.png)"));
+        newly_inserted.retain_state_from(&beyond_limit, 1);
+        assert!(
+            newly_inserted.pictures.is_empty(),
+            "an image beyond the new document's limit is released"
+        );
+    }
+
+    #[test]
+    fn document_images_parse_markdown_and_html_without_interpreting_code() {
+        let parsed = document_blocks(
+            "Before ![Plot](assets/a%20b.png) after.\n\n<img HEIGHT='96' src=assets/logo.png alt=\"Neptune &amp; logo\" width=96>\n\n`![literal](code.png)`\n\n```html\n<img src=code.png>\n```\n",
+        );
+        assert!(
+            matches!(&parsed[1].block, Block::Image(image) if image.source == "assets/a%20b.png" && image.alt == "Plot")
+        );
+        assert!(
+            matches!(&parsed[3].block, Block::Image(image) if image.width == Some(96) && image.height == Some(96) && image.alt == "Neptune & logo")
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|block| matches!(block.block, Block::Image(_)))
+                .count(),
+            2
+        );
+        let list = document_blocks(
+            "- A [![Logo](logo.png)](https://neptune.rs) after\n\n## ![Heading image](heading.png)",
+        );
+        assert!(
+            matches!(&list[1].block, Block::Image(image) if image.link.as_deref() == Some("https://neptune.rs"))
+        );
+        assert_eq!(list[1].inset, 1);
+        assert!(matches!(&list[3].block, Block::Image(image) if image.source == "heading.png"));
+        for cut in "<img src=\"broken.png\" alt='still typing'>"
+            .char_indices()
+            .map(|(at, _)| at)
+        {
+            document_blocks(&"<img src=\"broken.png\" alt='still typing'>"[..cut]);
+        }
+    }
+
+    #[test]
+    fn document_links_resolve_from_the_file_and_reject_executable_schemes() {
+        let file = Path::new("/project/README.md");
+        assert_eq!(
+            target_at("docs/user%20guide.md#settings", Some(file)),
+            Some(Target::Document(
+                "/project/docs/user guide.md".into(),
+                Some("settings".into())
+            ))
+        );
+        assert_eq!(
+            target_at("#quick-start", Some(file)),
+            Some(Target::Document(file.into(), Some("quick-start".into())))
+        );
+        assert!(matches!(
+            target_at("https://neptune.rs", Some(file)),
+            Some(Target::Web(_))
+        ));
+        for unsafe_link in [
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "relative%00name",
+            "https://",
+            "broken%xy",
+        ] {
+            assert!(
+                target_at(unsafe_link, Some(file)).is_none(),
+                "{unsafe_link}"
+            );
+        }
+        assert_eq!(
+            heading_anchor("Quick **start** & setup!"),
+            "quick-start--setup"
+        );
+    }
 
     /// The blocks of `text` without where they stand.
     fn kinds(text: &str, lines: Lines) -> Vec<Block> {
@@ -2266,6 +2939,71 @@ mod tests {
             collect(&clipped.shape, &mut found);
         }
         found
+    }
+
+    #[test]
+    fn document_links_emit_browser_and_relative_preview_actions_when_clicked() {
+        let ctx = context();
+        let document = Document::new(document_blocks(
+            "[Website](https://neptune.rs)\n\n[Guide](docs/usage.md#settings)\n\n[![Logo](logo.png)](https://neptune.rs/download)",
+        ));
+        let path = Path::new("/project/README.md");
+        let run = |events| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(WINDOW),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_width(300.0);
+                    show_document(
+                        ui,
+                        Palette::for_config(&crate::config::Config::default()),
+                        &document,
+                        path,
+                        None,
+                        &mut actions,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            (actions, output)
+        };
+        run(Vec::new());
+        let (_, output) = run(Vec::new());
+        let press = |label: &str| {
+            let pos = drawn(&output)
+                .into_iter()
+                .find(|(text, ..)| text == label)
+                .unwrap()
+                .1
+                .center();
+            run(vec![egui::Event::PointerMoved(pos)]);
+            run(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }]);
+            run(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }])
+            .0
+        };
+        assert!(
+            matches!(press("Website").as_slice(), [Action::OpenLink(link)] if link.as_str() == "https://neptune.rs")
+        );
+        assert!(
+            matches!(press("Guide").as_slice(), [Action::Explorer(super::super::explorer::Event::FollowLink { path, anchor })] if path == Path::new("/project/docs/usage.md") && anchor.as_deref() == Some("settings"))
+        );
+        assert!(
+            matches!(press("Loading image… · Logo").as_slice(), [Action::OpenLink(link)] if link.as_str() == "https://neptune.rs/download")
+        );
     }
 
     #[test]
