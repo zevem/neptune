@@ -11,6 +11,7 @@ use crate::runtime::pull_requests::Checks;
 use crate::ui::changes::{DiffBody, File, Status};
 use crate::ui::pull_request::{Body, Event, FileList, Problem, Shown};
 use neptune_model::PullRequest;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A slow host is asked less often: the GitHub CLI gets at most this share
 /// of the worker's time.
@@ -39,6 +40,11 @@ struct Watch {
     plain: bool,
     /// Another window is the active one: it is read less often.
     background: bool,
+    /// Which reading of it and of its files the tab waits for. Each counts
+    /// up when the tab lets go of what it had, so that the worker reports
+    /// again what it has already read once.
+    detail_turn: u64,
+    files_turn: u64,
 }
 
 enum Request {
@@ -59,6 +65,8 @@ enum Reply {
     },
     Files {
         link: PullRequest,
+        /// The reading of its files this answers.
+        turn: u64,
         read: Result<Files, Failure>,
     },
     Done {
@@ -115,6 +123,147 @@ impl Default for Source {
     }
 }
 
+/// The most pictures shown of one pull request, the most one may weigh and
+/// the most points a side of one keeps.
+const MAX_PICTURES: usize = 16;
+const PICTURE_BYTES: u64 = 8 * 1024 * 1024;
+const PICTURE_PIXELS: u32 = 1_024;
+
+type Decoded = ([u32; 2], egui::ColorImage);
+type Fetch = Box<dyn Fn(&PullRequest, &str) -> Option<Decoded> + Send>;
+/// A picture as its worker reports it: the pull request shown when it was
+/// asked for, where it comes from and what was read of it.
+type ReadPicture = (u64, String, Option<Decoded>);
+
+/// Whether a picture written in a pull request is fetched: one its host
+/// keeps, over an encrypted connection. A picture kept elsewhere would tell
+/// whoever keeps it that the person read this; it opens in the browser.
+fn fetched(link: &PullRequest, source: &str) -> bool {
+    let Some(rest) = source.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (of, _, _) = link.location();
+    host.eq_ignore_ascii_case(of)
+        || (of.eq_ignore_ascii_case("github.com")
+            && host
+                .to_ascii_lowercase()
+                .ends_with(".githubusercontent.com"))
+}
+
+/// Reads a picture without the person's account, as a public repository
+/// serves it, then through their GitHub CLI, as a private one does.
+fn fetch_picture(link: &PullRequest, source: &str) -> Option<Decoded> {
+    let limit = [PICTURE_PIXELS, PICTURE_PIXELS];
+    let open = || {
+        let address = crate::platform::links::WebLink::new(source)?;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .max_redirects(3)
+            .build()
+            .into();
+        let bytes = agent
+            .get(address.as_str())
+            .call()
+            .ok()?
+            .body_mut()
+            .with_config()
+            .limit(PICTURE_BYTES)
+            .read_to_vec()
+            .ok()?;
+        image_preview::decode_bytes(&bytes, limit)
+    };
+    open().or_else(|| {
+        // Only what was attached on the pull request's own host is asked
+        // for with the person's account.
+        let (host, _, _) = link.location();
+        let attached = source
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(of, path)| {
+                of.eq_ignore_ascii_case(host) && path.starts_with("user-attachments/")
+            });
+        if !attached {
+            return None;
+        }
+        let bytes = source::read_attachment(source, PICTURE_BYTES)?;
+        image_preview::decode_bytes(&bytes, limit)
+    })
+}
+
+/// The pictures of what is written in the pull request shown. They are read
+/// one at a time on a thread of their own, so that none holds up the pull
+/// request, and let go with it.
+struct Pictures {
+    replies: (mpsc::Sender<ReadPicture>, mpsc::Receiver<ReadPicture>),
+    worker: Option<mpsc::Sender<(u64, PullRequest, String)>>,
+    /// Taken by the worker, which starts with the first picture.
+    fetch: Option<Fetch>,
+    /// Counts the pull requests shown: a picture of an earlier one is
+    /// neither read nor kept.
+    turn: Arc<AtomicU64>,
+    read: ui::markup::Pictures,
+    asked: Vec<String>,
+    /// What is shown was read anew: its pictures are looked for.
+    due: bool,
+}
+
+impl Default for Pictures {
+    fn default() -> Self {
+        Self {
+            replies: mpsc::channel(),
+            worker: None,
+            // Tests of the application reach no host.
+            fetch: (!cfg!(test)).then(|| Box::new(fetch_picture) as Fetch),
+            turn: Arc::default(),
+            read: ui::markup::Pictures::new(),
+            asked: Vec::new(),
+            due: false,
+        }
+    }
+}
+
+impl Pictures {
+    fn forget(&mut self) {
+        self.turn.fetch_add(1, Ordering::Relaxed);
+        self.read.clear();
+        self.asked.clear();
+        self.due = true;
+    }
+
+    fn ask(&mut self, ctx: &egui::Context, link: &PullRequest, source: String) -> bool {
+        if self.worker.is_none() {
+            let Some(fetch) = self.fetch.take() else {
+                return false;
+            };
+            let (sender, requests) = mpsc::channel::<(u64, PullRequest, String)>();
+            let (replies, turn, wake) = (self.replies.0.clone(), self.turn.clone(), ctx.clone());
+            let spawned = std::thread::Builder::new()
+                .name("neptune-pull-request-pictures".into())
+                .spawn(move || {
+                    for (of, link, source) in requests {
+                        if turn.load(Ordering::Relaxed) != of {
+                            continue;
+                        }
+                        let picture = fetch(&link, &source);
+                        if replies.send((of, source, picture)).is_err() {
+                            return;
+                        }
+                        wake.request_repaint();
+                    }
+                });
+            if spawned.is_err() {
+                return false;
+            }
+            self.worker = Some(sender);
+        }
+        let of = self.turn.load(Ordering::Relaxed);
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| worker.send((of, link.clone(), source)).is_ok())
+    }
+}
+
 pub(super) struct PullRequestTab {
     replies: (mpsc::Sender<Reply>, mpsc::Receiver<Reply>),
     worker: Option<mpsc::Sender<Request>>,
@@ -132,6 +281,10 @@ pub(super) struct PullRequestTab {
     shown: Option<PullRequest>,
     detail: Option<Result<Box<Detail>, Failure>>,
     files: Option<Result<Files, Failure>>,
+    /// Which reading of each the tab waits for: see `Watch`.
+    detail_turn: u64,
+    files_turn: u64,
+    pictures: Pictures,
     /// The person asked for it to be read again, and it has not been yet.
     refreshing: bool,
     /// What is being done to it.
@@ -153,6 +306,9 @@ impl Default for PullRequestTab {
             shown: None,
             detail: None,
             files: None,
+            detail_turn: 0,
+            files_turn: 0,
+            pictures: Pictures::default(),
             refreshing: false,
             acting: None,
             problem: None,
@@ -264,7 +420,9 @@ fn worker(
 ) {
     let mut watch: Option<Watch> = None;
     let mut known: Option<(PullRequest, Result<Detail, Failure>)> = None;
-    // The pull request and commit whose files were read.
+    // The reading of it the tab was last told.
+    let mut told: Option<u64> = None;
+    // The pull request, commit and reading whose files were read.
     let mut files_of: Option<(PullRequest, String)> = None;
     let mut wanted: Vec<PullRequest> = Vec::new();
     let mut next = Instant::now();
@@ -322,7 +480,9 @@ fn worker(
             next = Instant::now();
         }
         if let Some(current) = &watch {
-            if Instant::now() >= next {
+            // A tab that let go of what it had is told again at once.
+            let waits = told != Some(current.detail_turn);
+            if waits || Instant::now() >= next {
                 let started = Instant::now();
                 let read = (source.detail)(&current.link);
                 let slower = if current.background { BACKGROUND } else { 1 };
@@ -331,13 +491,14 @@ fn worker(
                 let same = known
                     .as_ref()
                     .is_some_and(|(link, was)| link.same(&current.link) && *was == read);
-                if asked || !same {
+                if asked || waits || !same {
                     reports.push(Reply::Detail {
                         link: current.link.clone(),
                         read: read.clone().map(Box::new),
                     });
                     known = Some((current.link.clone(), read));
                 }
+                told = Some(current.detail_turn);
                 asked = false;
             }
             // Its files are read once for each commit it comes to end with,
@@ -350,14 +511,33 @@ fn worker(
                     _ => None,
                 })
                 .unwrap_or_default();
-            // Read anew when white space is to be left out, or shown again.
-            let of_commit = format!("{of_commit} {}", current.plain);
+            // Read anew when white space is to be left out, or shown again,
+            // and when the tab let go of the files it had.
+            let of_commit = format!("{of_commit} {} {}", current.plain, current.files_turn);
+            let read_for = |of_commit: &str| {
+                files_of
+                    .as_ref()
+                    .is_some_and(|(of, commit)| of.same(&current.link) && commit == of_commit)
+            };
             if current.files
+                && let Some((link, Err(failure))) = &known
+                && link.same(&current.link)
+            {
+                // Its files cannot be read while it cannot be: the tab is
+                // told so once, and they are read when it can be again.
+                let of_commit = format!("{of_commit} unread");
+                if !read_for(&of_commit) {
+                    reports.push(Reply::Files {
+                        link: link.clone(),
+                        turn: current.files_turn,
+                        read: Err(*failure),
+                    });
+                    files_of = Some((link.clone(), of_commit));
+                }
+            } else if current.files
                 && let Some((link, Ok(detail))) = &known
                 && link.same(&current.link)
-                && !files_of
-                    .as_ref()
-                    .is_some_and(|(of, commit)| of.same(link) && *commit == of_commit)
+                && !read_for(&of_commit)
             {
                 let read = (source.files)(link, current.commit.as_deref()).map(|files| {
                     // One commit's files are all listed, or cut off unseen.
@@ -370,6 +550,7 @@ fn worker(
                 files_of = Some((link.clone(), of_commit));
                 reports.push(Reply::Files {
                     link: link.clone(),
+                    turn: current.files_turn,
                     read,
                 });
             }
@@ -436,11 +617,19 @@ impl PullRequestTab {
             Some(Ok(self.kept.remove(place).1))
         });
         self.shown = link;
-        self.files = None;
+        self.detail_turn += 1;
+        self.forget_files();
+        self.pictures.forget();
         self.choices = None;
         self.refreshing = false;
         self.acting = None;
         self.problem = None;
+    }
+
+    /// Lets go of the files read: they are read again for what is shown now.
+    fn forget_files(&mut self) {
+        self.files = None;
+        self.files_turn += 1;
     }
 
     /// What the tab draws: the pull request in `shown`, or `linked`, the
@@ -471,6 +660,7 @@ impl PullRequestTab {
                     },
                 },
                 choices: self.choices.as_ref(),
+                pictures: &self.pictures.read,
                 refreshing: self.refreshing,
                 acting: self.acting.as_ref(),
                 problem: self
@@ -485,6 +675,23 @@ impl PullRequestTab {
 impl App {
     /// What the worker reported, taken whether or not anything shows it.
     pub(super) fn poll_pull_request(&mut self, ctx: &egui::Context) {
+        while let Ok((of, source, picture)) = self.pull_request.pictures.replies.1.try_recv() {
+            let pictures = &mut self.pull_request.pictures;
+            if pictures.turn.load(Ordering::Relaxed) != of {
+                continue;
+            }
+            pictures.asked.retain(|asked| *asked != source);
+            let picture = picture.map(|(pixels, image)| ui::markup::Picture {
+                pixels,
+                texture: ctx.load_texture(
+                    "pull-request-picture",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ),
+            });
+            pictures.read.insert(source, picture);
+            ctx.request_repaint();
+        }
         while let Ok(reply) = self.pull_request.replies.1.try_recv() {
             let of = |link: &PullRequest| {
                 self.pull_request
@@ -498,9 +705,13 @@ impl App {
                     // What was read stays in view while one read fails.
                     if read.is_ok() || !matches!(self.pull_request.detail, Some(Ok(_))) {
                         self.pull_request.detail = Some(read);
+                        self.pull_request.pictures.due = true;
                     }
                 }
-                Reply::Files { link, read } if of(&link) => {
+                // Files read for what the tab showed before are not its.
+                Reply::Files { link, turn, read }
+                    if of(&link) && turn == self.pull_request.files_turn =>
+                {
                     if let Ok(files) = &read
                         && let Some(selected) = &self.ui.pull_request.selected
                         && !files.files.iter().any(|file| file.path == *selected)
@@ -534,6 +745,38 @@ impl App {
         }
     }
 
+    /// Asks for the pictures of what is shown that were not asked for yet,
+    /// as many as one pull request may show.
+    fn want_pictures(&mut self, ctx: &egui::Context) {
+        let tab = &mut self.pull_request;
+        if !std::mem::take(&mut tab.pictures.due) {
+            return;
+        }
+        let (Some(link), Some(Ok(detail))) = (&tab.shown, &tab.detail) else {
+            return;
+        };
+        let written =
+            std::iter::once(&detail.body).chain(detail.entries.iter().flat_map(|entry| {
+                let replies = match &entry.kind {
+                    source::Kind::Thread { replies, .. } => replies.as_slice(),
+                    _ => &[],
+                };
+                std::iter::once(&entry.body).chain(replies.iter().map(|reply| &reply.body))
+            }));
+        for source in written.flat_map(|text| ui::markup::pictures_in(text)) {
+            let pictures = &mut tab.pictures;
+            if pictures.read.contains_key(&source) || pictures.asked.contains(&source) {
+                continue;
+            }
+            let room = pictures.read.len() + pictures.asked.len() < MAX_PICTURES;
+            if room && fetched(link, &source) && pictures.ask(ctx, link, source.clone()) {
+                pictures.asked.push(source);
+            } else {
+                pictures.read.insert(source, None);
+            }
+        }
+    }
+
     /// Tells the worker what this frame shows. A pull request is read only
     /// while its tab is in view, less often while another window is the
     /// active one, and not at all while this one is minimized.
@@ -550,7 +793,12 @@ impl App {
                 commit: self.ui.pull_request.scope.clone(),
                 plain: self.ui.pull_request.hide_whitespace,
                 background: self.window_focused == Some(false),
+                detail_turn: self.pull_request.detail_turn,
+                files_turn: self.pull_request.files_turn,
             });
+        if watch.is_some() {
+            self.want_pictures(ctx);
+        }
         if watch != self.pull_request.sent {
             // Nothing is started for a tab that shows no pull request.
             if watch.is_some() || self.pull_request.worker.is_some() {
@@ -769,7 +1017,7 @@ impl App {
             }
             Event::Whitespace(hide) => {
                 self.ui.pull_request.hide_whitespace = hide;
-                self.pull_request.files = None;
+                self.pull_request.forget_files();
             }
             Event::Hand { words, agent } => self.hand_to_terminal(ctx, &words, agent),
             Event::Start(task) => self.start_agent_on(ctx, task),
@@ -795,7 +1043,7 @@ impl App {
                 self.ui.pull_request.scope = commit;
                 self.ui.pull_request.selected = None;
                 self.ui.pull_request.segment = ui::pull_request::Segment::Code;
-                self.pull_request.files = None;
+                self.pull_request.forget_files();
             }
             Event::Refresh => {
                 if self.pull_request.shown.is_some() {
@@ -805,7 +1053,7 @@ impl App {
                         self.pull_request.detail = None;
                     }
                     if matches!(self.pull_request.files, Some(Err(_))) {
-                        self.pull_request.files = None;
+                        self.pull_request.forget_files();
                     }
                     self.pull_request.request(ctx, Request::Refresh);
                 }
@@ -925,6 +1173,7 @@ mod tests {
     #[derive(Default)]
     struct Host {
         title: String,
+        body: String,
         reads: usize,
         file_reads: usize,
         acts: Vec<Act>,
@@ -958,6 +1207,9 @@ mod tests {
                     return Err(Failure::NotFound);
                 }
                 let mut detail = detail(&host.title);
+                if !host.body.is_empty() {
+                    detail.body = host.body.clone();
+                }
                 if host.acts.contains(&Act::Merge(Method::Squash)) {
                     detail.state = State::Merged;
                 }
@@ -1102,6 +1354,115 @@ mod tests {
         app.action(&ctx, Action::PullRequest(Event::Open(link(84))));
         assert!(app.pull_request.detail.is_none());
         assert_eq!(app.ui.pull_request.segment, Segment::Summary);
+    }
+
+    #[test]
+    fn a_pull_request_shown_again_is_told_again_what_was_already_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, host) = opened(dir.path());
+        let named = |app: &App| title(app).is_some();
+        let listed = |app: &App| matches!(app.pull_request.files, Some(Ok(_)));
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        settle(&mut app, &ctx, "the pull request", named);
+        app.ui.pull_request.segment = Segment::Code;
+        settle(&mut app, &ctx, "its files", listed);
+
+        // Closed and opened again, nothing of it is kept: the worker, which
+        // read the same a moment ago, says it again, and its files as well.
+        app.action(&ctx, Action::PullRequest(Event::Close(link(83))));
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        assert!(app.pull_request.detail.is_none());
+        settle(&mut app, &ctx, "the pull request again", named);
+        app.ui.pull_request.segment = Segment::Code;
+        settle(&mut app, &ctx, "its files again", listed);
+
+        // So does the way back, which keeps what was read but not its files.
+        app.action(&ctx, Action::PullRequest(Event::Back));
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        app.ui.pull_request.segment = Segment::Code;
+        settle(&mut app, &ctx, "its files after the way back", listed);
+
+        // One commit chosen and all of them again before the worker looks:
+        // the files it read for all of them are the ones still wanted.
+        app.action(
+            &ctx,
+            Action::PullRequest(Event::Scope(Some("8b45e82".into()))),
+        );
+        app.action(&ctx, Action::PullRequest(Event::Scope(None)));
+        assert!(app.pull_request.files.is_none());
+        settle(&mut app, &ctx, "the files of all commits", listed);
+        app.action(&ctx, Action::PullRequest(Event::Whitespace(true)));
+        app.action(&ctx, Action::PullRequest(Event::Whitespace(false)));
+        settle(&mut app, &ctx, "its files with their white space", listed);
+
+        // Files read for one commit are not shown as those of all of them.
+        let files = host.lock().unwrap().file_reads;
+        app.action(
+            &ctx,
+            Action::PullRequest(Event::Scope(Some("8b45e82".into()))),
+        );
+        frame(&mut app, &ctx);
+        app.action(&ctx, Action::PullRequest(Event::Scope(None)));
+        settle(&mut app, &ctx, "all commits after one", |app| {
+            listed(app) && host.lock().unwrap().file_reads >= files + 2
+        });
+        frame(&mut app, &ctx);
+        assert!(listed(&app));
+    }
+
+    #[test]
+    fn pictures_written_in_a_pull_request_are_read_from_its_host_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, host) = opened(dir.path());
+        let attached = "https://github.com/user-attachments/assets/4e0618da";
+        let elsewhere = "https://tracker.example/seen.png";
+        host.lock().unwrap().body =
+            format!("Before\n<img alt=\"The tab\" src=\"{attached}\" />\n![Seen]({elsewhere})");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let fetches = asked.clone();
+        app.pull_request.pictures.fetch = Some(Box::new(move |_, source| {
+            fetches.lock().unwrap().push(source.to_owned());
+            Some((
+                [2, 2],
+                egui::ColorImage::filled([2, 2], egui::Color32::WHITE),
+            ))
+        }));
+        app.action(&ctx, Action::PullRequest(Event::Open(link(83))));
+        settle(&mut app, &ctx, "its pictures", |app| {
+            app.pull_request.pictures.read.len() == 2
+        });
+        let pictures = &app.pull_request.pictures;
+        assert!(pictures.read[attached].is_some() && pictures.asked.is_empty());
+        assert!(pictures.read[elsewhere].is_none(), "kept by someone else");
+        assert_eq!(*asked.lock().unwrap(), [attached]);
+
+        // Read again, it asks for no picture twice; left, it keeps none.
+        app.action(&ctx, Action::PullRequest(Event::Refresh));
+        settle(&mut app, &ctx, "the refresh", |app| {
+            !app.pull_request.refreshing
+        });
+        frame(&mut app, &ctx);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        app.action(&ctx, Action::PullRequest(Event::Back));
+        assert!(app.pull_request.pictures.read.is_empty());
+
+        assert!(fetched(
+            &link(83),
+            "https://private-user-images.githubusercontent.com/1/a.png?jwt=x"
+        ));
+        assert!(fetched(
+            &link(83),
+            "https://GitHub.com/zevem/neptune/raw/main/a.png"
+        ));
+        assert!(!fetched(&link(83), "http://github.com/a.png"));
+        assert!(!fetched(
+            &link(83),
+            "https://github.com.tracker.example/a.png"
+        ));
+        assert!(!fetched(
+            &link(83),
+            "https://evilgithubusercontent.com/a.png"
+        ));
     }
 
     #[test]
@@ -1597,11 +1958,12 @@ mod tests {
     /// `NEPTUNE_PR_STATE` names what is shown: `summary` (the default),
     /// `ready`, `merged`, `draft`, `conflicts`, `checks`, `confirm`, `close`,
     /// `problem`, `timeline`, `code`, `diff`, `comment`, `review`, `reading`,
-    /// `missing`, `signed-out`, `linked` and `empty`. `NEPTUNE_PR_NARROW=1`
+    /// `missing`, `signed-out`, `linked`, `empty` and `pictures` (a description
+    /// with a picture of its host and one kept elsewhere). `NEPTUNE_PR_NARROW=1`
     /// uses a 640×400 window, `NEPTUNE_PR_WIDTH` sets the panel's width and
     /// `NEPTUNE_PR_THEME` names a theme. `NEPTUNE_PR_LIVE` names a pull
     /// request by its address and reads it with the person's GitHub CLI
-    /// instead. The desktop's pointer and keyboard are kept out of it:
+    /// instead, pictures included. The desktop's pointer and keyboard are kept out of it:
     /// presses, typing and scrolling need a hand-driven native check.
     #[cfg(target_os = "linux")]
     #[test]
@@ -2144,6 +2506,7 @@ mod tests {
                         choices: Box::new(source::read_choices),
                         act: Box::new(|_, _, _| Err("A capture changes nothing.".into())),
                     });
+                    app.pull_request.pictures.fetch = Some(Box::new(fetch_picture));
                     app.pull_requests = Default::default();
                 } else {
                     use crate::runtime::pull_requests::{Checks, Status, Watcher};
@@ -2186,6 +2549,11 @@ mod tests {
                             }
                             "missing" => Err(Failure::NotFound),
                             "signed-out" => Err(Failure::SignedOut),
+                            "pictures" => {
+                                let mut detail = pictured("summary");
+                                detail.body = "A badge kept somewhere else is not fetched:\n\n![Build status](https://ci.example/badge.png)\n\nThe tab, from the running app:\n\n<img alt=\"The tab in the window\" src=\"https://github.com/user-attachments/assets/4e0618da\" />\n\nAnd what follows it.".into();
+                                Ok(detail)
+                            }
                             state => Ok(pictured(state)),
                         }),
                         files: Box::new(|_, _| {
@@ -2229,6 +2597,22 @@ mod tests {
                             }
                         }),
                     });
+                }
+                // A picture drawn here stands in for one read from the host.
+                if app.pull_request.pictures.fetch.is_none() {
+                    app.pull_request.pictures.fetch = Some(Box::new(|_, _| {
+                        let size = [960, 300];
+                        let mut picture = egui::ColorImage::filled(size, egui::Color32::BLACK);
+                        for (at, pixel) in picture.pixels.iter_mut().enumerate() {
+                            let (x, y) = (at % size[0], at / size[0]);
+                            *pixel = egui::Color32::from_rgb(
+                                (40 + x * 120 / size[0]) as u8,
+                                (60 + y * 120 / size[1]) as u8,
+                                160,
+                            );
+                        }
+                        Some(([960, 300], picture))
+                    }));
                 }
                 Ok(Box::new(NativeCapture {
                     app,

@@ -14,7 +14,8 @@ their preparation records remain in Git history.
 - Read a pull request without leaving the terminal. Click a pull request's
   number on a terminal's tab and it opens in the new **Pull request** tab of
   the right panel: its title and state, what stands between it and a merge,
-  reviewers, labels, description and checks under **Summary**, everything
+  reviewers, labels, description with its pictures and checks under
+  **Summary**, everything
   that happened to it under **Timeline**, and its changed files with their
   diffs under **Code**. From there you can merge it or have the host merge it
   by itself, mark it ready or a draft, close, reopen or revert it, edit its

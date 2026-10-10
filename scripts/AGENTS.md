@@ -101,7 +101,7 @@ NEPTUNE_PR_CAPTURE="$PWD/artifacts/native-pull-request.png" \
 `NEPTUNE_PR_STATE` names what is shown: `summary` (the default), `ready`,
 `merged`, `draft`, `conflicts`, `checks`, `confirm`, `close`, `problem`,
 `timeline`, `code`, `diff`, `comment`, `review`, `reading`, `missing`,
-`signed-out`, `linked`, `empty`, `split` (the diff side by side), `wrap` (its long lines wrapped), `line` (a
+`signed-out`, `linked`, `empty`, `pictures` (a description with a picture of its host, drawn by the test, and one kept elsewhere), `split` (the diff side by side), `wrap` (its long lines wrapped), `line` (a
 comment being written under a line of the diff), `tabs` (two pull requests
 open), `hover` (the card of a linked number) or `drive`. `drive` presses a number on the
 toolbar, opens the comment field, types, sends with the command key and Enter

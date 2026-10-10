@@ -1433,6 +1433,14 @@ fn complaint(said: &[u8]) -> String {
     short
 }
 
+/// The bytes of a file attached to what was written on the host, read with
+/// the person's account: a private repository serves them to nobody else.
+/// At most `limit` bytes; nothing when it could not be read.
+pub fn read_attachment(address: &str, limit: u64) -> Option<Vec<u8>> {
+    let printed = cli(&["api", address], limit).ok()?;
+    printed.ok.then_some(printed.bytes)
+}
+
 /// Does what was asked, as the account signed in to the GitHub CLI. On
 /// failure, what the host said of it; nothing when it said nothing.
 /// `id` is the host's name for the pull request, as it was read.

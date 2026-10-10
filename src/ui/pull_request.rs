@@ -359,6 +359,8 @@ pub struct Shown<'a> {
     pub files: FileList<'a>,
     /// The labels and people of its repository, once they were asked for.
     pub choices: Option<&'a Choices>,
+    /// The pictures of what was written in it, as far as they were read.
+    pub pictures: &'a markup::Pictures,
     /// It is being read again because the person asked.
     pub refreshing: bool,
     /// What is being done to it; nothing else is asked meanwhile.
@@ -848,10 +850,11 @@ fn written(
     p: Palette,
     name: impl std::hash::Hash + std::fmt::Debug,
     text: &str,
+    pictures: &markup::Pictures,
     actions: &mut Vec<Action>,
 ) {
     ui.push_id(name, |ui| {
-        markup::show_in(ui, p, text.trim(), markup::Lines::Kept, p.fg, actions);
+        markup::show_written(ui, p, text.trim(), pictures, actions);
     });
 }
 
@@ -2108,6 +2111,7 @@ struct Talk<'a> {
     idle: bool,
     composing: bool,
     now: i64,
+    pictures: &'a markup::Pictures,
     state: &'a mut State,
     events: &'a mut Vec<Event>,
     actions: &'a mut Vec<Action>,
@@ -2443,6 +2447,7 @@ fn entry_body(ui: &mut Ui, p: Palette, entry: &Entry, talk: &mut Talk) {
             p,
             ("pull-request-entry", &entry.url, entry.at),
             &entry.body,
+            talk.pictures,
             talk.actions,
         );
     }
@@ -2532,6 +2537,7 @@ fn reply_under(ui: &mut Ui, p: Palette, name: (&str, usize), reply: &Reply, talk
                     p,
                     ("pull-request-reply", name),
                     &reply.body,
+                    talk.pictures,
                     talk.actions,
                 );
             }
@@ -2792,6 +2798,7 @@ fn summary(ui: &mut Ui, p: Palette, shown: &Shown, talk: &mut Talk) {
                     p,
                     "pull-request-description",
                     &detail.body,
+                    talk.pictures,
                     talk.actions,
                 );
             });
@@ -3981,6 +3988,7 @@ fn pull_request(
             idle: shown.acting.is_none(),
             composing: view.composing,
             now: view.now,
+            pictures: shown.pictures,
             state,
             events,
             actions,
