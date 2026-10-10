@@ -11,11 +11,23 @@ their preparation records remain in Git history.
 
 ### What's New
 
+## [0.1.0-rc.5] - 2026-10-10
+
+### What's New
+
 - Preview websites beside your terminal with browser tabs that move and split
   within the same workspace. Open a local dev-server port, navigate and search
   pages, or inspect them with developer tools. Browser painting follows the
   display's refresh rate and pauses for hidden previews; tabs restore blank,
   without saving browsing history or addresses.
+- See subscription usage for your local Codex, Claude Code and Cursor accounts
+  in the footer. Click it for allowances, reset times, plan names and refresh
+  controls; unavailable or stale readings are explained. Checks run in the
+  background without starting an agent turn. Cursor Keychain access on macOS
+  is optional for each run.
+- Select and copy text in the file explorer's previews. Markdown files now
+  switch between source and formatted preview, with pictures, working web,
+  file and heading links, and Copy and Wrap controls on code blocks.
 - Read a pull request without leaving the terminal. Click a pull request's
   number on a terminal's tab and it opens in the new **Pull request** tab of
   the right panel: its title and state, what stands between it and a merge,
@@ -65,6 +77,41 @@ their preparation records remain in Git history.
   a terminal's list of attached files opens them at full size, newest first,
   and a band of small pictures at the foot of the window shows each one:
   click any of them, or keep using the arrow keys.
+
+### Acceptance notes and known limitations
+
+- Full native acceptance on every platform remains pending; this is a release
+  candidate for acceptance testing, not a production-stable release.
+- Saved workspaces now use schema version 14 for Projects and browser panes.
+  Earlier workspace files still load, but RC4 and earlier cannot restore or
+  save over layouts written by this version. Back up workspace state before
+  testing if you need to return to an earlier candidate. Restoration starts
+  fresh shells and SSH connections, and blank browser tabs; running commands,
+  process memory, browser addresses and browsing history are not restored.
+- Browser previews include a separate sandboxed Chromium runtime, increasing
+  installer size. Linux AppImages require working user namespaces for browser
+  previews; the DEB includes the sandbox helper for restricted hosts. A browser
+  startup failure leaves terminals usable. Browser sandbox, clipboard, IME,
+  DPI and installer behavior still need native acceptance on macOS and Windows.
+- Projects require Claude Code or Codex installed and signed in, and a local
+  workspace; they are not available on Windows yet. Pull request actions require
+  the GitHub CLI (`gh`) signed in with the necessary repository permissions.
+- Windows installers remain unsigned and may show an unverified-publisher or
+  SmartScreen warning. Both macOS installers require signing and notarization;
+  all installers are covered by signed update metadata and build attestations.
+- Linux x64 packages require glibc 2.35 or newer and working host graphics
+  drivers. Browser-downloaded AppImages need execute permission before launch;
+  enable it in file Properties or run `chmod u+x` on the downloaded file.
+- In-place updates remain unverified on macOS. The reported intermittent native
+  Wayland freeze still needs a capture of the blocking state; XWayland checks
+  do not establish native Wayland acceptance.
+- SSH requires an installed OpenSSH client and a POSIX remote shell. Remote
+  directory tracking is integrated for zsh; other shells need OSC 7 integration.
+- Kitty graphics and comprehensive complex-script shaping remain unsupported.
+  Keypad identity and some keyboard-layout information depend on the window
+  toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
+- Automatic updates never downgrade. After this candidate is published, select
+  Beta in Preferences → Updates to receive it; private drafts are not offered.
 
 ## [0.1.0-rc.4] - 2026-10-05
 
