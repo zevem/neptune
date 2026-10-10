@@ -63,7 +63,6 @@ pub enum Icon {
     Play,
     Stop,
     Lock,
-    Code,
     /// The eight reactions a host has, each a small picture.
     ThumbUp,
     ThumbDown,
@@ -546,12 +545,6 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             shackle.push([15.5, 10.5]);
             line(&shackle);
             rectangle(5.5, 10.5, 13.0, 9.5, 2.5);
-        }
-        Icon::Code => {
-            // Angle brackets around a stroke: the page's developer tools.
-            line(&[[8.5, 7.5], [4.0, 12.0], [8.5, 16.5]]);
-            line(&[[15.5, 7.5], [20.0, 12.0], [15.5, 16.5]]);
-            line(&[[13.5, 5.5], [10.5, 18.5]]);
         }
         Icon::ThumbUp | Icon::ThumbDown => {
             // A cuff and the hand that leaves it, thumb up; turned over for

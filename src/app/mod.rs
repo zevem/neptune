@@ -1475,7 +1475,7 @@ impl eframe::App for App {
             if self.ui.overlay == OverlayState::None && !menu_open && self.ui.pane_drag.is_none() {
                 let keyboard = self.controller.model().active_pane() == Some(pane)
                     && matches!(context, crate::input::RoutingContext::TerminalPane(_));
-                let events = Self::terminal_events(&ctx);
+                let events = self.terminal_events(&ctx);
                 if let Err(error) = self.browsers.input(
                     crate::runtime::browser::protocol::Target {
                         pane: pane.get(),
