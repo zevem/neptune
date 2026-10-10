@@ -119,7 +119,11 @@ native check. `NEPTUNE_PR_LIVE=<address of a merged pull request> cargo test -p
 neptune-terminal --lib runtime::pull_request::tests::the_github_cli --locked --
 --ignored` reads it with the signed-in GitHub CLI, marks one of its files as
 viewed and unmarks it (which only that account sees) and checks that a change
-the host must refuse comes back in the host's words.
+the host must refuse comes back in the host's words. `every_change` in the same module, with
+`NEPTUNE_PR_SANDBOX` and `NEPTUNE_PR_SANDBOX_OTHER` naming two throwaway open pull
+requests of a repository that has a label `sandbox-label`, sends every change
+the tab can ask for and reads each back; it merges the first. Run it only
+against a repository made for it.
 
 The integrated shell regression needs a POSIX shell. X11 injection verifies
 Linux/X11 input, not Wayland, macOS or Windows input. Inspection events verify

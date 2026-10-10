@@ -1889,6 +1889,175 @@ mod tests {
         }
     }
 
+    /// Everything the tab can ask of a pull request, done for real through
+    /// the signed-in GitHub CLI and read back. `NEPTUNE_PR_SANDBOX` names a
+    /// throwaway open pull request that changes `main.rs` and may be merged,
+    /// and `NEPTUNE_PR_SANDBOX_OTHER` another one that is closed and
+    /// reopened; their repository has a label `sandbox-label`. What a host
+    /// does not offer a repository (drafts, auto-merge) is reported, not
+    /// required.
+    #[test]
+    #[ignore = "Changes real pull requests; needs NEPTUNE_PR_SANDBOX and NEPTUNE_PR_SANDBOX_OTHER"]
+    fn every_change_the_tab_asks_for_reaches_the_host() {
+        let link = PullRequest::parse(&std::env::var("NEPTUNE_PR_SANDBOX").unwrap()).unwrap();
+        let other =
+            PullRequest::parse(&std::env::var("NEPTUNE_PR_SANDBOX_OTHER").unwrap()).unwrap();
+        let id = read(&link).unwrap().id;
+        let ask = |what: Act| {
+            let done = act(&link, &id, &what);
+            println!("{:<28} {done:?}", what.outcome().0);
+            done
+        };
+        let now = || read(&link).unwrap();
+
+        ask(Act::Comment("From the tab".into())).unwrap();
+        let said = now()
+            .entries
+            .into_iter()
+            .find(|entry| entry.body == "From the tab");
+        let said = said.expect("the comment is on the pull request");
+        assert!(said.can_edit);
+        let react = |on| Act::React {
+            subject: said.id.clone(),
+            emoji: Emoji::Rocket,
+            on,
+        };
+        ask(react(true)).unwrap();
+        let mine = |detail: &Detail| {
+            detail
+                .entries
+                .iter()
+                .find(|entry| entry.id == said.id)
+                .is_some_and(|entry| entry.reactions.iter().any(|given| given.mine))
+        };
+        assert!(mine(&now()));
+        ask(react(false)).unwrap();
+        assert!(!mine(&now()));
+        ask(Act::Edit {
+            subject: said.id.clone(),
+            said: Said::Comment,
+            body: "Rewritten from the tab".into(),
+        })
+        .unwrap();
+        assert!(
+            now()
+                .entries
+                .iter()
+                .any(|entry| entry.body == "Rewritten from the tab")
+        );
+
+        let label = |on| Act::Label {
+            name: "sandbox-label".into(),
+            on,
+        };
+        ask(label(true)).unwrap();
+        assert_eq!(now().labels, ["sandbox-label"]);
+        ask(label(false)).unwrap();
+        assert!(now().labels.is_empty());
+
+        ask(Act::Title("Say more, as the tab put it".into())).unwrap();
+        ask(Act::Description("A body the tab wrote.".into())).unwrap();
+        let edited = now();
+        assert_eq!(
+            (edited.title.as_str(), edited.body.as_str()),
+            ("Say more, as the tab put it", "A body the tab wrote.")
+        );
+
+        // A review that says something of one line opens a conversation.
+        let line = LineComment {
+            path: "main.rs".into(),
+            line: 2,
+            removed: false,
+            body: "Why two?".into(),
+        };
+        ask(Act::Review(
+            Verdict::Commented,
+            "A review from the tab".into(),
+            vec![line],
+        ))
+        .unwrap();
+        let thread = |detail: &Detail| {
+            detail.entries.iter().find_map(|entry| match &entry.kind {
+                Kind::Thread {
+                    id,
+                    resolved,
+                    replies,
+                    path,
+                    ..
+                } if path == "main.rs" => {
+                    Some((id.clone(), *resolved, replies.len(), entry.id.clone()))
+                }
+                _ => None,
+            })
+        };
+        let (conversation, _, _, opening) = thread(&now()).expect("a conversation on main.rs");
+        ask(Act::Reply {
+            thread: conversation.clone(),
+            body: "Because.".into(),
+        })
+        .unwrap();
+        let resolve = |resolved| Act::Resolve {
+            thread: conversation.clone(),
+            resolved,
+        };
+        ask(resolve(true)).unwrap();
+        assert_eq!(
+            thread(&now()).map(|found| (found.1, found.2)),
+            Some((true, 1))
+        );
+        ask(resolve(false)).unwrap();
+        assert_eq!(thread(&now()).map(|found| found.1), Some(false));
+        ask(Act::Edit {
+            subject: opening,
+            said: Said::Line,
+            body: "Why two, though?".into(),
+        })
+        .unwrap();
+        assert!(
+            now()
+                .entries
+                .iter()
+                .any(|entry| entry.body == "Why two, though?")
+        );
+
+        let viewed = |on| Act::Viewed {
+            path: "main.rs".into(),
+            on,
+        };
+        ask(viewed(true)).unwrap();
+        assert_eq!(now().viewed, ["main.rs"]);
+        ask(viewed(false)).unwrap();
+
+        // What this repository may not have is said in the host's words.
+        if ask(Act::Draft).is_ok() {
+            assert_eq!(now().state, State::Draft);
+            ask(Act::Ready).unwrap();
+        }
+        if ask(Act::AutoMerge(Some(Method::Squash))).is_ok() {
+            let _ = ask(Act::AutoMerge(None));
+        }
+        let _ = ask(Act::Request {
+            name: now().author,
+            on: true,
+        });
+
+        // The other one is closed and reopened, then this one merged, which
+        // leaves the other behind and gives something to revert.
+        let other_id = read(&other).unwrap().id;
+        act(&other, &other_id, &Act::Close).unwrap();
+        assert_eq!(read(&other).unwrap().state, State::Closed);
+        act(&other, &other_id, &Act::Reopen).unwrap();
+        assert_eq!(read(&other).unwrap().state, State::Open);
+        ask(Act::Merge(Method::Squash)).unwrap();
+        assert_eq!(now().state, State::Merged);
+        println!(
+            "{:<28} {:?}",
+            "Branch updated",
+            act(&other, &other_id, &Act::UpdateBranch)
+        );
+        ask(Act::Revert).unwrap();
+    }
+
     #[test]
     fn changed_files_carry_their_counts_and_the_diff_github_gives() {
         let response = br#"[

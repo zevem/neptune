@@ -2034,6 +2034,23 @@ mod tests {
                         .events
                         .push(egui::Event::PointerMoved(Pos2::new(410.0, 22.0)));
                 }
+                // An agent started for real is given time to come up.
+                if self.state == "start" && self.staged {
+                    let began = *self.began.get_or_insert_with(Instant::now);
+                    if self.step == 0 {
+                        self.step = 1;
+                        let task = "Reply with the single word ready and do nothing else.";
+                        self.app
+                            .action(ctx, Action::PullRequest(Event::Start(task.into())));
+                        self.seen
+                            .lock()
+                            .unwrap()
+                            .push(format!("started: error={:?}", self.app.ui.error));
+                    }
+                    if began.elapsed() < Duration::from_secs(25) {
+                        self.app.started = Instant::now() - Duration::from_secs(1);
+                    }
+                }
                 if self.state == "press" && self.staged {
                     self.press(ctx, input);
                 }
@@ -2064,6 +2081,27 @@ mod tests {
             }
             fn on_exit(&mut self) {
                 eframe::App::on_exit(&mut self.app);
+                if self.state == "start" {
+                    let model = self.app.controller.model();
+                    let front = model.active_pane();
+                    let said = front
+                        .and_then(|pane| self.app.sessions.get(pane))
+                        .map(|session| session.metadata().title);
+                    self.seen.lock().unwrap().push(format!(
+                        "agent: panes={} front_runs={:?} activity={:?} said={said:?}",
+                        model
+                            .workspaces()
+                            .iter()
+                            .map(|w| w.panes().len())
+                            .sum::<usize>(),
+                        front
+                            .and_then(|pane| model.pane(pane))
+                            .and_then(|pane| pane.agent().map(|agent| agent.kind)),
+                        front
+                            .and_then(|pane| self.app.agents.get(pane))
+                            .map(|found| found.0),
+                    ));
+                }
                 self.seen.lock().unwrap().push(format!(
                     "closed: shown={:?} plain={} split={} wrap={}",
                     self.app.pull_request.shown().map(PullRequest::number),
@@ -2203,6 +2241,10 @@ mod tests {
             }),
         )
         .unwrap();
+        if state == "start" {
+            println!("{:#?}", seen.lock().unwrap());
+            return;
+        }
         if state == "press" {
             let asked = asked.lock().unwrap();
             println!("{asked:#?}\n{:?}", seen.lock().unwrap());
