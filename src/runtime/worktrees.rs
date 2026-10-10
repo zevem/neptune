@@ -455,7 +455,9 @@ fn start(root: &Path, branch: &str, base: &str) -> Result<String, String> {
 fn is_origin(address: &str, repository: &str) -> bool {
     let address = address.trim().trim_end_matches('/');
     let address = address.strip_suffix(".git").unwrap_or(address);
-    let mut parts = address.rsplit(['/', ':']);
+    // A repository on this machine is named by its path, as its system
+    // writes one.
+    let mut parts = address.rsplit(['/', ':', '\\']);
     let (name, owner) = (parts.next(), parts.next());
     matches!((owner, name), (Some(owner), Some(name))
         if format!("{owner}/{name}").eq_ignore_ascii_case(repository))
@@ -709,6 +711,7 @@ mod tests {
             ("https://github.com/zevem/neptune.git", true),
             ("git@github.com:Zevem/Neptune", true),
             ("https://github.com/zevem/neptune/", true),
+            (r"C:\work\zevem\neptune", true),
             ("https://github.com/other/neptune.git", false),
             ("neptune", false),
         ] {
