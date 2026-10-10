@@ -230,7 +230,7 @@ fn parse_counts(bytes: &[u8]) -> Vec<(String, u32, u32)> {
 }
 
 /// Turns a unified diff of one file into lines to paint.
-fn parse_diff(bytes: &[u8]) -> DiffBody {
+pub(super) fn parse_diff(bytes: &[u8]) -> DiffBody {
     let text = String::from_utf8_lossy(bytes);
     let mut lines = Vec::new();
     let mut widest = 0;

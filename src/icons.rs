@@ -34,6 +34,8 @@ pub enum Icon {
     Sun,
     Moon,
     Copy,
+    Code,
+    Wrap,
     Ellipsis,
     Refresh,
     Pencil,
@@ -62,6 +64,15 @@ pub enum Icon {
     Stop,
     Lock,
     Code,
+    /// The eight reactions a host has, each a small picture.
+    ThumbUp,
+    ThumbDown,
+    Smile,
+    Party,
+    Unsure,
+    Heart,
+    Rocket,
+    Eyes,
 }
 
 /// Paint an icon into its visual bounds. The caller controls the hit area.
@@ -268,6 +279,23 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             }
             crescent.push(crescent[0]);
             line(&crescent);
+        }
+        Icon::Code => {
+            line(&[[8.0, 7.0], [3.0, 12.0], [8.0, 17.0]]);
+            line(&[[16.0, 7.0], [21.0, 12.0], [16.0, 17.0]]);
+            line(&[[14.0, 4.0], [10.0, 20.0]]);
+        }
+        Icon::Wrap => {
+            line(&[[4.0, 6.0], [20.0, 6.0]]);
+            line(&[
+                [4.0, 11.0],
+                [17.0, 11.0],
+                [20.0, 14.0],
+                [17.0, 17.0],
+                [12.0, 17.0],
+            ]);
+            line(&[[15.0, 14.0], [12.0, 17.0], [15.0, 20.0]]);
+            line(&[[4.0, 17.0], [8.0, 17.0]]);
         }
         Icon::Copy => {
             rectangle(8.0, 8.0, 12.0, 13.0, 2.5);
@@ -524,6 +552,83 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[[8.5, 7.5], [4.0, 12.0], [8.5, 16.5]]);
             line(&[[15.5, 7.5], [20.0, 12.0], [15.5, 16.5]]);
             line(&[[13.5, 5.5], [10.5, 18.5]]);
+        }
+        Icon::ThumbUp | Icon::ThumbDown => {
+            // A cuff and the hand that leaves it, thumb up; turned over for
+            // the other one.
+            let turned = |y: f32| if icon == Icon::ThumbDown { 24.0 - y } else { y };
+            let hand = [
+                [7.5, 11.0],
+                [11.0, 4.0],
+                [13.0, 4.5],
+                [13.5, 6.5],
+                [12.5, 10.0],
+                [19.0, 10.0],
+                [20.5, 11.5],
+                [19.0, 19.0],
+                [17.5, 20.0],
+                [7.5, 20.0],
+            ]
+            .map(|[x, y]| [x, turned(y)]);
+            line(&hand);
+            line(&[[3.5, turned(11.0)], [3.5, turned(20.0)]]);
+        }
+        Icon::Smile | Icon::Unsure => {
+            circle(12.0, 12.0, 9.0);
+            painter.circle_filled(point(9.0, 10.0), 1.2 * scale, color);
+            painter.circle_filled(point(15.0, 10.0), 1.2 * scale, color);
+            if icon == Icon::Smile {
+                let mouth: Vec<[f32; 2]> = (0..=8)
+                    .map(|step| {
+                        let angle = (25.0 + step as f32 * 130.0 / 8.0).to_radians();
+                        [12.0 + 5.0 * angle.cos(), 11.5 + 5.0 * angle.sin()]
+                    })
+                    .collect();
+                line(&mouth);
+            } else {
+                line(&[[8.5, 16.5], [11.0, 15.0], [13.0, 16.5], [15.5, 15.0]]);
+            }
+        }
+        Icon::Party => {
+            // A cone on its side, and what flies out of it.
+            line(&[[4.0, 20.0], [9.0, 8.0], [16.0, 15.0], [4.0, 20.0]]);
+            line(&[[14.0, 4.0], [14.0, 7.0]]);
+            line(&[[19.0, 6.0], [17.0, 8.0]]);
+            line(&[[20.5, 12.0], [17.5, 12.0]]);
+        }
+        Icon::Heart => {
+            let points = (0..32)
+                .map(|step| {
+                    let t = step as f32 * std::f32::consts::TAU / 32.0;
+                    let x = 16.0 * t.sin().powi(3);
+                    let y = 13.0 * t.cos()
+                        - 5.0 * (2.0 * t).cos()
+                        - 2.0 * (3.0 * t).cos()
+                        - (4.0 * t).cos();
+                    point(12.0 + x * 0.54, 11.5 - y * 0.54)
+                })
+                .collect();
+            painter.add(Shape::closed_line(points, stroke));
+        }
+        Icon::Rocket => {
+            line(&[
+                [12.0, 3.0],
+                [16.0, 8.5],
+                [16.0, 16.0],
+                [8.0, 16.0],
+                [8.0, 8.5],
+                [12.0, 3.0],
+            ]);
+            circle(12.0, 10.0, 1.7);
+            line(&[[8.0, 12.5], [5.0, 16.5], [8.0, 16.0]]);
+            line(&[[16.0, 12.5], [19.0, 16.5], [16.0, 16.0]]);
+            line(&[[10.5, 18.5], [12.0, 21.5], [13.5, 18.5]]);
+        }
+        Icon::Eyes => {
+            for x in [7.5, 16.5] {
+                circle(x, 12.0, 3.9);
+                painter.circle_filled(point(x + 1.0, 12.6), 1.4 * scale, color);
+            }
         }
         Icon::Star => {
             // Closed, so all five points are mitred alike.

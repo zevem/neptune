@@ -85,6 +85,7 @@ impl App {
                 self.ui.explorer.preview_location =
                     Some((pending.location.line, pending.location.column));
                 self.ui.explorer.preview_jump = true;
+                self.ui.explorer.markdown_preview = false;
             }
             Err(error) => self.ui.error = Some(error.into()),
         }
@@ -482,6 +483,10 @@ mod tests {
                 app.ui.error
             );
             assert_eq!(app.ui.explorer.preview_location, Some((1, 1)), "{name}");
+            assert!(
+                !app.ui.explorer.markdown_preview,
+                "file locations open source: {name}"
+            );
             // Let the panel settle before measuring the next terminal body.
             for _ in 0..25 {
                 frame(&mut app, &ctx, Vec::new());

@@ -267,6 +267,7 @@ fn diff(
     rect: Rect,
     p: Palette,
     (file, body): (&File, &DiffBody),
+    lines_of: &Lines,
     events: &mut Vec<Event>,
 ) {
     ui.painter().rect_filled(rect, metrics::PANE_RADIUS, p.bg);
@@ -351,33 +352,240 @@ fn diff(
     // The line's number, then its sign, then the line.
     let numbers = last.to_string().len() as f32 * column + 14.0;
     let gutter = numbers + column + 8.0;
-    let width = gutter + widest as f32 * column + 12.0;
-    let mut ui = ui.new_child(UiBuilder::new().id_salt("changes-diff-text").max_rect(area));
-    ui.set_clip_rect(area.intersect(ui.clip_rect()));
-    ui.spacing_mut().item_spacing = Vec2::ZERO;
-    egui::ScrollArea::both()
-        // Each file keeps its own place.
-        .id_salt(("changes-diff-lines", &file.path))
-        .auto_shrink([false, false])
-        .show_rows(
-            &mut ui,
-            height,
-            lines.len() + usize::from(truncated),
-            |ui, range| {
-                ui.set_min_width(width);
-                for index in range {
-                    let (_, row) = ui.allocate_space(vec2(width.max(ui.available_width()), height));
-                    let painter = ui.painter();
-                    let text = |x: f32, align: Align2, text: &str, colour: Color32| {
+    let side = gutter + widest as f32 * column + 12.0;
+    // Side by side, what was is on the leading half and what is on the
+    // trailing one: removed lines sit beside the added ones that follow.
+    let rows: Vec<(Option<&Line>, Option<&Line>)> = if lines_of.split {
+        let mut rows = Vec::with_capacity(lines.len());
+        let mut at = 0;
+        while at < lines.len() {
+            let run = |from: usize, kind| {
+                lines[from..]
+                    .iter()
+                    .take_while(|line| line.kind == kind)
+                    .count()
+            };
+            let removed = run(at, LineKind::Removed);
+            let added = run(at + removed, LineKind::Added);
+            if removed + added == 0 {
+                rows.push((Some(&lines[at]), Some(&lines[at])));
+                at += 1;
+                continue;
+            }
+            for pair in 0..removed.max(added) {
+                rows.push((
+                    (pair < removed).then(|| &lines[at + pair]),
+                    (pair < added).then(|| &lines[at + removed + pair]),
+                ));
+            }
+            at += removed + added;
+        }
+        rows
+    } else {
+        lines.iter().map(|line| (Some(line), None)).collect()
+    };
+    let named = |line: &Line| {
+        line.new
+            .or(line.old)
+            .map(|number| (number, line.new.is_none()))
+    };
+    // The row under which a field stands open, and the rows it takes.
+    let opened = lines_of.open.and_then(|(at, room)| {
+        let row = rows.iter().position(|(was, now)| {
+            [was, now]
+                .into_iter()
+                .flatten()
+                .any(|line| line.kind != LineKind::Hunk && named(line) == Some(at))
+        })?;
+        Some((row, room))
+    });
+    let room = opened.map_or(0, |(_, room)| room);
+    if lines_of.wrap && !lines_of.split {
+        // As many columns as the surface holds, and for each line how many
+        // rows that makes: the rows before it say where it starts.
+        let columns = (((area.width() - gutter - 12.0) / column).floor() as usize).max(20);
+        let mut tops = Vec::with_capacity(lines.len());
+        let mut total = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            tops.push(total);
+            total += match line.kind {
+                LineKind::Hunk => 1,
+                _ => line.text.chars().count().div_ceil(columns).max(1),
+            };
+            if opened.is_some_and(|(under, _)| under == index) {
+                total += room;
+            }
+        }
+        let mut ui = ui.new_child(UiBuilder::new().id_salt("changes-diff-text").max_rect(area));
+        ui.set_clip_rect(area.intersect(ui.clip_rect()));
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        egui::ScrollArea::vertical()
+            .id_salt(("changes-diff-wrapped", &file.path))
+            .auto_shrink([false, false])
+            .show_viewport(&mut ui, |ui, viewport| {
+                let rows = total + usize::from(truncated);
+                let (_, all) = ui.allocate_space(vec2(ui.available_width(), rows as f32 * height));
+                let painter = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
+                // Only the lines in view are drawn.
+                let first = tops
+                    .partition_point(|top| (*top as f32) * height <= viewport.top())
+                    .saturating_sub(1);
+                for (index, line) in lines.iter().enumerate().skip(first) {
+                    let top = all.top() + tops[index] as f32 * height;
+                    if top - all.top() > viewport.bottom() {
+                        break;
+                    }
+                    let taken = match line.kind {
+                        LineKind::Hunk => 1,
+                        _ => line.text.chars().count().div_ceil(columns).max(1),
+                    };
+                    let block = Rect::from_min_size(
+                        Pos2::new(all.left(), top),
+                        vec2(all.width(), taken as f32 * height),
+                    );
+                    if let (Some((under, room)), Some(slot)) = (opened, lines_of.slot)
+                        && under == index
+                    {
+                        let room = Rect::from_min_size(
+                            Pos2::new(area.left(), block.bottom()),
+                            vec2(area.width(), room as f32 * height),
+                        );
+                        slot.set(Some((room, area)));
+                    }
+                    let text = |x: f32, row: usize, align: Align2, text: &str, colour: Color32| {
                         painter.text(
-                            Pos2::new(row.left() + x, row.center().y),
+                            Pos2::new(block.left() + x, block.top() + (row as f32 + 0.5) * height),
                             align,
                             text,
                             font.clone(),
                             colour,
                         );
                     };
-                    let Some(line) = lines.get(index) else {
+                    let (fill, sign, ink) = match line.kind {
+                        LineKind::Hunk => (Some(theme::tint(p.fg, 0.05)), "", p.muted),
+                        LineKind::Context => (None, "", p.fg),
+                        LineKind::Added => (Some(theme::tint(p.green, 0.14)), "+", p.green),
+                        LineKind::Removed => (Some(theme::tint(p.red, 0.14)), "−", p.red),
+                    };
+                    if let Some(fill) = fill {
+                        painter.rect_filled(block, 0, fill);
+                    }
+                    if line.kind == LineKind::Hunk {
+                        text(numbers, 0, Align2::LEFT_CENTER, &line.text, ink);
+                        continue;
+                    }
+                    if let Some(at) = named(line) {
+                        text(
+                            numbers - 8.0,
+                            0,
+                            Align2::RIGHT_CENTER,
+                            &at.0.to_string(),
+                            p.muted,
+                        );
+                        if lines_of.marked.contains(&at) {
+                            painter.rect_filled(
+                                Rect::from_min_max(
+                                    block.left_top(),
+                                    Pos2::new(block.left() + 2.0, block.bottom()),
+                                ),
+                                0,
+                                p.accent,
+                            );
+                        }
+                        if let Some(pick) = lines_of.pick {
+                            let response = ui
+                                .interact(
+                                    block,
+                                    ui.id().with(("diff-line", index, 0)),
+                                    Sense::click(),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            response.widget_info(|| {
+                                WidgetInfo::labeled(
+                                    WidgetType::Button,
+                                    true,
+                                    format!("Comment on line {}", at.0),
+                                )
+                            });
+                            if response.hovered() {
+                                painter.rect_filled(block, 0, theme::tint(p.accent, 0.10));
+                            }
+                            if response.clicked() {
+                                pick.set(Some(at));
+                            }
+                        }
+                    }
+                    text(numbers, 0, Align2::LEFT_CENTER, sign, ink);
+                    let characters: Vec<char> = line.text.chars().collect();
+                    for (row, part) in characters.chunks(columns).enumerate() {
+                        let part: String = part.iter().collect();
+                        text(gutter, row, Align2::LEFT_CENTER, &part, p.fg);
+                    }
+                }
+                if truncated {
+                    painter.text(
+                        Pos2::new(all.left() + gutter, all.bottom() - height * 0.5),
+                        Align2::LEFT_CENTER,
+                        "The rest of the diff is not shown",
+                        theme::regular(11.0),
+                        p.muted,
+                    );
+                }
+            });
+        return;
+    }
+    // Side by side, both halves stay in view: each is as wide as half the
+    // surface, and a sideways scroll moves the text of both together.
+    let width = if lines_of.split { 0.0 } else { side };
+    let mut ui = ui.new_child(UiBuilder::new().id_salt("changes-diff-text").max_rect(area));
+    ui.set_clip_rect(area.intersect(ui.clip_rect()));
+    ui.spacing_mut().item_spacing = Vec2::ZERO;
+    let shift = if lines_of.split {
+        let id = ui.id().with(("diff-sideways", &file.path));
+        let hidden = (side - (area.width() * 0.5).floor()).max(0.0);
+        let mut shift = ui.data(|data| data.get_temp::<f32>(id)).unwrap_or(0.0);
+        if ui.rect_contains_pointer(area) {
+            shift -= ui.input(|input| input.smooth_scroll_delta.x);
+        }
+        let shift = shift.clamp(0.0, hidden);
+        ui.data_mut(|data| data.insert_temp(id, shift));
+        shift
+    } else {
+        0.0
+    };
+    egui::ScrollArea::both()
+        .scroll([!lines_of.split, true])
+        // Each file keeps its own place.
+        .id_salt(("changes-diff-lines", &file.path))
+        .auto_shrink([false, false])
+        .show_rows(
+            &mut ui,
+            height,
+            rows.len() + room + usize::from(truncated),
+            |ui, range| {
+                ui.set_min_width(width);
+                for index in range {
+                    let (_, row) = ui.allocate_space(vec2(width.max(ui.available_width()), height));
+                    // Rows after the open field make room for it.
+                    let index = match opened {
+                        Some((under, room)) if index > under && index <= under + room => {
+                            if let Some(slot) = lines_of.slot {
+                                // The room is as wide as what is in view,
+                                // however far the lines are scrolled.
+                                let top = row.top() - (index - under - 1) as f32 * height;
+                                let room = Rect::from_min_size(
+                                    Pos2::new(area.left(), top),
+                                    vec2(area.width(), room as f32 * height),
+                                );
+                                slot.set(Some((room, area)));
+                            }
+                            continue;
+                        }
+                        Some((under, room)) if index > under => index - room,
+                        _ => index,
+                    };
+                    let painter = ui.painter();
+                    let Some((was, now)) = rows.get(index) else {
                         painter.text(
                             Pos2::new(row.left() + gutter, row.center().y),
                             Align2::LEFT_CENTER,
@@ -387,29 +595,123 @@ fn diff(
                         );
                         continue;
                     };
-                    let (fill, sign, ink) = match line.kind {
-                        LineKind::Hunk => (Some(theme::tint(p.fg, 0.05)), "", p.muted),
-                        LineKind::Context => (None, "", p.fg),
-                        LineKind::Added => (Some(theme::tint(p.green, 0.14)), "+", p.green),
-                        LineKind::Removed => (Some(theme::tint(p.red, 0.14)), "−", p.red),
+                    let halves = if lines_of.split {
+                        let half = (row.width() * 0.5).floor();
+                        vec![
+                            (*was, Rect::from_min_size(row.min, vec2(half, height))),
+                            (
+                                *now,
+                                Rect::from_min_size(
+                                    Pos2::new(row.left() + half, row.top()),
+                                    vec2(row.width() - half, height),
+                                ),
+                            ),
+                        ]
+                    } else {
+                        vec![(*was, row)]
                     };
-                    if let Some(fill) = fill {
-                        painter.rect_filled(row, 0, fill);
-                    }
-                    if line.kind == LineKind::Hunk {
-                        text(numbers, Align2::LEFT_CENTER, &line.text, ink);
-                        continue;
-                    }
-                    if let Some(number) = line.new.or(line.old) {
-                        text(
-                            numbers - 8.0,
-                            Align2::RIGHT_CENTER,
-                            &number.to_string(),
-                            p.muted,
+                    for (place, (line, part)) in halves.into_iter().enumerate() {
+                        let Some(line) = line else {
+                            // Nothing stood, or stands, beside the other half.
+                            painter.rect_filled(part, 0, theme::tint(p.fg, 0.025));
+                            continue;
+                        };
+                        // A line that did not change is on both halves; a
+                        // heading is said once, across them.
+                        if line.kind == LineKind::Hunk && place == 1 {
+                            painter.rect_filled(part, 0, theme::tint(p.fg, 0.05));
+                            continue;
+                        }
+                        let text = |x: f32, align: Align2, text: &str, colour: Color32| {
+                            painter.with_clip_rect(part.intersect(ui.clip_rect())).text(
+                                Pos2::new(part.left() + x, part.center().y),
+                                align,
+                                text,
+                                font.clone(),
+                                colour,
+                            );
+                        };
+                        let (fill, sign, ink) = match line.kind {
+                            LineKind::Hunk => (Some(theme::tint(p.fg, 0.05)), "", p.muted),
+                            LineKind::Context => (None, "", p.fg),
+                            LineKind::Added => (Some(theme::tint(p.green, 0.14)), "+", p.green),
+                            LineKind::Removed => (Some(theme::tint(p.red, 0.14)), "−", p.red),
+                        };
+                        if let Some(fill) = fill {
+                            painter.rect_filled(part, 0, fill);
+                        }
+                        if line.kind == LineKind::Hunk {
+                            text(numbers, Align2::LEFT_CENTER, &line.text, ink);
+                            continue;
+                        }
+                        // Side by side, the leading half numbers what was.
+                        let number = if lines_of.split && place == 0 {
+                            line.old.or(line.new)
+                        } else {
+                            line.new.or(line.old)
+                        };
+                        if let Some(number) = number {
+                            text(
+                                numbers - 8.0,
+                                Align2::RIGHT_CENTER,
+                                &number.to_string(),
+                                p.muted,
+                            );
+                        }
+                        if let Some(at) = named(line) {
+                            // A line something is said of carries a mark,
+                            // and where lines are picked a press picks it.
+                            if lines_of.marked.contains(&at) {
+                                painter.rect_filled(
+                                    Rect::from_min_max(
+                                        part.left_top(),
+                                        Pos2::new(part.left() + 2.0, part.bottom()),
+                                    ),
+                                    0,
+                                    p.accent,
+                                );
+                            }
+                            // A line that did not change is picked once.
+                            let both = lines_of.split && line.kind == LineKind::Context;
+                            if let Some(pick) = lines_of.pick.filter(|_| !(both && place == 0)) {
+                                let response = ui
+                                    .interact(
+                                        part,
+                                        ui.id().with(("diff-line", index, place)),
+                                        Sense::click(),
+                                    )
+                                    .on_hover_cursor(CursorIcon::PointingHand);
+                                response.widget_info(|| {
+                                    WidgetInfo::labeled(
+                                        WidgetType::Button,
+                                        true,
+                                        format!("Comment on line {}", at.0),
+                                    )
+                                });
+                                if response.hovered() {
+                                    painter.rect_filled(part, 0, theme::tint(p.accent, 0.10));
+                                }
+                                if response.clicked() {
+                                    pick.set(Some(at));
+                                }
+                            }
+                        }
+                        text(numbers, Align2::LEFT_CENTER, sign, ink);
+                        // The line moves under its number and sign.
+                        let written = Rect::from_min_max(
+                            Pos2::new(part.left() + gutter, part.top()),
+                            part.max,
                         );
+                        painter
+                            .with_clip_rect(written.intersect(ui.clip_rect()))
+                            .text(
+                                Pos2::new(written.left() - shift, part.center().y),
+                                Align2::LEFT_CENTER,
+                                &line.text,
+                                font.clone(),
+                                p.fg,
+                            );
                     }
-                    text(numbers, Align2::LEFT_CENTER, sign, ink);
-                    text(gutter, Align2::LEFT_CENTER, &line.text, p.fg);
                 }
             },
         );
@@ -612,12 +914,66 @@ fn contents(
         centered_note(ui, body, p, &note);
         return;
     }
-    let total = repository.files.len() + usize::from(repository.more > 0);
+    listing(
+        ui,
+        body,
+        p,
+        Listed {
+            files: repository.files,
+            more: repository.more,
+            diff: repository.diff,
+            lines: Lines::default(),
+        },
+        (state.selected.as_deref(), &mut state.diff_share),
+        events,
+    );
+}
+
+/// What a diff's lines carry beyond their text, where a surface comments on
+/// them: each line is named by its number and whether it was removed.
+#[derive(Default)]
+pub(super) struct Lines<'a> {
+    /// Lines that something is said of.
+    pub marked: &'a [(u32, bool)],
+    /// Where a pressed line is reported; without it lines take no press.
+    pub pick: Option<&'a std::cell::Cell<Option<(u32, bool)>>>,
+    /// The line a field stands open under, and how many rows it is given.
+    pub open: Option<((u32, bool), usize)>,
+    /// Where the room for that field is, on the frames it is in view, and
+    /// the surface that clips it.
+    pub slot: Option<&'a std::cell::Cell<Option<(Rect, Rect)>>>,
+    /// What was and what is are set side by side.
+    pub split: bool,
+    /// A line longer than the surface goes on underneath itself, where the
+    /// lines are not side by side.
+    pub wrap: bool,
+}
+
+/// Changed files and the diff of the chosen one.
+pub(super) struct Listed<'a> {
+    pub files: &'a [File],
+    /// Files beyond the most a list shows.
+    pub more: usize,
+    pub diff: Option<(&'a File, &'a DiffBody)>,
+    pub lines: Lines<'a>,
+}
+
+/// The files in `body`, a row each, over the diff of the chosen one. The
+/// pull request tab lists its files the same way.
+pub(super) fn listing(
+    ui: &mut Ui,
+    body: Rect,
+    p: Palette,
+    listed: Listed,
+    (selected, diff_share): (Option<&str>, &mut f32),
+    events: &mut Vec<Event>,
+) {
+    let total = listed.files.len() + usize::from(listed.more > 0);
     // The diff takes the bottom of the panel; the divider above resizes it.
     // A list shorter than its share keeps only its rows, and the diff has
     // the room that leaves.
-    let diff_height = repository.diff.map_or(0.0, |_| {
-        (body.height() * state.diff_share)
+    let diff_height = listed.diff.map_or(0.0, |_| {
+        (body.height() * *diff_share)
             .clamp(96.0, (body.height() - 80.0).max(96.0))
             .max(body.height() - total as f32 * ROW - 6.0)
             .min(body.height())
@@ -636,23 +992,23 @@ fn contents(
         .show_rows(&mut rows, ROW, total, |ui, range| {
             for index in range {
                 let (_, rect) = ui.allocate_space(vec2(ui.available_width(), ROW));
-                let Some(file) = repository.files.get(index) else {
+                let Some(file) = listed.files.get(index) else {
                     ui.painter().text(
                         Pos2::new(rect.left() + 26.0, rect.center().y),
                         Align2::LEFT_CENTER,
-                        format!("{} more files are not listed", repository.more),
+                        format!("{} more files are not listed", listed.more),
                         theme::regular(11.5),
                         p.muted,
                     );
                     continue;
                 };
-                let selected = state.selected.as_deref() == Some(file.path.as_str());
+                let selected = selected == Some(file.path.as_str());
                 file_row(ui, rect, p, file, selected, events);
             }
         });
-    if let Some(shown) = repository.diff {
+    if let Some(shown) = listed.diff {
         let surface = Rect::from_min_max(Pos2::new(body.left(), list.bottom() + 6.0), body.max);
-        diff(ui, surface, p, shown, events);
+        diff(ui, surface, p, shown, &listed.lines, events);
         let handle = Rect::from_min_max(
             Pos2::new(body.left(), list.bottom()),
             Pos2::new(body.right(), list.bottom() + 6.0),
@@ -662,10 +1018,10 @@ fn contents(
             && let Some(pointer) = resize.interact_pointer_pos()
             && body.height() > 0.0
         {
-            state.diff_share = ((body.bottom() - pointer.y) / body.height()).clamp(0.2, 0.85);
+            *diff_share = ((body.bottom() - pointer.y) / body.height()).clamp(0.2, 0.85);
         }
         if resize.double_clicked() {
-            state.diff_share = State::default().diff_share;
+            *diff_share = State::default().diff_share;
         }
     }
 }

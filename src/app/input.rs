@@ -27,11 +27,11 @@ impl App {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
+        let events = self.terminal_events(ctx);
         let Some(pane) = self.renders.get_mut(&id) else {
             return;
         };
         let mode = session.modes();
-        let events = Self::terminal_events(ctx);
         let normalized = crate::input::normalize_events(&events, ctx.input(|i| i.modifiers));
         for input in crate::input::route_events(context, &normalized, mode) {
             let result = match input.action {
@@ -212,18 +212,20 @@ impl App {
     /// Whether text of a panel is selected, such as a reply of a project's
     /// lead. A copy is then that text's: labels take no keyboard focus, so
     /// the terminal would otherwise get the chord as a key.
-    fn text_selected(ctx: &egui::Context) -> bool {
-        ctx.with_plugin(|labels: &mut egui::text_selection::LabelSelectionState| {
-            labels.has_selection()
-        })
-        .unwrap_or(false)
+    fn text_selected(&self, ctx: &egui::Context) -> bool {
+        self.explorer_text_selected()
+            || ctx
+                .with_plugin(|labels: &mut egui::text_selection::LabelSelectionState| {
+                    labels.has_selection()
+                })
+                .unwrap_or(false)
     }
 
     /// The frame's events as a terminal takes them. A copy left for the text
     /// selected in a panel is not also the terminal's interrupt.
-    pub(super) fn terminal_events(ctx: &egui::Context) -> Vec<egui::Event> {
+    pub(super) fn terminal_events(&self, ctx: &egui::Context) -> Vec<egui::Event> {
         let mut events = ctx.input(|input| input.events.clone());
-        if Self::text_selected(ctx) {
+        if self.text_selected(ctx) {
             events.retain(|event| !matches!(event, egui::Event::Copy | egui::Event::Cut));
         }
         events
@@ -302,7 +304,7 @@ impl App {
                     ..
                 } => (*key, *physical_key, *pressed, *modifiers),
                 egui::Event::Copy
-                    if !Self::text_selected(ctx) && self.terminal_owns_shortcuts(ctx) =>
+                    if !self.text_selected(ctx) && self.terminal_owns_shortcuts(ctx) =>
                 {
                     (
                         if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
@@ -316,7 +318,7 @@ impl App {
                     )
                 }
                 egui::Event::Cut
-                    if !Self::text_selected(ctx) && self.terminal_owns_shortcuts(ctx) =>
+                    if !self.text_selected(ctx) && self.terminal_owns_shortcuts(ctx) =>
                 {
                     (
                         if frame_modifiers.ctrl || frame_modifiers.mac_cmd {
@@ -365,11 +367,7 @@ impl App {
                     });
                 // A menu or list open over a sheet that holds them is left
                 // before the sheet is.
-                if matches!(
-                    self.ui.overlay,
-                    OverlayState::Settings | OverlayState::Project
-                ) && egui::Popup::is_any_open(ctx)
-                {
+                if egui::Popup::is_any_open(ctx) {
                     egui::Popup::close_all(ctx);
                 } else if self.ui.pane_drag.is_some() {
                     self.cancel_pane_drag(ctx);
@@ -384,7 +382,7 @@ impl App {
                     self.action(ctx, Action::CloseSearch);
                 } else if self.explorer_escape(ctx) {
                     // A name being typed, a search or its field was left.
-                } else if self.project_escape(ctx) {
+                } else if self.project_escape(ctx) || self.pull_request_escape(ctx) {
                     // A message being written keeps its text; the keyboard
                     // returns to the terminal.
                 } else if self.ui.error.is_some() && self.controller.model().active_pane().is_none()
@@ -480,7 +478,7 @@ impl App {
             }
             // The copy chord is the selected text's too, as it is the
             // terminal selection's.
-            if binding == Binding::Copy && Self::text_selected(ctx) {
+            if binding == Binding::Copy && self.text_selected(ctx) {
                 if pressed {
                     self.shortcut_keys.insert(physical_key.unwrap_or(key));
                 }

@@ -16,6 +16,21 @@ their preparation records remain in Git history.
   pages, or inspect them with developer tools. Browser painting follows the
   display's refresh rate and pauses for hidden previews; tabs restore blank,
   without saving browsing history or addresses.
+- Read a pull request without leaving the terminal. Click a pull request's
+  number on a terminal's tab and it opens in the new **Pull request** tab of
+  the right panel: its title and state, what stands between it and a merge,
+  reviewers, labels, description with its pictures and checks under
+  **Summary**, everything
+  that happened to it under **Timeline**, and its changed files with their
+  diffs under **Code**. From there you can merge it or have the host merge it
+  by itself, mark it ready or a draft, close, reopen or revert it, edit its
+  title and description, change labels and reviewers, comment, react, answer
+  and resolve review conversations, mark files as viewed, review it with
+  comments on single lines, approve waiting workflow runs, walk a stack,
+  check it out in a worktree of its own and hand it to an agent. Each pull request you open is a tab of its own in the panel's strip. Ctrl-click (Command-click on
+  macOS) a number to open it in the browser as before. It is read with your
+  signed-in GitHub CLI (`gh`), only while its tab is in view, and nothing
+  read is saved.
 - Put an agent in charge of a piece of work with Projects. The new Project
   tab of the right panel starts a **lead**, your installed Claude Code or
   Codex, in the workspace in view: tell it what you want done and it plans,

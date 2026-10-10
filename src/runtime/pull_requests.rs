@@ -131,13 +131,25 @@ impl Lookup {
     }
 }
 
+/// What a linked number says of its pull request under the pointer, before
+/// it is opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preview {
+    pub title: String,
+    pub author: String,
+    /// Seconds since 1970.
+    pub opened: i64,
+}
+
 /// Reads the pull requests of one host; `None` for each it could not read.
-pub(crate) type Fetch = Box<dyn Fn(&str, &[PullRequest]) -> Vec<Option<Status>> + Send>;
+pub(crate) type Fetch = Box<dyn Fn(&str, &[PullRequest]) -> Vec<Option<(Status, Preview)>> + Send>;
 
 #[derive(Default)]
 struct Watched {
     wanted: Vec<PullRequest>,
     known: HashMap<String, (Lookup, Instant)>,
+    /// What each says of itself, kept as long as its state is.
+    previews: HashMap<String, Preview>,
     closed: bool,
 }
 #[derive(Default)]
@@ -214,6 +226,11 @@ impl Watcher {
             .get(&key(link))
             .map_or(Lookup::Checking, |known| known.0)
     }
+
+    /// The title, author and age of a pull request whose state was read.
+    pub fn preview(&self, link: &PullRequest) -> Option<Preview> {
+        self.shared.lock().previews.get(&key(link)).cloned()
+    }
 }
 impl Drop for Watcher {
     fn drop(&mut self) {
@@ -226,10 +243,16 @@ fn run(shared: &Shared, fetch: &Fetch, wake: &egui::Context) {
     let mut watched = shared.lock();
     while !watched.closed {
         let now = Instant::now();
-        let Watched { wanted, known, .. } = &mut *watched;
+        let Watched {
+            wanted,
+            known,
+            previews,
+            ..
+        } = &mut *watched;
         known.retain(|url, (_, read)| {
             now.duration_since(*read) < REMEMBERED || wanted.iter().any(|link| key(link) == *url)
         });
+        previews.retain(|url, _| known.contains_key(url));
         let mut due = Vec::new();
         let mut next: Option<Duration> = None;
         for link in wanted.iter() {
@@ -267,9 +290,12 @@ fn run(shared: &Shared, fetch: &Fetch, wake: &egui::Context) {
         watched = shared.lock();
         let now = Instant::now();
         let mut changed = false;
-        for (link, lookup) in due.iter().zip(read) {
+        for (link, (lookup, preview)) in due.iter().zip(read) {
             let before = watched.known.insert(key(link), (lookup, now));
             changed |= before.map(|before| before.0) != Some(lookup);
+            if let Some(preview) = preview {
+                watched.previews.insert(key(link), preview);
+            }
         }
         if changed {
             wake.request_repaint();
@@ -278,8 +304,8 @@ fn run(shared: &Shared, fetch: &Fetch, wake: &egui::Context) {
 }
 
 /// One lookup for each host, in turn.
-fn read_all(fetch: &Fetch, links: &[PullRequest]) -> Vec<Lookup> {
-    let mut read = vec![Lookup::Unavailable; links.len()];
+fn read_all(fetch: &Fetch, links: &[PullRequest]) -> Vec<(Lookup, Option<Preview>)> {
+    let mut read = vec![(Lookup::Unavailable, None); links.len()];
     let mut hosts: Vec<&str> = links.iter().map(|link| link.location().0).collect();
     hosts.sort_unstable();
     hosts.dedup();
@@ -291,17 +317,45 @@ fn read_all(fetch: &Fetch, links: &[PullRequest]) -> Vec<Lookup> {
             .map(|(place, link)| (place, link.clone()))
             .unzip();
         for (place, status) in places.into_iter().zip(fetch(host, &of_host)) {
-            read[place] = status.map_or(Lookup::Unavailable, Lookup::Known);
+            read[place] = match status {
+                Some((status, preview)) => (Lookup::Known(status), Some(preview)),
+                None => (Lookup::Unavailable, None),
+            };
         }
     }
     read
 }
 
-fn fetch(host: &str, links: &[PullRequest]) -> Vec<Option<Status>> {
+fn fetch(host: &str, links: &[PullRequest]) -> Vec<Option<(Status, Preview)>> {
     match gh(host, &query(links)) {
-        Some(response) => parse(&response, links.len()),
+        Some(response) => parse(&response, links.len())
+            .into_iter()
+            .zip(previews(&response, links.len()))
+            .map(|(status, preview)| status.map(|status| (status, preview)))
+            .collect(),
         None => vec![None; links.len()],
     }
+}
+
+/// What each pull request of a response says of itself.
+fn previews(response: &[u8], count: usize) -> Vec<Preview> {
+    let response: serde_json::Value = serde_json::from_slice(response).unwrap_or_default();
+    (0..count)
+        .map(|place| {
+            let pull = &response["data"][format!("p{place}")]["pullRequest"];
+            Preview {
+                title: pull["title"].as_str().unwrap_or_default().to_owned(),
+                author: pull["author"]["login"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                opened: pull["createdAt"]
+                    .as_str()
+                    .and_then(super::pull_request::timestamp)
+                    .unwrap_or(0),
+            }
+        })
+        .collect()
 }
 
 /// One aliased field for each pull request. `PullRequest::parse` admits only
@@ -312,7 +366,7 @@ fn query(links: &[PullRequest]) -> String {
         let (_, owner, repository) = link.location();
         query.push_str(&format!(
             "p{place}:repository(owner:\"{owner}\",name:\"{repository}\"){{\
-             pullRequest(number:{}){{state isDraft \
+             pullRequest(number:{}){{state isDraft title createdAt author{{login}} \
              commits(last:1){{nodes{{commit{{statusCheckRollup{{state}}}}}}}} \
              reviewThreads(first:{MAX_THREADS}){{nodes{{isResolved}}}}}}}}",
             link.number()
@@ -377,51 +431,91 @@ fn program() -> std::path::PathBuf {
     "gh".into()
 }
 
-/// The response of one GraphQL request made by the GitHub CLI, which prints
-/// what it could read even when part of the request failed.
-fn gh(host: &str, query: &str) -> Option<Vec<u8>> {
+/// What the GitHub CLI printed, and whether it said it succeeded.
+pub(super) struct Printed {
+    pub ok: bool,
+    pub bytes: Vec<u8>,
+}
+
+/// Runs the GitHub CLI without a prompt, reading at most `limit` bytes of what
+/// it prints and ending it at the time limit. An error when it could not be
+/// started, as where it is not installed.
+pub(super) fn cli(args: &[&str], limit: u64) -> std::io::Result<Printed> {
+    run_cli(args, limit, false)
+}
+
+/// The same for a command that changes something: what is read is what the
+/// CLI says went wrong, which is the host's own words.
+pub(super) fn cli_complaint(args: &[&str]) -> std::io::Result<Printed> {
+    run_cli(args, 4096, true)
+}
+
+fn run_cli(args: &[&str], limit: u64, complaint: bool) -> std::io::Result<Printed> {
     use std::process::{Command, Stdio};
+    let pipe = |read: bool| if read { Stdio::piped() } else { Stdio::null() };
     let mut command = Command::new(program());
     command
-        .args(["api", "graphql", "--hostname", host, "-f"])
-        .arg(format!("query={query}"))
+        .args(args)
+        // A command given an address must not act on a repository it is
+        // started in.
+        .current_dir(std::env::temp_dir())
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("NO_COLOR", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdout(pipe(!complaint))
+        .stderr(pipe(complaint));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let mut child = command.spawn().ok()?;
-    let mut output = child.stdout.take()?;
+    let mut child = command.spawn()?;
+    let mut output: Box<dyn Read + Send> = if complaint {
+        Box::new(child.stderr.take().ok_or(std::io::ErrorKind::BrokenPipe)?)
+    } else {
+        Box::new(child.stdout.take().ok_or(std::io::ErrorKind::BrokenPipe)?)
+    };
     std::thread::scope(|scope| {
         let reader = scope.spawn(move || {
             let mut response = Vec::new();
             (&mut output)
-                .take(MAX_RESPONSE)
+                .take(limit)
                 .read_to_end(&mut response)
-                .ok()
                 .map(|_| response)
         });
         let deadline = Instant::now() + LOOKUP_TIMEOUT;
-        loop {
+        let ok = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status.success(),
                 Ok(None) if Instant::now() < deadline && !reader.is_finished() => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break;
+                    break false;
                 }
             }
-        }
-        reader.join().ok().flatten()
+        };
+        let bytes = reader
+            .join()
+            .map_err(|_| std::io::ErrorKind::Other)?
+            .map_err(|error| error.kind())?;
+        Ok(Printed { ok, bytes })
     })
+}
+
+/// The response of one GraphQL request made by the GitHub CLI, which prints
+/// what it could read even when part of the request failed.
+fn gh(host: &str, query: &str) -> Option<Vec<u8>> {
+    let query = format!("query={query}");
+    cli(
+        &["api", "graphql", "--hostname", host, "-f", &query],
+        MAX_RESPONSE,
+    )
+    .ok()
+    .map(|printed| printed.bytes)
 }
 
 #[cfg(test)]
@@ -447,7 +541,7 @@ mod tests {
         ];
         let query = query(&links);
         assert!(query.starts_with(
-            "query{p0:repository(owner:\"zevem\",name:\"neptune\"){pullRequest(number:83){state isDraft "
+            "query{p0:repository(owner:\"zevem\",name:\"neptune\"){pullRequest(number:83){state isDraft title "
         ));
         assert!(query.contains(
             "p1:repository(owner:\"other-owner\",name:\"re.po_2\"){pullRequest(number:7){"
@@ -499,6 +593,21 @@ mod tests {
             ]
         );
         assert_eq!(parse(b"gh: not signed in", 2), [None, None]);
+        // What a number says of itself comes with the same response.
+        let said =
+            br#"{"data":{"p0":{"pullRequest":{"title":"A tab","createdAt":"1970-01-01T00:01:00Z",
+            "author":{"login":"ada"}}},"p1":null}}"#;
+        assert_eq!(
+            previews(said, 2),
+            [
+                Preview {
+                    title: "A tab".into(),
+                    author: "ada".into(),
+                    opened: 60,
+                },
+                Preview::default(),
+            ]
+        );
     }
 
     #[test]
@@ -531,7 +640,7 @@ mod tests {
     fn links_are_read_once_per_host_and_a_frame_is_asked_only_for_a_change() {
         use std::sync::mpsc;
         let (asked, asks) = mpsc::channel::<(String, Vec<u64>)>();
-        let (answer, answers) = mpsc::channel::<Vec<Option<Status>>>();
+        let (answer, answers) = mpsc::channel::<Vec<Option<(Status, Preview)>>>();
         let mut watcher = Watcher::with(Box::new(move |host, links| {
             let numbers = links.iter().map(PullRequest::number).collect();
             asked.send((host.to_owned(), numbers)).unwrap();
@@ -576,7 +685,7 @@ mod tests {
             ("github.com".into(), vec![83])
         );
         let open = status(State::Open, Checks::Pending, 0);
-        answer.send(vec![Some(open)]).unwrap();
+        answer.send(vec![Some((open, Preview::default()))]).unwrap();
         wait(&|| watcher.lookup(&same) == Lookup::Known(open));
         assert_eq!(watcher.lookup(&other), Lookup::Unavailable);
         wait(&|| frames() == 1);
@@ -617,7 +726,7 @@ mod tests {
             assert_eq!(links.len(), 1);
             // Closing with the answer ends the worker once it is stored.
             closing.lock().closed = true;
-            vec![Some(open)]
+            vec![Some((open, Preview::default()))]
         });
         run(&shared, &fetch, &egui::Context::default());
         let watched = shared.lock();

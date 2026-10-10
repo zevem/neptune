@@ -70,6 +70,13 @@ fn command(
 /// and each captures its target when the palette is drawn.
 fn commands(view: &PaletteView) -> Vec<Command> {
     let mut list = Vec::new();
+    list.push(command(
+        "Application",
+        Icon::Agents,
+        "Subscription usage",
+        "",
+        [Action::Usage],
+    ));
     if let Some(pane) = view.pane {
         for port in view.ports {
             if matches!(
@@ -622,6 +629,15 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             view.config.keybindings.hint(Binding::ShowProject),
             [Action::Panel(super::panel::Event::Show(
                 super::panel::Tab::Project,
+            ))],
+        ),
+        command(
+            "View",
+            Icon::PullRequest,
+            "Show pull request",
+            "",
+            [Action::Panel(super::panel::Event::Show(
+                super::panel::Tab::PullRequest,
             ))],
         ),
         command(

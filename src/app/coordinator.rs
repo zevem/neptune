@@ -408,6 +408,12 @@ impl App {
         }
         match action {
             Action::CheckUpdates => self.updates.check(ctx),
+            Action::Usage => {
+                self.ui.overlay = OverlayState::None;
+                egui::Popup::open_id(ctx, ui::usage::popup_id());
+            }
+            Action::RefreshUsage => self.usage.refresh(ctx, false),
+            Action::EnableCursorUsage => self.usage.refresh(ctx, true),
             Action::ReviewUpdate => {
                 if self.updates.release.is_some() {
                     self.ui.overlay = OverlayState::Update;
@@ -731,6 +737,7 @@ impl App {
             Action::Changes(event) => self.changes_event(ctx, event),
             Action::Worktree(event) => self.worktree_event(ctx, event),
             Action::Project(event) => self.project_event(ctx, event),
+            Action::PullRequest(event) => self.pull_request_event(ctx, event),
             Action::SidebarWidth(width) => {
                 let config = Config {
                     sidebar_width: width.clamp(170.0, 360.0),

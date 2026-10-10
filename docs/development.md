@@ -1,6 +1,6 @@
 # Development guide
 
-Neptune uses `egui`/`eframe` with `wgpu`, `alacritty_terminal` for terminal state, and `portable-pty` for Unix PTYs and Windows ConPTY. It contains no webview. This repository is an initial implementation: Linux is the local verification platform; macOS and Windows need native runtime verification before a production release.
+Neptune uses `egui`/`eframe` with `wgpu`, `alacritty_terminal` for terminal state, and `portable-pty` for Unix PTYs and Windows ConPTY. Its terminal and chrome remain native; optional [browser previews](browser.md) run in an isolated CEF helper. This repository is an initial implementation: Linux is the local verification platform; macOS and Windows need native runtime verification before a production release.
 
 [Project overview](../README.md) · [Build and run](installation.md#build-and-run)
 
@@ -133,3 +133,18 @@ exits after capture and removes its temporary data root. These captures use real
 PTY output and GPU rendering with application events; OS modifier-click,
 keyboard entry, the terminal context menu and clipboard ownership need a
 separate native input check.
+
+## Subscription usage captures
+
+Review the footer and dropdown with quota fixtures in a real native window:
+
+```sh
+NEPTUNE_USAGE_CAPTURE="$PWD/artifacts/native-usage.png" \
+  cargo test -p neptune-terminal --lib app::tests::capture_usage_native --locked -- --ignored --nocapture
+```
+
+`NEPTUNE_USAGE_SCREEN` selects `open` (default), `closed`, `empty`, `loading` or
+`stale`. `NEPTUNE_USAGE_NARROW=1` uses 640×400; `NEPTUNE_USAGE_LIGHT=1` selects
+Light and `NEPTUNE_USAGE_SPLIT=1` opens two terminals. Each capture owns fresh
+storage and exits after saving the screenshot. The fixtures verify presentation;
+use an isolated inspection launch to check real account reads, refresh and input.

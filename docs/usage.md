@@ -11,6 +11,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 - [Browser tabs](#browser-tabs)
 - [Closing terminals safely](#closing-terminals-safely)
 - [Coding agent sessions](#coding-agent-sessions)
+- [Subscription usage](#subscription-usage)
 - [Projects](#projects)
 - [Notifications](#notifications)
 - [Command-line options](#command-line-options)
@@ -195,6 +196,40 @@ foot of the window to click. The folder control on a row shows
 the file in your file manager and the cross dismisses it from the list without touching the file. See
 [attached files](agent-sessions.md#attached-files).
 
+## Subscription usage
+
+The bottom-right bar shows the percentage used of the most consumed allowance
+for your local Codex, Claude Code and Cursor subscriptions. Hover for the
+window's name. Click it, or choose **Subscription usage**
+in the command palette, for one line per reported window under its provider:
+the percentage **Used** and the time it **Resets in**. The header shows how old
+the readings are, and its **Refresh** button checks the accounts again. Checks
+also run every five minutes; opening the dropdown does not resize your
+terminals. A failed check keeps the last reading marked **Stale** with its age,
+and a reset time that has passed reads **due** until the next refresh rather
+than assuming the quota is available.
+
+Sign in through the provider's CLI first: `codex login`, `claude auth login`,
+or `agent login` for Cursor. Codex and Claude use their own read-only account
+protocols, with no prompt or agent turn. Cursor reads the same current-period
+dashboard percentages as its CLI, including bonus allowance. Missing CLIs,
+unsupported logins and failed checks are explained in the dropdown; API-key
+logins may not report subscription limits.
+
+The accounts are those signed in on the computer running Neptune, including
+when the terminal in view is connected over SSH. Codex and Claude honor their
+CLI's `CODEX_HOME` and `CLAUDE_CONFIG_DIR` environment settings. Cursor uses
+`CURSOR_AUTH_TOKEN` or its saved CLI `auth.json` in the platform's configuration
+directory; an explicit `CURSOR_API_KEY` never falls back to a different saved
+account. `CURSOR_API_ENDPOINT` may select another HTTPS endpoint with an
+explicit token or file login. On macOS, **Allow Cursor Keychain** grants this
+run permission to read the default CLI login; macOS may ask for access. This
+permission lasts until Neptune closes. A file-based login can instead use
+`AGENT_CLI_CREDENTIAL_STORE=file`.
+
+Only bounded quota metadata is kept in memory. Neptune does not scan agent
+transcripts, store credentials or usage history, or redeem reset credits.
+
 ## Projects
 
 A project gives a workspace a **lead**: your installed Claude Code or Codex,
@@ -316,13 +351,29 @@ Each [project](#projects) keeps its chat, shared context and watches in `project
 
 ## Right panel
 
-The **Toggle right panel** button at the trailing end of the toolbar, Ctrl+Shift+O (Command+O on macOS) or the command palette slides a panel in from the right. Its four tabs, **Files**, **Agents**, **Changes** and **Project**, are chosen by clicking them or with **Show files**, **Show agents**, **Show changes** and **Show project** in the command palette, which also open the panel. The Project tab holds the workspace's [project](#projects). The panel opens on the tab it last showed. Drag its leading edge to resize it, or double-click the edge for the default width. It starts closed with each launch; its width, its tab and what is typed in it are not saved.
+The **Toggle right panel** button at the trailing end of the toolbar, Ctrl+Shift+O (Command+O on macOS) or the command palette slides a panel in from the right. Its five tabs, **Files**, **Agents**, **Changes**, **Project** and **Pull request**, are chosen by clicking them or with **Show files**, **Show agents**, **Show changes**, **Show project** and **Show pull request** in the command palette, which also open the panel. The Project tab holds the workspace's [project](#projects). A panel near its narrowest names the last tab **PR**. The panel opens on the tab it last showed. Drag its leading edge to resize it, or double-click the edge for the default width. It starts closed with each launch; its width, its tab and what is typed in it are not saved.
 
 ## Agents
 
 The **Agents** tab lists every Claude Code, Codex, OpenCode, Gemini CLI, pi and Oh My Pi agent running in a terminal of any workspace, local or SSH, including workspaces and tabs out of view. Agents are grouped by what they are doing: **Needs input** first (an agent asking to allow a tool, asking a question, waiting for a plan to be approved, or otherwise blocked on you), then **Working**, then **Idle**. Each row shows the agent's name for its conversation, its state, which agent it is, its workspace and how long it has been in that state. Click a row to go to its terminal. Secondary-click the row of an agent that another agent or a project started, once its terminal is a tab, for **Send to background**: the tab goes and the agent runs on, as [before it was opened](agent-sessions.md#agents-that-start-agents). While an agent waits for input and the list is not in view, the panel's toolbar button carries a dot, and the Agents tab shows how many are waiting.
 
 An agent is listed while its CLI runs: it appears when its CLI starts and leaves when the CLI exits or its terminal is restarted or closed. In an SSH workspace Neptune installs small adapters in your cache directory on the host to report this through the terminal; see [agents on SSH hosts](agent-sessions.md#agents-on-ssh-hosts). Agents started inside `tmux` on a host, in an `ssh` you typed yourself, on Windows, as batch commands (`claude -p`, `codex exec`) or through an alias or absolute path that bypasses Neptune's adapters are not listed. Codex asks once to trust the hooks that report its activity; until it does, its state is read from its terminal title alone, about two seconds behind. Gemini CLI is always read from its title. See [agent sessions](agent-sessions.md#agent-activity) for how states are detected and where they can lag.
+
+## Pull requests
+
+Click a pull request's number on a terminal's tab, or in a project's list of agents, and the **Pull request** tab of the right panel shows it. Each one you open becomes a tab of its own in the panel's strip, named by its number, in place of the **Pull request** tab, up to eight; click one to return to it, and its cross or a middle click to close it. The icon after them lists the linked pull requests. Where the strip has no room for all of them they scroll sideways, and in a narrow panel the four other tabs become icons, named under the pointer, rather than be cut. Ctrl-click the number (Command-click on macOS) to open it in the default browser instead; a window too narrow for the panel always uses the browser. Without a pull request the tab lists those the terminals of the workspace in view have [linked](agent-sessions.md#linked-pull-requests), each with where it stands; click one to read it. The chevron at the top of a pull request leads back to that list.
+
+The header names the repository and the number, which open the pull request on its host, and carries **Refresh pull request** and a **⋯** menu. Under it are the title, the state (**Open**, **Draft**, **Merged** or **Closed**), who opened it and when it last changed, and three parts:
+
+- **Summary** leads with one line that says where it stands, naming what would keep it from merging first ("Conflicts with main", "Changes requested", "1 of 6 checks failing", "Review required") and otherwise "Ready to merge", with the one action that fits beside it: the merge button, **Ready for review** on a draft or **Reopen** on a closed one. Below are its branches (click the source branch to copy its name) with the lines added and removed, its reviewers with what each concluded, assignees and labels, the **Description** with its Markdown and pictures drawn, the **Checks** (folded, with their state said in the heading; click one to open its page) and the **Comments**: the ten most recent first, with older ones and resolved review conversations behind a control each.
+- **Timeline** lists what happened in order: when it was opened, its commits, reviews, comments and review conversations with their replies, and when it was merged or closed. **Newest first** turns the order around, here and for the comments.
+- **Code** lists the changed files as the Changes tab does; click one for its diff at the bottom of the panel.
+
+Next to the reviewers and the labels a **+** opens the people who can be asked to review and the repository's labels, with those in use ticked; the description has **Edit**, and **Edit title…** is in the **⋯** menu. Under a comment are its reactions, each a small picture with its count: click one to give or take back your own, and the **+** beside them for another. A review conversation also has **Reply** and **Resolve** or **Reopen**, and what you wrote yourself has **Edit**. A pull request that is part of a stack lists the open pull requests of that stack under its branches, up to five below it and five above; click one to open it. In **Code**, **All commits** chooses one commit's files instead (a commit in the Timeline leads there too) and offers **Hide whitespace changes**, **Side by side**, which sets what was beside what is, and **Wrap lines**, **Viewed** marks the file whose diff is open as viewed on the host, and clicking a line of that diff opens a field under it for a comment on that line; it waits, marked at the line's edge and counted on the round control, until you send it with your review, and each waiting comment can be taken back there.
+
+Merging asks once more in the same card ("Squash and merge #118 into main?") before anything is sent, and so does **Close pull request…** from the **⋯** menu. That menu also offers **Ready for review** or **Convert to draft**, **Enable auto-merge…** or **Disable auto-merge** where the repository has it, **Update branch** on a branch that is behind, **Revert changes…** once merged (it opens a pull request that reverts this one), the ways the repository allows a merge when there are several, **Ask the agent here about this…**, which writes a prompt naming the pull request at the agent of the terminal in front for you to finish and send, **Start an agent to explain it** and, where they apply, **Start an agent to fix the findings** and **Start an agent to resolve the conflicts**, which start an agent of its own on that task from the Claude Code or Codex in front, as [an agent starts another](agent-sessions.md#agents-that-start-agents), and show its terminal, **Check out in a new worktree**, which fetches the pull request from `origin` into a branch `pr-N` of the repository of the terminal in front and opens that branch's [worktree](agent-sessions.md) in a tab of its own with an agent, **Check out in the terminal**, which writes `gh pr checkout` at a local shell's prompt for you to send, the pull request's page, and copying its link, number, branch name or checkout command. What your account may not do is not offered. The round control at the bottom corner opens a field for a **Comment** or, on someone else's pull request, a **Review** that approves, requests changes or comments; Ctrl+Enter (Command+Enter on macOS) sends it, Escape puts the field away, and what you wrote is kept for that pull request until it is sent. When the host refuses something, a card says what it answered.
+
+Neptune reads and changes a pull request through the [GitHub CLI](https://cli.github.com) (`gh`) as the account signed in to it, and holds no token of its own. One opened in the tab is read at once, then every 15 seconds while its checks run, every minute while it is otherwise in review and every ten minutes once it is merged or closed; five times less often while another window is the active one, and not at all while another tab is in view or Neptune is minimized. Its files are read when **Code** is first shown and again when it gets a new commit. At most the 50 most recent comments, reviews and review conversations, 100 checks, 50 commits and 100 files are read, and the tab says when there are more. Pictures in the description and in comments are shown when the pull request's own host keeps them, as it does for those attached there: up to 16 for a pull request, each at most 8 MiB, read in the background without your account and, when the repository is private, through `gh`. A picture kept anywhere else is not fetched, so that nobody learns that you read the pull request: it is named in its place, and a click opens it in the browser, as it does for one that is shown. Nothing read is saved or written to diagnostics, and the tab shows a pull request only on a GitHub host. Without `gh`, without a sign-in for the host or without a network it says which, with **Try again** and the way to the browser. Workflow runs of a first-time contributor that wait for approval are said in the line at the top, with **Approve workflows**, which asks once more. Resting the pointer on a linked number shows a card with the pull request's title, author, age and state. Side by side, a sideways scroll moves the lines of both halves together.
 
 ## Changes
 
@@ -338,7 +389,7 @@ Neptune only reads: it never stages, commits, checks out or fetches, and it does
 
 The **Files** tab of the right panel shows the folder of the focused terminal and follows that terminal when it changes directory or when another terminal is focused. Every item is listed, hidden files and folders included, with folders first. Files made, renamed or removed by a program in the terminal appear within about two seconds; **Refresh** reads the folder at once.
 
-Click a folder to open or close it and a file to preview it at the bottom of the panel. Text is shown with line numbers (the first 256 KiB and 5,000 lines), PNG, JPEG, GIF, WebP and BMP pictures are fitted to the preview with their pixel size, and other files say that they have no preview. The preview follows the file as it changes. Drag the divider above the preview to resize it, and use its buttons to open the file with its default application or to close the preview.
+Click a folder to open or close it and a file to preview it at the bottom of the panel. Reopening a collapsed folder reads its contents afresh; nested expansion choices are kept. Text is shown with line numbers (the first 256 KiB, 5,000 lines and 1,000 columns per line). Drag across the text to select it, then copy with Ctrl+C or Ctrl+Shift+C on Linux/Windows, or Command+C on macOS. Secondary-click the source text for **Copy** or **Select all**; copied text excludes line numbers. Markdown (`.md`) files also offer a formatted **Preview**, with a `</>` icon button (**Toggle Markdown source / preview**) beside the open and close controls. The button stays highlighted while showing Source. Text in either view can be selected and copied. The preview formats headings, lists, quotes, tables and code blocks. Markdown images and HTML `img` elements show PNG, JPEG, GIF, WebP and BMP pictures; relative paths resolve from the Markdown file, and web images load in the background. Up to 16 pictures are loaded per document, with bounded sizes and timeouts. Hiding or closing the preview stops remaining picture work; returning to Files reloads a paused preview. Click web links to open your browser, or file links to preview their target; heading anchors scroll within the document. Each code block has **Copy** and **Toggle code line wrapping** controls. Copy preserves the original code, including tabs and long commands, within the file byte and line limits. Reloading keeps the scroll position and wrapping choices for unchanged code blocks. Turning wrapping off lets the code scroll horizontally within the block. Opening a file location selects **Source** to show its highlighted line. PNG, JPEG, GIF, WebP and BMP pictures are fitted to the preview with their pixel size, and other files say that they have no preview. The preview follows the file as it changes. Drag the divider above the preview to resize it, and use its buttons to open the file with its default application or to close the preview.
 
 **New file** and **New folder** in the panel's header create an item beside the selection, or in the folder shown when nothing is selected; type the name where the item will appear and press Enter. A name with slashes, such as `notes/today.md`, makes the folders on the way. Secondary-click an item for its menu: **New file…** and **New folder…** inside a folder, **Open with default app** for a file, **Reveal in file manager** (Finder on macOS, File Explorer on Windows), **Copy path**, **Copy relative path** (relative to the folder shown), **Rename…** and **Delete…**. Secondary-click empty space for the same creation commands, **Collapse all folders** and **Refresh**. Escape abandons a name being typed; clicking elsewhere uses it. Nothing is ever replaced: pressing Enter on a name that is taken keeps the field open and says so. **Delete…** asks first, then removes the file, or the folder with everything in it, permanently; it does not use the trash. Deleting a link removes the link, not what it points to.
 

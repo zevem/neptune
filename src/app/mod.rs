@@ -16,6 +16,7 @@ mod input;
 mod panel;
 mod ports;
 mod projects;
+mod pull_request;
 mod ssh;
 #[cfg(test)]
 mod tests;
@@ -129,6 +130,7 @@ pub struct App {
     projects: projects::Projects,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
     updates: crate::runtime::updates::Updates,
+    usage: crate::runtime::usage::Usage,
     /// Start the installed update once this approved exit completes.
     relaunch: bool,
     relaunch_arguments: Vec<std::ffi::OsString>,
@@ -141,6 +143,8 @@ pub struct App {
     explorer: explorer::Explorer,
     /// What git says about the folders in view.
     changes: changes::Changes,
+    /// The pull request the panel's tab shows.
+    pull_request: pull_request::PullRequestTab,
     file_drag: crate::platform::file_drag::FileDragSource,
     paste_chord: crate::input::PasteChord,
     /// Git worktrees made for agents, and the worker that runs git for them.
@@ -270,6 +274,7 @@ impl App {
             projects: projects::Projects::new(data.join("projects"), ephemeral),
             desktop_notifier: Default::default(),
             updates: Default::default(),
+            usage: Default::default(),
             relaunch: false,
             relaunch_arguments: launch.relaunch_arguments,
             pull_requests: Default::default(),
@@ -278,6 +283,7 @@ impl App {
             attached: Default::default(),
             explorer: Default::default(),
             changes: Default::default(),
+            pull_request: Default::default(),
             file_drag: Default::default(),
             paste_chord: Default::default(),
             worktrees: Default::default(),
@@ -299,6 +305,10 @@ impl App {
                 self.execute(ctx, effects);
             }
         }
+        if self.startup.is_none() && !self.ephemeral {
+            self.usage.start(ctx);
+        }
+        self.usage.poll();
         let focused = Self::window_has_focus(ctx);
         if self.window_focused != Some(focused) {
             let reported = self
@@ -531,6 +541,7 @@ impl App {
         self.poll_attached(ctx);
         self.poll_explorer(ctx);
         self.poll_changes(ctx);
+        self.poll_pull_request(ctx);
         self.poll_saves(ctx);
         self.poll_search(ctx);
         if self.diagnostics.enabled() {
@@ -753,6 +764,7 @@ impl App {
                             .map(|link| ui::helpers::LinkedPullRequest {
                                 link: link.clone(),
                                 lookup: self.pull_requests.lookup(link),
+                                preview: self.pull_requests.preview(link),
                             })
                             .collect(),
                         attached: self.attached_files(pane),
@@ -919,6 +931,9 @@ impl App {
     /// terminal can take over without dropping keys.
     fn release_closed_overlay_focus(&mut self, ctx: &egui::Context) {
         let open = self.ui.overlay != OverlayState::None;
+        if open {
+            self.ui.explorer.source_selection.reset();
+        }
         if self.overlay_was_open && !open {
             ctx.memory_mut(|memory| {
                 if let Some(id) = memory.focused() {
@@ -1193,6 +1208,9 @@ impl eframe::App for App {
             edge > 0.0,
             panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Changes,
         );
+        // A pull request is read only while its tab is the one in view.
+        let pull_request_shown = panel_reveal > 0.0 && panel_tab == ui::panel::Tab::PullRequest;
+        self.sync_pull_request(&ctx, pull_request_shown);
         let chrome = ui::chrome::ChromeView {
             keybindings: &self.config.keybindings,
             workspaces: &views,
@@ -1239,15 +1257,27 @@ impl eframe::App for App {
         );
         ui::chrome::toolbar(ui, toolbar, p, &chrome, &mut self.ui, &mut actions);
         ui::chrome::leading_controls(ui, p, &chrome, &mut actions);
+        let footer = Rect::from_min_max(
+            Pos2::new(
+                bounds.left() + edge,
+                bounds.bottom() - metrics::TOOLBAR_HEIGHT,
+            ),
+            bounds.max,
+        );
+        ui::usage::footer(
+            ui,
+            footer,
+            p,
+            &self.usage,
+            self.ui.overlay == OverlayState::None,
+            &mut actions,
+        );
         // Panes sit in the chrome like inset content; the sidebar supplies its
         // own trailing margin.
         let stage_from = |edge: f32, trailing: f32| {
             Rect::from_min_max(
                 Pos2::new(bounds.left() + edge.max(metrics::GUTTER), toolbar.bottom()),
-                Pos2::new(
-                    bounds.right() - trailing.max(metrics::GUTTER),
-                    bounds.bottom() - metrics::GUTTER,
-                ),
+                Pos2::new(bounds.right() - trailing.max(metrics::GUTTER), footer.top()),
             )
         };
         let stage = ui::workspace::Placement {
@@ -1323,7 +1353,7 @@ impl eframe::App for App {
         if panel_edge > 0.0 {
             let panel = Rect::from_min_max(
                 Pos2::new(bounds.right() - panel_edge, toolbar.bottom()),
-                Pos2::new(bounds.right() - panel_edge + panel_width, bounds.bottom()),
+                Pos2::new(bounds.right() - panel_edge + panel_width, footer.top()),
             );
             let rows = if agents_shown {
                 self.agent_rows()
@@ -1344,6 +1374,26 @@ impl eframe::App for App {
                 panel_reveal,
                 bounds,
             );
+            let linked = if pull_request_shown {
+                self.linked_pull_requests()
+            } else {
+                Vec::new()
+            };
+            let selected_file = self.ui.pull_request.selected.clone();
+            let pull_request = ui::pull_request::View {
+                body: self.pull_request.view(&linked, selected_file.as_deref()),
+                opened: self.pull_request.opened(),
+                now: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs() as i64),
+                composing: self.ime_composing,
+                reveal: panel_reveal,
+                window: bounds,
+            };
+            if pull_request_shown && self.pull_request.shown().is_some() {
+                // Its ages are shown in minutes.
+                Self::tick_agents(&ctx);
+            }
             let project = self.project_panel(project_shown);
             self.projects.look_for_leads(&ctx, &project);
             if project.has_agents() {
@@ -1367,6 +1417,7 @@ impl eframe::App for App {
                     window: bounds,
                     reveal: panel_reveal,
                 },
+                pull_request: &pull_request,
                 waiting: self.agents.waiting_count(),
                 needs: project_needs,
                 window: bounds,
@@ -1382,6 +1433,7 @@ impl eframe::App for App {
                     files: &mut self.ui.explorer,
                     changes: &mut self.ui.changes,
                     project: &mut self.ui.project,
+                    pull_request: &mut self.ui.pull_request,
                 },
                 &mut actions,
             );
@@ -1648,6 +1700,7 @@ impl eframe::App for App {
     }
     fn on_exit(&mut self) {
         self.browsers.shutdown();
+        self.usage.shutdown();
         // Leads are let go first, so each has until the shells have closed
         // to end.
         self.projects.shutdown();

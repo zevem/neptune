@@ -1,9 +1,9 @@
 //! The panel at the window's trailing edge. It holds the file explorer, the
-//! running agents, git's changes and the workspace's project as tabs, and owns
-//! what they share: the toolbar control, the slide, the width and the edge
+//! running agents, git's changes, the workspace's project and a pull request
+//! as tabs, and owns what they share: the toolbar control, the slide, the width and the edge
 //! that resizes it.
 use super::helpers::{animate, elided, galley_at};
-use super::{Action, agents, changes, chrome::SidebarSlide, explorer, project};
+use super::{Action, agents, changes, chrome::SidebarSlide, explorer, project, pull_request};
 use crate::{
     icons::{self, Icon},
     theme::{self, Palette},
@@ -17,6 +17,8 @@ pub const WIDTH: RangeInclusive<f32> = 220.0..=560.0;
 pub const MIN_STAGE: f32 = 240.0;
 /// The strip of tabs above the panel's content.
 pub const TABS: f32 = 34.0;
+/// A tab's icon, where it stands for its name.
+const ICON: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tab {
@@ -25,6 +27,7 @@ pub enum Tab {
     Agents,
     Changes,
     Project,
+    PullRequest,
 }
 
 impl Tab {
@@ -34,6 +37,27 @@ impl Tab {
             Self::Agents => "Agents",
             Self::Changes => "Changes",
             Self::Project => "Project",
+            Self::PullRequest => "Pull request",
+        }
+    }
+
+    /// The icon that stands for it where the strip has no room for names:
+    /// the one its command has in the palette.
+    fn icon(self) -> Icon {
+        match self {
+            Self::Files => Icon::Files,
+            Self::Agents => Icon::Terminal,
+            Self::Changes => Icon::Branch,
+            Self::Project => Icon::Agents,
+            Self::PullRequest => Icon::PullRequest,
+        }
+    }
+
+    /// Its name where the strip has no room for it in full.
+    fn short(self) -> &'static str {
+        match self {
+            Self::PullRequest => "PR",
+            tab => tab.label(),
         }
     }
 }
@@ -109,6 +133,7 @@ pub struct View<'a> {
     pub agents: &'a agents::View<'a>,
     pub changes: &'a changes::View<'a>,
     pub project: &'a project::View<'a>,
+    pub pull_request: &'a pull_request::View<'a>,
     /// Agents waiting for input, whichever tab is in view.
     pub waiting: usize,
     /// What the project of the workspace in view needs the person for.
@@ -124,6 +149,7 @@ pub struct Contents<'a> {
     pub files: &'a mut explorer::State,
     pub changes: &'a mut changes::State,
     pub project: &'a mut project::State,
+    pub pull_request: &'a mut pull_request::State,
 }
 
 /// How the names of the tabs are set in the strip.
@@ -133,19 +159,47 @@ struct Fit {
     /// Clear space inside a tab, both sides together.
     padding: f32,
     gap: f32,
+    /// A name too long for the strip is cut to its short form.
+    short: bool,
+    /// Each tab is its icon, named under the pointer.
+    icons: bool,
 }
 impl Fit {
     const ROOMY: Self = Self {
         font: 12.0,
         padding: 16.0,
         gap: 4.0,
+        short: false,
+        icons: false,
     };
-    /// For a panel near its narrowest, where four names share the strip.
+    /// For a panel short of room, where the names are set closer.
     const TIGHT: Self = Self {
         font: 11.5,
         padding: 8.0,
         gap: 2.0,
+        short: false,
+        icons: false,
     };
+    /// For a panel near its narrowest, where five names share the strip.
+    const SHORT: Self = Self {
+        font: 11.5,
+        padding: 6.0,
+        gap: 2.0,
+        short: true,
+        icons: false,
+    };
+    /// For a strip that open pull requests leave no room for names in.
+    const ICONS: Self = Self {
+        font: 11.5,
+        padding: 6.0,
+        gap: 2.0,
+        short: true,
+        icons: true,
+    };
+
+    fn name(self, tab: Tab) -> &'static str {
+        if self.short { tab.short() } else { tab.label() }
+    }
 }
 
 /// One tab of the strip. Returns whether it was chosen.
@@ -181,19 +235,30 @@ fn tab(
     let badge = (waiting > 0)
         .then(|| painter.layout_no_wrap(waiting.to_string(), theme::medium(10.5), p.attention));
     let badge_width = badge.as_ref().map_or(0.0, |badge| badge.size().x + 12.0);
-    let title = elided(
-        &painter,
-        tab.label(),
-        theme::medium(fit.font),
-        if selected { p.fg } else { p.secondary },
-        (rect.width() - fit.padding - badge_width).max(0.0),
-    );
-    let width = title.size().x + badge_width;
-    let named = galley_at(
-        &painter,
-        Pos2::new(rect.center().x - width * 0.5, rect.center().y),
-        title,
-    );
+    let ink = if selected { p.fg } else { p.secondary };
+    let named = if fit.icons {
+        let width = ICON + badge_width;
+        let glyph = Rect::from_min_size(
+            Pos2::new(rect.center().x - width * 0.5, rect.center().y - ICON * 0.5),
+            vec2(ICON, ICON),
+        );
+        icons::paint(&painter, glyph, tab.icon(), ink);
+        glyph
+    } else {
+        let title = elided(
+            &painter,
+            fit.name(tab),
+            theme::medium(fit.font),
+            ink,
+            (rect.width() - fit.padding - badge_width).max(0.0),
+        );
+        let width = title.size().x + badge_width;
+        galley_at(
+            &painter,
+            Pos2::new(rect.center().x - width * 0.5, rect.center().y),
+            title,
+        )
+    };
     if let Some(badge) = badge {
         let pill = Rect::from_min_max(
             Pos2::new(named.right() + 5.0, rect.center().y - 7.5),
@@ -205,7 +270,11 @@ fn tab(
         painter.rect_filled(pill, 7.5, theme::tint(p.attention, 0.18));
         painter.galley(pill.center() - badge.size() * 0.5, badge, p.attention);
     }
-    response.clicked()
+    let chosen = response.clicked();
+    if fit.icons {
+        response.on_hover_text(tab.label());
+    }
+    chosen
 }
 
 /// The panel in `rect`, which slides past the window's trailing edge while a
@@ -226,7 +295,47 @@ pub fn show(
     let mut child = ui.new_child(UiBuilder::new().id_salt("right-panel").max_rect(rect));
     child.set_clip_rect(rect.expand2(vec2(4.0, 0.0)).intersect(view.window));
     child.multiply_opacity(view.reveal);
-    let tabs = [Tab::Files, Tab::Agents, Tab::Changes, Tab::Project];
+    // A pull request that is open is a tab of its own, with its number;
+    // with none open one tab stands for them.
+    let mut tabs = vec![Tab::Files, Tab::Agents, Tab::Changes, Tab::Project];
+    let opened = pull_request::tabs_width(&child, view.pull_request);
+    if opened == 0.0 {
+        tabs.push(Tab::PullRequest);
+    }
+    // The numbers take what the names leave them, set close, and scroll
+    // past that; one of them always has room.
+    let strip = {
+        let names: f32 = tabs
+            .iter()
+            .map(|item| {
+                child
+                    .painter()
+                    .layout_no_wrap(
+                        item.label().to_owned(),
+                        theme::medium(Fit::TIGHT.font),
+                        p.fg,
+                    )
+                    .size()
+                    .x
+                    + Fit::TIGHT.padding
+                    + Fit::TIGHT.gap
+            })
+            .sum();
+        let numbers = opened
+            .min((strip.width() - names - 2.0).max(72.0))
+            .min((strip.width() * 0.5).floor());
+        if numbers > 0.0 {
+            let zone = Rect::from_min_max(
+                Pos2::new(strip.right() - numbers, strip.top() + 3.0),
+                Pos2::new(strip.right(), strip.bottom() - 3.0),
+            );
+            let in_view = state.tab == Tab::PullRequest;
+            pull_request::tabs(&mut child, zone, p, view.pull_request, in_view, actions);
+            Rect::from_min_max(strip.min, Pos2::new(zone.left() - 2.0, strip.bottom()))
+        } else {
+            strip
+        }
+    };
     let waiting = |item| match item {
         Tab::Agents => view.waiting,
         Tab::Project => view.needs,
@@ -234,28 +343,43 @@ pub fn show(
     };
     // Tabs are of equal width while every name fits one. In a panel too
     // narrow for that, each takes what its name needs and a share of the
-    // rest; in one too narrow for that as well, names are set closer.
+    // rest; in one too narrow for that as well, names are set closer, and
+    // then the longest is cut to its short form.
+    // Beside open pull requests, names that still do not fit give way to
+    // icons rather than be cut.
+    let last = if opened > 0.0 { Fit::ICONS } else { Fit::SHORT };
+    let mut fits = [Fit::ROOMY, Fit::TIGHT, Fit::SHORT, last].into_iter();
     let mut fit = Fit::ROOMY;
     let (needed, room) = loop {
         let room = strip.width() - fit.gap * (tabs.len() - 1) as f32;
-        let needed = tabs.map(|item| {
-            let width = |text: String, size| {
-                child
-                    .painter()
-                    .layout_no_wrap(text, theme::medium(size), p.fg)
-                    .size()
-                    .x
-            };
-            let badge = match waiting(item) {
-                0 => 0.0,
-                count => width(count.to_string(), 10.5) + 12.0,
-            };
-            width(item.label().to_owned(), fit.font) + badge + fit.padding
-        });
-        if needed.iter().sum::<f32>() <= room || fit == Fit::TIGHT {
+        let needed: Vec<f32> = tabs
+            .iter()
+            .map(|item| {
+                let width = |text: String, size| {
+                    child
+                        .painter()
+                        .layout_no_wrap(text, theme::medium(size), p.fg)
+                        .size()
+                        .x
+                };
+                let badge = match waiting(*item) {
+                    0 => 0.0,
+                    count => width(count.to_string(), 10.5) + 12.0,
+                };
+                if fit.icons {
+                    ICON + badge + fit.padding * 2.0
+                } else {
+                    width(fit.name(*item).to_owned(), fit.font) + badge + fit.padding
+                }
+            })
+            .collect();
+        if needed.iter().sum::<f32>() <= room {
             break (needed, room);
         }
-        fit = Fit::TIGHT;
+        match fits.find(|next| *next != fit) {
+            Some(next) => fit = next,
+            None => break (needed, room),
+        }
     };
     let each = room / tabs.len() as f32;
     let total = needed.iter().sum::<f32>();
@@ -295,6 +419,14 @@ pub fn show(
         Tab::Agents => agents::show(ui, body, p, view.agents, actions),
         Tab::Changes => changes::show(ui, body, p, view.changes, contents.changes, actions),
         Tab::Project => project::show(ui, body, p, view.project, contents.project, actions),
+        Tab::PullRequest => pull_request::show(
+            ui,
+            body,
+            p,
+            view.pull_request,
+            contents.pull_request,
+            actions,
+        ),
     }
     // The leading edge resizes the panel once it rests there.
     if view.reveal >= 1.0 {
@@ -378,6 +510,7 @@ mod tests {
         let mut drafted = project::State::default();
         let mut files = explorer::State::default();
         let mut changed = changes::State::default();
+        let mut reviewed = pull_request::State::default();
         let mut output = ctx.run_ui(
             RawInput {
                 screen_rect: Some(WINDOW),
@@ -414,6 +547,14 @@ mod tests {
                         window: WINDOW,
                         reveal: 1.0,
                     },
+                    pull_request: &pull_request::View {
+                        body: pull_request::Body::Linked(&[]),
+                        opened: &[],
+                        now: 0,
+                        composing: false,
+                        reveal: 1.0,
+                        window: WINDOW,
+                    },
                     needs,
                     waiting: rows
                         .iter()
@@ -432,6 +573,7 @@ mod tests {
                         files: &mut files,
                         changes: &mut changed,
                         project: &mut drafted,
+                        pull_request: &mut reviewed,
                     },
                     &mut actions,
                 );
@@ -479,12 +621,37 @@ mod tests {
         };
         let rows = rows();
         let strip = panel(state.width);
-        // Four tabs of equal width share the strip.
-        let quarter = (strip.width() - 14.0) / 4.0;
-        let agents_tab = Pos2::new(strip.left() + quarter * 1.5, strip.top() + TABS * 0.5);
-        let changes_tab = Pos2::new(strip.left() + quarter * 2.5, strip.top() + TABS * 0.5);
-        let project_tab = Pos2::new(strip.right() - 30.0, strip.top() + TABS * 0.5);
-        let files_tab = Pos2::new(strip.left() + 50.0, strip.top() + TABS * 0.5);
+        // Five tabs share the strip, each as wide as its name needs.
+        let places = |output: &egui::FullOutput| -> Vec<Pos2> {
+            let mut places: Vec<(usize, Pos2)> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => {
+                        let bounds = text.visual_bounding_rect();
+                        ["Files", "Agents", "Changes", "Project", "Pull request"]
+                            .iter()
+                            .position(|name| *name == text.galley.text())
+                            .filter(|_| bounds.bottom() <= strip.top() + TABS)
+                            .map(|place| (place, bounds.center()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            places.sort_by_key(|(place, _)| *place);
+            places.into_iter().map(|(_, centre)| centre).collect()
+        };
+        let named = places(&run(&ctx, Vec::new(), &rows, &mut state).1);
+        let [
+            files_tab,
+            agents_tab,
+            changes_tab,
+            project_tab,
+            pull_request_tab,
+        ] = named[..]
+        else {
+            panic!("five tabs are named: {named:?}");
+        };
         let mut actions = Vec::new();
         for events in click(agents_tab) {
             actions.extend(run(&ctx, events, &rows, &mut state).0);
@@ -508,6 +675,14 @@ mod tests {
         assert!(matches!(
             actions.as_slice(),
             [Action::Panel(Event::Show(Tab::Project))]
+        ));
+        let mut actions = Vec::new();
+        for events in click(pull_request_tab) {
+            actions.extend(run(&ctx, events, &rows, &mut state).0);
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Panel(Event::Show(Tab::PullRequest))]
         ));
         // The files tab is the one in view: clicking it asks for nothing.
         let mut actions = Vec::new();
@@ -533,6 +708,7 @@ mod tests {
             "Agents",
             "Changes",
             "Project",
+            "Pull request",
             "Needs input",
             "Asked a question",
             "Needs permission",
@@ -569,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn the_narrowest_panel_names_every_tab_in_full_beside_a_count() {
+    fn the_narrowest_panel_names_every_tab_beside_a_count() {
         let ctx = context();
         let mut state = State {
             open: true,
@@ -578,17 +754,18 @@ mod tests {
         };
         let (_, output) = run(&ctx, Vec::new(), &rows(), &mut state);
         let texts = texts(&output);
-        for expected in ["Files", "Agents", "2", "Changes", "Project"] {
+        // The longest name is cut to its short form there; none is elided.
+        for expected in ["Files", "Agents", "2", "Changes", "Project", "PR"] {
             assert!(
                 texts.iter().any(|text| text == expected),
                 "{expected} in {texts:?}"
             );
         }
         // With nobody waiting, and with the project's count beside the
-        // agents', four names still share the narrowest strip in full.
+        // agents', five names still share the narrowest strip.
         let (_, output) = run(&ctx, Vec::new(), &rows()[..1], &mut state);
         let texts = self::texts(&output);
-        for expected in ["Files", "Agents", "Changes", "Project"] {
+        for expected in ["Files", "Agents", "Changes", "Project", "PR"] {
             assert!(
                 texts.iter().any(|text| text == expected),
                 "{expected} in {texts:?}"
@@ -596,7 +773,7 @@ mod tests {
         }
         let (_, output) = run_with(&ctx, Vec::new(), &rows(), &mut state, 1);
         let texts = self::texts(&output);
-        for expected in ["Files", "Agents", "2", "Changes", "Project", "1"] {
+        for expected in ["Files", "Agents", "2", "Changes", "Project", "1", "PR"] {
             assert!(
                 texts.iter().any(|text| text == expected),
                 "{expected} in {texts:?}"
@@ -608,7 +785,8 @@ mod tests {
             .iter()
             .filter_map(|clipped| match &clipped.shape {
                 egui::Shape::Text(text)
-                    if ["Files", "Agents", "Changes", "Project"].contains(&text.galley.text()) =>
+                    if ["Files", "Agents", "Changes", "Project", "PR"]
+                        .contains(&text.galley.text()) =>
                 {
                     Some(text.visual_bounding_rect())
                 }
@@ -617,11 +795,142 @@ mod tests {
             // The explorer's own heading is below the strip.
             .filter(|label| label.bottom() <= panel(state.width).top() + TABS)
             .collect();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 5);
         for pair in labels.windows(2) {
             assert!(pair[0].right() < pair[1].left(), "{labels:?}");
         }
-        assert!(labels[3].right() <= panel(state.width).right());
+        assert!(labels[4].right() <= panel(state.width).right());
+    }
+
+    #[test]
+    fn open_pull_requests_are_tabs_of_their_own_that_show_and_close_them() {
+        let ctx = context();
+        let mut state = State {
+            open: true,
+            tab: Tab::PullRequest,
+            ..State::default()
+        };
+        let link = |number: u64| {
+            neptune_model::PullRequest::parse(&format!(
+                "https://github.com/zevem/neptune/pull/{number}"
+            ))
+            .unwrap()
+        };
+        let opened = [link(118), link(112)];
+        let frame = |state: &mut State, events: Vec<Input>| {
+            let mut actions = Vec::new();
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(WINDOW),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let p = Palette::for_config(&crate::config::Config::default());
+                    let files = explorer::View {
+                        root: None,
+                        notice: "",
+                        rows: &[],
+                        search: None,
+                        preview: None,
+                        reveal: 1.0,
+                        window: WINDOW,
+                    };
+                    let view = View {
+                        files: &files,
+                        agents: &agents::View {
+                            rows: &[],
+                            window: WINDOW,
+                            reveal: 1.0,
+                        },
+                        changes: &changes::View {
+                            repository: None,
+                            notice: "",
+                            reveal: 1.0,
+                            window: WINDOW,
+                        },
+                        project: &project::View {
+                            body: project::Body::Nothing,
+                            composing: false,
+                            window: WINDOW,
+                            reveal: 1.0,
+                        },
+                        pull_request: &pull_request::View {
+                            body: pull_request::Body::Reading(&opened[0]),
+                            opened: &opened,
+                            now: 0,
+                            composing: false,
+                            reveal: 1.0,
+                            window: WINDOW,
+                        },
+                        needs: 0,
+                        waiting: 0,
+                        window: WINDOW,
+                        reveal: 1.0,
+                    };
+                    show(
+                        ui,
+                        panel(state.width),
+                        p,
+                        &view,
+                        state,
+                        Contents {
+                            files: &mut explorer::State::default(),
+                            changes: &mut changes::State::default(),
+                            project: &mut project::State::default(),
+                            pull_request: &mut pull_request::State::default(),
+                        },
+                        &mut actions,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            (actions, output)
+        };
+        // Each is named by its number, where one tab stood for them.
+        let (_, output) = frame(&mut state, Vec::new());
+        let named = texts(&output);
+        for expected in ["Files", "Project", "#118", "#112"] {
+            assert!(
+                named.iter().any(|text| text == expected),
+                "{expected} in {named:?}"
+            );
+        }
+        assert!(
+            !named
+                .iter()
+                .any(|text| text == "Pull request" || text == "PR")
+        );
+        let at = |wanted: &str| -> Rect {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == wanted => {
+                        Some(text.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // The other one's number shows it; its cross closes it.
+        let other = at("#112");
+        let mut actions = Vec::new();
+        for events in click(other.center()) {
+            actions.extend(frame(&mut state, events).0);
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::PullRequest(pull_request::Event::Open(link))] if link.number() == 112
+        ));
+        let mut actions = Vec::new();
+        for events in click(Pos2::new(other.right() + 11.0, other.center().y)) {
+            actions.extend(frame(&mut state, events).0);
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::PullRequest(pull_request::Event::Close(link))] if link.number() == 112
+        ));
     }
 
     fn texts_contain(output: &egui::FullOutput, part: &str) -> bool {

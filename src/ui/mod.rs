@@ -18,10 +18,12 @@ pub mod panel;
 pub(crate) mod ports;
 pub mod preferences;
 pub mod project;
+pub mod pull_request;
 pub mod search;
 pub mod theme_browser;
 mod theme_editor;
 pub mod updates;
+pub mod usage;
 pub mod workspace;
 pub mod worktrees;
 use crate::{config::Config, terminal::Cache};
@@ -131,6 +133,8 @@ pub struct UiState {
     pub worktree: worktrees::State,
     /// The project tab: what is being written to a lead, or for a new one.
     pub project: project::State,
+    /// The pull request tab: the part in view and what is being written.
+    pub pull_request: pull_request::State,
 }
 #[derive(Clone)]
 pub enum Action {
@@ -189,6 +193,7 @@ pub enum Action {
     Changes(changes::Event),
     Worktree(worktrees::Event),
     Project(project::Event),
+    PullRequest(pull_request::Event),
     Find,
     CopyHints(PaneId),
     SearchChanged,
@@ -214,6 +219,10 @@ pub enum Action {
     SetName(WorkspaceId, String),
     Preferences(Config),
     CheckUpdates,
+    Usage,
+    RefreshUsage,
+    /// Allow this run to read Cursor's macOS Keychain login.
+    EnableCursorUsage,
     ReviewUpdate,
     DownloadUpdate(String),
     OpenUpdate(String),
