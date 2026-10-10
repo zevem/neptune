@@ -153,7 +153,8 @@ Do not tag an unrelated feature branch.
 
 Also attached: `SHA256SUMS`, `update-manifest.json`, `update-manifest.sig`.
 Linux targets glibc 2.35+; window libraries are bundled in AppImage, while glibc,
-graphics loaders/drivers remain host-owned. DEB declares native dependencies.
+graphics loaders/drivers and the GBM and Wayland libraries they link remain
+host-owned. DEB declares native dependencies.
 DEB maps SemVer prereleases to `~beta.N` / `~rc.N` so they sort below stable.
 AppImage tooling and its MIT runtime are version- and SHA-pinned; updating those
 pins requires reviewing upstream primary sources and rerunning packaging proof.
