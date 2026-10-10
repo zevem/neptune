@@ -49,7 +49,8 @@ struct Shown {
 }
 
 struct View {
-    path: PathBuf,
+    /// Web pictures are held in memory and have no local file to reread or reveal.
+    path: Option<PathBuf>,
     name: String,
     pixels: [u32; 2],
     /// The card's small picture until the file has been read at this size.
@@ -259,7 +260,7 @@ impl App {
         {
             preview.card = None;
             preview.view = Some(View {
-                path: shown.path,
+                path: Some(shown.path),
                 name: shown.name,
                 pixels: shown.pixels,
                 texture: shown.texture,
@@ -277,13 +278,29 @@ impl App {
         self.image_preview.hover = None;
         self.image_preview.card = None;
         self.image_preview.view = Some(View {
-            path: picture.path,
+            path: Some(picture.path),
             name: picture.label,
             pixels: picture.pixels,
             texture: picture.texture,
             request: None,
             zoom: Default::default(),
             gallery: Some(pane),
+        });
+        self.ui.overlay = OverlayState::Image;
+    }
+
+    /// Shows a web picture from the copy already read by its owning worker.
+    pub(super) fn view_picture(&mut self, name: String, picture: ui::markup::Picture) {
+        self.image_preview.hover = None;
+        self.image_preview.card = None;
+        self.image_preview.view = Some(View {
+            path: None,
+            name,
+            pixels: picture.pixels,
+            texture: picture.texture,
+            request: None,
+            zoom: Default::default(),
+            gallery: None,
         });
         self.ui.overlay = OverlayState::Image;
     }
@@ -295,7 +312,7 @@ impl App {
             .image_preview
             .view
             .as_ref()
-            .and_then(|view| Some((view.gallery?, view.path.clone())))
+            .and_then(|view| Some((view.gallery?, view.path.clone()?)))
         else {
             return;
         };
@@ -324,7 +341,10 @@ impl App {
     /// The file of the picture shown at full size.
     #[cfg(test)]
     pub(super) fn viewed_image(&self) -> Option<&Path> {
-        self.image_preview.view.as_ref().map(|view| &*view.path)
+        self.image_preview
+            .view
+            .as_ref()
+            .and_then(|view| view.path.as_deref())
     }
 
     /// The clicked picture over the dimmed window, read again in more
@@ -340,11 +360,13 @@ impl App {
             return;
         };
         let size = view.texture.size();
-        if view.request.is_none() && size != view.pixels.map(|side| side as usize) {
+        if view.request.is_none()
+            && size != view.pixels.map(|side| side as usize)
+            && let Some(path) = view.path.clone()
+        {
             // Enough to stay sharp when zoomed in, whatever the window's size.
             let side = ctx.input(|input| input.max_texture_side).min(VIEW_PIXELS) as u32;
             let limit = [side, side];
-            let path = view.path.clone();
             let request = preview.request(ctx, move || {
                 let (pixels, image) = decode(&path, limit)?;
                 Some(Picture {
@@ -370,7 +392,7 @@ impl App {
         };
         let position = pictures
             .iter()
-            .position(|picture| picture.path == view.path)
+            .position(|picture| Some(&picture.path) == view.path.as_ref())
             .map(|index| (index + 1, pictures.len()));
         let strip: Vec<_> = pictures
             .iter()
@@ -384,6 +406,7 @@ impl App {
             texture: &view.texture,
             name: &view.name,
             pixels: view.pixels,
+            reveal: view.path.is_some(),
             position,
             strip: &strip,
         };
@@ -395,8 +418,9 @@ impl App {
             Verdict::Next => self.step_attached(1),
             Verdict::Show(index) => self.show_attached(index),
             Verdict::Reveal => {
-                let path = view.path.clone();
-                self.action(ctx, Action::RevealAttachment(path));
+                if let Some(path) = view.path.clone() {
+                    self.action(ctx, Action::RevealAttachment(path));
+                }
             }
         }
     }
@@ -536,6 +560,57 @@ fn decode_reader<R: std::io::BufRead + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_web_picture_stays_in_memory_and_ignores_an_earlier_file_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, _) = super::super::tests::fixture(dir.path());
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let texture = ctx.load_texture(
+            "web-picture",
+            egui::ColorImage::filled([20, 10], egui::Color32::WHITE),
+            Default::default(),
+        );
+        let id = texture.id();
+        app.view_picture(
+            "Evidence".into(),
+            ui::markup::Picture {
+                texture,
+                pixels: [2000, 1000],
+            },
+        );
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Read {
+                request: 1,
+                picture: Some(Picture {
+                    reading: 0,
+                    path: dir.path().join("earlier.png"),
+                    pixels: [1, 1],
+                    image: egui::ColorImage::filled([1, 1], egui::Color32::RED),
+                }),
+            })
+            .unwrap();
+        app.image_preview.channel = Some((sender, receiver));
+        app.image_preview.reading = true;
+        app.image_preview.requests = 1;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.preview_image(
+                ui,
+                Palette::for_config(&Config::default()),
+                ui.max_rect(),
+                None,
+            );
+        });
+        output.textures_delta.clear();
+        let view = app.image_preview.view.as_ref().unwrap();
+        assert_eq!(view.texture.id(), id);
+        assert_eq!(view.pixels, [2000, 1000]);
+        assert!(view.path.is_none() && view.gallery.is_none() && view.request.is_none());
+        assert!(!app.image_preview.reading);
+        assert_eq!(app.image_preview.requests, 1, "no local reread was started");
+    }
 
     fn picture(path: &Path, width: u32, height: u32) {
         image::RgbaImage::from_pixel(width, height, image::Rgba([200, 40, 40, 255]))

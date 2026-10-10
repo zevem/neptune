@@ -239,6 +239,11 @@ pub enum Action {
     Resize(PaneId, crate::terminal_view::geometry::ResizeRequest),
     Selection(PaneId, crate::terminal_view::SelectionInteraction),
     OpenLink(crate::platform::links::WebLink),
+    /// Show an already loaded web picture in the shared image overlay.
+    ViewPicture {
+        name: String,
+        picture: markup::Picture,
+    },
     OpenTerminalLink(PaneId, crate::terminal_view::LinkTarget),
     /// Show an attached picture at full size, or open another kind of file
     /// with its application.
