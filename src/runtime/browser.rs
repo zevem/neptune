@@ -538,6 +538,297 @@ impl Browsers {
     }
 }
 
+fn run(
+    receiver: mpsc::Receiver<Command>,
+    incoming: Arc<Mutex<Incoming>>,
+    targets: Arc<Mutex<BTreeSet<Target>>>,
+    stopping: Arc<AtomicBool>,
+    ctx: egui::Context,
+) -> std::io::Result<()> {
+    let executable = std::env::var_os("NEPTUNE_BROWSER_HOST")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe().ok().and_then(|p| {
+                p.parent().map(|parent| {
+                    let name = if cfg!(windows) {
+                        "neptune_browser.exe"
+                    } else {
+                        "neptune-browser"
+                    };
+                    let sibling = parent.join(name);
+                    if sibling.is_file() {
+                        sibling
+                    } else if cfg!(windows) {
+                        parent.join("browser").join(name)
+                    } else if cfg!(target_os = "linux") {
+                        parent.join("../lib/neptune/browser").join(name)
+                    } else {
+                        sibling
+                    }
+                })
+            })
+        });
+    let Some(executable) = executable else {
+        return Err(std::io::Error::other("Browser helper unavailable"));
+    };
+    // The supervisor owns this root through process teardown, so renderer or
+    // host crashes cannot leave profiles behind. Creation is outside UI frames.
+    let mut profile_builder = tempfile::Builder::new();
+    profile_builder.prefix("neptune-browser-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        profile_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let profile = profile_builder.tempdir()?;
+    let mut process = Process::new(executable);
+    process
+        .env("NEPTUNE_BROWSER_PROFILE", profile.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        process.creation_flags(0x0800_0000);
+    }
+    let mut child = ChildGuard {
+        child: process.spawn()?,
+        terminated: false,
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("Browser pipe unavailable"));
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("Browser pipe unavailable"));
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
+        }
+        // Linux F_GETPIPE_SZ / F_SETPIPE_SZ. This worker exclusively owns the
+        // new child pipe; a bounded 1 MiB window reduces context switches for
+        // large frames. Restricted kernels retain their original capacity.
+        // SAFETY: the descriptor is live and both commands take integer args.
+        unsafe {
+            if fcntl(stdout.as_raw_fd(), 1032) < 1024 * 1024 {
+                let _ = fcntl(stdout.as_raw_fd(), 1031, 1024_i32 * 1024);
+            }
+        }
+    }
+    let process_done = Arc::new(AtomicBool::new(false));
+    let writer_done = process_done.clone();
+    let writer = std::thread::Builder::new()
+        .name("neptune-browser-input".into())
+        .spawn(move || -> std::io::Result<()> {
+            while !writer_done.load(Ordering::Acquire) {
+                let command = match receiver.recv_timeout(Duration::from_millis(20)) {
+                    Ok(command) => command,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                serde_json::to_writer(&mut stdin, &command)?;
+                stdin.write_all(b"\n")?;
+                stdin.flush()?;
+            }
+            serde_json::to_writer(&mut stdin, &Command::Shutdown)?;
+            stdin.write_all(b"\n")?;
+            stdin.flush()
+        })?;
+    let reader_ctx = ctx.clone();
+    let reader = std::thread::Builder::new()
+        .name("neptune-browser-output".into())
+        .spawn(move || read(stdout, incoming, targets, reader_ctx))?;
+    let mut since = None;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if stopping.load(Ordering::Acquire) {
+            let since = *since.get_or_insert(Instant::now());
+            if since.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                break child.wait()?;
+            }
+        }
+        if reader.is_finished() || writer.is_finished() && !stopping.load(Ordering::Acquire) {
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    child.terminate();
+    // Closing the process releases blocked pipe workers. The supervisor, never
+    // the UI, joins them and accounts for teardown.
+    process_done.store(true, Ordering::Release);
+    let _ = writer.join();
+    let _ = reader.join();
+    if status.success() && stopping.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("Browser host stopped"))
+    }
+}
+
+/// A startup or pipe error must also reap the process and its Unix children.
+struct ChildGuard {
+    child: std::process::Child,
+    terminated: bool,
+}
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+impl ChildGuard {
+    fn terminate(&mut self) {
+        if std::mem::replace(&mut self.terminated, true) {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            // This process group was created specifically for this child. No
+            // application-name or worktree matching is used for teardown.
+            if let Ok(pid) = i32::try_from(self.child.id()) {
+                unsafe {
+                    kill(-pid, 9);
+                }
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn read(
+    stdout: impl Read,
+    incoming: Arc<Mutex<Incoming>>,
+    targets: Arc<Mutex<BTreeSet<Target>>>,
+    ctx: egui::Context,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stdout);
+    let mut surfaces: BTreeMap<(Target, bool), pixels::Surface> = BTreeMap::new();
+    let mut bytes = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let count = reader
+            .by_ref()
+            .take(protocol::MAX_MESSAGE as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if count == 0 {
+            return Ok(());
+        }
+        if line.len() > protocol::MAX_MESSAGE || line.last() != Some(&b'\n') {
+            return Err(std::io::Error::other("Invalid browser message"));
+        }
+        let event: Event = serde_json::from_slice(&line)
+            .map_err(|_| std::io::Error::other("Invalid browser message"))?;
+        match event {
+            Event::State { target, state } => {
+                if state.title.len() > 2048
+                    || state.url.len() > protocol::MAX_URL
+                    || state.error.as_ref().is_some_and(|e| e.len() > 2048)
+                {
+                    return Err(std::io::Error::other("Browser state limit"));
+                }
+                if targets.lock().is_ok_and(|live| live.contains(&target))
+                    && let Ok(mut updates) = incoming.lock()
+                {
+                    updates.states.insert(target, state);
+                }
+            }
+            Event::Frame {
+                target,
+                width,
+                height,
+                popup,
+                x,
+                y,
+                damage,
+            } => {
+                let cleared = popup && width == 0 && height == 0 && damage.is_none();
+                let damage = damage.unwrap_or(protocol::Damage::full(width, height));
+                let len = if cleared {
+                    0
+                } else {
+                    protocol::frame_len(width, height)
+                        .filter(|_| damage.valid(width, height))
+                        .and_then(|_| protocol::frame_len(damage.width, damage.height))
+                        .ok_or_else(|| std::io::Error::other("Browser frame limit"))?
+                };
+                bytes.resize(len, 0);
+                reader.read_exact(&mut bytes)?;
+                let live = targets
+                    .lock()
+                    .map_err(|_| std::io::Error::other("Browser targets unavailable"))?;
+                surfaces.retain(|(target, _), _| live.contains(target));
+                if !live.contains(&target) {
+                    continue;
+                }
+                drop(live);
+                let key = (target, popup);
+                let size = [width as usize, height as usize];
+                if cleared {
+                    surfaces.remove(&key);
+                    if let Ok(mut updates) = incoming.lock() {
+                        updates.frames.insert(
+                            key,
+                            Frame {
+                                image: Arc::new(egui::ColorImage::new([0, 0], Vec::new())),
+                                position: [x, y],
+                                size,
+                                offset: [0, 0],
+                            },
+                        );
+                    }
+                } else {
+                    if surfaces.get(&key).is_none_or(|s| s.size() != size) {
+                        if damage != protocol::Damage::full(width, height) {
+                            return Err(std::io::Error::other(
+                                "Browser frame missing initial pixels",
+                            ));
+                        }
+                        surfaces.insert(key, pixels::Surface::new(size));
+                    }
+                    if let Some(surface) = surfaces.get_mut(&key) {
+                        surface.update(damage, &bytes);
+                        if let Ok(mut updates) = incoming.lock() {
+                            let frame = surface.snapshot(damage, updates.frames.get(&key), [x, y]);
+                            updates.frames.insert(key, frame);
+                        }
+                    }
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,296 +1288,5 @@ mod tests {
         assert!(browsers.poll(&ctx, &[pane], None).is_empty());
         browsers.close(pane);
         assert!(browsers.closing.is_empty());
-    }
-}
-
-fn run(
-    receiver: mpsc::Receiver<Command>,
-    incoming: Arc<Mutex<Incoming>>,
-    targets: Arc<Mutex<BTreeSet<Target>>>,
-    stopping: Arc<AtomicBool>,
-    ctx: egui::Context,
-) -> std::io::Result<()> {
-    let executable = std::env::var_os("NEPTUNE_BROWSER_HOST")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::current_exe().ok().and_then(|p| {
-                p.parent().map(|parent| {
-                    let name = if cfg!(windows) {
-                        "neptune_browser.exe"
-                    } else {
-                        "neptune-browser"
-                    };
-                    let sibling = parent.join(name);
-                    if sibling.is_file() {
-                        sibling
-                    } else if cfg!(windows) {
-                        parent.join("browser").join(name)
-                    } else if cfg!(target_os = "linux") {
-                        parent.join("../lib/neptune/browser").join(name)
-                    } else {
-                        sibling
-                    }
-                })
-            })
-        });
-    let Some(executable) = executable else {
-        return Err(std::io::Error::other("Browser helper unavailable"));
-    };
-    // The supervisor owns this root through process teardown, so renderer or
-    // host crashes cannot leave profiles behind. Creation is outside UI frames.
-    let mut profile_builder = tempfile::Builder::new();
-    profile_builder.prefix("neptune-browser-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        profile_builder.permissions(std::fs::Permissions::from_mode(0o700));
-    }
-    let profile = profile_builder.tempdir()?;
-    let mut process = Process::new(executable);
-    process
-        .env("NEPTUNE_BROWSER_PROFILE", profile.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        process.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        process.creation_flags(0x0800_0000);
-    }
-    let mut child = ChildGuard {
-        child: process.spawn()?,
-        terminated: false,
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(std::io::Error::other("Browser pipe unavailable"));
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(std::io::Error::other("Browser pipe unavailable"));
-    };
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        unsafe extern "C" {
-            fn fcntl(fd: i32, command: i32, ...) -> i32;
-        }
-        // Linux F_GETPIPE_SZ / F_SETPIPE_SZ. This worker exclusively owns the
-        // new child pipe; a bounded 1 MiB window reduces context switches for
-        // large frames. Restricted kernels retain their original capacity.
-        // SAFETY: the descriptor is live and both commands take integer args.
-        unsafe {
-            if fcntl(stdout.as_raw_fd(), 1032) < 1024 * 1024 {
-                let _ = fcntl(stdout.as_raw_fd(), 1031, 1024_i32 * 1024);
-            }
-        }
-    }
-    let process_done = Arc::new(AtomicBool::new(false));
-    let writer_done = process_done.clone();
-    let writer = std::thread::Builder::new()
-        .name("neptune-browser-input".into())
-        .spawn(move || -> std::io::Result<()> {
-            while !writer_done.load(Ordering::Acquire) {
-                let command = match receiver.recv_timeout(Duration::from_millis(20)) {
-                    Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-                serde_json::to_writer(&mut stdin, &command)?;
-                stdin.write_all(b"\n")?;
-                stdin.flush()?;
-            }
-            serde_json::to_writer(&mut stdin, &Command::Shutdown)?;
-            stdin.write_all(b"\n")?;
-            stdin.flush()
-        })?;
-    let reader_ctx = ctx.clone();
-    let reader = std::thread::Builder::new()
-        .name("neptune-browser-output".into())
-        .spawn(move || read(stdout, incoming, targets, reader_ctx))?;
-    let mut since = None;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if stopping.load(Ordering::Acquire) {
-            let since = *since.get_or_insert(Instant::now());
-            if since.elapsed() > Duration::from_secs(5) {
-                let _ = child.kill();
-                break child.wait()?;
-            }
-        }
-        if reader.is_finished() || writer.is_finished() && !stopping.load(Ordering::Acquire) {
-            let _ = child.kill();
-            break child.wait()?;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    child.terminate();
-    // Closing the process releases blocked pipe workers. The supervisor, never
-    // the UI, joins them and accounts for teardown.
-    process_done.store(true, Ordering::Release);
-    let _ = writer.join();
-    let _ = reader.join();
-    if status.success() && stopping.load(Ordering::Acquire) {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("Browser host stopped"))
-    }
-}
-
-/// A startup or pipe error must also reap the process and its Unix children.
-struct ChildGuard {
-    child: std::process::Child,
-    terminated: bool,
-}
-impl std::ops::Deref for ChildGuard {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target {
-        &self.child
-    }
-}
-impl std::ops::DerefMut for ChildGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.child
-    }
-}
-impl ChildGuard {
-    fn terminate(&mut self) {
-        if std::mem::replace(&mut self.terminated, true) {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            unsafe extern "C" {
-                fn kill(pid: i32, signal: i32) -> i32;
-            }
-            // This process group was created specifically for this child. No
-            // application-name or worktree matching is used for teardown.
-            if let Ok(pid) = i32::try_from(self.child.id()) {
-                unsafe {
-                    kill(-pid, 9);
-                }
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        self.terminate();
-    }
-}
-
-fn read(
-    stdout: impl Read,
-    incoming: Arc<Mutex<Incoming>>,
-    targets: Arc<Mutex<BTreeSet<Target>>>,
-    ctx: egui::Context,
-) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stdout);
-    let mut surfaces: BTreeMap<(Target, bool), pixels::Surface> = BTreeMap::new();
-    let mut bytes = Vec::new();
-    loop {
-        let mut line = Vec::new();
-        let count = reader
-            .by_ref()
-            .take(protocol::MAX_MESSAGE as u64 + 1)
-            .read_until(b'\n', &mut line)?;
-        if count == 0 {
-            return Ok(());
-        }
-        if line.len() > protocol::MAX_MESSAGE || line.last() != Some(&b'\n') {
-            return Err(std::io::Error::other("Invalid browser message"));
-        }
-        let event: Event = serde_json::from_slice(&line)
-            .map_err(|_| std::io::Error::other("Invalid browser message"))?;
-        match event {
-            Event::State { target, state } => {
-                if state.title.len() > 2048
-                    || state.url.len() > protocol::MAX_URL
-                    || state.error.as_ref().is_some_and(|e| e.len() > 2048)
-                {
-                    return Err(std::io::Error::other("Browser state limit"));
-                }
-                if targets.lock().is_ok_and(|live| live.contains(&target))
-                    && let Ok(mut updates) = incoming.lock()
-                {
-                    updates.states.insert(target, state);
-                }
-            }
-            Event::Frame {
-                target,
-                width,
-                height,
-                popup,
-                x,
-                y,
-                damage,
-            } => {
-                let cleared = popup && width == 0 && height == 0 && damage.is_none();
-                let damage = damage.unwrap_or(protocol::Damage::full(width, height));
-                let len = if cleared {
-                    0
-                } else {
-                    protocol::frame_len(width, height)
-                        .filter(|_| damage.valid(width, height))
-                        .and_then(|_| protocol::frame_len(damage.width, damage.height))
-                        .ok_or_else(|| std::io::Error::other("Browser frame limit"))?
-                };
-                bytes.resize(len, 0);
-                reader.read_exact(&mut bytes)?;
-                let live = targets
-                    .lock()
-                    .map_err(|_| std::io::Error::other("Browser targets unavailable"))?;
-                surfaces.retain(|(target, _), _| live.contains(target));
-                if !live.contains(&target) {
-                    continue;
-                }
-                drop(live);
-                let key = (target, popup);
-                let size = [width as usize, height as usize];
-                if cleared {
-                    surfaces.remove(&key);
-                    if let Ok(mut updates) = incoming.lock() {
-                        updates.frames.insert(
-                            key,
-                            Frame {
-                                image: Arc::new(egui::ColorImage::new([0, 0], Vec::new())),
-                                position: [x, y],
-                                size,
-                                offset: [0, 0],
-                            },
-                        );
-                    }
-                } else {
-                    if surfaces.get(&key).is_none_or(|s| s.size() != size) {
-                        if damage != protocol::Damage::full(width, height) {
-                            return Err(std::io::Error::other(
-                                "Browser frame missing initial pixels",
-                            ));
-                        }
-                        surfaces.insert(key, pixels::Surface::new(size));
-                    }
-                    if let Some(surface) = surfaces.get_mut(&key) {
-                        surface.update(damage, &bytes);
-                        if let Ok(mut updates) = incoming.lock() {
-                            let frame = surface.snapshot(damage, updates.frames.get(&key), [x, y]);
-                            updates.frames.insert(key, frame);
-                        }
-                    }
-                }
-            }
-        }
-        ctx.request_repaint();
     }
 }
