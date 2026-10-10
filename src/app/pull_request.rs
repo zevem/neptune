@@ -1395,19 +1395,27 @@ mod tests {
         app.action(&ctx, Action::PullRequest(Event::Whitespace(false)));
         settle(&mut app, &ctx, "its files with their white space", listed);
 
-        // Files read for one commit are not shown as those of all of them.
+        // Files read for one commit are not shown as those of all of them:
+        // the answer waits unread while all of them are chosen again.
         let files = host.lock().unwrap().file_reads;
         app.action(
             &ctx,
             Action::PullRequest(Event::Scope(Some("8b45e82".into()))),
         );
         frame(&mut app, &ctx);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while host.lock().unwrap().file_reads == files {
+            assert!(Instant::now() < deadline, "the commit's files are read");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The worker reports a moment after it has read.
+        std::thread::sleep(Duration::from_millis(100));
         app.action(&ctx, Action::PullRequest(Event::Scope(None)));
+        app.poll_pull_request(&ctx);
+        assert!(app.pull_request.files.is_none(), "one commit's files");
         settle(&mut app, &ctx, "all commits after one", |app| {
-            listed(app) && host.lock().unwrap().file_reads >= files + 2
+            listed(app) && host.lock().unwrap().file_reads == files + 2
         });
-        frame(&mut app, &ctx);
-        assert!(listed(&app));
     }
 
     #[test]
