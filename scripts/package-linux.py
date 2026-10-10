@@ -46,6 +46,21 @@ def bundle_libraries(appdir):
         if not matches:
             raise ValueError(f"Missing runtime library {name}")
         queue.append(Path(matches[0]))
+    # NSS opens its own modules at runtime, where ldd cannot see them, and a
+    # newer system's modules do not load into this older bundled NSS.
+    nss = re.findall(r"\slibnss3\.so \(.*x86-64.*\) => (\S+)", ldconfig)
+    if not nss:
+        raise ValueError("Missing runtime library libnss3.so")
+    for name in ("libsoftokn3", "libfreeblpriv3", "libfreebl3", "libnssdbm3", "libnssckbi"):
+        found = [d / f"{name}.so" for d in (Path(nss[0]).parent / "nss", Path(nss[0]).parent) if (d / f"{name}.so").is_file()]
+        if not found:
+            if name in ("libsoftokn3", "libfreeblpriv3"):
+                raise ValueError(f"Missing NSS module {name}.so")
+            continue
+        queue.append(found[0])
+        # FIPS mode verifies each module against the signature beside it.
+        if found[0].with_suffix(".chk").is_file():
+            shutil.copy2(found[0].with_suffix(".chk"), library_dir / f"{name}.chk")
     seen = set()
     copyrights = appdir / "usr/share/doc/neptune/system-libraries"
     copyrights.mkdir()

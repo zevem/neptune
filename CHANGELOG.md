@@ -11,6 +11,14 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Browser tabs now open in the Linux AppImage on Ubuntu 24.04 and later, where
+  they reported a stopped browser host. These systems block Chromium's sandbox
+  for an AppImage, so previews there run without it and a blank tab says so;
+  other systems and the DEB keep the sandbox. The installation guide says how
+  to allow it for the AppImage.
+- Browser tabs in the Linux AppImage no longer need Chromium's libraries
+  installed on the system; the AppImage's own copies serve when they are
+  missing.
 - The Linux AppImage now starts on systems with current Mesa graphics drivers,
   such as Ubuntu 26.04, Fedora 44 and Arch, where it reported that it could
   not start its renderer. It uses the system's Wayland libraries, which those

@@ -713,6 +713,7 @@ impl App {
                                 },
                                 ..Default::default()
                             },
+                            unsandboxed: false,
                             texture: None,
                             popup: None,
                             failed: matches!(pane.lifecycle(), Lifecycle::Failed(_)),

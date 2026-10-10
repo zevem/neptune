@@ -62,7 +62,8 @@ Only HTTP, HTTPS and a blank page are navigable. Page JavaScript receives no
 Neptune bridge, shell access or model commands. Profiles are in-memory with a
 unique temporary root for CEF bookkeeping, owned and removed by the supervisor
 even after helper crashes. Certificate checks, web security and
-the Chromium sandbox retain their defaults. Popup links with a user gesture
+the Chromium sandbox retain their defaults, except on a Linux system that allows
+Chromium no sandbox (see below). Popup links with a user gesture
 stay in the preview; unsolicited windows are rejected. DevTools opens a CEF
 window. Platform sandbox setup follows [CEF's official requirements](https://chromiumembedded.github.io/cef/sandbox_setup).
 
@@ -81,8 +82,27 @@ Linux builds also need the GLib development library (`libglib2.0-dev` on Debian/
 for native event dispatch. Linux needs the Chromium runtime libraries (NSS/NSPR, ATK, CUPS, GBM, Pango,
 Cairo, ALSA and X11). A system with restricted user namespaces also needs a
 root-owned mode-4755 `chrome-sandbox`; the DEB packages that helper. AppImage
-uses the host's user namespace support. Never work around a sandbox failure by
-disabling it. The browser error screen keeps terminals usable.
+uses the host's user namespace support, and an AppImage mount cannot provide a
+setuid helper. Chromium aborts at startup with neither, which is every AppImage
+launch on Ubuntu 24.04 and later, where AppArmor denies the namespace its
+capabilities.
+
+Browser previews must work without setup, so before each host launch the
+supervisor checks, on its worker, for a valid helper beside the host and
+whether a child may map its user in a new user namespace. Only when the system
+allows neither does it start the host with `--no-sandbox`; a page then runs
+with the user's access, and a blank preview says that pages run without
+Chromium's sandbox. A system that allows either keeps the sandbox, and
+[the installation guide](installation.md#browser-previews-and-chromiums-sandbox)
+says how to allow one. Never disable the sandbox to work around any other
+failure. The browser error screen keeps terminals usable.
+
+Neptune restores the launch environment before it starts children, so an
+AppImage's host loads the system's Chromium runtime libraries, which match its
+graphics drivers and NSS database. When glibc's loader reports that the system
+lacks one of them, the supervisor starts the host with the AppImage's `usr/lib`
+first in its library path. That bundle carries the NSS modules NSS opens at
+runtime, since a newer system's modules do not load into it.
 
 macOS packaging places the CEF framework and role-specific helper apps in
 `Contents/Frameworks`, initializes the helper sandbox before loading CEF and

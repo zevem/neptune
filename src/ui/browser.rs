@@ -650,7 +650,11 @@ pub(crate) fn show(
                 (Icon::Globe, p.accent),
                 (
                     "Preview your project",
-                    "Enter an address above, or open a port your dev server is listening on.",
+                    if view.unsandboxed {
+                        "Enter an address above, or open a port your dev server is listening on. Pages run without Chromium's sandbox on this system."
+                    } else {
+                        "Enter an address above, or open a port your dev server is listening on."
+                    },
                 ),
                 false,
             );

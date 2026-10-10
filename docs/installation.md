@@ -35,6 +35,33 @@ and use its launch or integration control. If a desktop double-click does nothin
 run the executable AppImage from a terminal to see the error. The DEB uses the
 system package installer and does not need execute permission.
 
+#### Browser previews and Chromium's sandbox
+
+Browser tabs need no setup. Ubuntu 24.04 and later restrict unprivileged user
+namespaces, which Chromium's sandbox uses, and an AppImage cannot carry the
+root-owned sandbox helper that the DEB installs. On such a system the AppImage
+runs previews without Chromium's sandbox, and a blank browser tab says so: a
+page then runs with your user's access, as the commands in a terminal do. To keep the sandbox, install the DEB,
+or allow user namespaces for the AppImage's browser helper with an AppArmor
+profile:
+
+```sh
+sudo tee /etc/apparmor.d/neptune-browser >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile neptune-browser /tmp/.mount_*/usr/lib/neptune/browser/neptune-browser flags=(unconfined) {
+  userns,
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/neptune-browser
+```
+
+Neptune uses the sandbox from the next browser tab on. The path is where the
+AppImage runtime mounts itself; replace `/tmp` if `TMPDIR` points elsewhere.
+Any program able to run from a matching path gains the same permission, as it
+had before the restriction.
+
 ## Build and run
 
 Install a pinned Rust 1.97.1 toolchain (installed automatically by rustup) with Cargo. A graphical desktop and a working graphics driver are required. On Debian/Ubuntu, install the native build dependencies:
