@@ -160,8 +160,20 @@ icon buttons keep a 28-point target around a 16-point glyph.
   the sidebar is hidden the toolbar also carries the window controls, the
   sidebar toggle and "New workspace". In narrow windows the command field
   collapses to an icon and search takes the title's room.
-- **Right panel.** A panel at the trailing edge, below the toolbar and in the
-  window material. Toggling it slides it in from the trailing edge over 160
+- **Subscription footer.** A 44-point strip below the content, sharing the
+  window material. Its trailing control shows each available local AI
+  subscription's most consumed allowance and a small track; it collapses
+  to **AI usage** when there is little room or no reading yet. Clicking opens
+  one upward popover, at most 316 points wide. Providers are headed groups on
+  one shared grid, a 22-point line per window: name, track, percentage used
+  and time to reset under **Used** and **Resets in** captions. The header
+  carries the readings' age and an icon-only Refresh. It scrolls only when the
+  window is too short. Failures retain visibly stale readings, in the footer
+  and the group's heading. Painted text keeps accessible labels that name the
+  provider. The popover never resizes the shell, and checking runs on one
+  sleeping worker.
+- **Right panel.** A panel at the trailing edge, below the toolbar and above
+  the footer, in the window material. Toggling it slides it in from the trailing edge over 160
   ms with a matching fade, from the button, the shortcut or the command
   palette alike. As with the sidebar, the terminals follow its edge, each shell
   is resized once to the size it will rest at, and a toggle reversed midway
@@ -196,10 +208,15 @@ icon buttons keep a 28-point target around a 16-point glyph.
   outlines the field in red with the reason on the next row. Deleting is
   permanent, so it waits for a sheet that names the item. The preview is a
   content surface at the bottom of the panel, resized by the divider above it:
-  text in the terminal face with line numbers, pictures fitted to its room,
-  and a plain statement for anything else. All reading, searching and changing
-  of files happens off the UI thread; the folders in view are read again every
-  two seconds, and a frame is drawn only when something changed. Nothing is
+  selectable text in the terminal face with line numbers, pictures fitted to
+  its room, and a plain statement for anything else.
+  Markdown files have a Source / Preview icon button beside the file's open and
+  close controls. The native preview shows local and web pictures, follows
+  links, and keeps its text selectable. Code blocks have quiet copy and line
+  wrap controls; unwrapped code scrolls horizontally within its own card.
+  All reading, searching, Markdown block parsing and changing of files happens
+  off the UI thread; the folders in view are read again every two seconds,
+  and a frame is drawn only when something changed. Nothing is
   read while the Agents tab is the one in view.
 - **Agents.** The Agents tab lists every CLI agent running in a terminal of any
   workspace, under the headings "Needs input", "Working" and "Idle", in that

@@ -10,6 +10,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 - [Dev servers and ports](#dev-servers-and-ports)
 - [Closing terminals safely](#closing-terminals-safely)
 - [Coding agent sessions](#coding-agent-sessions)
+- [Subscription usage](#subscription-usage)
 - [Projects](#projects)
 - [Notifications](#notifications)
 - [Command-line options](#command-line-options)
@@ -160,6 +161,40 @@ rows opens every picture on the list at once, with a small copy of each at the
 foot of the window to click. The folder control on a row shows
 the file in your file manager and the cross dismisses it from the list without touching the file. See
 [attached files](agent-sessions.md#attached-files).
+
+## Subscription usage
+
+The bottom-right bar shows the percentage used of the most consumed allowance
+for your local Codex, Claude Code and Cursor subscriptions. Hover for the
+window's name. Click it, or choose **Subscription usage**
+in the command palette, for one line per reported window under its provider:
+the percentage **Used** and the time it **Resets in**. The header shows how old
+the readings are, and its **Refresh** button checks the accounts again. Checks
+also run every five minutes; opening the dropdown does not resize your
+terminals. A failed check keeps the last reading marked **Stale** with its age,
+and a reset time that has passed reads **due** until the next refresh rather
+than assuming the quota is available.
+
+Sign in through the provider's CLI first: `codex login`, `claude auth login`,
+or `agent login` for Cursor. Codex and Claude use their own read-only account
+protocols, with no prompt or agent turn. Cursor reads the same current-period
+dashboard percentages as its CLI, including bonus allowance. Missing CLIs,
+unsupported logins and failed checks are explained in the dropdown; API-key
+logins may not report subscription limits.
+
+The accounts are those signed in on the computer running Neptune, including
+when the terminal in view is connected over SSH. Codex and Claude honor their
+CLI's `CODEX_HOME` and `CLAUDE_CONFIG_DIR` environment settings. Cursor uses
+`CURSOR_AUTH_TOKEN` or its saved CLI `auth.json` in the platform's configuration
+directory; an explicit `CURSOR_API_KEY` never falls back to a different saved
+account. `CURSOR_API_ENDPOINT` may select another HTTPS endpoint with an
+explicit token or file login. On macOS, **Allow Cursor Keychain** grants this
+run permission to read the default CLI login; macOS may ask for access. This
+permission lasts until Neptune closes. A file-based login can instead use
+`AGENT_CLI_CREDENTIAL_STORE=file`.
+
+Only bounded quota metadata is kept in memory. Neptune does not scan agent
+transcripts, store credentials or usage history, or redeem reset credits.
 
 ## Projects
 
@@ -320,7 +355,7 @@ Neptune only reads: it never stages, commits, checks out or fetches, and it does
 
 The **Files** tab of the right panel shows the folder of the focused terminal and follows that terminal when it changes directory or when another terminal is focused. Every item is listed, hidden files and folders included, with folders first. Files made, renamed or removed by a program in the terminal appear within about two seconds; **Refresh** reads the folder at once.
 
-Click a folder to open or close it and a file to preview it at the bottom of the panel. Reopening a collapsed folder reads its contents afresh; nested expansion choices are kept. Text is shown with line numbers (the first 256 KiB and 5,000 lines), PNG, JPEG, GIF, WebP and BMP pictures are fitted to the preview with their pixel size, and other files say that they have no preview. The preview follows the file as it changes. Drag the divider above the preview to resize it, and use its buttons to open the file with its default application or to close the preview.
+Click a folder to open or close it and a file to preview it at the bottom of the panel. Reopening a collapsed folder reads its contents afresh; nested expansion choices are kept. Text is shown with line numbers (the first 256 KiB, 5,000 lines and 1,000 columns per line). Drag across the text to select it, then copy with Ctrl+C or Ctrl+Shift+C on Linux/Windows, or Command+C on macOS. Secondary-click the source text for **Copy** or **Select all**; copied text excludes line numbers. Markdown (`.md`) files also offer a formatted **Preview**, with a `</>` icon button (**Toggle Markdown source / preview**) beside the open and close controls. The button stays highlighted while showing Source. Text in either view can be selected and copied. The preview formats headings, lists, quotes, tables and code blocks. Markdown images and HTML `img` elements show PNG, JPEG, GIF, WebP and BMP pictures; relative paths resolve from the Markdown file, and web images load in the background. Up to 16 pictures are loaded per document, with bounded sizes and timeouts. Hiding or closing the preview stops remaining picture work; returning to Files reloads a paused preview. Click web links to open your browser, or file links to preview their target; heading anchors scroll within the document. Each code block has **Copy** and **Toggle code line wrapping** controls. Copy preserves the original code, including tabs and long commands, within the file byte and line limits. Reloading keeps the scroll position and wrapping choices for unchanged code blocks. Turning wrapping off lets the code scroll horizontally within the block. Opening a file location selects **Source** to show its highlighted line. PNG, JPEG, GIF, WebP and BMP pictures are fitted to the preview with their pixel size, and other files say that they have no preview. The preview follows the file as it changes. Drag the divider above the preview to resize it, and use its buttons to open the file with its default application or to close the preview.
 
 **New file** and **New folder** in the panel's header create an item beside the selection, or in the folder shown when nothing is selected; type the name where the item will appear and press Enter. A name with slashes, such as `notes/today.md`, makes the folders on the way. Secondary-click an item for its menu: **New file…** and **New folder…** inside a folder, **Open with default app** for a file, **Reveal in file manager** (Finder on macOS, File Explorer on Windows), **Copy path**, **Copy relative path** (relative to the folder shown), **Rename…** and **Delete…**. Secondary-click empty space for the same creation commands, **Collapse all folders** and **Refresh**. Escape abandons a name being typed; clicking elsewhere uses it. Nothing is ever replaced: pressing Enter on a name that is taken keeps the field open and says so. **Delete…** asks first, then removes the file, or the folder with everything in it, permanently; it does not use the trash. Deleting a link removes the link, not what it points to.
 

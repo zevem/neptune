@@ -18,6 +18,9 @@ use eframe::egui::{
 };
 use std::path::{Path, PathBuf};
 
+mod selection;
+use selection::Selection;
+
 /// Folders a search leaves out until the field says otherwise.
 pub const DEFAULT_EXCLUDE: &str =
     "**/node_modules/**, **/.git/**, **/dist/**, **/target/**, **/build/**";
@@ -79,6 +82,9 @@ pub struct State {
     pub preview_share: f32,
     pub preview_location: Option<(u32, u32)>,
     pub preview_jump: bool,
+    pub markdown_preview: bool,
+    pub markdown_anchor: Option<String>,
+    pub source_selection: Selection,
 }
 
 impl Default for State {
@@ -95,6 +101,9 @@ impl Default for State {
             preview_share: 0.45,
             preview_location: None,
             preview_jump: false,
+            markdown_preview: true,
+            markdown_anchor: None,
+            source_selection: Selection::default(),
         }
     }
 }
@@ -104,6 +113,10 @@ pub enum Event {
     Expand(PathBuf, bool),
     /// Preview a file.
     Select(PathBuf),
+    FollowLink {
+        path: PathBuf,
+        anchor: Option<String>,
+    },
     /// Leave the search and show this item, a folder if `true`, in the tree.
     ShowInTree(PathBuf, bool),
     ClosePreview,
@@ -125,6 +138,7 @@ pub enum Event {
     ConfirmDelete,
     Reveal(PathBuf),
     Open(PathBuf),
+    OpenLink(crate::platform::links::WebLink),
     CopyPath(PathBuf),
     CopyRelativePath(PathBuf),
     Refresh,
@@ -184,6 +198,7 @@ pub enum PreviewBody<'a> {
         /// Columns of the longest line.
         widest: usize,
         truncated: bool,
+        markdown: Option<&'a super::markup::Document>,
     },
     Image {
         texture: &'a egui::TextureHandle,
@@ -196,6 +211,7 @@ pub enum PreviewBody<'a> {
 pub struct PreviewView<'a> {
     pub path: &'a Path,
     pub name: &'a str,
+    pub revision: u64,
     pub size: Option<u64>,
     pub body: PreviewBody<'a>,
 }
@@ -707,6 +723,10 @@ fn preview(
     let header = Rect::from_min_size(rect.min, vec2(rect.width(), 32.0));
     let middle = header.center().y;
     let picture = matches!(view.body, PreviewBody::Image { .. });
+    let markdown = match &view.body {
+        PreviewBody::Text { markdown, .. } => *markdown,
+        _ => None,
+    };
     let left = place(
         ui,
         header.shrink2(vec2(3.0, 0.0)),
@@ -719,6 +739,24 @@ fn preview(
             }
             if icons::button(ui, Icon::ArrowUpRight, "Open with default app").clicked() {
                 events.push(Event::Open(view.path.to_path_buf()));
+            }
+            if markdown.is_some() {
+                let response = latching(
+                    ui,
+                    p,
+                    Icon::Code,
+                    "Toggle Markdown source / preview",
+                    !state.markdown_preview,
+                );
+                if response.clicked() {
+                    state.markdown_preview = !state.markdown_preview;
+                    state.source_selection.reset();
+                    ui.ctx().with_plugin(
+                        |labels: &mut egui::text_selection::LabelSelectionState| {
+                            labels.clear_selection()
+                        },
+                    );
+                }
             }
             ui.min_rect().left()
         },
@@ -759,6 +797,68 @@ fn preview(
     if body.height() < 8.0 {
         return;
     }
+    if let Some(document) = markdown.filter(|_| state.markdown_preview) {
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .id_salt(("explorer-markdown", view.path))
+                .max_rect(body.shrink2(vec2(10.0, 4.0))),
+        );
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        egui::ScrollArea::vertical()
+            .id_salt(("explorer-markdown-scroll", view.path))
+            .auto_shrink([false, false])
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            })
+            .show(&mut child, |ui| {
+                let mut actions = Vec::new();
+                super::markup::show_document(
+                    ui,
+                    p,
+                    document,
+                    view.path,
+                    state.markdown_anchor.as_deref(),
+                    &mut actions,
+                );
+                state.markdown_anchor = None;
+                for action in actions {
+                    match action {
+                        Action::Explorer(event) => events.push(event),
+                        Action::OpenLink(link) => events.push(Event::OpenLink(link)),
+                        _ => {}
+                    }
+                }
+                if matches!(
+                    view.body,
+                    PreviewBody::Text {
+                        truncated: true,
+                        ..
+                    }
+                ) {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("The source preview is truncated")
+                            .color(p.muted)
+                            .size(11.0),
+                    );
+                }
+            });
+        if document.blocks.is_empty() {
+            centered_note(ui, body, p, "Empty file");
+        }
+        return;
+    }
+    if ui.input(|input| {
+        input.pointer.any_pressed()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| !body.contains(pos))
+    }) && !egui::Popup::is_any_open(ui.ctx())
+    {
+        state.source_selection.reset();
+    }
     match &view.body {
         PreviewBody::Loading => {}
         PreviewBody::Failed(message) => centered_note(ui, body, p, message),
@@ -770,6 +870,7 @@ fn preview(
             lines,
             widest,
             truncated,
+            ..
         } => {
             if state
                 .preview_location
@@ -815,58 +916,87 @@ fn preview(
             let scrolled = scroll
                 .id_salt(("explorer-preview-lines", view.path))
                 .auto_shrink([false, false])
-                .show_rows(
-                    &mut ui,
-                    height,
-                    lines.len() + usize::from(*truncated),
-                    |ui, range| {
-                        ui.set_min_width(width);
-                        for index in range {
-                            let (_, line) =
-                                ui.allocate_space(vec2(width.max(ui.available_width()), height));
-                            let painter = ui.painter();
-                            if let Some((target, col)) = location
-                                && index + 1 == target as usize
-                            {
-                                painter.rect_filled(line, 0, p.accent.gamma_multiply(0.15));
-                                let x = line.left()
-                                    + gutter
-                                    + (col.saturating_sub(1) as usize)
-                                        .min(lines[index].chars().count())
-                                        as f32
-                                        * column;
-                                painter.line_segment(
-                                    [egui::pos2(x, line.top()), egui::pos2(x, line.bottom())],
-                                    egui::Stroke::new(1.5, p.accent),
-                                );
-                            }
-                            let Some(text) = lines.get(index) else {
-                                painter.text(
-                                    Pos2::new(line.left() + gutter, line.center().y),
-                                    Align2::LEFT_CENTER,
-                                    "The rest of the file is not shown",
-                                    theme::regular(11.0),
-                                    p.muted,
-                                );
-                                continue;
-                            };
-                            painter.text(
-                                Pos2::new(line.left() + gutter - 10.0, line.center().y),
-                                Align2::RIGHT_CENTER,
-                                index + 1,
-                                font.clone(),
-                                p.muted,
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Never,
+                    ..Default::default()
+                })
+                .show_viewport(&mut ui, |ui, viewport| {
+                    let count = lines.len() + usize::from(*truncated);
+                    let (_, content) = ui.allocate_space(vec2(
+                        width.max(ui.available_width()),
+                        count as f32 * height,
+                    ));
+                    let response = ui
+                        .interact(
+                            content.intersect(ui.clip_rect()),
+                            ui.id().with(("source-selection", view.path)),
+                            Sense::click_and_drag() - Sense::FOCUSABLE,
+                        )
+                        .on_hover_cursor(CursorIcon::Text);
+                    response.widget_info(|| {
+                        WidgetInfo::labeled(WidgetType::Label, true, "File source")
+                    });
+                    state.source_selection.sync(view.path, view.revision);
+                    state.source_selection.update(
+                        ui,
+                        &response,
+                        lines,
+                        content.min + vec2(gutter, 0.0),
+                        height,
+                        &font,
+                    );
+                    state.source_selection.menu(&response, lines, p);
+                    let range = (viewport.top() / height).floor().max(0.0) as usize
+                        ..((viewport.bottom() / height).ceil() as usize).min(count);
+                    for index in range {
+                        let line = Rect::from_min_size(
+                            content.min + vec2(0.0, index as f32 * height),
+                            vec2(content.width(), height),
+                        );
+                        let painter = ui.painter();
+                        if let Some((target, col)) = location
+                            && index + 1 == target as usize
+                        {
+                            painter.rect_filled(line, 0, p.accent.gamma_multiply(0.15));
+                            let x = line.left()
+                                + gutter
+                                + (col.saturating_sub(1) as usize).min(lines[index].chars().count())
+                                    as f32
+                                    * column;
+                            painter.line_segment(
+                                [egui::pos2(x, line.top()), egui::pos2(x, line.bottom())],
+                                egui::Stroke::new(1.5, p.accent),
                             );
+                        }
+                        let Some(text) = lines.get(index) else {
                             painter.text(
                                 Pos2::new(line.left() + gutter, line.center().y),
                                 Align2::LEFT_CENTER,
-                                text,
-                                font.clone(),
-                                p.fg,
+                                "The rest of the file is not shown",
+                                theme::regular(11.0),
+                                p.muted,
                             );
-                        }
-                    },
-                );
+                            continue;
+                        };
+                        painter.text(
+                            Pos2::new(line.left() + gutter - 10.0, line.center().y),
+                            Align2::RIGHT_CENTER,
+                            index + 1,
+                            font.clone(),
+                            p.muted,
+                        );
+                        let galley = painter.layout_no_wrap(text.clone(), font.clone(), p.fg);
+                        let origin = Pos2::new(line.left() + gutter, line.top());
+                        state
+                            .source_selection
+                            .paint(ui, index, origin, &galley, height, p);
+                        painter.galley(
+                            origin + vec2(0.0, (height - galley.size().y) * 0.5),
+                            galley,
+                            p.fg,
+                        );
+                    }
+                });
             if state.preview_jump && !ui.is_sizing_pass() && !ui.ctx().will_discard() {
                 let desired = location.map_or(0.0, |(line, _)| {
                     (line.saturating_sub(1) as usize).min(lines.len().saturating_sub(1)) as f32
@@ -1502,6 +1632,269 @@ mod tests {
 mod location_tests {
     use super::*;
 
+    fn frame(
+        ctx: &egui::Context,
+        view: &PreviewView,
+        state: &mut State,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 400.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                preview(
+                    ui,
+                    Rect::from_min_size(Pos2::ZERO, vec2(300.0, 240.0)),
+                    Palette::new(crate::config::Theme::Graphite),
+                    view,
+                    state,
+                    &mut Vec::new(),
+                )
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn painted(output: &egui::FullOutput, text: &str) -> Option<Rect> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(shape) if shape.galley.text() == text => {
+                Some(shape.visual_bounding_rect())
+            }
+            _ => None,
+        })
+    }
+
+    fn drag(ctx: &egui::Context, view: &PreviewView, state: &mut State, from: Pos2, to: Pos2) {
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![button(from, true)],
+            vec![egui::Event::PointerMoved(to)],
+            vec![button(to, false)],
+        ] {
+            frame(ctx, view, state, events);
+        }
+    }
+
+    #[test]
+    fn source_selection_copies_multiple_lines_and_survives_scrolling() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let lines: Vec<String> = (1..=100)
+            .map(|line| format!("source line {line}"))
+            .collect();
+        let view = PreviewView {
+            path: Path::new("/tmp/source.rs"),
+            name: "source.rs",
+            revision: 1,
+            size: None,
+            body: PreviewBody::Text {
+                lines: &lines,
+                widest: 15,
+                truncated: false,
+                markdown: None,
+            },
+        };
+        let mut state = State::default();
+        let output = frame(&ctx, &view, &mut state, Vec::new());
+        let from = painted(&output, "source line 1").unwrap().left_center();
+        let to = painted(&output, "source line 3").unwrap().right_center() + vec2(1.0, 0.0);
+        drag(&ctx, &view, &mut state, from, to);
+        let output = frame(&ctx, &view, &mut state, vec![egui::Event::Copy]);
+        assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == "source line 1\nsource line 2\nsource line 3")));
+        let context = egui::Event::PointerButton {
+            pos: from + vec2(30.0, 17.0),
+            pressed: true,
+            button: egui::PointerButton::Secondary,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &ctx,
+            &view,
+            &mut state,
+            vec![egui::Event::PointerMoved(from + vec2(30.0, 17.0))],
+        );
+        frame(&ctx, &view, &mut state, vec![context.clone()]);
+        let mut release = context;
+        if let egui::Event::PointerButton { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        frame(&ctx, &view, &mut state, vec![release]);
+        let output = frame(&ctx, &view, &mut state, Vec::new());
+        let copy = painted(&output, "Copy").unwrap().center();
+        frame(
+            &ctx,
+            &view,
+            &mut state,
+            vec![egui::Event::PointerMoved(copy)],
+        );
+        let output = frame(
+            &ctx,
+            &view,
+            &mut state,
+            vec![
+                egui::Event::PointerButton {
+                    pos: copy,
+                    pressed: true,
+                    button: egui::PointerButton::Primary,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: copy,
+                    pressed: false,
+                    button: egui::PointerButton::Primary,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == "source line 1\nsource line 2\nsource line 3")), "copying through the menu must preserve the selection");
+        frame(
+            &ctx,
+            &view,
+            &mut state,
+            vec![egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, -600.0),
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        for _ in 0..12 {
+            frame(&ctx, &view, &mut state, Vec::new());
+        }
+        let output = frame(&ctx, &view, &mut state, vec![egui::Event::Copy]);
+        assert!(
+            state
+                .source_selection
+                .has_selection(view.path, view.revision)
+        );
+        assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == "source line 1\nsource line 2\nsource line 3")));
+        assert!(
+            painted(&output, "source line 1").is_none(),
+            "offscreen lines stay virtualized"
+        );
+    }
+
+    #[test]
+    fn markdown_switch_shows_source_or_formatted_selectable_text() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let lines = vec!["# Heading".into(), "".into(), "Some **bold** text.".into()];
+        let blocks =
+            super::super::markup::blocks(&lines.join("\n"), super::super::markup::Lines::Joined);
+        let document = super::super::markup::Document::new(blocks);
+        let view = PreviewView {
+            path: Path::new("/tmp/notes.md"),
+            name: "notes.md",
+            revision: 1,
+            size: None,
+            body: PreviewBody::Text {
+                lines: &lines,
+                widest: 19,
+                truncated: false,
+                markdown: Some(&document),
+            },
+        };
+        let mut state = State::default();
+        let output = frame(&ctx, &view, &mut state, Vec::new());
+        let heading = painted(&output, "Heading").unwrap();
+        assert!(painted(&output, "Some bold text.").is_some());
+        drag(
+            &ctx,
+            &view,
+            &mut state,
+            heading.left_center(),
+            heading.right_center() + vec2(1.0, 0.0),
+        );
+        let output = frame(&ctx, &view, &mut state, vec![egui::Event::Copy]);
+        assert!(output.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(text) if text == "Heading")
+        ));
+        // The third 28-point icon is left of Open and Close in the header.
+        let source = Pos2::new(300.0 - 3.0 - 2.0 * 28.0 - 14.0, 16.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: source,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &ctx,
+            &view,
+            &mut state,
+            vec![egui::Event::PointerMoved(source)],
+        );
+        frame(&ctx, &view, &mut state, vec![button(true)]);
+        let output = frame(&ctx, &view, &mut state, vec![button(false)]);
+        assert!(!state.markdown_preview);
+        assert!(painted(&output, "# Heading").is_some());
+        assert!(painted(&output, "Some **bold** text.").is_some());
+        frame(&ctx, &view, &mut state, vec![button(true)]);
+        let output = frame(&ctx, &view, &mut state, vec![button(false)]);
+        assert!(state.markdown_preview);
+        assert!(painted(&output, "Heading").is_some());
+        assert!(painted(&output, "Some bold text.").is_some());
+    }
+
+    #[test]
+    fn markdown_scroll_survives_a_file_revision_change() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let lines: Vec<String> = (0..80)
+            .map(|index| format!("Paragraph {index}\n"))
+            .collect();
+        let document = super::super::markup::Document::new(super::super::markup::document_blocks(
+            &lines.join("\n"),
+        ));
+        let mut view = PreviewView {
+            path: Path::new("/tmp/scroll.md"),
+            name: "scroll.md",
+            revision: 1,
+            size: None,
+            body: PreviewBody::Text {
+                lines: &lines,
+                widest: 15,
+                truncated: false,
+                markdown: Some(&document),
+            },
+        };
+        let mut state = State::default();
+        frame(&ctx, &view, &mut state, Vec::new());
+        frame(
+            &ctx,
+            &view,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(Pos2::new(140.0, 180.0)),
+                egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -220.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..12 {
+            frame(&ctx, &view, &mut state, Vec::new());
+        }
+        let before = frame(&ctx, &view, &mut state, Vec::new());
+        let paragraph = painted(&before, "Paragraph 10").unwrap();
+        view.revision = 2;
+        let after = frame(&ctx, &view, &mut state, Vec::new());
+        let reloaded = painted(&after, "Paragraph 10").unwrap();
+        assert!((reloaded.top() - paragraph.top()).abs() < 2.0);
+        assert!(paragraph.top() < 160.0, "the preview actually scrolled");
+    }
+
     #[test]
     fn a_file_location_scrolls_the_visible_preview_to_its_highlighted_line() {
         let ctx = egui::Context::default();
@@ -1510,11 +1903,13 @@ mod location_tests {
         let view = PreviewView {
             path: Path::new("/tmp/location.rs"),
             name: "location.rs",
+            revision: 1,
             size: Some(1024),
             body: PreviewBody::Text {
                 lines: &lines,
                 widest: 20,
                 truncated: false,
+                markdown: None,
             },
         };
         let mut state = State {

@@ -10,4 +10,5 @@ pub mod pull_request;
 pub mod pull_requests;
 pub mod sessions;
 pub mod updates;
+pub mod usage;
 pub mod worktrees;

@@ -63,6 +63,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         projects: projects::Projects::new(root.join("projects"), true),
         desktop_notifier: Default::default(),
         updates: Default::default(),
+        usage: Default::default(),
         relaunch: false,
         relaunch_arguments: Vec::new(),
         pull_requests: Default::default(),
@@ -1441,6 +1442,187 @@ fn escape_leaves_one_surface_at_a_time_and_otherwise_belongs_to_the_shell() {
     assert!(press(&mut app, &ctx, escape()));
     assert!(!app.ui.search_open);
     assert!(app.ui.error.is_some(), "one surface per Escape");
+}
+
+#[test]
+fn subscription_usage_owns_escape_before_search_and_restores_terminal_shortcuts() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    app.startup = None;
+    app.ui.search_open = true;
+    ctx.memory_mut(|memory| memory.request_focus(ui::search::input_id()));
+    app.action(&ctx, Action::Usage);
+    assert!(egui::Popup::is_id_open(&ctx, ui::usage::popup_id()));
+    assert!(!app.terminal_owns_shortcuts(&ctx));
+    assert!(press(
+        &mut app,
+        &ctx,
+        key(egui::Key::Escape, None, egui::Modifiers::NONE)
+    ));
+    assert!(!egui::Popup::is_any_open(&ctx));
+    assert!(app.ui.search_open, "Escape closes the usage popover first");
+    ctx.memory_mut(|memory| memory.surrender_focus(ui::search::input_id()));
+    assert!(app.terminal_owns_shortcuts(&ctx));
+}
+
+/// Quota fixtures in the actual GPU/native window, without production switches
+/// or reading a developer's credentials. Run manually with fresh storage.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "Native visual QA; needs a desktop and NEPTUNE_USAGE_CAPTURE"]
+fn capture_usage_native() {
+    use crate::runtime::usage::{Provider, Unavailable, Window};
+    use winit::platform::x11::EventLoopBuilderExtX11;
+    let output = PathBuf::from(
+        std::env::var("NEPTUNE_USAGE_CAPTURE").expect("Set a task-owned capture path"),
+    );
+    let screen = std::env::var("NEPTUNE_USAGE_SCREEN").unwrap_or_else(|_| "open".into());
+    let narrow = std::env::var_os("NEPTUNE_USAGE_NARROW").is_some();
+    let split = std::env::var_os("NEPTUNE_USAGE_SPLIT").is_some();
+    let light = std::env::var_os("NEPTUNE_USAGE_LIGHT").is_some();
+    let data = tempfile::tempdir().unwrap();
+    let cwd = data.path().join("neptune");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::write(
+        data.path().join("config.toml"),
+        "shell = '/bin/sh'\ncheck_updates = false\n",
+    )
+    .unwrap();
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(if narrow {
+                [640.0, 400.0]
+            } else {
+                [1000.0, 700.0]
+            })
+            .with_decorations(false),
+        event_loop_builder: Some(Box::new(|builder| {
+            builder.with_any_thread(true);
+        })),
+        ..Default::default()
+    };
+    struct Capture {
+        app: App,
+        _data: tempfile::TempDir,
+        screen: String,
+        light: bool,
+        split: bool,
+        applied: bool,
+    }
+    impl eframe::App for Capture {
+        fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+            eframe::App::logic(&mut self.app, ctx, frame);
+        }
+        fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+            if self.app.startup.is_none() && !self.applied {
+                self.applied = true;
+                if self.light {
+                    self.app.config.theme = crate::config::Theme::Light;
+                    theme::apply(ui.ctx(), &self.app.config);
+                }
+                if self.split
+                    && let Some(pane) = self.app.controller.model().active_pane()
+                {
+                    self.app.action(
+                        ui.ctx(),
+                        Action::Split(pane, neptune_model::Axis::Horizontal),
+                    );
+                }
+                if self.screen != "closed" {
+                    self.app.action(ui.ctx(), Action::Usage);
+                }
+            }
+            eframe::App::ui(&mut self.app, ui, frame);
+        }
+        fn on_exit(&mut self) {
+            eframe::App::on_exit(&mut self.app);
+        }
+    }
+    eframe::run_native(
+        "Neptune subscription usage visual QA",
+        options,
+        Box::new(move |cc| {
+            let mut app = App::new(
+                cc,
+                Launch {
+                    data_root: Some(data.path().into()),
+                    cwd: Some(cwd),
+                    screenshot: Some(output),
+                    command: Some("printf 'Neptune · subscription usage\\n\\n'".into()),
+                    ..Default::default()
+                },
+                window_state::LoadReport::default(),
+            );
+            let now = crate::runtime::usage::epoch();
+            for reading in &mut app.usage.readings {
+                reading.checked_at = Some(std::time::SystemTime::now());
+                reading.plan = Some(
+                    match reading.provider {
+                        Provider::Codex => "Plus",
+                        Provider::Claude => "Max",
+                        Provider::Cursor => "Pro",
+                    }
+                    .into(),
+                );
+                let (used, weekly) = match reading.provider {
+                    Provider::Codex => (24.0, 61.0),
+                    Provider::Claude => (83.0, 36.0),
+                    Provider::Cursor => (42.0, 18.0),
+                };
+                reading.windows = vec![
+                    Window {
+                        label: if reading.provider == Provider::Cursor {
+                            "Monthly"
+                        } else {
+                            "Session"
+                        }
+                        .into(),
+                        used_percent: used,
+                        resets_at: Some(now + 3 * 3600 + 20 * 60),
+                    },
+                    Window {
+                        label: if reading.provider == Provider::Cursor {
+                            "Auto"
+                        } else {
+                            "Weekly"
+                        }
+                        .into(),
+                        used_percent: weekly,
+                        resets_at: Some(now + 5 * 86400 + 3600),
+                    },
+                ];
+                if screen == "empty" {
+                    reading.windows.clear();
+                    reading.plan = None;
+                    reading.checked_at = None;
+                    reading.unavailable = Some(Unavailable::SignIn);
+                }
+                if screen == "stale" {
+                    reading.unavailable = Some(Unavailable::Failed);
+                    reading.checked_at =
+                        Some(std::time::SystemTime::now() - Duration::from_secs(10 * 60));
+                    reading.windows[0].resets_at = Some(now - 60);
+                }
+                if screen == "loading" {
+                    reading.windows.clear();
+                    reading.checked_at = None;
+                    reading.plan = None;
+                    app.usage.refreshing = true;
+                }
+            }
+            Ok(Box::new(Capture {
+                app,
+                _data: data,
+                screen,
+                light,
+                split,
+                applied: false,
+            }))
+        }),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -4094,7 +4276,7 @@ fn a_copy_chord_copies_the_text_selected_in_a_panel_before_it_reaches_the_termin
                 app.shortcuts(ui.ctx());
                 seen = shortcut_events(ui.ctx());
                 // What the terminal in front would write for them.
-                let events = App::terminal_events(ui.ctx());
+                let events = app.terminal_events(ui.ctx());
                 let normalized = crate::input::normalize_events(&events, ui.input(|i| i.modifiers));
                 written = crate::input::route_events(
                     crate::input::RoutingContext::TerminalPane(1),

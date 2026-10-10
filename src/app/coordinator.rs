@@ -394,6 +394,12 @@ impl App {
         }
         match action {
             Action::CheckUpdates => self.updates.check(ctx),
+            Action::Usage => {
+                self.ui.overlay = OverlayState::None;
+                egui::Popup::open_id(ctx, ui::usage::popup_id());
+            }
+            Action::RefreshUsage => self.usage.refresh(ctx, false),
+            Action::EnableCursorUsage => self.usage.refresh(ctx, true),
             Action::ReviewUpdate => {
                 if self.updates.release.is_some() {
                     self.ui.overlay = OverlayState::Update;

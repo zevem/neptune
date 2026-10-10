@@ -128,6 +128,7 @@ pub struct App {
     projects: projects::Projects,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
     updates: crate::runtime::updates::Updates,
+    usage: crate::runtime::usage::Usage,
     /// Start the installed update once this approved exit completes.
     relaunch: bool,
     relaunch_arguments: Vec<std::ffi::OsString>,
@@ -269,6 +270,7 @@ impl App {
             projects: projects::Projects::new(data.join("projects"), ephemeral),
             desktop_notifier: Default::default(),
             updates: Default::default(),
+            usage: Default::default(),
             relaunch: false,
             relaunch_arguments: launch.relaunch_arguments,
             pull_requests: Default::default(),
@@ -287,6 +289,10 @@ impl App {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        if self.startup.is_none() && !self.ephemeral {
+            self.usage.start(ctx);
+        }
+        self.usage.poll();
         let focused = Self::window_has_focus(ctx);
         if self.window_focused != Some(focused) {
             let reported = self
@@ -791,6 +797,9 @@ impl App {
     /// terminal can take over without dropping keys.
     fn release_closed_overlay_focus(&mut self, ctx: &egui::Context) {
         let open = self.ui.overlay != OverlayState::None;
+        if open {
+            self.ui.explorer.source_selection.reset();
+        }
         if self.overlay_was_open && !open {
             ctx.memory_mut(|memory| {
                 if let Some(id) = memory.focused() {
@@ -1103,15 +1112,27 @@ impl eframe::App for App {
         );
         ui::chrome::toolbar(ui, toolbar, p, &chrome, &mut self.ui, &mut actions);
         ui::chrome::leading_controls(ui, p, &chrome, &mut actions);
+        let footer = Rect::from_min_max(
+            Pos2::new(
+                bounds.left() + edge,
+                bounds.bottom() - metrics::TOOLBAR_HEIGHT,
+            ),
+            bounds.max,
+        );
+        ui::usage::footer(
+            ui,
+            footer,
+            p,
+            &self.usage,
+            self.ui.overlay == OverlayState::None,
+            &mut actions,
+        );
         // Panes sit in the chrome like inset content; the sidebar supplies its
         // own trailing margin.
         let stage_from = |edge: f32, trailing: f32| {
             Rect::from_min_max(
                 Pos2::new(bounds.left() + edge.max(metrics::GUTTER), toolbar.bottom()),
-                Pos2::new(
-                    bounds.right() - trailing.max(metrics::GUTTER),
-                    bounds.bottom() - metrics::GUTTER,
-                ),
+                Pos2::new(bounds.right() - trailing.max(metrics::GUTTER), footer.top()),
             )
         };
         let stage = ui::workspace::Placement {
@@ -1187,7 +1208,7 @@ impl eframe::App for App {
         if panel_edge > 0.0 {
             let panel = Rect::from_min_max(
                 Pos2::new(bounds.right() - panel_edge, toolbar.bottom()),
-                Pos2::new(bounds.right() - panel_edge + panel_width, bounds.bottom()),
+                Pos2::new(bounds.right() - panel_edge + panel_width, footer.top()),
             );
             let rows = if agents_shown {
                 self.agent_rows()
@@ -1501,6 +1522,7 @@ impl eframe::App for App {
         self.release_closed_overlay_focus(&ctx);
     }
     fn on_exit(&mut self) {
+        self.usage.shutdown();
         // Leads are let go first, so each has until the shells have closed
         // to end.
         self.projects.shutdown();

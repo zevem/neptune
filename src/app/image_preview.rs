@@ -487,15 +487,29 @@ fn percent_decoded(text: &str) -> String {
 /// Decodes a regular file by its contents, whatever its name claims, within
 /// fixed bounds. Returns the file's own pixel size with the scaled picture.
 pub(super) fn decode(path: &Path, limit: [u32; 2]) -> Option<([u32; 2], egui::ColorImage)> {
-    use image::ImageDecoder as _;
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
         return None;
     }
-    let mut reader = image::ImageReader::open(path)
+    let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
+    decode_reader(reader, limit)
+}
+
+pub(super) fn decode_bytes(bytes: &[u8], limit: [u32; 2]) -> Option<([u32; 2], egui::ColorImage)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    decode_reader(reader, limit)
+}
+
+fn decode_reader<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+    limit: [u32; 2],
+) -> Option<([u32; 2], egui::ColorImage)> {
+    use image::ImageDecoder as _;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_PIXELS_PER_SIDE);
     limits.max_image_height = Some(MAX_PIXELS_PER_SIDE);

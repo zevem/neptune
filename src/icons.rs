@@ -34,6 +34,8 @@ pub enum Icon {
     Sun,
     Moon,
     Copy,
+    Code,
+    Wrap,
     Ellipsis,
     Refresh,
     Pencil,
@@ -275,6 +277,23 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             }
             crescent.push(crescent[0]);
             line(&crescent);
+        }
+        Icon::Code => {
+            line(&[[8.0, 7.0], [3.0, 12.0], [8.0, 17.0]]);
+            line(&[[16.0, 7.0], [21.0, 12.0], [16.0, 17.0]]);
+            line(&[[14.0, 4.0], [10.0, 20.0]]);
+        }
+        Icon::Wrap => {
+            line(&[[4.0, 6.0], [20.0, 6.0]]);
+            line(&[
+                [4.0, 11.0],
+                [17.0, 11.0],
+                [20.0, 14.0],
+                [17.0, 17.0],
+                [12.0, 17.0],
+            ]);
+            line(&[[15.0, 14.0], [12.0, 17.0], [15.0, 20.0]]);
+            line(&[[4.0, 17.0], [8.0, 17.0]]);
         }
         Icon::Copy => {
             rectangle(8.0, 8.0, 12.0, 13.0, 2.5);
