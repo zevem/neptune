@@ -89,7 +89,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config libnss3 libnspr4 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor1 libxi6 libxrandr2 libxinerama1 libegl1 libvulkan1 desktop-file-utils squashfs-tools
+          sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config libglib2.0-dev libnss3 libnspr4 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor1 libxi6 libxrandr2 libxinerama1 libegl1 libvulkan1 desktop-file-utils squashfs-tools
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: 1.97.1

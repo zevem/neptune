@@ -137,7 +137,7 @@ jobs:
         if: needs.preflight.outputs.code == 'true' && runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config libnss3 libnspr4 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev zsh xvfb libgl1-mesa-dri mesa-vulkan-drivers
+          sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config libglib2.0-dev libnss3 libnspr4 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev zsh xvfb libgl1-mesa-dri mesa-vulkan-drivers
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         if: needs.preflight.outputs.code == 'true'
         with:
@@ -195,7 +195,7 @@ jobs:
         if: needs.preflight.outputs.code == 'true'
       - run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config libnss3 libnspr4 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config libglib2.0-dev libnss3 libnspr4 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
         if: needs.preflight.outputs.code == 'true'
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         if: needs.preflight.outputs.code == 'true'

@@ -77,7 +77,8 @@ cargo build -p neptune-terminal --features inspection --locked --bin neptune --b
 
 CEF's initial download is large. CMake and Ninja are required. A validated
 distribution may be reused with `CEF_PATH`; its archive must match the lockfile.
-Linux needs the Chromium runtime libraries (NSS/NSPR, ATK, CUPS, GBM, Pango,
+Linux builds also need the GLib development library (`libglib2.0-dev` on Debian/Ubuntu)
+for native event dispatch. Linux needs the Chromium runtime libraries (NSS/NSPR, ATK, CUPS, GBM, Pango,
 Cairo, ALSA and X11). A system with restricted user namespaces also needs a
 root-owned mode-4755 `chrome-sandbox`; the DEB packages that helper. AppImage
 uses the host's user namespace support. Never work around a sandbox failure by

@@ -437,7 +437,7 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
                 ..Default::default()
             };
             #[cfg(windows)]
-            let info = info.set_as_popup(std::ptr::null_mut(), "Neptune Developer Tools");
+            let info = info.set_as_popup(Default::default(), "Neptune Developer Tools");
             host.show_dev_tools(
                 Some(&info),
                 Some(&mut client),
