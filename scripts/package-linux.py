@@ -32,11 +32,13 @@ def library_package(path):
 def bundle_libraries(appdir):
     library_dir = appdir / "usr/lib"
     library_dir.mkdir(exist_ok=True)
-    # Platform/graphics drivers and glibc belong to the host. Bundle the window
-    # libraries winit loads at runtime as well as linked transitive dependencies.
-    exclude = re.compile(r"^(ld-linux|lib(c|m|dl|rt|pthread|resolv|nss_[^.]+)\.so|lib(GL|EGL|GLX|GLdispatch|vulkan|drm))")
+    # Platform/graphics drivers and glibc belong to the host, with the GBM and
+    # Wayland libraries those drivers link: a newer Mesa does not load against
+    # older copies. Bundle the other window libraries winit loads at runtime as
+    # well as linked transitive dependencies.
+    exclude = re.compile(r"^(ld-linux|lib(c|m|dl|rt|pthread|resolv|nss_[^.]+)\.so|lib(GL|EGL|GLX|GLdispatch|vulkan|drm|gbm|wayland-[a-z]+))")
     ldconfig = subprocess.check_output(["/sbin/ldconfig", "-p"], text=True)
-    names = ("libxkbcommon.so.0", "libxkbcommon-x11.so.0", "libwayland-client.so.0", "libwayland-cursor.so.0", "libwayland-egl.so.1", "libX11.so.6", "libXcursor.so.1", "libXi.so.6", "libXrandr.so.2", "libXinerama.so.1")
+    names = ("libxkbcommon.so.0", "libxkbcommon-x11.so.0", "libX11.so.6", "libXcursor.so.1", "libXi.so.6", "libXrandr.so.2", "libXinerama.so.1")
     browser = appdir / "usr/lib/neptune/browser"
     queue = [appdir / "usr/bin/neptune", browser / "neptune-browser", browser / "libcef.so"]
     for name in names:

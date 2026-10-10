@@ -11,6 +11,11 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- The Linux AppImage now starts on systems with current Mesa graphics drivers,
+  such as Ubuntu 26.04, Fedora 44 and Arch, where it reported that it could
+  not start its renderer. It uses the system's Wayland libraries, which those
+  drivers require.
+
 ## [0.1.0-rc.5] - 2026-10-10
 
 ### What's New
