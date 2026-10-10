@@ -11,6 +11,11 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Preview websites beside your terminal with browser tabs that move and split
+  within the same workspace. Open a local dev-server port, navigate and search
+  pages, or inspect them with developer tools. Browser painting follows the
+  display's refresh rate and pauses for hidden previews; tabs restore blank,
+  without saving browsing history or addresses.
 - Put an agent in charge of a piece of work with Projects. The new Project
   tab of the right panel starts a **lead**, your installed Claude Code or
   Codex, in the workspace in view: tell it what you want done and it plans,

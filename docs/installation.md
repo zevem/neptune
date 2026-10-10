@@ -52,6 +52,12 @@ cargo build --release --locked --bin neptune
 
 The executable is `target/release/neptune` on Linux/macOS and `target\release\neptune.exe` on Windows.
 
+Website previews also require `cargo build -p neptune-browser --release --locked`
+and CMake/Ninja. Keep its pinned CEF runtime with the helper; macOS and Windows
+need their bundled helper layout. See [browser development and platform setup](browser.md).
+The terminal starts normally when that optional development payload is absent;
+opening a browser then shows a recoverable error.
+
 For optional compiler caching and build job limits, see
 [development builds](development.md#development-builds).
 
@@ -65,6 +71,8 @@ executable in an app bundle to use the icon in Finder and the Dock:
 python3 scripts/package-macos.py
 open target/release/Neptune.app
 ```
+
+Build `neptune-browser` first; the bundle includes Chromium and its helper apps.
 
 Local bundles are unsigned. Official release DMGs require Developer ID signing, Apple notarization and stapling; see [the release guide](releases.md).
 On Linux, install the [desktop entry](../packaging/neptune.desktop) and PNG icons

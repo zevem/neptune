@@ -63,6 +63,28 @@ impl App {
     /// Pastes the clipboard's text, or the path of a saved copy of its picture.
     /// `quiet` leaves an empty clipboard unreported, as for a key chord.
     pub(super) fn paste_clipboard(&mut self, ctx: &egui::Context, pane: PaneId, quiet: bool) {
+        if let Some(item) = self
+            .controller
+            .model()
+            .pane(pane)
+            .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+        {
+            // A page owns native clipboard formats, including images. It must
+            // never enter the terminal's image-to-file attachment pipeline.
+            if let Err(error) =
+                self.browsers
+                    .send(crate::runtime::browser::protocol::Command::Paste {
+                        target: crate::runtime::browser::protocol::Target {
+                            pane: pane.get(),
+                            generation: item.generation(),
+                        },
+                        text: clipboard::read().unwrap_or_default(),
+                    })
+            {
+                self.ui.error = Some(error.into());
+            }
+            return;
+        }
         match clipboard::read() {
             Ok(text) if !text.is_empty() => self.paste_text(pane, &text),
             _ => self.paste_image(ctx, pane, quiet),
@@ -70,6 +92,26 @@ impl App {
     }
 
     pub(super) fn paste_text(&mut self, pane: PaneId, text: &str) {
+        if let Some(item) = self
+            .controller
+            .model()
+            .pane(pane)
+            .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+        {
+            if let Err(error) =
+                self.browsers
+                    .send(crate::runtime::browser::protocol::Command::Paste {
+                        target: crate::runtime::browser::protocol::Target {
+                            pane: pane.get(),
+                            generation: item.generation(),
+                        },
+                        text: text.into(),
+                    })
+            {
+                self.ui.error = Some(error.into());
+            }
+            return;
+        }
         if let Some(session) = self.sessions.get(pane) {
             match session.paste(text) {
                 Ok(()) => self.notifications.acknowledge(Some(pane)),

@@ -16,6 +16,7 @@ pub enum Error {
     WorkspaceLimit,
     PaneLimit,
     TotalPaneLimit,
+    BrowserLimit,
     InvalidLayout(&'static str),
     InvalidRatio,
     InvalidIdentity,
@@ -51,6 +52,7 @@ impl std::fmt::Display for Error {
             Self::WorkspaceLimit => f.write_str("Workspace limit reached"),
             Self::PaneLimit => f.write_str("Workspace pane limit reached"),
             Self::TotalPaneLimit => f.write_str("Total pane limit reached"),
+            Self::BrowserLimit => f.write_str("A window can have at most eight browser panes"),
             Self::InvalidLayout(reason) => write!(f, "Invalid layout: {reason}"),
             Self::InvalidRatio => f.write_str("Split ratio must be finite and between 0.1 and 0.9"),
             Self::InvalidIdentity => f.write_str("Identities must be nonzero and unique"),
@@ -132,9 +134,23 @@ pub enum Lifecycle {
     Failed(String),
 }
 
+/// The content of a layout leaf. Browser navigation and engine state are
+/// ephemeral desktop state; restoration opens a fresh browser in this place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneKind {
+    #[default]
+    Terminal,
+    Browser,
+}
+impl PaneKind {
+    pub const MAX_BROWSERS: usize = 8;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
     pub(crate) id: PaneId,
+    pub(crate) kind: PaneKind,
     pub(crate) cwd: PathBuf,
     pub(crate) remote_cwd: Option<PathBuf>,
     pub(crate) agent: Option<crate::AgentSession>,
@@ -147,6 +163,9 @@ pub struct Pane {
     pub(crate) lifecycle: Lifecycle,
 }
 impl Pane {
+    pub fn kind(&self) -> PaneKind {
+        self.kind
+    }
     pub fn agent(&self) -> Option<&crate::AgentSession> {
         self.agent.as_ref()
     }
@@ -194,6 +213,7 @@ impl Pane {
 #[derive(Debug, Clone)]
 pub struct PaneSpec {
     pub id: PaneId,
+    pub kind: PaneKind,
     pub cwd: PathBuf,
     pub remote_cwd: Option<PathBuf>,
     pub agent: Option<crate::AgentSession>,
@@ -649,6 +669,15 @@ impl Model {
         if specs.len() > limits.workspaces {
             return Err(Error::WorkspaceLimit);
         }
+        if specs
+            .iter()
+            .flat_map(|w| &w.panes)
+            .filter(|p| p.kind == PaneKind::Browser)
+            .count()
+            > PaneKind::MAX_BROWSERS
+        {
+            return Err(Error::BrowserLimit);
+        }
         let mut model = Self::new(limits);
         if groups.len() > limits.workspaces {
             return Err(Error::WorkspaceGroupLimit);
@@ -700,6 +729,15 @@ impl Model {
             }
             let mut members = HashSet::new();
             for pane in &spec.panes {
+                if pane.kind == PaneKind::Browser
+                    && (pane.agent.is_some()
+                        || pane.remote_cwd.is_some()
+                        || pane.spawned_by.is_some()
+                        || pane.project.is_some()
+                        || pane.worktree.is_some())
+                {
+                    return Err(Error::InvalidLayout("browser has terminal state"));
+                }
                 if pane
                     .agent
                     .as_ref()
@@ -778,6 +816,7 @@ impl Model {
                     .into_iter()
                     .map(|pane| Pane {
                         id: pane.id,
+                        kind: pane.kind,
                         cwd: pane.cwd,
                         remote_cwd: pane.remote_cwd,
                         agent: pane.agent,
@@ -905,6 +944,7 @@ impl Model {
                     .iter()
                     .map(|pane| PaneSpec {
                         id: pane.id,
+                        kind: pane.kind,
                         cwd: pane.cwd.clone(),
                         remote_cwd: pane.remote_cwd.clone(),
                         agent: pane.agent.clone(),

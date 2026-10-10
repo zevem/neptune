@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use terminal_core::{Mode as TermMode, SessionMetadata, SessionStatus, ViewportSnapshot};
 
 pub struct PanePresentation {
+    pub(crate) browser: Option<crate::runtime::browser::View>,
     pub generation: u64,
     pub ports: Vec<crate::runtime::ports::Port>,
     /// The CLI agent the terminal is running, which takes dropped files.
@@ -82,6 +83,7 @@ pub struct Placement {
 
 #[derive(Default)]
 pub struct StageOutput {
+    pub browser_bodies: Vec<(PaneId, u64, Rect)>,
     /// Terminal grid of the focused pane, for input and pointer routing.
     pub active_body: Option<Rect>,
     /// Widget identity of the focused terminal, which holds keyboard focus.
@@ -263,7 +265,7 @@ fn pane_menu(
     id: PaneId,
     // Zoomed, on this machine, in a worktree made for its agent, and listed
     // by whoever started its agent, so that its tab can be put away.
-    (zoomed, local, worktree, background): (bool, bool, bool, bool),
+    (zoomed, local, worktree, background, browser): (bool, bool, bool, bool, bool),
     bindings: &Keybindings,
     actions: &mut Vec<Action>,
 ) {
@@ -291,7 +293,7 @@ fn pane_menu(
     }
     helpers::menu_separator(ui, p);
     let hints_shortcut = bindings.hint(Binding::CopyHints);
-    if menu_item(ui, p, Icon::Copy, "Copy with hints", &hints_shortcut, false) {
+    if !browser && menu_item(ui, p, Icon::Copy, "Copy with hints", &hints_shortcut, false) {
         chosen.push(Action::CopyHints(id));
     }
     if menu_item(
@@ -309,13 +311,24 @@ fn pane_menu(
         ui,
         p,
         Icon::Plus,
-        "New tab",
+        "New terminal tab",
         &bindings.hint(Binding::NewTab),
         false,
     ) {
         chosen.push(Action::NewTab(id));
     }
+    if menu_item(
+        ui,
+        p,
+        Icon::Globe,
+        "New browser tab",
+        &bindings.hint(Binding::NewBrowser),
+        false,
+    ) {
+        chosen.push(Action::NewBrowser(id, None, None));
+    }
     if local
+        && !browser
         && menu_item(
             ui,
             p,
@@ -356,9 +369,9 @@ fn pane_menu(
             Icon::Maximize
         },
         if zoomed {
-            "Show all terminals"
+            "Show all panes"
         } else {
-            "Zoom terminal"
+            "Zoom pane"
         },
         &bindings.hint(Binding::ZoomPane),
         false,
@@ -366,21 +379,27 @@ fn pane_menu(
         chosen.extend([Action::Focus(id), Action::Zoom]);
     }
     helpers::menu_separator(ui, p);
-    if menu_item(
-        ui,
-        p,
-        Icon::Eraser,
-        "Clear scrollback",
-        &bindings.hint(Binding::ClearScrollback),
-        false,
-    ) {
+    if !browser
+        && menu_item(
+            ui,
+            p,
+            Icon::Eraser,
+            "Clear scrollback",
+            &bindings.hint(Binding::ClearScrollback),
+            false,
+        )
+    {
         chosen.push(Action::Clear(id));
     }
     if menu_item(
         ui,
         p,
         Icon::Refresh,
-        "Restart terminal",
+        if browser {
+            "Restart preview"
+        } else {
+            "Restart terminal"
+        },
         &bindings.hint(Binding::RestartPane),
         false,
     ) {
@@ -406,7 +425,11 @@ fn pane_menu(
         ui,
         p,
         Icon::Close,
-        "Close terminal",
+        if browser {
+            "Close browser"
+        } else {
+            "Close terminal"
+        },
         &bindings.hint(Binding::ClosePane),
         true,
     ) {
@@ -447,7 +470,15 @@ fn tab(
             WidgetType::SelectableLabel,
             true,
             shown,
-            format!("Terminal tab {}", id.get()),
+            format!(
+                "{} tab {}",
+                if presentation.browser.is_some() {
+                    "Browser"
+                } else {
+                    "Terminal"
+                },
+                id.get()
+            ),
         )
     });
     let closable = rect.width() >= 60.0;
@@ -457,7 +488,17 @@ fn tab(
     );
     let close_response = closable.then(|| {
         let response = ui.interact(close, ui.id().with(("tab-close", id)), Sense::click());
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Close terminal"));
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Button,
+                true,
+                if presentation.browser.is_some() {
+                    "Close browser"
+                } else {
+                    "Close terminal"
+                },
+            )
+        });
         response
     });
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
@@ -523,18 +564,23 @@ fn tab(
         || attached.hovered()
         || ports.hovered();
 
-    // A place with one terminal reads as a plain title, as it always has.
-    let fill = if shown && !alone {
-        0.08
-    } else if hovered && !alone {
-        0.045
+    // Browser tabs own their new surface; terminal tabs retain their styling.
+    let browser_tab = presentation.browser.is_some();
+    if browser_tab && !alone {
+        super::browser::tab_surface(&painter, rect, p, shown, hovered);
     } else {
-        0.0
-    };
-    if fill > 0.0 {
-        painter.rect_filled(rect, 7, theme::tint(p.fg, fill));
+        let fill = if shown && !alone {
+            0.08
+        } else if hovered && !alone {
+            0.045
+        } else {
+            0.0
+        };
+        if fill > 0.0 {
+            painter.rect_filled(rect, 7, theme::tint(p.fg, fill));
+        }
     }
-    let mut left = rect.left() + 9.0;
+    let mut left = rect.left() + if browser_tab { 10.0 } else { 9.0 };
     if !shown && presentation.unread > 0 {
         painter.circle_filled(Pos2::new(left + 3.0, rect.center().y), 3.0, p.attention);
         left += 11.0;
@@ -572,6 +618,15 @@ fn tab(
     // A worktree's tab is named by its branch, and says what runs there
     // where another tab names its folder.
     let branch = presentation.worktree.as_ref().map(|tab| &tab.branch);
+    if presentation.browser.is_some() && right - left > 40.0 {
+        icons::paint(
+            &painter,
+            Rect::from_center_size(Pos2::new(left + 6.5, rect.center().y), Vec2::splat(13.0)),
+            Icon::Globe,
+            p.secondary,
+        );
+        left += 18.0;
+    }
     if branch.is_some() && right - left > 40.0 {
         icons::paint(
             &painter,
@@ -596,7 +651,7 @@ fn tab(
     let title_width = title.size().x;
     galley_at(&painter, Pos2::new(left, rect.center().y + 1.0), title);
     let remaining = room - title_width - 9.0;
-    if remaining > 36.0 {
+    if remaining > 36.0 && presentation.browser.is_none() {
         let folder = match &presentation.remote {
             _ if branch.is_some() => pane_label(metadata),
             Some(destination) => destination.clone(),
@@ -639,7 +694,12 @@ fn tab(
         if close_response
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text(format!(
-                "Close terminal   {}",
+                "Close {}   {}",
+                if presentation.browser.is_some() {
+                    "browser"
+                } else {
+                    "terminal"
+                },
                 stage.config.keybindings.hint(Binding::ClosePane)
             ))
             .clicked()
@@ -668,6 +728,7 @@ fn tab(
                 presentation.remote.is_none(),
                 presentation.worktree.is_some(),
                 presentation.can_background,
+                presentation.browser.is_some(),
             ),
             &stage.config.keybindings,
             actions,
@@ -842,6 +903,77 @@ fn draw_pane(
     let metadata = &presentation.metadata;
     let remote = presentation.remote.is_some();
     let selected = id == stage.active;
+    if let Some(browser) = &presentation.browser {
+        // Tabs and navigation share one band over the page, which paints its
+        // own content surface beneath.
+        ui.painter()
+            .rect_filled(card, metrics::PANE_RADIUS, super::browser::bar(p));
+        let header = metrics::PANE_HEADER;
+        pane_header(
+            ui,
+            (tabs, id),
+            Rect::from_min_size(card.min, vec2(card.width(), header)),
+            1.0,
+            stage,
+            actions,
+            output,
+        );
+        let body = Rect::from_min_max(
+            egui::pos2(card.left(), (card.top() + header).min(card.bottom())),
+            card.max,
+        );
+        super::browser::show(
+            ui,
+            body,
+            (id, presentation.generation, browser),
+            &mut pane.browser,
+            stage,
+            actions,
+            output,
+        );
+        // The same edge, focus ring and lift as a terminal's place.
+        let painter = ui.painter();
+        painter.rect_stroke(
+            card,
+            metrics::PANE_RADIUS,
+            Stroke::new(1.0, p.separator),
+            StrokeKind::Inside,
+        );
+        let focus = animate(ui.ctx(), ui.id().with(("pane-focus", id)), selected, 0.14);
+        if stage.multiple && focus > 0.0 {
+            painter.rect_stroke(
+                card,
+                metrics::PANE_RADIUS,
+                Stroke::new(1.5, theme::tint(p.accent, 0.85 * focus)),
+                StrokeKind::Inside,
+            );
+        }
+        let lifted = animate(
+            ui.ctx(),
+            ui.id().with(("pane-lifted", id)),
+            stage.drag == Some(id),
+            0.12,
+        );
+        if lifted > 0.0 {
+            painter.rect_filled(
+                card,
+                metrics::PANE_RADIUS,
+                theme::tint(p.chrome, 0.6 * lifted),
+            );
+        }
+        if let Some(dragged) = stage.drag
+            && tabs != [dragged]
+            && let Some(pointer) = ui.ctx().pointer_interact_pos()
+            && card.contains(pointer)
+            && pointer.y >= card.top() + header
+        {
+            output.drop = drop_destination(card, pointer, id, tabs.contains(&dragged));
+        }
+        // Browser cards accept pane moves, but never receive shell path pastes
+        // from an operating-system file drop.
+        output.cards.push((id, card, false));
+        return;
+    }
     let header_height = if stage.multiple {
         metrics::PANE_HEADER
     } else {
@@ -963,6 +1095,7 @@ fn draw_pane(
                         presentation.remote.is_none(),
                         presentation.worktree.is_some(),
                         presentation.can_background,
+                        false,
                     ),
                     &stage.config.keybindings,
                     actions,
@@ -1608,6 +1741,7 @@ mod tests {
                         (
                             id,
                             PanePresentation {
+                                browser: None,
                                 generation: 1,
                                 ports: Vec::new(),
                                 agent: None,
@@ -1765,6 +1899,7 @@ mod tests {
         let mut bench = Bench::new();
         // The first place holds two tabs, with the first in view.
         let presentation = PanePresentation {
+            browser: None,
             generation: 1,
             ports: Vec::new(),
             agent: None,
@@ -1851,7 +1986,7 @@ mod tests {
                         ui,
                         Palette::for_config(&config),
                         id,
-                        (false, true, false, background),
+                        (false, true, false, background, false),
                         &config.keybindings,
                         &mut actions,
                     )
@@ -2027,6 +2162,7 @@ mod tests {
         let presentations: BTreeMap<_, _> = [left, right]
             .map(|id| {
                 let presentation = PanePresentation {
+                    browser: None,
                     generation: 1,
                     ports: Vec::new(),
                     agent: None,

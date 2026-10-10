@@ -26,6 +26,7 @@ pub struct ChromeView<'a> {
     pub sidebar_order: &'a [SidebarItem],
     pub active: Option<WorkspaceId>,
     pub pane: Option<PaneId>,
+    pub pane_kind: neptune_model::PaneKind,
     /// The focused terminal's label and directory.
     pub subtitle: &'a str,
     /// The focused terminal's linked pull requests, while it has no tab to
@@ -403,6 +404,16 @@ pub fn toolbar(
                     }
                     if icons::button_with_hint(
                         ui,
+                        Icon::Globe,
+                        "New browser tab",
+                        &view.keybindings.hint(Binding::NewBrowser),
+                    )
+                    .clicked()
+                    {
+                        actions.push(Action::NewBrowser(pane, None, None));
+                    }
+                    if icons::button_with_hint(
+                        ui,
                         Icon::Search,
                         "Find in terminal",
                         &view.keybindings.hint(Binding::Find),
@@ -484,7 +495,7 @@ pub fn toolbar(
             )
         };
         if field.width() >= 150.0 {
-            super::search::show(ui, field, p, state, actions);
+            super::search::show(ui, field, p, view.pane_kind, state, actions);
         }
         if !show_field {
             return;
@@ -2177,6 +2188,7 @@ mod tests {
                 sidebar_order: &self.sidebar_order,
                 active: views.first().map(|workspace| workspace.id),
                 pane: None,
+                pane_kind: neptune_model::PaneKind::Terminal,
                 subtitle: "",
                 pull_requests: &[],
                 attached: &[],
@@ -2262,6 +2274,7 @@ mod tests {
                     cwd: "/srv/app".into(),
                     remote: None,
                     panes: vec![neptune_model::PaneSpec {
+                        kind: neptune_model::PaneKind::Terminal,
                         id: PaneId::new(*id),
                         cwd: "/srv/app".into(),
                         remote_cwd: None,
@@ -2842,6 +2855,7 @@ mod tests {
                             ],
                             active: Some(WorkspaceId::new(1)),
                             pane: Some(pane),
+                            pane_kind: neptune_model::PaneKind::Terminal,
                             subtitle: "",
                             pull_requests: &[],
                             attached: &[],

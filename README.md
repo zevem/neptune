@@ -5,7 +5,8 @@
 [neptune.rs](https://neptune.rs) · [Downloads](https://neptune.rs/download) · [User guide](docs/usage.md)
 
 A native Rust terminal for focused work, inspired by cmux and Ghostty. Independent
-shell sessions, GPU rendering, and a quiet workspace interface, with no webview.
+shell sessions, GPU rendering, and a quiet native workspace interface. Optional
+browser tabs preview websites alongside terminals.
 
 ## Features
 
@@ -13,6 +14,7 @@ shell sessions, GPU rendering, and a quiet workspace interface, with no webview.
 - Local shells and SSH workspaces backed by real PTY sessions.
 - Scrollback, terminal search, selection/clipboard, and a command palette.
 - [Custom keybindings](docs/usage.md#custom-keybindings) configured in TOML.
+- [Browser tabs](docs/usage.md#browser-tabs) that split and move with terminals.
 - 715 built-in themes and custom themes shared by the window and terminal.
 - Terminal notifications with optional native desktop banners.
 - Saved workspace layouts and directories, plus optional Claude Code, Codex,
@@ -47,6 +49,10 @@ working graphics driver are required. On Debian/Ubuntu:
 sudo apt-get install pkg-config libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 cargo run --release --locked --bin neptune
 ```
+
+For website previews, also build the isolated browser helper with
+`cargo build -p neptune-browser --release --locked`. It downloads the pinned CEF
+runtime and requires CMake and Ninja. See [browser development](docs/browser.md).
 
 See [building from source](docs/installation.md#build-and-run) for macOS and
 Windows prerequisites, executable locations, and desktop integration.

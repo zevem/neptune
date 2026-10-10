@@ -381,8 +381,7 @@ impl App {
                         self.action(ctx, Action::CloseOverlay);
                     }
                 } else if searching {
-                    self.ui.search_open = false;
-                    self.search_task = None;
+                    self.action(ctx, Action::CloseSearch);
                 } else if self.explorer_escape(ctx) {
                     // A name being typed, a search or its field was left.
                 } else if self.project_escape(ctx) {
@@ -554,6 +553,34 @@ impl App {
             NewWorkspace => Action::New,
             NewWorktree => Action::Worktree(ui::worktrees::Event::New(pane?)),
             NewTab => pane.map_or(Action::New, Action::NewTab),
+            NewBrowser => Action::NewBrowser(pane?, None, None),
+            BrowserAddress => {
+                let pane = pane?;
+                if self.controller.model().pane(pane)?.kind() != neptune_model::PaneKind::Browser {
+                    return None;
+                }
+                Action::BrowserAddress(pane)
+            }
+            BrowserReload | BrowserBack | BrowserForward | BrowserDevTools => {
+                let pane = pane?;
+                let item = self.controller.model().pane(pane)?;
+                if item.kind() != neptune_model::PaneKind::Browser {
+                    return None;
+                }
+                let generation = item.generation();
+                let target = crate::runtime::browser::protocol::Target {
+                    pane: pane.get(),
+                    generation,
+                };
+                use crate::runtime::browser::protocol::Command as BrowserCommand;
+                let command = match binding {
+                    BrowserReload => BrowserCommand::Reload { target },
+                    BrowserBack => BrowserCommand::Back { target },
+                    BrowserForward => BrowserCommand::Forward { target },
+                    _ => BrowserCommand::DevTools { target },
+                };
+                Action::Browser(pane, generation, command)
+            }
             SplitRight => Action::Split(pane?, neptune_model::Axis::Vertical),
             SplitBelow => Action::Split(pane?, neptune_model::Axis::Horizontal),
             ClosePane => Action::ClosePane(pane?),

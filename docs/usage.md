@@ -8,6 +8,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 - [Workspace groups](#workspace-groups)
 - [SSH workspaces](#ssh-workspaces)
 - [Dev servers and ports](#dev-servers-and-ports)
+- [Browser tabs](#browser-tabs)
 - [Closing terminals safely](#closing-terminals-safely)
 - [Coding agent sessions](#coding-agent-sessions)
 - [Projects](#projects)
@@ -60,8 +61,9 @@ The first terminal starts in the host's login directory; splitting inherits the 
 
 TCP listeners owned by a terminal's shell or its child processes appear as
 chips such as **localhost:3000** on its tab. A single terminal shows them in
-the toolbar. Click a local chip to open its HTTP address in your default
-browser. Several ports, or a narrow tab, share a **ports** menu.
+the toolbar. Click a local chip to preview its HTTP address in a browser split
+beside the terminal. Secondary-click offers **Open in external browser**.
+Several ports, or a narrow tab, share a **ports** menu.
 IPv4 and IPv6 localhost listeners, including wildcard bindings, open as
 `http://localhost:<port>/`. Listeners bound to another specific address open
 that address.
@@ -86,6 +88,38 @@ Each pane shows up to 16 distinct ports, with up to 64 active forwards across
 the application. Process, descriptor, helper-output and
 query-time limits bound discovery work. Chips identify TCP listeners, so an
 HTTP browser may not be suitable for every service.
+
+## Browser tabs
+
+Choose **New browser tab** from the palette, the globe in the toolbar, or a
+tab's menu. Browser tabs share the terminal layout: drag to reorder, split,
+join another tab group, or move to another workspace. **Split right** and
+**Split below** on a browser open another preview of its current address.
+**New tab** opens a terminal.
+
+Enter an HTTP/HTTPS URL in the address bar; `localhost:3000` uses HTTP.
+Back, Forward, Reload/Stop, external opening and developer tools are in the
+navigation row. Narrow panes keep the latter actions in **More browser actions**
+(the ellipsis button). Use
+Ctrl/Cmd+L for the address, Ctrl/Cmd+R to reload, Alt+Left/Right for history,
+Ctrl+Shift+I (Cmd+Alt+I on macOS) for developer tools, and Ctrl/Cmd+Shift+L for a new browser tab. The
+existing Find shortcut searches the page while a browser is focused. Browser
+shortcuts leave shell Ctrl+L and Ctrl+R available in terminals.
+
+A window supports eight browser panes. Hidden previews retain their pages and
+connections, and suspend painting. Closing a browser releases its page;
+**Restart preview** opens a fresh page at the current address after a helper
+failure. Browser tabs restore their layout with a blank address. URLs, history,
+cookies and page contents are session-local and never enter workspace saves.
+Each preview has its own in-memory profile. User-initiated popup links navigate
+the current preview; separate popup workflows, including some OAuth flows, need
+the external browser. Browser panes can move between local and SSH workspaces;
+their network access is always from this computer. Closing the terminal that
+owns an SSH forward closes that forward even if its browser remains open.
+
+Start with a preview split using `neptune --browser http://localhost:3000`.
+Source builds need the [browser helper and runtime](browser.md); installed
+packages include them. Platform acceptance remains listed in that guide.
 
 ## Closing terminals safely
 
@@ -367,6 +401,7 @@ Chords contain modifiers separated by `+`, followed by one logical key. Names ar
 | Actions | Config names |
 | --- | --- |
 | Create and arrange terminals | `new-workspace`, `new-worktree`, `new-tab`, `split-right`, `split-below`, `zoom-pane` |
+| Browser tabs | `new-browser`, `browser-address`, `browser-reload`, `browser-back`, `browser-forward`, `browser-dev-tools` |
 | Close and restart | `close-pane`, `close-workspace`, `restart-pane` |
 | Agents out of view | `background-pane` (no default shortcut): sends the focused terminal's tab to the background, where that is offered |
 | Clipboard, history and search | `copy`, `copy-hints`, `paste`, `clear-scrollback`, `find` |

@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Version 14 adds browser pane kinds. Browser addresses and profiles are never saved.
 /// Version 13 adds projects: the identity of each, the workspace it works in
 /// and the panes whose agents its lead started. Nothing a project says or is
 /// asked is saved here. Version 12 adds what agents linked and attached in conversations that are
@@ -18,8 +19,8 @@ use std::{
 /// earlier build would take for damage. Version 9 added the pane whose agent
 /// started a pane's agent. Version 8 added workspace group default
 /// directories and the pull requests an agent linked to its pane. Versions
-/// 1–12 remain readable.
-pub const SCHEMA_VERSION: u32 = 13;
+/// 1–13 remain readable.
+pub const SCHEMA_VERSION: u32 = 14;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -167,6 +168,8 @@ pub struct SavedWorkspace {
 #[serde(deny_unknown_fields)]
 pub struct SavedPane {
     pub id: PaneId,
+    #[serde(default)]
+    pub kind: neptune_model::PaneKind,
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cwd: Option<PathBuf>,
@@ -250,6 +253,7 @@ impl StateSnapshot {
                         .iter()
                         .map(|pane| SavedPane {
                             id: pane.id(),
+                            kind: pane.kind(),
                             cwd: pane.cwd().into(),
                             remote_cwd: pane.remote_cwd().map(Path::to_path_buf),
                             agent: pane.agent().cloned(),
@@ -383,6 +387,7 @@ impl SavedWorkspace {
                 .into_iter()
                 .map(|pane| PaneSpec {
                     id: pane.id,
+                    kind: pane.kind,
                     cwd: pane.cwd,
                     remote_cwd: pane.remote_cwd,
                     pull_requests: pane
@@ -1005,6 +1010,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
             };
             panes.push(PaneSpec {
                 id: pane_id,
+                kind: neptune_model::PaneKind::Terminal,
                 cwd,
                 remote_cwd: None,
                 agent: None,
@@ -1025,6 +1031,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
             }
             panes.push(PaneSpec {
                 id: PaneId::new(next_pane),
+                kind: neptune_model::PaneKind::Terminal,
                 cwd: workspace.cwd.clone(),
                 remote_cwd: None,
                 agent: None,
@@ -1185,6 +1192,46 @@ mod tests {
             })
             .unwrap();
         StateSnapshot::from_model(controller.model())
+    }
+
+    #[test]
+    fn browser_pane_kind_round_trips_without_browsing_state() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut controller =
+            Controller::new(sample(root.path()).into_model(Limits::default()).unwrap());
+        controller
+            .dispatch(Command::OpenBrowser {
+                workspace: controller.model().active_workspace().unwrap(),
+                pane: controller.model().active_pane().unwrap(),
+                axis: None,
+            })
+            .unwrap();
+        let browser = controller.model().active_pane().unwrap();
+        let snapshot = StateSnapshot::from_model(controller.model());
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("url") && !serialized.contains("cookie"));
+        std::fs::write(&path, serialized).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let controller = Controller::new(report.model.unwrap());
+        assert!(controller.start_effects().iter().any(
+            |e| matches!(e, neptune_model::Effect::StartBrowser { pane, .. } if *pane == browser)
+        ));
+        let mut old = serde_json::to_value(sample(root.path())).unwrap();
+        old["version"] = 13.into();
+        for pane in old["workspaces"][0]["panes"].as_array_mut().unwrap() {
+            pane.as_object_mut().unwrap().remove("kind");
+        }
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let restored = load_state(&path, Limits::default()).model.unwrap();
+        assert!(
+            restored
+                .workspaces()
+                .iter()
+                .flat_map(|w| w.panes())
+                .all(|p| p.kind() == neptune_model::PaneKind::Terminal)
+        );
     }
 
     #[test]
@@ -1712,6 +1759,7 @@ mod tests {
         second.name = "valid successor".into();
         second.panes = vec![SavedPane {
             id: PaneId::new(3),
+            kind: neptune_model::PaneKind::Terminal,
             cwd: directory.path().into(),
             remote_cwd: None,
             agent: None,
@@ -1878,7 +1926,7 @@ mod project_tests {
             .unwrap();
         let snapshot = StateSnapshot::from_model(controller.model());
         let saved = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(saved["version"], 13);
+        assert_eq!(saved["version"], SCHEMA_VERSION);
         // Identity and membership only: a new field here needs a decision.
         assert_eq!(
             saved["projects"],

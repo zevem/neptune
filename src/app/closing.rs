@@ -53,6 +53,14 @@ impl App {
             return;
         }
         self.pending_close = None;
+        self.ui.close_browser = match target {
+            Close::Pane(id) => self
+                .controller
+                .model()
+                .pane(id)
+                .is_some_and(|p| p.kind() == neptune_model::PaneKind::Browser),
+            _ => false,
+        };
         if !self.confirms_close() && !self.config.warn_running_processes {
             self.finish_close(ctx, target);
             return;
@@ -68,6 +76,14 @@ impl App {
         };
         if self.config.warn_running_processes {
             for &(pane, generation) in &pending.panes {
+                if self
+                    .controller
+                    .model()
+                    .pane(pane)
+                    .is_some_and(|p| p.kind() == neptune_model::PaneKind::Browser)
+                {
+                    continue;
+                }
                 if let Some(session) = self.sessions.get(pane)
                     && self.sessions.generation(pane) == Some(generation)
                 {

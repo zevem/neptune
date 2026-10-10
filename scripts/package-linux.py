@@ -31,13 +31,14 @@ def library_package(path):
 
 def bundle_libraries(appdir):
     library_dir = appdir / "usr/lib"
-    library_dir.mkdir()
+    library_dir.mkdir(exist_ok=True)
     # Platform/graphics drivers and glibc belong to the host. Bundle the window
     # libraries winit loads at runtime as well as linked transitive dependencies.
     exclude = re.compile(r"^(ld-linux|lib(c|m|dl|rt|pthread|resolv|nss_[^.]+)\.so|lib(GL|EGL|GLX|GLdispatch|vulkan|drm))")
     ldconfig = subprocess.check_output(["/sbin/ldconfig", "-p"], text=True)
     names = ("libxkbcommon.so.0", "libxkbcommon-x11.so.0", "libwayland-client.so.0", "libwayland-cursor.so.0", "libwayland-egl.so.1", "libX11.so.6", "libXcursor.so.1", "libXi.so.6", "libXrandr.so.2", "libXinerama.so.1")
-    queue = [appdir / "usr/bin/neptune"]
+    browser = appdir / "usr/lib/neptune/browser"
+    queue = [appdir / "usr/bin/neptune", browser / "neptune-browser", browser / "libcef.so"]
     for name in names:
         matches = re.findall(rf"\s{re.escape(name)} \(.*x86-64.*\) => (\S+)", ldconfig)
         if not matches:
@@ -51,7 +52,7 @@ def bundle_libraries(appdir):
         if path in seen:
             continue
         seen.add(path)
-        if path.name != "neptune":
+        if path.name != "neptune" and not path.is_relative_to(browser):
             shutil.copy2(path.resolve(), library_dir / path.name)
             owner = library_package(path)
             copyright_file = Path("/usr/share/doc") / owner / "copyright"
@@ -82,6 +83,9 @@ def main():
     (stage / "usr/bin").mkdir(parents=True)
     shutil.copy2(args.binary, stage / "usr/bin/neptune")
     (stage / "usr/bin/neptune").chmod(0o755)
+    common.browser_payload(args.binary.parent, stage / "usr/lib/neptune/browser", "linux")
+    # dpkg-deb installs this root-owned helper; AppImage uses user namespaces.
+    (stage / "usr/lib/neptune/browser/chrome-sandbox").chmod(0o4755)
     desktop = stage / "usr/share/applications/rs.neptune.terminal.desktop"
     desktop.parent.mkdir(parents=True)
     shutil.copy2(ROOT / "packaging/neptune.desktop", desktop)
@@ -99,8 +103,9 @@ def main():
         deb_version += "~" + match[4]
     if match[5]:
         deb_version += "+" + match[5]
-    (control / "control").write_text(f"Package: neptune\nVersion: {deb_version}\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: Neptune maintainers <maintainers@neptune.rs>\nHomepage: https://neptune.rs\nInstalled-Size: {sum(p.stat().st_size for p in stage.rglob('*') if p.is_file()) // 1024}\nDepends: libc6 (>= 2.35), libgcc-s1, libstdc++6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxi6, libxrandr2, libxinerama1, libegl1, libvulkan1\nDescription: Native GPU terminal for focused work\n Independent PTY shells and persistent workspace organization.\n")
+    (control / "control").write_text(f"Package: neptune\nVersion: {deb_version}\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: Neptune maintainers <maintainers@neptune.rs>\nHomepage: https://neptune.rs\nInstalled-Size: {sum(p.stat().st_size for p in stage.rglob('*') if p.is_file()) // 1024}\nDepends: libc6 (>= 2.35), libgcc-s1, libstdc++6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libx11-6, libxcursor1, libxi6, libxrandr2, libxinerama1, libegl1, libvulkan1, libnss3, libnspr4, libatk1.0-0, libatk-bridge2.0-0, libcups2, libxcomposite1, libxdamage1, libxfixes3, libgbm1, libpango-1.0-0, libcairo2, libasound2\nDescription: Native GPU terminal for focused work\n Independent PTY shells and persistent workspace organization.\n")
     run("dpkg-deb", "--root-owner-group", "--build", str(stage), str(dist / names["linux-x64-deb"]))
+    (stage / "usr/lib/neptune/browser/chrome-sandbox").chmod(0o755)
     shutil.rmtree(control)
     shutil.copy2(desktop, stage / "neptune.desktop")
     shutil.copy2(ROOT / "assets/icons/neptune-256.png", stage / "neptune.png")

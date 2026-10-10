@@ -1,5 +1,4 @@
-//! Scrollback search for the focused terminal. The field lives in the toolbar,
-//! so searching never covers terminal rows or resizes the shell.
+//! Search for the focused pane, without covering content or resizing it.
 use super::helpers::{bare_text_edit, place};
 use super::{Action, UiState};
 use crate::{
@@ -16,7 +15,14 @@ pub fn input_id() -> Id {
     Id::new("terminal-search-input")
 }
 
-pub fn show(ui: &mut Ui, field: Rect, p: Palette, state: &mut UiState, actions: &mut Vec<Action>) {
+pub fn show(
+    ui: &mut Ui,
+    field: Rect,
+    p: Palette,
+    kind: neptune_model::PaneKind,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
     let focused = ui.memory(|memory| memory.has_focus(input_id()));
     let radius = metrics::CONTROL_RADIUS;
     let painter = ui.painter().clone();
@@ -99,14 +105,25 @@ pub fn show(ui: &mut Ui, field: Rect, p: Palette, state: &mut UiState, actions: 
                         ui,
                         input_id(),
                         &mut state.search,
-                        "Find in scrollback",
+                        match kind {
+                            neptune_model::PaneKind::Terminal => "Find in scrollback",
+                            neptune_model::PaneKind::Browser => "Find in page",
+                        },
                         12.5,
                         input.width(),
                     )
                 },
             );
-            response
-                .widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Terminal search"));
+            response.widget_info(|| {
+                WidgetInfo::labeled(
+                    WidgetType::TextEdit,
+                    true,
+                    match kind {
+                        neptune_model::PaneKind::Terminal => "Terminal search",
+                        neptune_model::PaneKind::Browser => "Page search",
+                    },
+                )
+            });
             if state.search_focus {
                 response.request_focus();
                 state.search_focus = false;

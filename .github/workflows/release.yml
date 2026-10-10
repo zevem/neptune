@@ -89,7 +89,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor1 libxi6 libxrandr2 libxinerama1 libegl1 libvulkan1 desktop-file-utils squashfs-tools
+          sudo apt-get install --no-install-recommends -y cmake ninja-build pkg-config libnss3 libnspr4 libatk-bridge2.0-0 libcups2 libxcomposite1 libxdamage1 libgbm1 libpango-1.0-0 libcairo2 libasound2 libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcursor1 libxi6 libxrandr2 libxinerama1 libegl1 libvulkan1 desktop-file-utils squashfs-tools
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: 1.97.1
@@ -97,6 +97,8 @@ jobs:
       # No dependency cache: each tag is a new cache scope, so restores always miss.
       - name: Build optimized native executable
         run: cargo build -p neptune-terminal --release --locked --bin neptune --target ${{ matrix.target }}
+      - name: Build isolated browser runtime
+        run: cargo build -p neptune-browser --release --locked --target ${{ matrix.target }}
       - name: Sign and notarize macOS app and DMG
         if: runner.os == 'macOS'
         env:
@@ -118,6 +120,8 @@ jobs:
         run: |
           python -c "import sys; sys.path.insert(0, 'scripts'); import importlib; common = importlib.import_module('package-common'); from pathlib import Path; common.notices(Path('package/windows'))"
           if ($LASTEXITCODE -ne 0) { throw 'License collection failed' }
+          python -c "import sys; sys.path.insert(0, 'scripts'); import importlib; common = importlib.import_module('package-common'); from pathlib import Path; common.browser_payload(Path('target/x86_64-pc-windows-msvc/release'), Path('package/windows-browser'), 'windows')"
+          if ($LASTEXITCODE -ne 0) { throw 'Browser packaging failed' }
           $numeric = ($env:RELEASE_VERSION -split '[-+]')[0] + '.0'
           & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DVersion=$env:RELEASE_VERSION" "/DNumericVersion=$numeric" packaging/windows.iss
           if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }

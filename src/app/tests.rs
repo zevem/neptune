@@ -8,6 +8,8 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         ..Config::default()
     };
     let app = App {
+        browsers: Default::default(),
+        browser_launch: None,
         controller: Controller::new(Model::default()),
         sessions: SessionManager::new(ResourcePolicy::default(), false),
         renders: BTreeMap::new(),
@@ -92,6 +94,119 @@ fn loaded(config: Config, model: Model) -> Startup {
         },
         error: None,
     }
+}
+
+#[test]
+fn browser_actions_create_split_tabs_without_pty_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _) = fixture(root.path());
+    app.startup = None;
+    app.controller
+        .dispatch(Command::AddWorkspace {
+            group: None,
+            cwd: root.path().into(),
+            name: "Preview".into(),
+            remote: None,
+        })
+        .unwrap();
+    let terminal = app.controller.model().active_pane().unwrap();
+    let ctx = egui::Context::default();
+    app.action(
+        &ctx,
+        Action::NewBrowser(
+            terminal,
+            Some(neptune_model::Axis::Vertical),
+            Some("localhost:3000".into()),
+        ),
+    );
+    let browser = app.controller.model().active_pane().unwrap();
+    assert_ne!(browser, terminal);
+    assert_eq!(
+        app.controller.model().pane(browser).unwrap().kind(),
+        neptune_model::PaneKind::Browser
+    );
+    assert!(app.sessions.get(browser).is_none());
+    app.action(
+        &ctx,
+        Action::Split(browser, neptune_model::Axis::Horizontal),
+    );
+    let second = app.controller.model().active_pane().unwrap();
+    assert_ne!(second, browser);
+    assert_eq!(
+        app.controller.model().pane(second).unwrap().kind(),
+        neptune_model::PaneKind::Browser
+    );
+    assert!(app.sessions.get(second).is_none());
+    app.browsers.shutdown();
+}
+
+#[test]
+fn browser_shortcuts_leave_shell_control_l_and_r_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _) = fixture(root.path());
+    app.startup = None;
+    app.controller
+        .dispatch(Command::AddWorkspace {
+            group: None,
+            cwd: root.path().into(),
+            name: "Shell".into(),
+            remote: None,
+        })
+        .unwrap();
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            events: vec![
+                key(egui::Key::L, None, egui::Modifiers::CTRL),
+                key(egui::Key::R, None, egui::Modifiers::CTRL),
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.shortcuts(ui.ctx());
+            assert_eq!(ui.input(|i| i.events.len()), 2);
+        },
+    );
+    output.textures_delta.clear();
+}
+
+#[test]
+fn browser_restoration_gives_a_cli_command_a_terminal_target() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _) = fixture(root.path());
+    let mut controller = Controller::new(Model::default());
+    controller
+        .dispatch(Command::AddWorkspace {
+            group: None,
+            cwd: root.path().into(),
+            name: "Preview".into(),
+            remote: None,
+        })
+        .unwrap();
+    let workspace = controller.model().active_workspace().unwrap();
+    let terminal = controller.model().active_pane().unwrap();
+    controller
+        .dispatch(Command::OpenBrowser {
+            workspace,
+            pane: terminal,
+            axis: None,
+        })
+        .unwrap();
+    let model = Model::restore(
+        controller.model().specs(),
+        Some(workspace),
+        true,
+        Default::default(),
+    )
+    .unwrap();
+    app.complete_startup(&egui::Context::default(), loaded(app.config.clone(), model));
+    let (target, _) = app.command_target.unwrap();
+    assert_eq!(
+        app.controller.model().pane(target).unwrap().kind(),
+        neptune_model::PaneKind::Terminal
+    );
+    assert_ne!(target, terminal);
+    app.browsers.shutdown();
 }
 
 #[test]

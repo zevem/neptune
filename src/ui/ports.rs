@@ -203,14 +203,14 @@ fn hint(port: &Port) -> String {
             message,
             local: Some(local),
         } => format!(
-            "Open localhost:{local}\nCould not stop forwarding: {message}\nRight-click to retry stopping"
+            "Preview localhost:{local}\nCould not stop forwarding: {message}\nRight-click to retry stopping"
         ),
         Forward::On(local) => format!(
-            "Open localhost:{local} (forwarded from {})\nRight-click to stop forwarding",
+            "Preview localhost:{local} (forwarded from {})\nRight-click to stop forwarding",
             port.listener.label()
         ),
         _ if port.remote => format!("Forward {} to this computer", port.listener.label()),
-        _ => format!("Open {}", port.label()),
+        _ => format!("Preview {}", port.label()),
     }
 }
 fn port_menu(
@@ -229,7 +229,7 @@ fn port_menu(
     let label = if port.remote && port.url().is_none() {
         format!("Forward {}", port.listener.label())
     } else {
-        format!("Open {}", port.label())
+        format!("Preview {}", port.label())
     };
     if helpers::menu_item(ui, p, Icon::Globe, &label, "", false) {
         actions.push(Action::Port {
@@ -238,6 +238,20 @@ fn port_menu(
             listener: port.listener,
             stop: false,
         });
+        ui.close();
+    }
+    if let Some(url) = port.url()
+        && let Some(link) = crate::platform::links::WebLink::new(&url)
+        && helpers::menu_item(
+            ui,
+            p,
+            Icon::ArrowUpRight,
+            "Open in external browser",
+            "",
+            false,
+        )
+    {
+        actions.push(Action::OpenLink(link));
         ui.close();
     }
     if matches!(

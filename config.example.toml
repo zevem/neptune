@@ -93,5 +93,7 @@ desktop_notifications = true
 # split-right = ["Alt+H", "Primary+Shift+F10"]
 # split-below = ["Alt+J"]
 # command-palette = ["Primary+Shift+P", "F12"]
+# new-browser = ["Primary+Shift+L"]
+# browser-address = ["Primary+L"]
 # copy = []
 # paste = ["Primary+Shift+V"]

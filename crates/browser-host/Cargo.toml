@@ -1,0 +1,27 @@
+[package]
+name = "neptune-browser"
+version = "0.1.0-rc.4"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+description = "Isolated Chromium preview host for Neptune"
+
+[dependencies]
+cef = { version = "=154.5.0", default-features = false, features = ["sandbox"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+url = "2.5"
+
+[lib]
+name = "neptune_browser"
+crate-type = ["cdylib"]
+path = "src/windows.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder"] }
+
+[[bin]]
+name = "neptune-browser"
+path = "src/main.rs"

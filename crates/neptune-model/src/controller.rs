@@ -1,6 +1,7 @@
 use crate::{
-    Axis, Edge, Error, Layout, Lifecycle, Model, Pane, PaneId, Project, ProjectId, ProjectKey,
-    Remote, SidebarItem, SplitId, Workspace, WorkspaceGroup, WorkspaceGroupId, WorkspaceId,
+    Axis, Edge, Error, Layout, Lifecycle, Model, Pane, PaneId, PaneKind, Project, ProjectId,
+    ProjectKey, Remote, SidebarItem, SplitId, Workspace, WorkspaceGroup, WorkspaceGroupId,
+    WorkspaceId,
 };
 use std::path::PathBuf;
 
@@ -75,6 +76,12 @@ pub enum Command {
         workspace: WorkspaceId,
         pane: PaneId,
         cwd: PathBuf,
+    },
+    /// Opens a browser as a tab, or across a split of the targeted tab group.
+    OpenBrowser {
+        workspace: WorkspaceId,
+        pane: PaneId,
+        axis: Option<Axis>,
     },
     /// Opens a tab following `pane` in a git worktree made for an agent,
     /// and has its shell open `agent` there. The tab is named by the branch.
@@ -227,6 +234,10 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
+    StartBrowser {
+        pane: PaneId,
+        generation: u64,
+    },
     StartSession {
         pane: PaneId,
         generation: u64,
@@ -306,13 +317,22 @@ impl Controller {
             .workspaces
             .iter()
             .flat_map(|workspace| {
-                workspace.panes.iter().map(|pane| Effect::StartSession {
-                    pane: pane.id,
-                    generation: pane.generation,
-                    cwd: pane.cwd.clone(),
-                    remote: workspace.remote.clone(),
-                    remote_cwd: pane.remote_cwd.clone(),
-                    replacement: false,
+                workspace.panes.iter().map(|pane| {
+                    if pane.kind == PaneKind::Browser {
+                        Effect::StartBrowser {
+                            pane: pane.id,
+                            generation: pane.generation,
+                        }
+                    } else {
+                        Effect::StartSession {
+                            pane: pane.id,
+                            generation: pane.generation,
+                            cwd: pane.cwd.clone(),
+                            remote: workspace.remote.clone(),
+                            remote_cwd: pane.remote_cwd.clone(),
+                            replacement: false,
+                        }
+                    }
                 })
             })
             .collect()
@@ -392,6 +412,7 @@ impl Controller {
                     remote: remote.clone(),
                     panes: vec![Pane {
                         id: pane_id,
+                        kind: crate::PaneKind::Terminal,
                         cwd: cwd.clone(),
                         remote_cwd: None,
                         agent: None,
@@ -552,7 +573,8 @@ impl Controller {
                 axis,
                 cwd,
             } => {
-                effects.push(self.add_pane(workspace, pane, Some(axis), cwd)?);
+                let kind = self.model.pane(pane).ok_or(Error::UnknownPane(pane))?.kind;
+                effects.push(self.add_pane(workspace, pane, Some(axis), cwd, kind)?);
                 dirty = true;
             }
             Command::AddTab {
@@ -560,7 +582,21 @@ impl Controller {
                 pane,
                 cwd,
             } => {
-                effects.push(self.add_pane(workspace, pane, None, cwd)?);
+                effects.push(self.add_pane(workspace, pane, None, cwd, PaneKind::Terminal)?);
+                dirty = true;
+            }
+            Command::OpenBrowser {
+                workspace,
+                pane,
+                axis,
+            } => {
+                let cwd = self
+                    .model
+                    .pane(pane)
+                    .ok_or(Error::UnknownPane(pane))?
+                    .cwd
+                    .clone();
+                effects.push(self.add_pane(workspace, pane, axis, cwd, PaneKind::Browser)?);
                 dirty = true;
             }
             Command::OpenWorktree {
@@ -580,7 +616,13 @@ impl Controller {
                 {
                     return Err(Error::InvalidWorktree);
                 }
-                effects.push(self.add_pane(workspace, pane, None, worktree.path.clone())?);
+                effects.push(self.add_pane(
+                    workspace,
+                    pane,
+                    None,
+                    worktree.path.clone(),
+                    PaneKind::Terminal,
+                )?);
                 let ws = self.model.workspace_mut(workspace)?;
                 let id = ws.active;
                 if let Some(item) = ws.panes.iter_mut().find(|item| item.id == id) {
@@ -700,6 +742,9 @@ impl Controller {
                     }
                     ws.remote.clone_from(&remote);
                     for pane in &mut ws.panes {
+                        if pane.kind == PaneKind::Browser {
+                            continue;
+                        }
                         let previous = pane.generation;
                         pane.generation += 1;
                         pane.lifecycle = Lifecycle::Starting;
@@ -772,13 +817,20 @@ impl Controller {
                     pane,
                     generation: previous,
                 });
-                effects.push(Effect::StartSession {
-                    pane,
-                    generation: item.generation,
-                    cwd: item.cwd.clone(),
-                    remote,
-                    remote_cwd: item.remote_cwd.clone(),
-                    replacement: true,
+                effects.push(if item.kind == PaneKind::Browser {
+                    Effect::StartBrowser {
+                        pane,
+                        generation: item.generation,
+                    }
+                } else {
+                    Effect::StartSession {
+                        pane,
+                        generation: item.generation,
+                        cwd: item.cwd.clone(),
+                        remote,
+                        remote_cwd: item.remote_cwd.clone(),
+                        replacement: true,
+                    }
                 });
                 if old_focus == Some(pane) {
                     effects.push(Effect::ResetSearch);
@@ -839,7 +891,8 @@ impl Controller {
                     .and_then(|id| self.model.workspace(id))
                     .is_some_and(|ws| ws.remote.is_none());
                 let open = self.model.pane(pane).filter(|item| {
-                    item.generation == generation
+                    item.kind == PaneKind::Terminal
+                        && item.generation == generation
                         && matches!(item.lifecycle, Lifecycle::Starting | Lifecycle::Running)
                 });
                 if local
@@ -894,6 +947,7 @@ impl Controller {
                 let item = ws.pane(parent).ok_or(Error::UnknownPane(parent))?;
                 // Only the agent still open in a local terminal starts another.
                 if ws.remote.is_some()
+                    || item.kind != PaneKind::Terminal
                     || item.generation != generation
                     || item.agent.is_none()
                     || !matches!(item.lifecycle, Lifecycle::Starting | Lifecycle::Running)
@@ -917,6 +971,7 @@ impl Controller {
                 let ws = self.model.workspace_mut(workspace)?;
                 ws.panes.push(Pane {
                     id,
+                    kind: crate::PaneKind::Terminal,
                     cwd: cwd.clone(),
                     remote_cwd: None,
                     agent: None,
@@ -1044,6 +1099,7 @@ impl Controller {
                 let ws = self.model.workspace_mut(workspace)?;
                 ws.panes.push(Pane {
                     id,
+                    kind: crate::PaneKind::Terminal,
                     cwd: cwd.clone(),
                     remote_cwd: None,
                     agent: None,
@@ -1137,6 +1193,7 @@ impl Controller {
                 cwd,
             } => {
                 if let Ok(item) = self.model.pane_mut(pane)
+                    && item.kind == PaneKind::Terminal
                     && item.generation == generation
                     && item.cwd != cwd
                 {
@@ -1156,6 +1213,7 @@ impl Controller {
                     .is_some_and(|workspace| workspace.remote.is_some());
                 if remote
                     && let Ok(item) = self.model.pane_mut(pane)
+                    && item.kind == PaneKind::Terminal
                     && item.generation == generation
                     && item.remote_cwd.as_ref() != Some(&cwd)
                 {
@@ -1221,7 +1279,20 @@ impl Controller {
         pane: PaneId,
         axis: Option<Axis>,
         cwd: PathBuf,
+        kind: PaneKind,
     ) -> Result<Effect, Error> {
+        if kind == PaneKind::Browser
+            && self
+                .model
+                .workspaces
+                .iter()
+                .flat_map(|w| &w.panes)
+                .filter(|p| p.kind == PaneKind::Browser)
+                .count()
+                >= PaneKind::MAX_BROWSERS
+        {
+            return Err(Error::BrowserLimit);
+        }
         let ws = self
             .model
             .workspace(workspace)
@@ -1255,8 +1326,13 @@ impl Controller {
         }
         ws.panes.push(Pane {
             id,
+            kind,
             cwd: cwd.clone(),
-            remote_cwd: remote_cwd.clone(),
+            remote_cwd: if kind == PaneKind::Terminal {
+                remote_cwd.clone()
+            } else {
+                None
+            },
             agent: None,
             pull_requests: Vec::new(),
             attachments: Vec::new(),
@@ -1273,13 +1349,20 @@ impl Controller {
         if axis.is_some() {
             self.model.next_split = next_split;
         }
-        Ok(Effect::StartSession {
-            pane: id,
-            generation: 1,
-            cwd,
-            remote,
-            remote_cwd,
-            replacement: false,
+        Ok(if kind == PaneKind::Browser {
+            Effect::StartBrowser {
+                pane: id,
+                generation: 1,
+            }
+        } else {
+            Effect::StartSession {
+                pane: id,
+                generation: 1,
+                cwd,
+                remote,
+                remote_cwd,
+                replacement: false,
+            }
         })
     }
 
@@ -1323,8 +1406,12 @@ impl Controller {
         if destination != source {
             // A local shell would be shown as running on the host, and a
             // connection as a local shell, until the next restart.
-            if self.model.workspace(source).map(|ws| &ws.remote)
-                != self.model.workspace(destination).map(|ws| &ws.remote)
+            if self
+                .model
+                .pane(pane)
+                .is_some_and(|p| p.kind == PaneKind::Terminal)
+                && self.model.workspace(source).map(|ws| &ws.remote)
+                    != self.model.workspace(destination).map(|ws| &ws.remote)
             {
                 return Err(Error::RemoteMismatch);
             }
@@ -1514,6 +1601,164 @@ impl Controller {
 mod tests {
     use super::*;
     use crate::{Limits, PaneSpec, WorkspaceSpec};
+
+    #[test]
+    fn browser_tabs_share_layouts_without_starting_a_pty() {
+        let mut controller = Controller::new(Model::default());
+        let workspace = create(&mut controller, "Web");
+        let terminal = controller.model().active_pane().unwrap();
+        let effects = controller
+            .dispatch(Command::OpenBrowser {
+                workspace,
+                pane: terminal,
+                axis: None,
+            })
+            .unwrap();
+        let browser = controller.model().active_pane().unwrap();
+        assert_eq!(
+            controller.model().pane(browser).unwrap().kind(),
+            PaneKind::Browser
+        );
+        assert!(effects.contains(&Effect::StartBrowser {
+            pane: browser,
+            generation: 1
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartSession { .. }))
+        );
+        controller
+            .dispatch(Command::MovePane {
+                pane: browser,
+                destination: Destination::Beside {
+                    pane: terminal,
+                    edge: Edge::Right,
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            controller
+                .model()
+                .workspace(workspace)
+                .unwrap()
+                .layout
+                .shown()
+                .len(),
+            2
+        );
+        assert_eq!(controller.model().pane(browser).unwrap().generation(), 1);
+        let restored = Model::restore(
+            controller.model().specs(),
+            Some(workspace),
+            true,
+            Limits::default(),
+        )
+        .unwrap();
+        let starts = Controller::new(restored).start_effects();
+        assert!(starts.contains(&Effect::StartBrowser {
+            pane: browser,
+            generation: 1
+        }));
+        assert_eq!(
+            starts
+                .iter()
+                .filter(|e| matches!(e, Effect::StartSession { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn browser_split_restart_and_ssh_changes_keep_resources_distinct() {
+        let mut controller = Controller::new(Model::default());
+        let workspace = create(&mut controller, "Web");
+        let terminal = controller.model().active_pane().unwrap();
+        controller
+            .dispatch(Command::OpenBrowser {
+                workspace,
+                pane: terminal,
+                axis: Some(Axis::Vertical),
+            })
+            .unwrap();
+        let browser = controller.model().active_pane().unwrap();
+        controller
+            .dispatch(Command::SessionStarted {
+                pane: browser,
+                generation: 1,
+            })
+            .unwrap();
+        let effects = controller
+            .dispatch(Command::SetWorkspaceRemote {
+                workspace,
+                remote: Some("devbox".into()),
+            })
+            .unwrap();
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::StopSession { pane, .. } if *pane == browser))
+        );
+        assert_eq!(controller.model().pane(browser).unwrap().generation(), 1);
+        controller
+            .dispatch(Command::SplitPane {
+                workspace,
+                pane: browser,
+                axis: Axis::Horizontal,
+                cwd: "/project".into(),
+            })
+            .unwrap();
+        let split = controller.model().active_pane().unwrap();
+        assert_eq!(
+            controller.model().pane(split).unwrap().kind(),
+            PaneKind::Browser
+        );
+        let restart = controller.dispatch(Command::RestartPane(browser)).unwrap();
+        assert!(restart.contains(&Effect::StartBrowser {
+            pane: browser,
+            generation: 2
+        }));
+        controller
+            .dispatch(Command::SessionStarted {
+                pane: browser,
+                generation: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            controller.model().pane(browser).unwrap().lifecycle(),
+            &Lifecycle::Starting
+        );
+    }
+
+    #[test]
+    fn browser_capacity_refuses_without_changing_layout() {
+        let mut controller = Controller::new(Model::default());
+        let workspace = create(&mut controller, "Web");
+        let terminal = controller.model().active_pane().unwrap();
+        for _ in 0..PaneKind::MAX_BROWSERS {
+            controller
+                .dispatch(Command::OpenBrowser {
+                    workspace,
+                    pane: terminal,
+                    axis: None,
+                })
+                .unwrap();
+        }
+        let before = controller.model().specs();
+        let layout = before[0].layout.clone();
+        assert_eq!(
+            controller.dispatch(Command::OpenBrowser {
+                workspace,
+                pane: terminal,
+                axis: None
+            }),
+            Err(Error::BrowserLimit)
+        );
+        assert_eq!(
+            controller.model().workspace(workspace).unwrap().layout(),
+            &layout
+        );
+    }
 
     #[derive(Default)]
     struct FakeRuntime {
@@ -3186,6 +3431,7 @@ mod tests {
             panes: vec![
                 PaneSpec {
                     id: PaneId::new(1),
+                    kind: crate::PaneKind::Terminal,
                     cwd: PathBuf::new(),
                     remote_cwd: None,
                     agent: None,
@@ -3197,6 +3443,7 @@ mod tests {
                 },
                 PaneSpec {
                     id: PaneId::new(2),
+                    kind: crate::PaneKind::Terminal,
                     cwd: PathBuf::new(),
                     remote_cwd: None,
                     agent: None,

@@ -27,6 +27,8 @@ pub struct Launch {
     pub config: Option<PathBuf>,
     pub data_root: Option<PathBuf>,
     pub command: Option<String>,
+    /// Open a browser split beside the initial terminal after restoration.
+    pub browser: Option<String>,
     pub screenshot: Option<PathBuf>,
     pub size: Option<[f32; 2]>,
     pub no_restore: bool,

@@ -363,9 +363,18 @@ fn confirm_close(
     p: Palette,
     close: Close,
     status: CloseStatus,
+    browser: bool,
     actions: &mut Vec<Action>,
 ) {
-    let (title, consequence, verb) = close_copy(close);
+    let (title, consequence, verb) = if browser && matches!(close, Close::Pane(_)) {
+        (
+            "Close browser?",
+            "This preview will close. Unsaved changes on the page will be lost.",
+            "Close",
+        )
+    } else {
+        close_copy(close)
+    };
     let message = match status {
         CloseStatus::General => consequence.to_owned(),
         // Keep input ownership while checking, but do not flash a sheet or
@@ -599,9 +608,14 @@ pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut 
         OverlayState::RemoveProject(project) => remove_project(ctx, p, project, actions),
         OverlayState::Ssh(workspace) => ssh(ctx, p, state, workspace, None, actions),
         OverlayState::SshInGroup(group) => ssh(ctx, p, state, None, Some(group), actions),
-        OverlayState::ConfirmClose(close) => {
-            confirm_close(ctx, p, close, state.close_status, actions)
-        }
+        OverlayState::ConfirmClose(close) => confirm_close(
+            ctx,
+            p,
+            close,
+            state.close_status,
+            state.close_browser,
+            actions,
+        ),
         OverlayState::NewWorktree(_) => {
             let enter = confirmed_by_enter(ctx, state);
             super::worktrees::new_agent(ctx, p, state, enter, accepts_focus, actions)
