@@ -25,6 +25,8 @@ pub(crate) struct View {
     pub texture: Option<egui::TextureId>,
     pub popup: Option<(egui::TextureId, egui::Rect)>,
     pub failed: bool,
+    /// This system allowed Chromium no sandbox, so the host runs without one.
+    pub unsandboxed: bool,
 }
 #[derive(Clone)]
 pub(crate) struct Frame {
@@ -38,6 +40,7 @@ struct Incoming {
     states: BTreeMap<Target, State>,
     frames: BTreeMap<(Target, bool), Frame>,
     failed: bool,
+    unsandboxed: bool,
 }
 struct Bridge {
     sender: Option<mpsc::SyncSender<Command>>,
@@ -118,6 +121,7 @@ pub(crate) struct Browsers {
     closing: BTreeMap<Target, bool>,
     bridge: Option<Bridge>,
     frame_rate: Option<u32>,
+    unsandboxed: bool,
 }
 impl Browsers {
     pub fn has_previews(&self) -> bool {
@@ -207,6 +211,7 @@ impl Browsers {
                 .as_ref()
                 .map(|(texture, rect)| (texture.id(), *rect)),
             failed: entry.failed,
+            unsandboxed: self.unsandboxed,
         })
     }
     pub fn address(&self, pane: PaneId, generation: u64) -> Option<String> {
@@ -331,7 +336,10 @@ impl Browsers {
         }
         if self.bridge.is_none() && !self.entries.is_empty() {
             match Bridge::launch(ctx.clone()) {
-                Ok(bridge) => self.bridge = Some(bridge),
+                Ok(bridge) => {
+                    self.bridge = Some(bridge);
+                    self.unsandboxed = false;
+                }
                 Err(error) => {
                     for (pane, entry) in &mut self.entries {
                         if !entry.failed {
@@ -356,6 +364,7 @@ impl Browsers {
             .ok()
             .map(|mut data| std::mem::take(&mut *data));
         if let Some(incoming) = incoming {
+            self.unsandboxed |= incoming.unsandboxed;
             for (target, state) in incoming.states {
                 if state.closed {
                     self.closing.remove(&target);
@@ -581,7 +590,23 @@ fn run(
         profile_builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
     let profile = profile_builder.tempdir()?;
+    #[cfg(target_os = "linux")]
+    let unsandboxed = sandbox_unavailable(&executable);
     let mut process = Process::new(executable);
+    // Chromium aborts at startup when the system allows it neither sandbox,
+    // as an AppImage on Ubuntu does. Previews then run without it; any other
+    // startup failure keeps the sandbox and shows the error screen.
+    #[cfg(target_os = "linux")]
+    if unsandboxed {
+        process.arg("--no-sandbox");
+        if let Ok(mut updates) = incoming.lock() {
+            updates.unsandboxed = true;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(libraries) = bundled_libraries(process.get_program().as_ref()) {
+        process.env("LD_LIBRARY_PATH", libraries);
+    }
     process
         .env("NEPTUNE_BROWSER_PROFILE", profile.path())
         .stdin(Stdio::piped())
@@ -679,6 +704,92 @@ fn run(
     } else {
         Err(std::io::Error::other("Browser host stopped"))
     }
+}
+
+/// Whether this system allows Chromium neither of its Linux sandboxes: a
+/// root-owned setuid `chrome-sandbox` beside the host, or a user namespace in
+/// which this user may map itself. Runs on the supervisor, outside frames.
+#[cfg(target_os = "linux")]
+fn sandbox_unavailable(host: &std::path::Path) -> bool {
+    use std::os::unix::{fs::MetadataExt, process::CommandExt};
+    if std::fs::metadata(host.with_file_name("chrome-sandbox"))
+        .is_ok_and(|helper| helper.uid() == 0 && helper.mode() & 0o4001 == 0o4001)
+    {
+        return false;
+    }
+    unsafe extern "C" {
+        fn getuid() -> u32;
+        fn unshare(flags: i32) -> i32;
+        fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+        fn write(fd: i32, bytes: *const std::ffi::c_void, count: usize) -> isize;
+    }
+    const CLONE_NEWUSER: i32 = 0x1000_0000;
+    const O_WRONLY: i32 = 1;
+    const ECANCELED: i32 = 125;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let map = format!("0 {} 1", unsafe { getuid() });
+    let mut probe = Process::new(host);
+    probe
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // The forked child enters a user namespace and maps its own user, as
+    // Chromium's check does, then always fails the launch: nothing is executed.
+    // Ubuntu's AppArmor restriction allows the namespace and denies the map.
+    // SAFETY: only async-signal-safe system calls run in the forked child.
+    unsafe {
+        probe.pre_exec(move || {
+            if unshare(CLONE_NEWUSER) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fd = open(c"/proc/self/uid_map".as_ptr(), O_WRONLY);
+            if fd < 0 || write(fd, map.as_ptr().cast(), map.len()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Err(std::io::Error::from_raw_os_error(ECANCELED))
+        });
+    }
+    match probe.spawn() {
+        Ok(mut child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            false
+        }
+        // EPERM, EACCES, EINVAL, ENOSPC, ENOSYS and EUSERS are how a kernel or
+        // its policy refuses the namespace. A fork that failed for want of
+        // memory or processes says nothing, and must not cost the sandbox.
+        Err(error) => matches!(error.raw_os_error(), Some(1 | 13 | 22 | 28 | 38 | 87)),
+    }
+}
+
+/// The search path that puts an AppImage's own Chromium runtime libraries
+/// first, when this system cannot load the host with the libraries it has.
+/// Systems that can keep their own, which match their graphics and NSS setup.
+#[cfg(target_os = "linux")]
+fn bundled_libraries(host: &std::path::Path) -> Option<std::ffi::OsString> {
+    if !crate::platform::host_env::appimage() {
+        return None;
+    }
+    // `usr/lib`, three levels above `usr/lib/neptune/browser/neptune-browser`.
+    let bundled = host.ancestors().nth(3)?;
+    // glibc's loader lists what it would load, and what it cannot find, without
+    // running the program. Neptune's own launch environment is already restored.
+    let listed = Process::new(host)
+        .env("LD_TRACE_LOADED_OBJECTS", "1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !String::from_utf8_lossy(&listed.stdout).contains("=> not found") {
+        return None;
+    }
+    // An empty entry would name the working directory.
+    let host_path = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
+    std::env::join_paths(
+        std::iter::once(bundled.to_path_buf())
+            .chain(std::env::split_paths(&host_path).filter(|entry| !entry.as_os_str().is_empty())),
+    )
+    .ok()
 }
 
 /// A startup or pipe error must also reap the process and its Unix children.
@@ -1288,5 +1399,35 @@ mod tests {
         assert!(browsers.poll(&ctx, &[pane], None).is_empty());
         browsers.close(pane);
         assert!(browsers.closing.is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browser_keeps_its_sandbox_when_a_setuid_helper_or_namespaces_serve() {
+        unsafe extern "C" {
+            fn getuid() -> u32;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("neptune-browser");
+        std::fs::write(&host, b"").unwrap();
+        // No helper: the answer is whether this user may map itself in a new
+        // user namespace, which `unshare --map-root-user` also requires.
+        let namespaces = Process::new("unshare")
+            .args(["--user", "--map-root-user", "true"])
+            .stderr(Stdio::null())
+            .status();
+        if let Ok(status) = namespaces {
+            assert_eq!(sandbox_unavailable(&host), !status.success());
+        }
+        // A helper this user owns is not the setuid-root one Chromium accepts.
+        use std::os::unix::fs::PermissionsExt;
+        let helper = dir.path().join("chrome-sandbox");
+        std::fs::write(&helper, b"").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        if unsafe { getuid() } != 0
+            && let Ok(status) = namespaces
+        {
+            assert_eq!(sandbox_unavailable(&host), !status.success());
+        }
     }
 }
