@@ -53,6 +53,9 @@ impl App {
         if !open || tab != Tab::Project {
             self.leave_project(ctx);
         }
+        if !open || tab != Tab::PullRequest {
+            self.leave_pull_request(ctx);
+        }
         ctx.request_repaint();
     }
 

@@ -16,6 +16,7 @@ mod input;
 mod panel;
 mod ports;
 mod projects;
+mod pull_request;
 mod ssh;
 #[cfg(test)]
 mod tests;
@@ -140,6 +141,8 @@ pub struct App {
     explorer: explorer::Explorer,
     /// What git says about the folders in view.
     changes: changes::Changes,
+    /// The pull request the panel's tab shows.
+    pull_request: pull_request::PullRequestTab,
     file_drag: crate::platform::file_drag::FileDragSource,
     paste_chord: crate::input::PasteChord,
     /// Git worktrees made for agents, and the worker that runs git for them.
@@ -276,6 +279,7 @@ impl App {
             attached: Default::default(),
             explorer: Default::default(),
             changes: Default::default(),
+            pull_request: Default::default(),
             file_drag: Default::default(),
             paste_chord: Default::default(),
             worktrees: Default::default(),
@@ -521,6 +525,7 @@ impl App {
         self.poll_attached(ctx);
         self.poll_explorer(ctx);
         self.poll_changes(ctx);
+        self.poll_pull_request(ctx);
         self.poll_saves(ctx);
         self.poll_search(ctx);
         if self.diagnostics.enabled() {
@@ -671,6 +676,7 @@ impl App {
                             .map(|link| ui::helpers::LinkedPullRequest {
                                 link: link.clone(),
                                 lookup: self.pull_requests.lookup(link),
+                                preview: self.pull_requests.preview(link),
                             })
                             .collect(),
                         attached: self.attached_files(pane),
@@ -1060,6 +1066,9 @@ impl eframe::App for App {
             edge > 0.0,
             panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Changes,
         );
+        // A pull request is read only while its tab is the one in view.
+        let pull_request_shown = panel_reveal > 0.0 && panel_tab == ui::panel::Tab::PullRequest;
+        self.sync_pull_request(&ctx, pull_request_shown);
         let chrome = ui::chrome::ChromeView {
             keybindings: &self.config.keybindings,
             workspaces: &views,
@@ -1220,6 +1229,26 @@ impl eframe::App for App {
                 panel_reveal,
                 bounds,
             );
+            let linked = if pull_request_shown {
+                self.linked_pull_requests()
+            } else {
+                Vec::new()
+            };
+            let selected_file = self.ui.pull_request.selected.clone();
+            let pull_request = ui::pull_request::View {
+                body: self.pull_request.view(&linked, selected_file.as_deref()),
+                opened: self.pull_request.opened(),
+                now: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs() as i64),
+                composing: self.ime_composing,
+                reveal: panel_reveal,
+                window: bounds,
+            };
+            if pull_request_shown && self.pull_request.shown().is_some() {
+                // Its ages are shown in minutes.
+                Self::tick_agents(&ctx);
+            }
             let project = self.project_panel(project_shown);
             self.projects.look_for_leads(&ctx, &project);
             if project.has_agents() {
@@ -1243,6 +1272,7 @@ impl eframe::App for App {
                     window: bounds,
                     reveal: panel_reveal,
                 },
+                pull_request: &pull_request,
                 waiting: self.agents.waiting_count(),
                 needs: project_needs,
                 window: bounds,
@@ -1258,6 +1288,7 @@ impl eframe::App for App {
                     files: &mut self.ui.explorer,
                     changes: &mut self.ui.changes,
                     project: &mut self.ui.project,
+                    pull_request: &mut self.ui.pull_request,
                 },
                 &mut actions,
             );

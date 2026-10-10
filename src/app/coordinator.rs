@@ -672,6 +672,7 @@ impl App {
             Action::Changes(event) => self.changes_event(ctx, event),
             Action::Worktree(event) => self.worktree_event(ctx, event),
             Action::Project(event) => self.project_event(ctx, event),
+            Action::PullRequest(event) => self.pull_request_event(ctx, event),
             Action::SidebarWidth(width) => {
                 let config = Config {
                     sidebar_width: width.clamp(170.0, 360.0),

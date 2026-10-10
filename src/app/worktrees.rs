@@ -196,6 +196,52 @@ impl App {
         }
     }
 
+    /// Has git fetch a pull request into a branch of its own and make that
+    /// branch's worktree, beside the terminal in `pane`: its tab opens with
+    /// `agent` when git answers, as one made from the sheet does.
+    pub(super) fn checkout_worktree(
+        &mut self,
+        ctx: &egui::Context,
+        pane: PaneId,
+        (repository, number): (String, u64),
+        agent: AgentKind,
+    ) -> Result<(), &'static str> {
+        if self.remote_of(pane).is_some() {
+            return Err("Worktrees are made for terminals on this machine");
+        }
+        if self.worktrees.creating.is_some() {
+            return Err("Another worktree is being made. Try again in a moment.");
+        }
+        let Some(item) = self.controller.model().pane(pane) else {
+            return Err("Open a terminal first.");
+        };
+        let cwd = self
+            .sessions
+            .get(pane)
+            .map(|session| session.metadata().cwd)
+            .unwrap_or_else(|| item.cwd().to_path_buf());
+        let branch = format!("pr-{number}");
+        let asked = self.git(
+            ctx,
+            Request::Checkout {
+                cwd: cwd.clone(),
+                branch: branch.clone(),
+                repository,
+                number,
+            },
+        );
+        if !asked {
+            return Err("Could not start git.");
+        }
+        self.worktrees.creating = Some(Creating {
+            pane,
+            cwd,
+            branch,
+            agent,
+        });
+        Ok(())
+    }
+
     /// Has git make the worktree of the branch a project's lead named for
     /// a new agent, in the repository the project works in. The agent
     /// starts when git answers, on a later frame. `Err` hands the request

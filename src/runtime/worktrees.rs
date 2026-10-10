@@ -64,6 +64,15 @@ pub enum Request {
         cwd: PathBuf,
         branch: String,
     },
+    /// Fetch a pull request of the repository's `origin` into `branch` and
+    /// make that branch's worktree. Answered as `Created` is.
+    Checkout {
+        cwd: PathBuf,
+        branch: String,
+        /// `owner/repository`, which `origin` must be.
+        repository: String,
+        number: u64,
+    },
     Inspect(Worktree),
     Remove {
         worktree: Worktree,
@@ -174,6 +183,20 @@ fn work(receiver: mpsc::Receiver<Request>, events: Arc<Mutex<Vec<Event>>>, wake:
             }
             Some(Request::Create { cwd, branch }) => {
                 let result = create(&cwd, &branch);
+                report(Event::Created {
+                    cwd,
+                    branch,
+                    result,
+                });
+            }
+            Some(Request::Checkout {
+                cwd,
+                branch,
+                repository,
+                number,
+            }) => {
+                let result = fetch_pull_request(&cwd, &branch, &repository, number)
+                    .and_then(|()| create(&cwd, &branch));
                 report(Event::Created {
                     cwd,
                     branch,
@@ -427,6 +450,58 @@ fn start(root: &Path, branch: &str, base: &str) -> Result<String, String> {
         )
 }
 
+/// Whether `origin`, as git names its address, is `repository`
+/// (`owner/name`): the last two parts of the address, whatever leads them.
+fn is_origin(address: &str, repository: &str) -> bool {
+    let address = address.trim().trim_end_matches('/');
+    let address = address.strip_suffix(".git").unwrap_or(address);
+    // A repository on this machine is named by its path, as its system
+    // writes one.
+    let mut parts = address.rsplit(['/', ':', '\\']);
+    let (name, owner) = (parts.next(), parts.next());
+    matches!((owner, name), (Some(owner), Some(name))
+        if format!("{owner}/{name}").eq_ignore_ascii_case(repository))
+}
+
+/// Brings pull request `number` of `origin` into `branch`, where `origin`
+/// is `repository`. A branch that is already there is brought up to date
+/// when it only has to move forward, and left as it is otherwise.
+fn fetch_pull_request(
+    cwd: &Path,
+    branch: &str,
+    repository: &str,
+    number: u64,
+) -> Result<(), String> {
+    let root = list(cwd)?[0].0.clone();
+    let origin = git(&root, &["remote", "get-url", "origin"])
+        .map_err(|_| "This repository has no remote named origin".to_owned())?;
+    if !is_origin(&origin, repository) {
+        return Err(format!(
+            "The repository of this terminal is not {repository}. Focus a terminal in it"
+        ));
+    }
+    let known = git(
+        &root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok();
+    let fetched = git(
+        &root,
+        &["fetch", "origin", &format!("pull/{number}/head:{branch}")],
+    );
+    match fetched {
+        Ok(_) => Ok(()),
+        // One that is checked out, or has work of its own, stays.
+        Err(_) if known => Ok(()),
+        Err(why) => Err(why),
+    }
+}
+
 /// Makes the worktree of `branch`, or finds the one it already has. A new
 /// branch starts from the base branch; an existing one is checked out as is.
 fn create(cwd: &Path, branch: &str) -> Result<Worktree, String> {
@@ -630,6 +705,46 @@ mod tests {
         git(directory, arguments).unwrap_or_else(|error| panic!("git {arguments:?}: {error}"))
     }
     /// A repository with one commit on `main`, in a directory of its own.
+    #[test]
+    fn a_pull_request_is_fetched_into_a_branch_of_its_own_from_its_own_repository() {
+        for (address, is) in [
+            ("https://github.com/zevem/neptune.git", true),
+            ("git@github.com:Zevem/Neptune", true),
+            ("https://github.com/zevem/neptune/", true),
+            (r"C:\work\zevem\neptune", true),
+            ("https://github.com/other/neptune.git", false),
+            ("neptune", false),
+        ] {
+            assert_eq!(is_origin(address, "zevem/neptune"), is, "{address}");
+        }
+        // A repository that stands in for the host, with a pull request's
+        // head where a host keeps it.
+        let (_host_directory, host) = repository();
+        run(&host, &["checkout", "--quiet", "-b", "feature"]);
+        commit(&host, "feature.txt", "work");
+        run(&host, &["update-ref", "refs/pull/7/head", "HEAD"]);
+        run(&host, &["checkout", "--quiet", "main"]);
+        let (_directory, root) = repository();
+        // Named as the address of the repository it is asked for.
+        let named = host.parent().unwrap().join("zevem").join("neptune");
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        std::fs::rename(&host, &named).unwrap();
+        run(&root, &["remote", "add", "origin", named.to_str().unwrap()]);
+        assert!(
+            fetch_pull_request(&root, "pr-7", "other/neptune", 7)
+                .unwrap_err()
+                .contains("is not other/neptune")
+        );
+        fetch_pull_request(&root, "pr-7", "zevem/neptune", 7).unwrap();
+        let made = create(&root, "pr-7").unwrap();
+        assert!(made.path.join("feature.txt").is_file());
+        assert_eq!(made.branch, "pr-7");
+        // Asked for again, the branch that is checked out stays as it is.
+        fetch_pull_request(&root, "pr-7", "zevem/neptune", 7).unwrap();
+        assert_eq!(create(&root, "pr-7").unwrap().path, made.path);
+        assert!(fetch_pull_request(&root, "pr-8", "zevem/neptune", 8).is_err());
+    }
+
     fn repository() -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap().join("project");

@@ -179,9 +179,15 @@ icon buttons keep a 28-point target around a 16-point glyph.
   is resized once to the size it will rest at, and a toggle reversed midway
   turns around from where it is. Its leading edge resizes it (220–560 points;
   double-click restores 300) and it always leaves the terminals 240 points. A
-  34-point strip at its top holds four tabs, "Files", "Agents", "Changes" and
-  "Project", of equal width unless the panel is too narrow for a name, where
-  they are set closer and each takes what its name needs. They are drawn like terminal tabs: the one in view takes a faint fill. They
+  34-point strip at its top holds five tabs, "Files", "Agents", "Changes",
+  "Project" and "Pull request", of equal width unless the panel is too narrow
+  for a name, where they are set closer and each takes what its name needs;
+  near its narrowest the last is named "PR". Each pull request that is open
+  takes the last tab's place with a tab of its own at the strip's trailing
+  end: its number and a cross, then an icon tab that lists the linked ones.
+  They take the room the names leave, scroll sideways past it, and always
+  keep room for one; names that would be cut beside them become the icons
+  their commands have in the palette, named under the pointer. They are drawn like terminal tabs: the one in view takes a faint fill. They
   are chosen with the pointer or the command palette, never with Tab or the
   arrow keys. The Agents tab counts the agents waiting for input in a pill in
   the attention colour, and the Project tab counts what its project needs the
@@ -242,6 +248,58 @@ icon buttons keep a 28-point target around a 16-point glyph.
   is not a repository, an SSH workspace, a missing Git and a branch with
   nothing to compare with each say so in muted text. Git runs off the UI
   thread; a frame is drawn only when what it reported changed.
+- **Pull request.** The Pull request tab shows one pull request, opened by
+  pressing its number on a terminal's tab; pressed as a terminal's link is
+  (Ctrl or Command), the number opens the browser instead. A 30-point row
+  leads with a back chevron, the state's icon, the repository in the
+  secondary colour and the number in the state's colour, which together open
+  the host's page, and trails "Refresh pull request" and a "⋯" menu. Under
+  it the title is set in the medium weight at 14 points on two lines at
+  most, then a pill in the state's tint with its icon and word beside who
+  opened it and when it last changed, then a segmented control "Summary",
+  "Timeline", "Code". The state keeps the colours of a linked number:
+  accent open, `secondary` draft, `muted` closed, `merged` once merged.
+  Summary scrolls and leads with one card on `control` that says where the
+  pull request stands in a line (a green check "Ready to merge", a red
+  warning for conflicts, requested changes or failing checks, a yellow ring
+  while checks run, a muted ring otherwise) with its one action at the
+  trailing edge, under the line where both do not fit: the accent merge
+  button, "Ready for review" or a plain "Reopen". Merging and closing ask
+  once more in the card, with "Cancel" and the confirming button, which is
+  red for closing. What the host refused is a card in the red tint with its
+  words and a dismiss control. Then the branches in the terminal face (the
+  source is a chip that copies its name and says "Copied"), the lines added
+  and removed, and labelled rows that wrap: reviewers and assignees as a
+  disc in an identity colour with an initial (no picture is loaded) and the
+  reviewer's verdict as a check, a cross, a comment or a ring, labels as
+  pills. "Description" and "Checks" are headings that fold; a check is a
+  26-point row with the mark of a linked number's checks, its name, its
+  workflow in muted text and how long it ran or its state in words.
+  Comments are cards on `control`: the writer's disc and name, what they did
+  ("commented", "approved" in green, "requested changes" in red), the age
+  and an arrow to the host, the file and line of a review conversation in
+  the terminal face with "Outdated" and "Resolved", the Markdown, and
+  replies set in behind a two-point bar. Timeline is the same things said
+  in order on a rail of 19-point marks joined by a `separator` hairline.
+  Code is the Changes tab's list and diff. A round control on the elevated
+  material floats over the bottom trailing corner and opens the field for a
+  comment or review at the bottom of the tab, under a hairline, with its
+  one accent button; a field that leaves view gives up the keyboard and
+  keeps its text. Rows that can be added to end in a "+" that opens a menu with what is in
+  use ticked. Under a comment its reactions are pills of a small outline picture and a count
+  (the person's own in the accent tint) with a "+" for another, and a review
+  conversation trails "Reply" and "Resolve"; a reply and an edited
+  description are written in a field in place, with "Cancel" and one
+  accent button. In Code a line something is said of carries a two-point
+  accent bar at its leading edge, and the lines of the open diff take a
+  press that opens a field for a comment in the diff, under that line, on
+  the elevated material. Side by side, what was takes the leading half of
+  the diff and what is the trailing one; wrapped, a long line goes on
+  under itself, set in from the numbers. Without a pull request the tab lists the linked ones as
+  46-point rows of an icon, `owner/repo#N` and the state in words. Reading
+  and every change run off the UI thread; a pull request in view is drawn
+  again every 30 seconds for its ages, and otherwise only when what was
+  read changed.
 - **Project.** The Project tab holds the project of the workspace in view,
   and is a conversation with its lead. A workspace without one shows the
   creation form: "New project", a muted line naming the directory, and one

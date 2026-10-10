@@ -1786,6 +1786,7 @@ impl App {
                         .map(|link| ui::helpers::LinkedPullRequest {
                             link: link.clone(),
                             lookup: self.pull_requests.lookup(link),
+                            preview: self.pull_requests.preview(link),
                         })
                         .collect(),
                     ready: run.is_some_and(|run| run.unread.contains(&pane.id().get())),
@@ -2644,6 +2645,7 @@ impl App {
                     .map(|link| ui::helpers::LinkedPullRequest {
                         link: link.clone(),
                         lookup: self.pull_requests.lookup(link),
+                        preview: self.pull_requests.preview(link),
                     })
                     .collect();
                 // As the pull request stands now, not when the row was drawn.
@@ -7827,11 +7829,14 @@ mod tests {
             // once, from what the lead was last told.
             app.pull_requests = pull_requests::Watcher::with(Box::new(|_, links| {
                 vec![
-                    Some(pull_requests::Status {
-                        state: pull_requests::State::Open,
-                        checks: pull_requests::Checks::Failing,
-                        unresolved: 0,
-                    });
+                    Some((
+                        pull_requests::Status {
+                            state: pull_requests::State::Open,
+                            checks: pull_requests::Checks::Failing,
+                            unresolved: 0,
+                        },
+                        pull_requests::Preview::default(),
+                    ));
                     links.len()
                 ]
             }));
@@ -7911,11 +7916,14 @@ mod tests {
     ) {
         app.pull_requests = pull_requests::Watcher::with(Box::new(move |_, links| {
             vec![
-                Some(pull_requests::Status {
-                    state,
-                    checks,
-                    unresolved,
-                });
+                Some((
+                    pull_requests::Status {
+                        state,
+                        checks,
+                        unresolved,
+                    },
+                    pull_requests::Preview::default(),
+                ));
                 links.len()
             ]
         }));

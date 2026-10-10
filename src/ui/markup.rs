@@ -531,8 +531,28 @@ fn parse_blocks(text: &str, lines: Lines, verbatim_code: bool) -> Vec<Placed> {
 /// File documents also show Markdown images and HTML `img` elements.
 /// Other HTML stays literal; this parser never executes markup.
 pub fn document_blocks(text: &str) -> Vec<Placed> {
+    with_pictures(parse_blocks(text, Lines::Joined, true))
+}
+
+/// What someone wrote on a web host, its pictures blocks of their own.
+fn written_blocks(text: &str) -> Vec<Placed> {
+    with_pictures(blocks(text, Lines::Kept))
+}
+
+/// Where the pictures of what someone wrote come from, in their order.
+pub fn pictures_in(text: &str) -> Vec<String> {
+    written_blocks(text)
+        .into_iter()
+        .filter_map(|placed| match placed.block {
+            Block::Image(image) => Some(image.source),
+            _ => None,
+        })
+        .collect()
+}
+
+fn with_pictures(blocks: Vec<Placed>) -> Vec<Placed> {
     let mut result = Vec::new();
-    for placed in parse_blocks(text, Lines::Joined, true) {
+    for placed in blocks {
         let text = match &placed.block {
             Block::Text(text)
             | Block::Bullet(text)
@@ -1696,7 +1716,32 @@ fn render(
     ink: Color32,
     actions: Option<&mut Vec<Action>>,
 ) -> Option<Rect> {
-    render_blocks(ui, p, &blocks(text, lines), lines, ink, actions, None)
+    render_blocks(ui, p, &blocks(text, lines), lines, ink, actions, None, None)
+}
+
+/// The pictures of what someone wrote, by where each comes from: one that
+/// could not be had is nothing, and one not here yet is still on its way.
+pub type Pictures = HashMap<String, Option<Picture>>;
+
+/// The same as `show_in` for what someone wrote on a web host, with its
+/// pictures drawn. A picture that leads nowhere opens itself when pressed.
+pub fn show_written(
+    ui: &mut Ui,
+    p: Palette,
+    text: &str,
+    pictures: &Pictures,
+    actions: &mut Vec<Action>,
+) -> Option<Rect> {
+    render_blocks(
+        ui,
+        p,
+        &written_blocks(text),
+        Lines::Kept,
+        p.fg,
+        Some(actions),
+        None,
+        Some(pictures),
+    )
 }
 
 /// Draws a document already parsed by a file-preview worker.
@@ -1718,9 +1763,11 @@ pub fn show_document(
         p.fg,
         Some(actions),
         Some((path, document, anchor)),
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_blocks(
     ui: &mut Ui,
     p: Palette,
@@ -1729,6 +1776,7 @@ fn render_blocks(
     ink: Color32,
     mut actions: Option<&mut Vec<Action>>,
     document: Option<(&Path, &Document, Option<&str>)>,
+    pictures: Option<&Pictures>,
 ) -> Option<Rect> {
     let marker = |ui: &mut Ui, block: &Block| {
         let (_, marker) = ui.allocate_space(vec2(16.0, LINE));
@@ -1834,7 +1882,11 @@ fn render_blocks(
                     .rect
             }
             Block::Image(image) => {
-                let picture = document.and_then(|(_, document, _)| document.pictures.get(&index));
+                let written = pictures.map(|pictures| pictures.get(&image.source));
+                let picture = match written {
+                    Some(found) => found.and_then(Option::as_ref),
+                    None => document.and_then(|(_, document, _)| document.pictures.get(&index)),
+                };
                 let rect = if let Some(picture) = picture {
                     let mut size = vec2(picture.pixels[0] as f32, picture.pixels[1] as f32);
                     match (image.width, image.height) {
@@ -1863,7 +1915,10 @@ fn render_blocks(
                     );
                     response.on_hover_text(&image.alt).rect
                 } else {
-                    let loading = document.is_some_and(|(_, document, _)| document.loading_images);
+                    let loading = match written {
+                        Some(found) => found.is_none(),
+                        None => document.is_some_and(|(_, document, _)| document.loading_images),
+                    };
                     let status = if loading {
                         "Loading image…"
                     } else {
@@ -1877,14 +1932,20 @@ fn render_blocks(
                     ui.label(egui::RichText::new(caption).color(p.muted))
                         .on_hover_text(if loading {
                             "Pictures load in the background"
+                        } else if written.is_some() {
+                            "This picture is not shown here. Press to open it in the browser."
                         } else {
                             "Could not load this picture or the document's image limit was reached"
                         })
                         .rect
                 };
+                // A picture someone wrote in opens itself where it leads nowhere.
+                let leads = image
+                    .link
+                    .as_deref()
+                    .or(written.map(|_| image.source.as_str()));
                 if let Some((actions, _, _)) = links
-                    && let Some(target) =
-                        image.link.as_deref().and_then(|link| target_at(link, base))
+                    && let Some(target) = leads.and_then(|link| target_at(link, base))
                 {
                     let response = ui.interact(
                         rect,
@@ -1898,7 +1959,7 @@ fn render_blocks(
                     }
                     if response
                         .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text(image.link.as_deref().unwrap_or_default())
+                        .on_hover_text(leads.unwrap_or_default())
                         .clicked()
                     {
                         actions.push(target.action());
@@ -2310,6 +2371,24 @@ mod tests {
     }
     fn links(text: &str) -> Vec<String> {
         inline(text, true).links
+    }
+
+    #[test]
+    fn what_is_written_on_a_host_keeps_its_lines_and_shows_its_pictures() {
+        let text = "Before, no tab.\nAfter:\n<img alt=\"The tab\" src=\"https://github.com/a.png\" />\n\n- ![Two](https://github.com/b.png) beside\n\n`![not](one.png)`";
+        assert_eq!(
+            pictures_in(text),
+            ["https://github.com/a.png", "https://github.com/b.png"]
+        );
+        let kinds: Vec<_> = written_blocks(text)
+            .into_iter()
+            .map(|placed| placed.block)
+            .collect();
+        assert!(matches!(&kinds[0], Block::Text(text) if text == "Before, no tab.\nAfter:"));
+        assert!(matches!(&kinds[1], Block::Image(image) if image.alt == "The tab"));
+        assert!(matches!(&kinds[2], Block::Image(image) if image.alt == "Two"));
+        assert!(matches!(&kinds[3], Block::Text(text) if text == "beside"));
+        assert!(matches!(&kinds[4], Block::Text(text) if text.contains("not")));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Label and window helpers, plus the shared controls of the visual system.
 pub use super::controls::*;
-use crate::runtime::pull_requests::{Checks, Lookup, State, unresolved_label};
+use crate::runtime::pull_requests::{Checks, Lookup, Preview, State, unresolved_label};
 use eframe::egui::{self, Rect, Sense, Vec2};
 pub fn compact_path(path: &std::path::Path) -> String {
     let text = path.display().to_string();
@@ -155,6 +155,8 @@ pub fn path_label(path: &std::path::Path, max: usize) -> String {
 pub struct LinkedPullRequest {
     pub link: neptune_model::PullRequest,
     pub lookup: Lookup,
+    /// Its title, author and age, once its state was read.
+    pub preview: Option<Preview>,
 }
 impl LinkedPullRequest {
     /// Its state in the chip's icon and colour. A merged pull request has its
@@ -207,7 +209,8 @@ impl PullRequestChip {
     }
 }
 
-/// Pull request numbers that open their pull request, laid out leading from
+/// Pull request numbers that open their pull request in the panel's tab, or
+/// in the browser when pressed as a terminal's link is, laid out leading from
 /// a trailing edge. Each carries its state: a colour and icon once merged,
 /// closed or a draft, and while in review a mark for its checks and a count of
 /// unresolved comments. Interaction is claimed first so the surface beneath
@@ -349,8 +352,15 @@ impl<'a> PullRequestChips<'a> {
         actions: &mut Vec<super::Action>,
     ) {
         use crate::icons::{self, Icon};
+        // The press that opens a terminal's link in the browser does so here.
+        let outside = painter
+            .ctx()
+            .input(|input| input.modifiers.ctrl || input.modifiers.mac_cmd);
         let open = |link: &neptune_model::PullRequest, actions: &mut Vec<super::Action>| {
-            if let Some(link) = crate::platform::links::WebLink::new(link.url()) {
+            if !outside {
+                let shown = super::pull_request::Event::Open(link.clone());
+                actions.push(super::Action::PullRequest(shown));
+            } else if let Some(link) = crate::platform::links::WebLink::new(link.url()) {
                 actions.push(super::Action::OpenLink(link));
             }
         };
@@ -404,15 +414,74 @@ impl<'a> PullRequestChips<'a> {
             }
             let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
             if !self.menu {
-                let mut text = format!("Open pull request {}", linked.link.label());
-                match linked.lookup {
-                    Lookup::Known(status) => text = format!("{text}\n{}", status.describe()),
-                    Lookup::Unavailable => text.push_str(
-                        "\nStatus unavailable. Neptune reads it with the GitHub CLI (gh), signed in.",
-                    ),
-                    Lookup::Checking => {}
-                }
-                if response.on_hover_text(text).clicked() {
+                // A card that says what it is before it is opened: its
+                // title, where it lives, who opened it and when, how it
+                // stands, and the other way to open it.
+                let stands = match linked.lookup {
+                    Lookup::Known(status) => status.describe(),
+                    Lookup::Unavailable => {
+                        "Status unavailable. Neptune reads it with the GitHub CLI (gh), signed in."
+                            .to_owned()
+                    }
+                    Lookup::Checking => String::new(),
+                };
+                let said = linked
+                    .preview
+                    .as_ref()
+                    .filter(|said| !said.title.is_empty());
+                let hint = if cfg!(target_os = "macos") {
+                    "Click to read it here · ⌘-click for the browser"
+                } else {
+                    "Click to read it here · Ctrl+click for the browser"
+                };
+                let (icon, ink) = (chip.icon, chip.ink);
+                let response = response.on_hover_ui(|ui| {
+                    use crate::theme;
+                    ui.set_max_width(300.0);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    let label = |ui: &mut egui::Ui, text: String, font, color| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).font(font).color(color))
+                                .wrap()
+                                .selectable(false),
+                        );
+                    };
+                    match said {
+                        Some(said) => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |since| since.as_secs() as i64);
+                            label(ui, said.title.clone(), theme::medium(12.5), p.fg);
+                            label(
+                                ui,
+                                format!(
+                                    "{} · {} · opened {}",
+                                    linked.link.label(),
+                                    said.author,
+                                    super::pull_request::ago(now - said.opened)
+                                ),
+                                theme::regular(11.5),
+                                p.secondary,
+                            );
+                        }
+                        None => label(
+                            ui,
+                            format!("Pull request {}", linked.link.label()),
+                            theme::medium(12.5),
+                            p.fg,
+                        ),
+                    }
+                    if !stands.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let (_, mark) = ui.allocate_space(Vec2::splat(13.0));
+                            icons::paint(ui.painter(), mark, icon, ink);
+                            label(ui, stands.clone(), theme::regular(11.5), ink);
+                        });
+                    }
+                    label(ui, hint.to_owned(), theme::regular(11.0), p.muted);
+                });
+                if response.clicked() {
                     open(&linked.link, actions);
                 }
                 continue;
@@ -638,6 +707,7 @@ mod tests {
                 checks,
                 unresolved,
             }),
+            preview: None,
         };
         let failing = linked(7, State::Open, Checks::Failing, 2);
         let merged = linked(8, State::Merged, Checks::Failing, 3);
@@ -699,5 +769,61 @@ mod tests {
         assert_eq!(shown(&reordered), Some(p.secondary));
         // With none in review, the newest stands for them.
         assert_eq!(shown(&narrower), Some(p.muted));
+    }
+
+    #[test]
+    fn a_pressed_number_opens_its_tab_and_the_browser_when_pressed_as_a_link_is() {
+        use eframe::egui::{Event, Modifiers, PointerButton, RawInput, pos2};
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let p = crate::theme::Palette::new(crate::config::Theme::Graphite);
+        let links = [LinkedPullRequest {
+            link: neptune_model::PullRequest::parse("https://github.com/zevem/neptune/pull/83")
+                .unwrap(),
+            lookup: Lookup::Checking,
+            preview: None,
+        }];
+        let press = |modifiers: Modifiers| {
+            let mut actions = Vec::new();
+            let mut at = pos2(390.0, 20.0);
+            let button = |pressed| Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers,
+            };
+            for events in [
+                vec![Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+            ] {
+                let mut events = events;
+                events.insert(0, Event::ModifiersChanged(modifiers));
+                let input = RawInput {
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    let chips =
+                        PullRequestChips::layout(ui, ui.id(), &links, (200.0, 400.0, 20.0), p);
+                    at = pos2((chips.left + 400.0) * 0.5, 20.0);
+                    let painter = ui.painter().clone();
+                    chips.paint(&painter, p, &mut actions);
+                });
+                output.textures_delta.clear();
+            }
+            actions
+        };
+        assert!(matches!(
+            press(Modifiers::NONE).as_slice(),
+            [crate::ui::Action::PullRequest(crate::ui::pull_request::Event::Open(link))]
+                if link.number() == 83
+        ));
+        for modifiers in [Modifiers::CTRL, Modifiers::MAC_CMD] {
+            assert!(matches!(
+                press(modifiers).as_slice(),
+                [crate::ui::Action::OpenLink(link)] if link.as_str().ends_with("/pull/83")
+            ));
+        }
     }
 }
