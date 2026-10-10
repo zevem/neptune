@@ -2,6 +2,7 @@
 //! may change durable workspace state; renderer caches remain desktop-owned.
 pub mod agents;
 pub mod attached;
+pub mod browser;
 pub mod changes;
 pub mod chat;
 pub mod chrome;
@@ -85,6 +86,7 @@ pub enum CloseStatus {
 pub struct UiState {
     pub overlay: OverlayState,
     pub close_status: CloseStatus,
+    pub close_browser: bool,
     pub preferences: theme_browser::State,
     /// The Preferences pane in view and the settings search.
     pub preference_view: preferences::View,
@@ -139,6 +141,10 @@ pub enum Action {
     Split(PaneId, Axis),
     /// Open a terminal as a tab beside this one.
     NewTab(PaneId),
+    NewBrowser(PaneId, Option<Axis>, Option<String>),
+    Browser(PaneId, u64, crate::runtime::browser::protocol::Command),
+    NavigateBrowser(PaneId, u64, String),
+    BrowserAddress(PaneId),
     MovePane(PaneId, Destination),
     ClosePane(PaneId),
     /// Put a terminal's tab away. Its agent runs on out of view, listed
@@ -284,6 +290,7 @@ pub struct Branch {
     pub dirty: bool,
 }
 pub struct PaneRender {
+    pub browser: browser::State,
     pub preedit: String,
     pub id: PaneId,
     pub cache: Cache,
@@ -293,6 +300,7 @@ pub struct PaneRender {
 impl PaneRender {
     pub fn new(id: PaneId) -> Self {
         Self {
+            browser: browser::State::default(),
             id,
             preedit: String::new(),
             cache: Cache::default(),

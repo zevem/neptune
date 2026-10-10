@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/terminal-core", "crates/neptune-model"]
+members = ["crates/terminal-core", "crates/neptune-model", "crates/browser-host"]
 resolver = "3"
 
 [package]

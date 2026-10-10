@@ -100,6 +100,19 @@ impl App {
             .collect();
         for effect in effects {
             match effect {
+                Effect::StartBrowser { pane, generation } => {
+                    self.renders.insert(pane, PaneRender::new(pane));
+                    if let Err(error) = self.browsers.start(ctx, pane, generation) {
+                        self.dispatch(
+                            ctx,
+                            Command::SessionFailed {
+                                pane,
+                                generation,
+                                error: error.into(),
+                            },
+                        );
+                    }
+                }
                 Effect::StartSession {
                     pane,
                     generation,
@@ -183,6 +196,7 @@ impl App {
                     }
                 }
                 Effect::StopSession { pane, .. } => {
+                    self.browsers.close(pane);
                     self.desktop_notifier.cancel(pane);
                     if !replacements.contains(&pane) {
                         self.sessions.close(pane);
@@ -529,6 +543,57 @@ impl App {
             Action::Disconnect(workspace) => self.request_close(ctx, Close::Connection(workspace)),
             Action::Split(pane, axis) => self.open_beside(ctx, pane, Some(axis)),
             Action::NewTab(pane) => self.open_beside(ctx, pane, None),
+            Action::NewBrowser(pane, axis, url) => {
+                let previous = self.controller.model().active_pane();
+                if let Some(workspace) = self.controller.model().workspace_for_pane(pane) {
+                    self.dispatch(
+                        ctx,
+                        Command::OpenBrowser {
+                            workspace,
+                            pane,
+                            axis,
+                        },
+                    );
+                    if let Some(opened) = self.controller.model().active_pane()
+                        && Some(opened) != previous
+                        && opened != pane
+                        && let Some(item) = self.controller.model().pane(opened)
+                        && item.kind() == neptune_model::PaneKind::Browser
+                    {
+                        if let Some(url) = url {
+                            if let Err(error) =
+                                self.browsers.navigate(opened, item.generation(), &url)
+                            {
+                                self.ui.error = Some(error.into());
+                            }
+                        } else if let Some(render) = self.renders.get_mut(&opened) {
+                            render.browser.focus_address = true;
+                        }
+                    }
+                }
+            }
+            Action::Browser(pane, generation, command) => {
+                if self.controller.model().pane(pane).is_some_and(|p| {
+                    p.generation() == generation && p.kind() == neptune_model::PaneKind::Browser
+                }) && let Err(error) = self.browsers.send(command)
+                {
+                    self.ui.error = Some(error.into());
+                }
+            }
+            Action::NavigateBrowser(pane, generation, url) => {
+                if self.controller.model().pane(pane).is_some_and(|p| {
+                    p.generation() == generation && p.kind() == neptune_model::PaneKind::Browser
+                }) && let Err(error) = self.browsers.navigate(pane, generation, &url)
+                {
+                    self.ui.error = Some(error.into());
+                }
+                ctx.request_repaint();
+            }
+            Action::BrowserAddress(pane) => {
+                if let Some(render) = self.renders.get_mut(&pane) {
+                    render.browser.focus_address = true;
+                }
+            }
             Action::SelectWorkspace(id) => {
                 self.dispatch(ctx, Command::SelectWorkspace(id));
                 if self.controller.model().active_workspace() == Some(id)
@@ -734,8 +799,10 @@ impl App {
                     // Search is open but the terminal has the keyboard: return
                     // to the field instead of closing it.
                     self.ui.search_focus = true;
+                } else if self.ui.search_open {
+                    self.action(ctx, Action::CloseSearch);
                 } else {
-                    self.ui.search_open = !self.ui.search_open;
+                    self.ui.search_open = true;
                     self.ui.search_focus = self.ui.search_open;
                     self.search_point = None;
                     self.search_task = None;
@@ -747,6 +814,22 @@ impl App {
             }
             Action::FindNext { reverse } => self.find_next(reverse),
             Action::CloseSearch => {
+                if let Some(pane) = self
+                    .controller
+                    .model()
+                    .active_pane()
+                    .and_then(|id| self.controller.model().pane(id))
+                    .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+                {
+                    let _ =
+                        self.browsers
+                            .send(crate::runtime::browser::protocol::Command::StopFind {
+                                target: crate::runtime::browser::protocol::Target {
+                                    pane: pane.id().get(),
+                                    generation: pane.generation(),
+                                },
+                            });
+                }
                 self.ui.search_open = false;
                 self.search_task = None;
             }
@@ -771,12 +854,38 @@ impl App {
                 }
             }
             Action::Restart(pane) => {
+                let browser_url = self
+                    .controller
+                    .model()
+                    .pane(pane)
+                    .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+                    .and_then(|p| self.browsers.address(pane, p.generation()));
                 if let Some(metadata) = self.sessions.get(pane).map(|session| session.metadata()) {
                     self.sync_directory(ctx, pane, &metadata);
                 }
                 self.dispatch(ctx, Command::RestartPane(pane));
+                if let Some(url) = browser_url.filter(|u| !u.is_empty())
+                    && let Some(item) = self.controller.model().pane(pane)
+                {
+                    let _ = self.browsers.navigate(pane, item.generation(), &url);
+                }
             }
             Action::Copy(pane) => {
+                if let Some(item) = self
+                    .controller
+                    .model()
+                    .pane(pane)
+                    .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+                {
+                    let _ = self
+                        .browsers
+                        .send(crate::runtime::browser::protocol::Command::Copy {
+                            target: crate::runtime::browser::protocol::Target {
+                                pane: pane.get(),
+                                generation: item.generation(),
+                            },
+                        });
+                }
                 if let Some(text) = self
                     .sessions
                     .get(pane)
@@ -890,7 +999,7 @@ impl App {
 
     /// Opens a terminal beside `pane`, in the directory that terminal is in:
     /// across a split, or as a tab in the same place without an axis.
-    fn open_beside(
+    pub(super) fn open_beside(
         &mut self,
         ctx: &egui::Context,
         pane: PaneId,
@@ -899,6 +1008,11 @@ impl App {
         let Some(workspace) = self.controller.model().workspace_for_pane(pane) else {
             return;
         };
+        let previous = self.controller.model().active_pane();
+        let browser_url = axis
+            .and_then(|_| self.controller.model().pane(pane))
+            .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+            .and_then(|p| self.browsers.address(pane, p.generation()));
         let local = self.remote_of(pane).is_none();
         let metadata = self.sessions.get(pane).map(|session| session.metadata());
         if let Some(metadata) = &metadata {
@@ -931,6 +1045,14 @@ impl App {
                 },
             },
         );
+        if let Some(url) = browser_url
+            && let Some(opened) = self.controller.model().active_pane()
+            && Some(opened) != previous
+            && opened != pane
+            && let Some(item) = self.controller.model().pane(opened)
+        {
+            let _ = self.browsers.navigate(opened, item.generation(), &url);
+        }
     }
 
     pub(super) fn create_workspace(

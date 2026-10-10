@@ -2,6 +2,7 @@
 """Wrap a built macOS executable in Neptune.app with its Finder/Dock icon."""
 
 import argparse
+import importlib.util
 from pathlib import Path
 import plistlib
 import shutil
@@ -26,6 +27,19 @@ def main() -> None:
     executable = contents / "MacOS/neptune"
     shutil.copy2(args.binary, executable)
     executable.chmod(executable.stat().st_mode | 0o111)
+    shutil.copy2(args.binary.parent / "neptune-browser", contents / "MacOS/neptune-browser")
+    spec = importlib.util.spec_from_file_location("common", REPO / "scripts/package-common.py")
+    common = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(common)
+    common.browser_payload(args.binary.parent, contents / "Frameworks", "macos")
+    for suffix in ("", " (Renderer)", " (GPU)", " (Plugin)", " (Alerts)"):
+        name = "Neptune Browser Helper" + suffix
+        helper = contents / "Frameworks" / (name + ".app") / "Contents"
+        (helper / "MacOS").mkdir(parents=True)
+        shutil.copy2(args.binary.parent / "neptune-browser", helper / "MacOS" / name)
+        with (helper / "Info.plist").open("wb") as output:
+            plistlib.dump({"CFBundleIdentifier": "rs.neptune.browser.helper" + suffix.replace(" ", "").replace("(", ".").replace(")", "").lower(), "CFBundleName": name, "CFBundleExecutable": name, "CFBundlePackageType": "APPL", "LSUIElement": True}, output)
+    shutil.copy2(REPO / "packaging/cef-LICENSE.txt", contents / "Resources/CEF-LICENSE.txt")
     shutil.copy2(REPO / "assets/icons/neptune.icns", contents / "Resources/neptune.icns")
     version = tomllib.loads((REPO / "Cargo.toml").read_text())["package"]["version"]
     # Apple requires numeric bundle versions. Full SemVer remains in the binary,

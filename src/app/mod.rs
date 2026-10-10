@@ -65,6 +65,7 @@ struct ActiveSearch {
 pub struct App {
     controller: Controller,
     sessions: SessionManager,
+    browsers: crate::runtime::browser::Browsers,
     renders: BTreeMap<PaneId, PaneRender>,
     config: Config,
     config_path: PathBuf,
@@ -94,6 +95,7 @@ pub struct App {
     frame_started: Instant,
     command: Option<String>,
     command_target: Option<(PaneId, u64)>,
+    browser_launch: Option<String>,
     screenshot: Option<PathBuf>,
     capture_sent: bool,
     exit_approved: bool,
@@ -244,6 +246,7 @@ impl App {
             frame_started: Instant::now(),
             command: launch.command,
             command_target: None,
+            browser_launch: launch.browser,
             screenshot: launch.screenshot,
             capture_sent: false,
             exit_approved: false,
@@ -264,6 +267,7 @@ impl App {
             file_location: None,
             file_opener: Default::default(),
             ports: Default::default(),
+            browsers: Default::default(),
             notifications: Default::default(),
             agents: Default::default(),
             delegation: Default::default(),
@@ -289,6 +293,18 @@ impl App {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        let shown = self.shown();
+        let focused = if self.ui.overlay == OverlayState::None && self.terminal_owns_shortcuts(ctx)
+        {
+            self.controller.model().active_pane()
+        } else {
+            None
+        };
+        for completion in self.browsers.poll(ctx, &shown, focused) {
+            if let Ok(effects) = self.controller.complete(completion) {
+                self.execute(ctx, effects);
+            }
+        }
         if self.startup.is_none() && !self.ephemeral {
             self.usage.start(ctx);
         }
@@ -577,13 +593,38 @@ impl App {
             let remote = self.initial_remote.take();
             self.create_workspace(ctx, cwd, None, remote, None);
         }
+        if self.command.is_some()
+            && let Some(pane) = self.controller.model().active_pane()
+            && self
+                .controller
+                .model()
+                .pane(pane)
+                .is_some_and(|p| p.kind() == neptune_model::PaneKind::Browser)
+        {
+            self.open_beside(ctx, pane, None);
+        }
         // Bind the CLI command before queued user actions can change focus.
         self.command_target = self.controller.model().active_pane().and_then(|id| {
             self.controller
                 .model()
                 .pane(id)
+                .filter(|pane| pane.kind() == neptune_model::PaneKind::Terminal)
                 .map(|pane| (id, pane.generation()))
         });
+        if self.command.is_some() && self.command_target.is_none() {
+            self.command = None;
+            self.ui.error.get_or_insert_with(|| {
+                "The startup command needs an available terminal pane.".into()
+            });
+        }
+        if let Some(url) = self.browser_launch.take()
+            && let Some(pane) = self.controller.model().active_pane()
+        {
+            self.action(
+                ctx,
+                Action::NewBrowser(pane, Some(neptune_model::Axis::Vertical), Some(url)),
+            );
+        }
         for action in std::mem::take(&mut self.deferred_actions) {
             self.action(ctx, action);
         }
@@ -662,11 +703,58 @@ impl App {
             .iter()
             .map(|pane| {
                 let shown = shown.contains(&pane.id());
-                let presentation = if let Some(session) = self.sessions.get(pane.id()) {
+                let presentation = if pane.kind() == neptune_model::PaneKind::Browser {
+                    let browser = self.browsers.view(pane.id(), pane.generation()).unwrap_or(
+                        crate::runtime::browser::View {
+                            state: crate::runtime::browser::protocol::State {
+                                error: match pane.lifecycle() {
+                                    Lifecycle::Failed(error) => Some(error.clone()),
+                                    _ => None,
+                                },
+                                ..Default::default()
+                            },
+                            texture: None,
+                            popup: None,
+                            failed: matches!(pane.lifecycle(), Lifecycle::Failed(_)),
+                        },
+                    );
+                    PanePresentation {
+                        browser: Some(browser.clone()),
+                        generation: pane.generation(),
+                        ports: Vec::new(),
+                        agent: None,
+                        pull_requests: Vec::new(),
+                        attached: Vec::new(),
+                        spawned: Vec::new(),
+                        can_background: false,
+                        worktree: None,
+                        unread: 0,
+                        metadata: SessionMetadata {
+                            title: if browser.state.title.is_empty()
+                                || browser.state.url == "about:blank"
+                            {
+                                "Browser".into()
+                            } else {
+                                browser.state.title.clone()
+                            },
+                            shell: "Browser".into(),
+                            cwd: pane.cwd().into(),
+                            reported_cwd: None,
+                            process_id: None,
+                            remote_process_id: None,
+                            status: SessionStatus::Running,
+                            bell_count: 0,
+                        },
+                        snapshot: None,
+                        starting: false,
+                        remote: None,
+                    }
+                } else if let Some(session) = self.sessions.get(pane.id()) {
                     if shown {
                         session.acknowledge_repaint();
                     }
                     PanePresentation {
+                        browser: None,
                         generation: pane.generation(),
                         ports: self.ports.view(pane.id(), pane.generation()).to_vec(),
                         agent: pane.agent().map(|agent| agent.kind),
@@ -695,6 +783,7 @@ impl App {
                         _ => "Starting shell…".into(),
                     };
                     PanePresentation {
+                        browser: None,
                         generation: pane.generation(),
                         ports: Vec::new(),
                         agent: None,
@@ -737,11 +826,56 @@ impl App {
     fn find_next(&mut self, reverse: bool) {
         if self.ui.search.is_empty() {
             self.search_task = None;
+            self.search_query = None;
+            self.ui.search_error = None;
+            if let Some(pane) = self
+                .controller
+                .model()
+                .active_pane()
+                .and_then(|id| self.controller.model().pane(id))
+                .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+            {
+                let _ = self
+                    .browsers
+                    .send(crate::runtime::browser::protocol::Command::StopFind {
+                        target: crate::runtime::browser::protocol::Target {
+                            pane: pane.id().get(),
+                            generation: pane.generation(),
+                        },
+                    });
+            }
             return;
         }
         let Some(pane) = self.controller.model().active_pane() else {
             return;
         };
+        if let Some(item) = self
+            .controller
+            .model()
+            .pane(pane)
+            .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+        {
+            self.ui.search_error = None;
+            let next = self
+                .search_query
+                .as_ref()
+                .is_some_and(|(q, _)| q == &self.ui.search);
+            let _ = self
+                .browsers
+                .send(crate::runtime::browser::protocol::Command::Find {
+                    target: crate::runtime::browser::protocol::Target {
+                        pane: pane.get(),
+                        generation: item.generation(),
+                    },
+                    text: self.ui.search.clone(),
+                    reverse,
+                    next,
+                });
+            if let Ok(query) = SearchQuery::compile(&ui::helpers::regex_escape(&self.ui.search)) {
+                self.search_query = Some((self.ui.search.clone(), query));
+            }
+            return;
+        }
         let Some(session) = self.sessions.get(pane) else {
             return;
         };
@@ -878,6 +1012,14 @@ impl eframe::App for App {
         self.file_drag.attach(frame, ctx);
         self.poll_directory(ctx);
         self.poll_worktrees(ctx);
+        if self.browsers.has_previews() {
+            self.browsers.display_rate(
+                frame
+                    .winit_window()
+                    .and_then(|window| window.current_monitor())
+                    .and_then(|monitor| monitor.refresh_rate_millihertz()),
+            );
+        }
         window::sync_minimized(
             ctx,
             frame
@@ -1076,6 +1218,9 @@ impl eframe::App for App {
             sidebar_order: self.controller.model().sidebar_order(),
             active,
             pane: active_pane,
+            pane_kind: active_pane
+                .and_then(|pane| self.controller.model().pane(pane))
+                .map_or(neptune_model::PaneKind::Terminal, |pane| pane.kind()),
             subtitle: &subtitle,
             pull_requests,
             attached,
@@ -1314,8 +1459,37 @@ impl eframe::App for App {
         } else {
             crate::input::RoutingContext::Overlay
         };
-        if let Some(rect) = output.active_body {
+        if let Some(rect) = output.active_body
+            && self
+                .controller
+                .model()
+                .active_pane()
+                .and_then(|id| self.controller.model().pane(id))
+                .is_none_or(|p| p.kind() == neptune_model::PaneKind::Terminal)
+        {
             self.terminal_input(&ctx, rect, context);
+        }
+        for (pane, generation, rect) in output.browser_bodies {
+            self.browsers
+                .geometry(pane, generation, rect.size(), ctx.pixels_per_point());
+            if self.ui.overlay == OverlayState::None && !menu_open && self.ui.pane_drag.is_none() {
+                let keyboard = self.controller.model().active_pane() == Some(pane)
+                    && matches!(context, crate::input::RoutingContext::TerminalPane(_));
+                let events = self.terminal_events(&ctx);
+                if let Err(error) = self.browsers.input(
+                    crate::runtime::browser::protocol::Target {
+                        pane: pane.get(),
+                        generation,
+                    },
+                    rect,
+                    &events,
+                    keyboard,
+                    ctx.input(|i| i.modifiers),
+                    ctx.pointer_latest_pos(),
+                ) {
+                    self.ui.error = Some(error.into());
+                }
+            }
         }
         self.terminal_focus = output.active_terminal;
         // Sheets dim the whole window, following its rounded shape. A close
@@ -1419,6 +1593,9 @@ impl eframe::App for App {
                 &mut self.ui,
                 &ui::palette::PaletteView {
                     pane: self.controller.model().active_pane(),
+                    browser: active_pane
+                        .and_then(|id| self.controller.model().pane(id))
+                        .is_some_and(|p| p.kind() == neptune_model::PaneKind::Browser),
                     local: self
                         .controller
                         .model()
@@ -1522,6 +1699,7 @@ impl eframe::App for App {
         self.release_closed_overlay_focus(&ctx);
     }
     fn on_exit(&mut self) {
+        self.browsers.shutdown();
         self.usage.shutdown();
         // Leads are let go first, so each has until the shells have closed
         // to end.

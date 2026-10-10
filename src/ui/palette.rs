@@ -15,6 +15,7 @@ use neptune_model::{Axis, Destination, FocusDirection, PaneId, WorkspaceId};
 
 pub struct PaletteView<'a> {
     pub pane: Option<PaneId>,
+    pub browser: bool,
     /// The focused terminal runs on this machine, where git can be run.
     pub local: bool,
     /// The branch of the worktree the focused terminal is in.
@@ -122,6 +123,13 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         }
         list.extend([
             command(
+                "Browser",
+                Icon::Globe,
+                "New browser tab",
+                view.config.keybindings.hint(Binding::NewBrowser),
+                [Action::NewBrowser(pane, None, None)],
+            ),
+            command(
                 "Terminal",
                 Icon::Plus,
                 "New tab",
@@ -207,7 +215,63 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 [Action::ClosePane(pane)],
             ),
         ]);
-        if view.local {
+        if view.browser {
+            list.retain(|c| {
+                !c.actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Clear(_) | Action::CopyHints(_)))
+            });
+            for c in &mut list {
+                match c.title.as_str() {
+                    "Find in terminal" => c.title = "Find in page".into(),
+                    "Restart terminal" => c.title = "Restart preview".into(),
+                    "Close terminal" => c.title = "Close browser".into(),
+                    "Zoom terminal" => c.title = "Zoom browser".into(),
+                    _ => {}
+                }
+                if c.group == "Terminal" {
+                    c.group = "Browser";
+                }
+            }
+            let target = crate::runtime::browser::protocol::Target {
+                pane: pane.get(),
+                generation: view.pane_generation,
+            };
+            for (title, binding, action) in [
+                (
+                    "Focus browser address",
+                    Binding::BrowserAddress,
+                    Action::BrowserAddress(pane),
+                ),
+                (
+                    "Reload page",
+                    Binding::BrowserReload,
+                    Action::Browser(
+                        pane,
+                        view.pane_generation,
+                        crate::runtime::browser::protocol::Command::Reload { target },
+                    ),
+                ),
+                (
+                    "Developer tools",
+                    Binding::BrowserDevTools,
+                    Action::Browser(
+                        pane,
+                        view.pane_generation,
+                        crate::runtime::browser::protocol::Command::DevTools { target },
+                    ),
+                ),
+            ] {
+                list.push(command(
+                    "Browser",
+                    Icon::Globe,
+                    title,
+                    view.config.keybindings.hint(binding),
+                    [action],
+                ));
+            }
+        }
+        if view.local && !view.browser {
             // Beside "New tab": it opens one, in a worktree of its own.
             list.insert(
                 1,
@@ -484,7 +548,9 @@ fn commands(view: &PaletteView) -> Vec<Command> {
             .find(|workspace| Some(workspace.id) == view.active)
             .map(|workspace| &workspace.remote);
         for workspace in view.workspaces {
-            if Some(workspace.id) == view.active || Some(&workspace.remote) != machine {
+            if Some(workspace.id) == view.active
+                || !view.browser && Some(&workspace.remote) != machine
+            {
                 continue;
             }
             list.push(Command {
@@ -492,7 +558,11 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 ..command(
                     "Move to",
                     Icon::ArrowUpRight,
-                    format!("Move terminal to {}", workspace.name),
+                    format!(
+                        "Move {} to {}",
+                        if view.browser { "browser" } else { "terminal" },
+                        workspace.name
+                    ),
                     "",
                     [Action::MovePane(pane, Destination::Workspace(workspace.id))],
                 )
@@ -957,6 +1027,7 @@ mod tests {
     fn view<'a>(config: &'a Config, workspaces: &'a [WorkspaceView]) -> PaletteView<'a> {
         PaletteView {
             pane: None,
+            browser: false,
             local: true,
             worktree: None,
             can_background: false,

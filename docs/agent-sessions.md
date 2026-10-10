@@ -75,10 +75,10 @@ Only provider, session ID, directory, the addresses of
 [started an agent](#agents-that-start-agents), the
 [worktree made for an agent](#agents-in-worktrees) and the
 [project](#projects) a terminal's agent belongs to are saved in workspace
-schema 13, which reads versions 1–12; version 10 widened the CLIs a reference
+schema 14, which reads versions 1–13; version 10 widened the CLIs a reference
 can name, version 12 added the pull requests and files of
 [conversations set aside](#a-new-conversation), under their provider and
-session ID, and version 13 added projects. Invalid references receive the same
+session ID, version 13 added projects, and version 14 added browser pane kinds. Invalid references receive the same
 recovery-copy protection as other damaged workspace state. Prompts,
 transcripts, arbitrary commands, credentials and permission-bypass flags are
 not saved or replayed. The one exception is a [project](#projects), which

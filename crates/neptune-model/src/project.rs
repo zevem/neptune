@@ -1119,6 +1119,7 @@ mod tests {
             plain.id = WorkspaceId::new(50);
             plain.panes = vec![PaneSpec {
                 id: PaneId::new(50),
+                kind: crate::PaneKind::Terminal,
                 cwd: std::env::temp_dir(),
                 remote_cwd: None,
                 agent: None,
@@ -1202,6 +1203,7 @@ mod tests {
         elsewhere.id = WorkspaceId::new(50);
         elsewhere.panes = vec![PaneSpec {
             id: PaneId::new(50),
+            kind: crate::PaneKind::Terminal,
             ..moved[0].panes[1].clone()
         }];
         elsewhere.layout = crate::Layout::pane(PaneId::new(50));

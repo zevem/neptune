@@ -62,6 +62,7 @@ pub enum Icon {
     Pause,
     Play,
     Stop,
+    Lock,
     /// The eight reactions a host has, each a small picture.
     ThumbUp,
     ThumbDown,
@@ -533,6 +534,17 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             ]);
             line(&[[10.0, 10.5], [10.3, 17.0]]);
             line(&[[14.0, 10.5], [13.7, 17.0]]);
+        }
+        Icon::Lock => {
+            // A shackle over the body: a page reached over a secure connection.
+            let mut shackle = vec![[8.5, 10.5]];
+            for step in 0..=8 {
+                let angle = std::f32::consts::PI * (1.0 + step as f32 / 8.0);
+                shackle.push([12.0 + 3.5 * angle.cos(), 7.5 + 3.5 * angle.sin()]);
+            }
+            shackle.push([15.5, 10.5]);
+            line(&shackle);
+            rectangle(5.5, 10.5, 13.0, 9.5, 2.5);
         }
         Icon::ThumbUp | Icon::ThumbDown => {
             // A cuff and the hand that leaves it, thumb up; turned over for

@@ -37,6 +37,7 @@ Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Files]
 Source: "..\target\x86_64-pc-windows-msvc\release\neptune.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\package\windows-browser\*"; DestDir: "{app}\browser"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\package\windows\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

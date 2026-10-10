@@ -877,6 +877,7 @@ mod tests {
         let mut specs = controller.model().specs();
         specs[0].panes.push(crate::PaneSpec {
             id: crate::PaneId::new(90),
+            kind: crate::PaneKind::Terminal,
             cwd: std::env::temp_dir(),
             remote_cwd: None,
             agent: None,

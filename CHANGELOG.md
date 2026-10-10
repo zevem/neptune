@@ -11,6 +11,11 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Preview websites beside your terminal with browser tabs that move and split
+  within the same workspace. Open a local dev-server port, navigate and search
+  pages, or inspect them with developer tools. Browser painting follows the
+  display's refresh rate and pauses for hidden previews; tabs restore blank,
+  without saving browsing history or addresses.
 - Read a pull request without leaving the terminal. Click a pull request's
   number on a terminal's tab and it opens in the new **Pull request** tab of
   the right panel: its title and state, what stands between it and a merge,

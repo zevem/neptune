@@ -1,6 +1,6 @@
 # Development guide
 
-Neptune uses `egui`/`eframe` with `wgpu`, `alacritty_terminal` for terminal state, and `portable-pty` for Unix PTYs and Windows ConPTY. It contains no webview. This repository is an initial implementation: Linux is the local verification platform; macOS and Windows need native runtime verification before a production release.
+Neptune uses `egui`/`eframe` with `wgpu`, `alacritty_terminal` for terminal state, and `portable-pty` for Unix PTYs and Windows ConPTY. Its terminal and chrome remain native; optional [browser previews](browser.md) run in an isolated CEF helper. This repository is an initial implementation: Linux is the local verification platform; macOS and Windows need native runtime verification before a production release.
 
 [Project overview](../README.md) · [Build and run](installation.md#build-and-run)
 

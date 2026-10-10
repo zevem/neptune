@@ -24,6 +24,12 @@ impl FontShortcutMonitor {
     }
 }
 
+/// CEF's macOS key events use the hardware key position, not a Windows VK.
+#[cfg(target_os = "macos")]
+pub(crate) fn browser_keycode(physical: Key) -> Option<i32> {
+    macos::keycode(physical).map(i32::from)
+}
+
 /// Resolve a physical key using the current macOS layout, without modifiers.
 /// egui otherwise loses symbols such as `*` and `_` and substitutes a US key
 /// position. Query on demand so changing the input source takes effect at once.
@@ -183,7 +189,7 @@ mod macos {
     }
 
     /// macOS virtual keycodes describe US key positions, as does physical_key.
-    fn keycode(key: Key) -> Option<u16> {
+    pub(super) fn keycode(key: Key) -> Option<u16> {
         Some(match key {
             Key::A => 0x00,
             Key::S => 0x01,
@@ -233,6 +239,33 @@ mod macos {
             Key::M => 0x2e,
             Key::Period => 0x2f,
             Key::Backtick => 0x32,
+            Key::Enter => 0x24,
+            Key::Tab => 0x30,
+            Key::Space => 0x31,
+            Key::Backspace => 0x33,
+            Key::Escape => 0x35,
+            Key::F1 => 0x7a,
+            Key::F2 => 0x78,
+            Key::F3 => 0x63,
+            Key::F4 => 0x76,
+            Key::F5 => 0x60,
+            Key::F6 => 0x61,
+            Key::F7 => 0x62,
+            Key::F8 => 0x64,
+            Key::F9 => 0x65,
+            Key::F10 => 0x6d,
+            Key::F11 => 0x67,
+            Key::F12 => 0x6f,
+            Key::Insert => 0x72,
+            Key::Home => 0x73,
+            Key::PageUp => 0x74,
+            Key::Delete => 0x75,
+            Key::End => 0x77,
+            Key::PageDown => 0x79,
+            Key::ArrowLeft => 0x7b,
+            Key::ArrowRight => 0x7c,
+            Key::ArrowDown => 0x7d,
+            Key::ArrowUp => 0x7e,
             Key::Plus => 0x45, // The keypad's Add key.
             _ => return None,
         })

@@ -63,9 +63,10 @@ impl App {
                 .find(|p| p.listener == listener)
                 .and_then(|p| p.url())
         {
-            if let Some(link) = crate::platform::links::WebLink::new(&url) {
-                self.action(ctx, Action::OpenLink(link));
-            }
+            self.action(
+                ctx,
+                Action::NewBrowser(pane, Some(neptune_model::Axis::Vertical), Some(url)),
+            );
         } else if let Err(error) = self.ports.request(pane, generation, listener, stop) {
             self.ui.error = Some(error.into());
         }

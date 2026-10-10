@@ -10,6 +10,12 @@ pub enum BindingAction {
     NewWorkspace,
     NewWorktree,
     NewTab,
+    NewBrowser,
+    BrowserAddress,
+    BrowserReload,
+    BrowserBack,
+    BrowserForward,
+    BrowserDevTools,
     SplitRight,
     SplitBelow,
     ClosePane,
@@ -95,6 +101,12 @@ impl BindingAction {
         Self::NewWorkspace,
         Self::NewWorktree,
         Self::NewTab,
+        Self::NewBrowser,
+        Self::BrowserAddress,
+        Self::BrowserReload,
+        Self::BrowserBack,
+        Self::BrowserForward,
+        Self::BrowserDevTools,
         Self::SplitRight,
         Self::SplitBelow,
         Self::ClosePane,
@@ -145,6 +157,29 @@ impl BindingAction {
             Self::NewWorkspace => const { &[host(Key::N)] },
             Self::NewWorktree => const { &[host(Key::G)] },
             Self::NewTab => const { &[host(Key::T)] },
+            Self::NewBrowser => {
+                const {
+                    &[chord(
+                        Key::L,
+                        Modifiers {
+                            shift: true,
+                            ..HOST
+                        },
+                    )]
+                }
+            }
+            Self::BrowserAddress => const { &[chord(Key::L, CTRL), chord(Key::L, CMD)] },
+            Self::BrowserReload => const { &[chord(Key::R, CTRL), chord(Key::R, CMD)] },
+            Self::BrowserBack => const { &[chord(Key::ArrowLeft, Modifiers::ALT)] },
+            Self::BrowserForward => const { &[chord(Key::ArrowRight, Modifiers::ALT)] },
+            Self::BrowserDevTools => {
+                const {
+                    &[
+                        chord(Key::I, CTRL_SHIFT),
+                        chord(Key::I, Modifiers { alt: true, ..CMD }),
+                    ]
+                }
+            }
             Self::SplitRight => const { &[host(Key::D)] },
             Self::SplitBelow => const { &[host(Key::E)] },
             Self::ClosePane => const { &[host(Key::W)] },

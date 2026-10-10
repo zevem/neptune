@@ -63,6 +63,22 @@ def main():
             spec.loader.exec_module(common)
             common.notices(app / "Contents/Resources/licenses")
             identity = os.environ["MACOS_SIGN_IDENTITY"]
+            def sign_browser(path, entitlements=False):
+                arguments = ["codesign", "--force", "--timestamp", "--options", "runtime", "--keychain", str(keychain), "--sign", identity]
+                if entitlements:
+                    arguments += ["--entitlements", str(ROOT / "packaging/browser-entitlements.plist")]
+                run(*arguments, str(path))
+            frameworks = app / "Contents/Frameworks"
+            framework = frameworks / "Chromium Embedded Framework.framework"
+            for library in sorted(framework.rglob("*.dylib")):
+                if not library.is_symlink():
+                    sign_browser(library)
+            sign_browser(framework)
+            for helper in sorted(frameworks.glob("*.app")):
+                for executable in (helper / "Contents/MacOS").iterdir():
+                    sign_browser(executable, True)
+                sign_browser(helper, True)
+            sign_browser(app / "Contents/MacOS/neptune-browser", True)
             run("codesign", "--force", "--timestamp", "--options", "runtime", "--keychain", str(keychain), "--sign", identity, str(app / "Contents/MacOS/neptune"))
             run("codesign", "--force", "--timestamp", "--options", "runtime", "--keychain", str(keychain), "--sign", identity, str(app))
             run("codesign", "--verify", "--deep", "--strict", str(app))
