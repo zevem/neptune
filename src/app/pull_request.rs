@@ -1419,6 +1419,81 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_pull_request_picture_opens_the_shared_image_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, ctx, _) = opened(dir.path());
+        let source = "https://github.com/user-attachments/assets/picture";
+        let picture = ui::markup::Picture {
+            pixels: [2400, 1200],
+            texture: ctx.load_texture(
+                "pull-request-test-picture",
+                egui::ColorImage::filled([240, 120], egui::Color32::WHITE),
+                Default::default(),
+            ),
+        };
+        let pictures = ui::markup::Pictures::from([(source.into(), Some(picture))]);
+        for written in [
+            format!("![Evidence]({source})"),
+            format!("<img alt=\"Evidence\" src=\"{source}\" />"),
+            format!("[![Evidence]({source})](https://neptune.rs)"),
+        ] {
+            let mut run = |events| {
+                let mut actions = Vec::new();
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui::markup::show_written(
+                            ui,
+                            Palette::for_config(&Config::default()),
+                            &written,
+                            &pictures,
+                            &mut actions,
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                for action in actions {
+                    assert!(
+                        !matches!(action, Action::OpenLink(_)),
+                        "picture opened in browser"
+                    );
+                    if let Action::ViewPicture { name, picture } = &action {
+                        assert_eq!(name, "Evidence");
+                        assert_eq!(picture.pixels, [2400, 1200]);
+                        assert_eq!(
+                            picture.texture.id(),
+                            pictures[source].as_ref().unwrap().texture.id()
+                        );
+                    }
+                    app.action(&ctx, action);
+                }
+            };
+            let pos = Pos2::new(100.0, 60.0);
+            run(vec![egui::Event::PointerMoved(pos)]);
+            run(Vec::new());
+            for pressed in [true, false] {
+                run(vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                }]);
+            }
+            assert_eq!(app.ui.overlay, OverlayState::Image);
+            assert!(
+                app.viewed_image().is_none(),
+                "web pictures have no local file"
+            );
+            frame(&mut app, &ctx);
+            app.action(&ctx, Action::CloseOverlay);
+        }
+    }
+
+    #[test]
     fn pictures_written_in_a_pull_request_are_read_from_its_host_only() {
         let dir = tempfile::tempdir().unwrap();
         let (mut app, ctx, host) = opened(dir.path());
@@ -1967,7 +2042,9 @@ mod tests {
     /// `ready`, `merged`, `draft`, `conflicts`, `checks`, `confirm`, `close`,
     /// `problem`, `timeline`, `code`, `diff`, `comment`, `review`, `reading`,
     /// `missing`, `signed-out`, `linked`, `empty` and `pictures` (a description
-    /// with a picture of its host and one kept elsewhere). `NEPTUNE_PR_NARROW=1`
+    /// with a picture of its host and one kept elsewhere). `NEPTUNE_PR_IMAGE`
+    /// supplies a local picture for the fixture, and `NEPTUNE_PR_OPEN_IMAGE=1`
+    /// shows that loaded picture in the shared overlay. `NEPTUNE_PR_NARROW=1`
     /// uses a 640×400 window, `NEPTUNE_PR_WIDTH` sets the panel's width and
     /// `NEPTUNE_PR_THEME` names a theme. `NEPTUNE_PR_LIVE` names a pull
     /// request by its address and reads it with the person's GitHub CLI
@@ -2279,6 +2356,29 @@ mod tests {
         impl eframe::App for NativeCapture {
             fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
                 eframe::App::logic(&mut self.app, ctx, frame);
+                if self.staged
+                    && self.step == 0
+                    && std::env::var_os("NEPTUNE_PR_OPEN_IMAGE").is_some()
+                    && let Some(picture) = self
+                        .app
+                        .pull_request
+                        .pictures
+                        .read
+                        .values()
+                        .flatten()
+                        .next()
+                        .cloned()
+                {
+                    self.app.action(
+                        ctx,
+                        Action::ViewPicture {
+                            name: "The tab in the window".into(),
+                            picture,
+                        },
+                    );
+                    self.step = 1;
+                    self.app.started = Instant::now();
+                }
                 let Some(pane) = self.app.controller.model().active_pane() else {
                     return;
                 };
@@ -2450,6 +2550,10 @@ mod tests {
                 }
             }
             fn on_exit(&mut self) {
+                if std::env::var_os("NEPTUNE_PR_OPEN_IMAGE").is_some() {
+                    assert_eq!(self.app.ui.overlay, OverlayState::Image);
+                    assert!(self.app.viewed_image().is_none());
+                }
                 eframe::App::on_exit(&mut self.app);
                 if self.state == "start" {
                     let model = self.app.controller.model();
@@ -2605,6 +2709,11 @@ mod tests {
                             }
                         }),
                     });
+                }
+                if let Some(path) = std::env::var_os("NEPTUNE_PR_IMAGE").map(PathBuf::from) {
+                    app.pull_request.pictures.fetch = Some(Box::new(move |_, _| {
+                        image_preview::decode(&path, [PICTURE_PIXELS, PICTURE_PIXELS])
+                    }));
                 }
                 // A picture drawn here stands in for one read from the host.
                 if app.pull_request.pictures.fetch.is_none() {

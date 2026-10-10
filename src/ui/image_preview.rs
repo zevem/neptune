@@ -162,6 +162,8 @@ pub struct View<'a> {
     pub texture: &'a egui::TextureHandle,
     pub name: &'a str,
     pub pixels: [u32; 2],
+    /// Whether this picture has a local file to show in its folder.
+    pub reveal: bool,
     /// Which of several pictures this is, counted from one, and of how many.
     pub position: Option<(usize, usize)>,
     /// Small copies of all of them, in order; empty for a picture on its own.
@@ -477,7 +479,7 @@ fn view_contents(
         .map(|(index, count)| format!("{index} of {count}   "))
         .unwrap_or_default();
     // The control that shows the file in its folder ends the caption.
-    const REVEAL: f32 = 26.0;
+    let reveal_width = if view.reveal { 26.0 } else { 0.0 };
     let label = elided(
         painter,
         &format!(
@@ -486,7 +488,7 @@ fn view_contents(
         ),
         theme::medium(12.0),
         p.fg,
-        bounds.width() - VIEW_MARGIN * 2.0 - 28.0 - REVEAL,
+        bounds.width() - VIEW_MARGIN * 2.0 - 28.0 - reveal_width,
     );
     // Under a fitted picture; over a zoomed one, at the foot of the window.
     let foot = bounds.bottom() - VIEW_MARGIN - VIEW_CAPTION * 0.5 + 4.0;
@@ -495,7 +497,7 @@ fn view_contents(
             bounds.center().x,
             (picture.bottom() + VIEW_CAPTION * 0.5 + 4.0).min(foot),
         ),
-        vec2(label.size().x + 24.0 + REVEAL, 28.0),
+        vec2(label.size().x + 24.0 + reveal_width, 28.0),
     );
     // The caption is not the picture: a click on it does not close the view.
     ui.interact(chip, Id::new("image-view-caption"), Sense::click());
@@ -505,29 +507,31 @@ fn view_contents(
         Pos2::new(chip.left() + 14.0, chip.center().y),
         label,
     );
-    let reveal = view_control(
-        ui,
-        Rect::from_center_size(
-            Pos2::new(chip.right() - 15.0, chip.center().y),
-            Vec2::splat(22.0),
-        ),
-        crate::platform::files::REVEAL_LABEL,
-    );
-    if reveal.hovered() {
-        painter.rect_filled(reveal.rect, 11, theme::tint(p.fg, 0.12));
-    }
-    icons::paint(
-        painter,
-        Rect::from_center_size(reveal.rect.center(), Vec2::splat(13.0)),
-        Icon::Folder,
-        if reveal.hovered() { p.fg } else { p.secondary },
-    );
     let mut verdict = step;
-    if reveal
-        .on_hover_text(crate::platform::files::REVEAL_LABEL)
-        .clicked()
-    {
-        verdict = Verdict::Reveal;
+    if view.reveal {
+        let reveal = view_control(
+            ui,
+            Rect::from_center_size(
+                Pos2::new(chip.right() - 15.0, chip.center().y),
+                Vec2::splat(22.0),
+            ),
+            crate::platform::files::REVEAL_LABEL,
+        );
+        if reveal.hovered() {
+            painter.rect_filled(reveal.rect, 11, theme::tint(p.fg, 0.12));
+        }
+        icons::paint(
+            painter,
+            Rect::from_center_size(reveal.rect.center(), Vec2::splat(13.0)),
+            Icon::Folder,
+            if reveal.hovered() { p.fg } else { p.secondary },
+        );
+        if reveal
+            .on_hover_text(crate::platform::files::REVEAL_LABEL)
+            .clicked()
+        {
+            verdict = Verdict::Reveal;
+        }
     }
     if several {
         let middle = room(bounds).center().y;
@@ -679,6 +683,7 @@ mod tests {
                             texture,
                             name: "a.png",
                             pixels: [300, 200],
+                            reveal: true,
                             position: None,
                             strip: &[],
                         };
@@ -740,6 +745,7 @@ mod tests {
                         texture,
                         name: "a.png",
                         pixels: [300, 200],
+                        reveal: true,
                         position,
                         strip: &[],
                     };
@@ -820,6 +826,7 @@ mod tests {
                         texture,
                         name: "a.png",
                         pixels: [300, 200],
+                        reveal: true,
                         position: Some((1, 3)),
                         strip: &strip,
                     };

@@ -952,6 +952,7 @@ impl App {
                     self.ui.error = Some(error.into());
                 }
             }
+            Action::ViewPicture { name, picture } => self.view_picture(name, picture),
             Action::OpenTerminalLink(pane, target) => match target {
                 crate::terminal_view::LinkTarget::Web(link) => {
                     if let Err(error) = self.link_opener.open(link, ctx.clone()) {

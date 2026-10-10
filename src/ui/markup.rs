@@ -1724,7 +1724,8 @@ fn render(
 pub type Pictures = HashMap<String, Option<Picture>>;
 
 /// The same as `show_in` for what someone wrote on a web host, with its
-/// pictures drawn. A picture that leads nowhere opens itself when pressed.
+/// pictures drawn. Loaded pictures open in the shared image overlay;
+/// placeholders retain their link to the browser.
 pub fn show_written(
     ui: &mut Ui,
     p: Palette,
@@ -1939,13 +1940,16 @@ fn render_blocks(
                         })
                         .rect
                 };
-                // A picture someone wrote in opens itself where it leads nowhere.
+                // A loaded web picture carries its owned snapshot into the
+                // overlay, even when it is wrapped in a link. File documents
+                // and web placeholders keep their link's original destination.
+                let shown = picture.filter(|_| written.is_some());
                 let leads = image
                     .link
                     .as_deref()
                     .or(written.map(|_| image.source.as_str()));
                 if let Some((actions, _, _)) = links
-                    && let Some(target) = leads.and_then(|link| target_at(link, base))
+                    && (shown.is_some() || leads.and_then(|link| target_at(link, base)).is_some())
                 {
                     let response = ui.interact(
                         rect,
@@ -1959,10 +1963,25 @@ fn render_blocks(
                     }
                     if response
                         .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text(leads.unwrap_or_default())
+                        .on_hover_text(if shown.is_some() {
+                            "Open image"
+                        } else {
+                            leads.unwrap_or_default()
+                        })
                         .clicked()
                     {
-                        actions.push(target.action());
+                        if let Some(picture) = shown {
+                            actions.push(Action::ViewPicture {
+                                name: if image.alt.is_empty() {
+                                    "Image".into()
+                                } else {
+                                    image.alt.clone()
+                                },
+                                picture: picture.clone(),
+                            });
+                        } else if let Some(target) = leads.and_then(|link| target_at(link, base)) {
+                            actions.push(target.action());
+                        }
                     }
                 }
                 rect
@@ -3018,6 +3037,54 @@ mod tests {
             collect(&clipped.shape, &mut found);
         }
         found
+    }
+
+    #[test]
+    fn written_image_placeholders_keep_the_browser_fallback() {
+        let source = "https://images.example/evidence.png";
+        for pictures in [Pictures::new(), Pictures::from([(source.into(), None)])] {
+            let ctx = context();
+            let run = |events| {
+                let mut actions = Vec::new();
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(WINDOW),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        show_written(
+                            ui,
+                            Palette::for_config(&crate::config::Config::default()),
+                            &format!("![Evidence]({source})"),
+                            &pictures,
+                            &mut actions,
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                (actions, output)
+            };
+            run(Vec::new());
+            let (_, output) = run(Vec::new());
+            let pos = drawn(&output)
+                .into_iter()
+                .find(|(text, ..)| text.contains("Evidence"))
+                .unwrap()
+                .1
+                .center();
+            run(vec![egui::Event::PointerMoved(pos)]);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            run(vec![button(true)]);
+            assert!(
+                matches!(run(vec![button(false)]).0.as_slice(), [Action::OpenLink(link)] if link.as_str() == source)
+            );
+        }
     }
 
     #[test]
