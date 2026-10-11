@@ -260,7 +260,10 @@ mod tests {
         assert!(!app.ui.project.drafts.contains_key(&moved));
         app.enter_window(child);
         assert_eq!(app.ui.project.drafts[&moved], "Unsent message");
-        assert_eq!(app.ui.project.attached[&moved], [file.clone()]);
+        assert_eq!(
+            app.ui.project.attached[&moved].as_slice(),
+            std::slice::from_ref(&file)
+        );
         assert_eq!(app.ui.project.instructions[&moved], "Unsaved context");
         app.move_workspace_to_window(&ctx, workspaces[2], WindowId::ROOT);
         assert!(app.controller.model().window(child).is_none());
@@ -1181,7 +1184,8 @@ impl App {
         {
             self.search_task = None;
             self.search_point = None;
-            self.hints = None;
+            // hint_input must consume the pending frame and key releases before
+            // cancelling hints whose captured pane is no longer selected.
             self.ui.search_error = None;
         }
     }

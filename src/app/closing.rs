@@ -665,7 +665,7 @@ mod tests {
             output.viewport_commands.get(&egui::ViewportId::ROOT),
             Some(&vec![egui::ViewportCommand::Close])
         );
-        assert!(output.viewport_commands.get(&child).is_none());
+        assert!(!output.viewport_commands.contains_key(&child));
     }
 
     #[test]
