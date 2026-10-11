@@ -270,6 +270,22 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                     [action],
                 ));
             }
+            for (icon, title, tool) in [
+                (Icon::Pointer, "Pick an element", super::browser::Tool::Pick),
+                (
+                    Icon::Record,
+                    "Record the page",
+                    super::browser::Tool::Record,
+                ),
+            ] {
+                list.push(command(
+                    "Browser",
+                    icon,
+                    title,
+                    String::new(),
+                    [Action::BrowserTool(pane, view.pane_generation, tool)],
+                ));
+            }
         }
         if view.local && !view.browser {
             // Beside "New tab": it opens one, in a worktree of its own.

@@ -13,7 +13,13 @@ copy; the downloaded SDK remains intact.
 The pure model owns `PaneKind`, generation, lifecycle and layout. Its existing
 move/split/close commands remain the layout authority. Workspace schema 14
 stores pane kind, defaults earlier panes to terminals and restores browsers
-blank. Addresses, history, profiles and page contents are never serialized.
+blank. Addresses, history and page contents are never serialized in workspace
+state. The address and profile of each tab in a saved profile are kept beside
+the profiles, in `<data>/browser/tabs.json` (at most 64 tabs, written off the
+UI thread a second after a change), so a restored tab opens where it was; a
+private tab is never written there and closing a tab forgets it. Tabs were
+restored blank until this was asked for. The configuration names the browser profiles; their cookies and site
+data are Chromium's own files under the data directory.
 
 The desktop supervises one helper per window, with a maximum of eight browser
 panes. Pipe commands are bounded to 64; messages are capped at 512 KiB and
@@ -59,13 +65,74 @@ window separately from the page's requestAnimationFrame rate; neither metric
 measures photon latency.
 
 Only HTTP, HTTPS and a blank page are navigable. Page JavaScript receives no
-Neptune bridge, shell access or model commands. Profiles are in-memory with a
-unique temporary root for CEF bookkeeping, owned and removed by the supervisor
-even after helper crashes. Certificate checks, web security and
+Neptune bridge, shell access or model commands. Certificate checks, web security and
 the Chromium sandbox retain their defaults, except on a Linux system that allows
 Chromium no sandbox (see below). Popup links with a user gesture
 stay in the preview; unsolicited windows are rejected. DevTools opens a CEF
 window. Platform sandbox setup follows [CEF's official requirements](https://chromiumembedded.github.io/cef/sandbox_setup).
+
+## Profiles, cookies, picking and recording
+
+Browser profiles were in-memory until they were made to keep sign-ins on
+request; **Private** and `browser_profile = "private"` keep the earlier
+behaviour. A saved profile is a CEF request context whose cache path is a
+direct child, `profile.<id>`, of `<data>/browser`, the helper's root cache
+path; a path further down is silently in-memory. A disk context initializes
+asynchronously, so the helper holds a tab's creation until it has. One Neptune
+process holds `<data>/browser/lock`; others, screenshot captures and a failed
+lock use a temporary root that the supervisor removes even after helper
+crashes, and only private tabs. Removing a profile writes
+`<data>/browser/removed/<id>`; the directory is deleted before the next helper
+starts, when Chromium no longer has it open. A tab's profile is fixed when its
+browser is created: changing it restarts the pane. Cookies and site data are
+unencrypted Chromium files readable by the user account, like a browser's own.
+
+Cookie import reads another browser's cookie database on a desktop worker
+from a private snapshot, never the live file, refuses a browser that is
+running, and sends cookies to the helper in batches of 64 to set through CEF's
+cookie manager. Chromium-family values are decrypted with the key from the
+Secret Service on Linux or the Keychain on macOS; Windows app-bound encryption
+and Safari are unsupported. Cookie names and values are never logged or shown;
+the result is a count. The readers have run on Linux against generated
+databases and a stand-in Secret Service; a real keyring, macOS and Windows
+remain to be accepted.
+
+Picking evaluates a script in the page's own JavaScript world through DevTools
+and awaits its result. The page can therefore see and alter it: the result is
+untrusted text, capped at 16 KiB, with every part bounded and control
+characters removed before it reaches the clipboard, and never interpreted. The
+picture is cropped by the supervisor from its own last frame. The script
+installs no bridge and is removed when the pick ends.
+
+Recording asks DevTools for a JPEG screencast of the page and feeds the frames
+to a hidden helper page that encodes VP9 WebM with MediaRecorder. The helper
+writes the file, to a path the supervisor chose, creating it new. Recordings
+stop after ten minutes, when their tab closes and when the helper exits. They
+carry no audio and no duration header.
+
+Previews paint on white where a page sets no background, as browsers do;
+earlier the pane's own background showed through.
+
+The CEF build in use paints an offscreen page at one pixel per view unit
+whatever `device_scale_factor` its screen information reports (measured on
+Linux with CEF 154: `devicePixelRatio` stayed 1 and frames kept the view's
+size at 1.5 and 2). The helper therefore sizes the view in the pane's physical
+pixels and zooms the page by the display's scale, reapplied on each main-frame
+navigation because Chromium keeps zoom by site. The page gets the layout width
+and `devicePixelRatio` of a window on that display, and a frame meets the
+screen one to one. Pointer positions and wheel distances cross the pipe in
+logical points and are scaled in the helper. A touchpad's distances are sent
+as precise deltas, with what falls short of a pixel carried to the next
+event; a wheel's notches are 53 points each and left to Chromium to ease.
+
+The pointer a page asks for, the tooltip of the element under it and the
+address of a hovered link travel in the pane's state as a cursor type and two
+bounded single-line strings; they are page data and are only ever shown. A
+saved profile opens asynchronously, so the helper holds a tab's size,
+visibility, focus, frame rate and first address until its browser exists.
+
+A page's icon is downloaded by Chromium, shrunk to at most 64 pixels a side and sent
+as a bitmap for the tab; it is page data and is only ever drawn.
 
 ## Development and verification
 

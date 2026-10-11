@@ -8,6 +8,7 @@ mod mac;
 mod pacing;
 #[path = "../../../src/runtime/browser/protocol.rs"]
 mod protocol;
+mod tools;
 
 use cef::{args::Args, *};
 use protocol::{Command, Event, Target};
@@ -53,7 +54,7 @@ impl Output {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
-        if pending.len() >= protocol::MAX_BROWSERS * 3 && !pending.contains_key(&(target, slot)) {
+        if pending.len() >= protocol::MAX_BROWSERS * 7 && !pending.contains_key(&(target, slot)) {
             return;
         }
         // A slow pipe may replace several paints. Include every outstanding
@@ -98,7 +99,7 @@ impl Output {
     }
     fn put(&self, target: Target, slot: u8, event: Event, bytes: Vec<u8>) {
         if let Ok(mut pending) = self.pending.lock()
-            && (pending.len() < protocol::MAX_BROWSERS * 3 || pending.contains_key(&(target, slot)))
+            && (pending.len() < protocol::MAX_BROWSERS * 7 || pending.contains_key(&(target, slot)))
         {
             pending.insert((target, slot), (event, bytes));
         }
@@ -145,6 +146,12 @@ impl Output {
 struct Entry {
     browser: Browser,
     data: Arc<handlers::Data>,
+    /// Keeps this browser's DevTools replies coming.
+    _observer: Option<Registration>,
+    /// DevTools requests awaiting their reply, and the id of the last one.
+    pending: BTreeMap<i32, tools::Purpose>,
+    next: i32,
+    recording: Option<tools::Recording>,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -265,6 +272,7 @@ pub(crate) fn run(sandbox_info: *mut u8) -> anyhow::Result<()> {
         "Browser initialization failed"
     );
     let mut entries: BTreeMap<Target, Entry> = BTreeMap::new();
+    let mut tools = tools::Tools::new(profile, output.clone());
     let mut stopping = None;
     loop {
         if let Ok(mut next) = deadline.0.lock() {
@@ -276,18 +284,54 @@ pub(crate) fn run(sandbox_info: *mut u8) -> anyhow::Result<()> {
         for command in receiver.try_iter().take(64) {
             if matches!(command, Command::Shutdown) {
                 stopping.get_or_insert(Instant::now());
-                for entry in entries.values() {
+                for entry in entries.values_mut() {
+                    tools.abandon(entry);
                     if let Some(host) = entry.browser.host() {
                         host.close_dev_tools();
                         host.close_browser(1);
                     }
                 }
             } else if stopping.is_none() {
-                handle(command, &mut entries, &output);
+                handle(command, &mut entries, &output, &mut tools);
             }
         }
-        entries.retain(|_, entry| !entry.data.closed());
-        if stopping.is_some() && entries.is_empty() {
+        for (target, profile) in std::mem::take(&mut tools.waiting) {
+            if stopping.is_none() {
+                let profile = Some(profile);
+                handle(
+                    Command::Open { target, profile },
+                    &mut entries,
+                    &output,
+                    &mut tools,
+                );
+            }
+            // What the pane said of itself while its profile was opening.
+            if entries.contains_key(&target) {
+                let (held, kept) = std::mem::take(&mut tools.held)
+                    .into_iter()
+                    .partition(|(waited, _)| *waited == target);
+                tools.held = kept;
+                for (_, command) in held {
+                    handle(command, &mut entries, &output, &mut tools);
+                }
+            }
+        }
+        let replies = tools
+            .replies
+            .lock()
+            .map(|mut replies| std::mem::take(&mut *replies))
+            .unwrap_or_default();
+        for reply in replies {
+            tools.reply(&mut entries, reply);
+        }
+        tools.tick(&mut entries);
+        entries.retain(|_, entry| {
+            if entry.data.closed() {
+                tools.abandon(entry);
+            }
+            !entry.data.closed()
+        });
+        if stopping.is_some() && entries.is_empty() && tools.closing.is_empty() {
             break;
         }
         // A stalled engine is killed by Neptune's supervisor; do not tear CEF
@@ -304,7 +348,7 @@ pub(crate) fn run(sandbox_info: *mut u8) -> anyhow::Result<()> {
                     at.saturating_duration_since(Instant::now())
                 })
             }
-            .min(if stopping.is_some() {
+            .min(if stopping.is_some() || !tools.waiting.is_empty() {
                 Duration::from_millis(10)
             } else if !entries.is_empty() {
                 entries
@@ -340,8 +384,22 @@ fn pump_native_events() {
     }
 }
 
-fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<Output>) {
-    if let Command::Open { target } = command {
+fn handle(
+    command: Command,
+    entries: &mut BTreeMap<Target, Entry>,
+    output: &Arc<Output>,
+    tools: &mut tools::Tools,
+) {
+    let command = match command {
+        Command::SetCookies {
+            profile,
+            cookies,
+            last,
+        } => return tools.set_cookies(&profile, cookies, last),
+        Command::ClearCookies { profile } => return tools.clear_cookies(&profile),
+        command => command,
+    };
+    if let Command::Open { target, profile } = command {
         if entries.contains_key(&target) || entries.len() >= protocol::MAX_BROWSERS {
             return;
         }
@@ -353,10 +411,28 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
         };
         let settings = BrowserSettings {
             windowless_frame_rate: protocol::DEFAULT_FRAME_RATE as i32,
+            // A page that sets no background is white, as in any browser,
+            // rather than see-through to the pane behind it.
+            background_color: 0xFFFF_FFFF,
             ..Default::default()
         };
-        let mut context =
-            cef::request_context_create_context(Some(&RequestContextSettings::default()), None);
+        // A private browser keeps everything in memory. A saved profile's
+        // browser opens once Chromium has that profile's files open.
+        let mut context = match profile.as_deref().filter(|id| tools.saves(Some(id))) {
+            None => {
+                cef::request_context_create_context(Some(&RequestContextSettings::default()), None)
+            }
+            Some(id) => match tools.context(id) {
+                Some((context, true)) => Some(context),
+                Some((_, false)) => {
+                    if !tools.waiting.iter().any(|(waiting, _)| *waiting == target) {
+                        tools.waiting.push((target, id.to_owned()));
+                    }
+                    return;
+                }
+                None => None,
+            },
+        };
         if let Some(browser) = cef::browser_host_create_browser_sync(
             Some(&info),
             Some(&mut client),
@@ -365,7 +441,24 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
             None,
             context.as_mut(),
         ) {
-            entries.insert(target, Entry { browser, data });
+            let observer = browser.host().and_then(|host| {
+                host.add_dev_tools_message_observer(Some(&mut handlers::Observer::new(
+                    target,
+                    false,
+                    tools.replies.clone(),
+                )))
+            });
+            entries.insert(
+                target,
+                Entry {
+                    browser,
+                    data,
+                    _observer: observer,
+                    pending: BTreeMap::new(),
+                    next: 0,
+                    recording: None,
+                },
+            );
         } else {
             data.update(|state| {
                 state.closed = true;
@@ -378,7 +471,26 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
     let Some(target) = command_target(&command) else {
         return;
     };
+    if matches!(command, Command::Close { .. }) {
+        tools.waiting.retain(|(waiting, _)| *waiting != target);
+        tools.held.retain(|(waiting, _)| *waiting != target);
+    }
     let Some(entry) = entries.get_mut(&target) else {
+        // A saved profile opens in its own time. The pane's size, place and
+        // first page are kept for the browser that follows, not lost.
+        if tools.held.len() < protocol::MAX_BROWSERS * 8
+            && tools.waiting.iter().any(|(waiting, _)| *waiting == target)
+            && matches!(
+                command,
+                Command::Resize { .. }
+                    | Command::Visible { .. }
+                    | Command::Focus { .. }
+                    | Command::FrameRate { .. }
+                    | Command::Navigate { .. }
+            )
+        {
+            tools.held.push((target, command));
+        }
         return;
     };
     if matches!(&command, Command::Text { text, .. } | Command::Paste { text, .. } | Command::Ime { text, .. } | Command::Find { text, .. } if text.len() > protocol::MAX_TEXT)
@@ -392,7 +504,10 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
         return;
     };
     match command {
+        Command::Pick { active, .. } => entry.pick(active),
+        Command::Record { path, .. } => tools.record(entry, path),
         Command::Close { .. } => {
+            tools.abandon(entry);
             host.close_dev_tools();
             host.close_browser(1);
         }
@@ -463,19 +578,13 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
             scale,
             ..
         } => {
-            if width > 0
-                && height > 0
-                && width <= protocol::MAX_SIDE
-                && height <= protocol::MAX_SIDE
-                && scale.is_finite()
+            if scale.is_finite()
                 && (0.25..=4.0).contains(&scale)
-                && protocol::frame_len(
-                    (width as f32 * scale).ceil() as u32,
-                    (height as f32 * scale).ceil() as u32,
-                )
-                .is_some()
+                && protocol::frame_len(width, height).is_some()
             {
                 entry.data.resize(width, height, scale);
+                // The page is zoomed by the display's scale: see `Data::zoom`.
+                host.set_zoom_level(f64::from(scale).ln() / 1.2f64.ln());
                 host.notify_screen_info_changed();
                 host.was_resized();
             }
@@ -561,7 +670,12 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
             kind,
             ..
         } => {
+            // The pane speaks in logical points; the view is physical pixels.
+            let scale = entry.data.scale();
+            let pixels = |points: i32| (points as f32 * scale).round() as i32;
+            let (x, y) = (pixels(x), pixels(y));
             let event = MouseEvent { x, y, modifiers };
+            entry.pointer(x, y, &kind);
             match kind {
                 protocol::Mouse::Move { leave } => {
                     host.send_mouse_move_event(Some(&event), i32::from(leave))
@@ -581,7 +695,7 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
                     clicks.clamp(1, 3),
                 ),
                 protocol::Mouse::Wheel { dx, dy } => {
-                    host.send_mouse_wheel_event(Some(&event), dx, dy)
+                    host.send_mouse_wheel_event(Some(&event), pixels(dx), pixels(dy))
                 }
             }
         }
@@ -603,13 +717,18 @@ fn handle(command: Command, entries: &mut BTreeMap<Target, Entry>, output: &Arc<
                 frame.paste();
             }
         }
-        Command::Open { .. } | Command::Shutdown => {}
+        Command::Open { .. }
+        | Command::SetCookies { .. }
+        | Command::ClearCookies { .. }
+        | Command::Shutdown => {}
     }
 }
 
 fn command_target(command: &Command) -> Option<Target> {
     match command {
-        Command::Open { target }
+        Command::Open { target, .. }
+        | Command::Pick { target, .. }
+        | Command::Record { target, .. }
         | Command::Close { target }
         | Command::Navigate { target, .. }
         | Command::Back { target }
@@ -630,7 +749,7 @@ fn command_target(command: &Command) -> Option<Target> {
         | Command::Copy { target }
         | Command::Cut { target }
         | Command::Paste { target, .. } => Some(*target),
-        Command::Shutdown => None,
+        Command::SetCookies { .. } | Command::ClearCookies { .. } | Command::Shutdown => None,
     }
 }
 

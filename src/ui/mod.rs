@@ -106,6 +106,8 @@ pub struct UiState {
     /// A dialog field should take keyboard focus on its first frame.
     pub overlay_focus: bool,
     pub error: Option<String>,
+    /// Something done that the user asked for, and when it was said.
+    pub notice: Option<(String, f64)>,
     /// The font size or window zoom just stepped to, while its chip shows.
     pub level: Option<controls::Level>,
     pub search_open: bool,
@@ -136,6 +138,16 @@ pub struct UiState {
     /// The pull request tab: the part in view and what is being written.
     pub pull_request: pull_request::State,
 }
+impl UiState {
+    /// How long a notice stays before it goes by itself.
+    pub const NOTICE_SECONDS: f64 = 6.0;
+
+    /// Say that something the user asked for was done.
+    pub fn say(&mut self, ctx: &eframe::egui::Context, said: String) {
+        self.notice = Some((said, ctx.input(|i| i.time)));
+    }
+}
+
 #[derive(Clone)]
 pub enum Action {
     Split(PaneId, Axis),
@@ -144,6 +156,8 @@ pub enum Action {
     NewBrowser(PaneId, Option<Axis>, Option<String>),
     Browser(PaneId, u64, crate::runtime::browser::protocol::Command),
     NavigateBrowser(PaneId, u64, String),
+    /// A browser tab's profile, cookies, element picker or recording.
+    BrowserTool(PaneId, u64, browser::Tool),
     BrowserAddress(PaneId),
     MovePane(PaneId, Destination),
     ClosePane(PaneId),

@@ -33,7 +33,7 @@ Port discovery and forwarding are ephemeral desktop state in `runtime/ports.rs`.
 
 `persistence/workspace_state.rs` owns independent versioned DTOs and the legacy migration fixture. Invalid entries produce contextual diagnostics. Recovery copies protect damaged/lossy state before replacement; unreadable and unsupported schemas disable workspace saves. `persistence/window_state.rs` stores the normal window dimensions in logical points and its maximized state independently of workspace restoration and settings; invalid, unreadable or unsupported window files remain read-only. A project's own files are not written here; `runtime/project_store.rs` owns them. One background writer accepts immutable workspace, config and window snapshots, coalesces each destination, debounces changes for 75 ms, uses atomic replacement and acknowledges saved generations. Intentional shutdown flushes the latest accepted snapshots with a bounded wait.
 
-Optional browser panes use an isolated CEF helper and owned pixel snapshots; they share the native tab/split layout and never create a PTY. Browser startup and I/O run off the UI thread. URLs and profiles remain session-local. See [browser ownership, limits and platform setup](browser.md).
+Optional browser panes use an isolated CEF helper and owned pixel snapshots; they share the native tab/split layout and never create a PTY. Browser startup and I/O run off the UI thread. URLs remain session-local; named profiles keep cookies and site data under the data directory, and private tabs keep nothing. See [browser ownership, limits and platform setup](browser.md).
 
 The terminal display path is:
 

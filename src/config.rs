@@ -38,6 +38,35 @@ pub struct Config {
     /// Update checks use only public release metadata, never terminal contents.
     pub check_updates: bool,
     pub release_channel: crate::runtime::updates::ReleaseChannel,
+    /// The profile new browser tabs use: `default`, `private` for one that
+    /// forgets, or the id of one below. Omitted while it is the default, so
+    /// settings without it still load in older versions.
+    #[serde(skip_serializing_if = "BrowserProfile::is_default")]
+    pub browser_profile: String,
+    /// Further saved browser profiles, each with cookies of its own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub browser_profiles: Vec<BrowserProfile>,
+}
+
+/// A saved browser profile the user made. Its cookies and site data are kept
+/// in Neptune's data directory under `id`; the name is only what menus show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserProfile {
+    pub id: String,
+    pub name: String,
+}
+
+impl BrowserProfile {
+    pub const DEFAULT: &'static str = crate::runtime::browser::DEFAULT_PROFILE;
+    /// A browser that keeps its cookies in memory and forgets them when it closes.
+    pub const PRIVATE: &'static str = "private";
+    pub const MAX: usize = 24;
+    pub const MAX_NAME: usize = 48;
+
+    fn is_default(id: &String) -> bool {
+        id == Self::DEFAULT
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -148,11 +177,31 @@ impl Default for Config {
             desktop_notifications: true,
             check_updates: true,
             release_channel: Default::default(),
+            browser_profile: BrowserProfile::DEFAULT.into(),
+            browser_profiles: Vec::new(),
         }
     }
 }
 
 impl Config {
+    /// The saved profile a new browser tab keeps its cookies in, or none for
+    /// a private one.
+    pub fn browser_profile(&self) -> Option<String> {
+        (self.browser_profile != BrowserProfile::PRIVATE).then(|| self.browser_profile.clone())
+    }
+    /// What menus call a browser's profile.
+    pub fn browser_profile_name(&self, profile: Option<&str>) -> &str {
+        match profile {
+            None => "Private",
+            Some(BrowserProfile::DEFAULT) => "Default",
+            Some(id) => self
+                .browser_profiles
+                .iter()
+                .find(|profile| profile.id == id)
+                .map_or("Removed profile", |profile| profile.name.as_str()),
+        }
+    }
+
     // Match the bounds of the existing app zoom shortcuts.
     pub const WINDOW_ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.2..=5.0;
 
@@ -204,6 +253,36 @@ impl Config {
         let mut favorites = std::mem::take(&mut self.favorite_themes);
         favorites.retain(|theme| self.has_theme(theme) && seen.insert(theme.clone()));
         self.favorite_themes = favorites;
+        anyhow::ensure!(
+            self.browser_profiles.len() <= BrowserProfile::MAX,
+            "At most 24 browser profiles are allowed"
+        );
+        let mut profiles = std::collections::HashSet::new();
+        for profile in &mut self.browser_profiles {
+            anyhow::ensure!(
+                crate::runtime::browser::protocol::valid_profile(&profile.id)
+                    && ![BrowserProfile::DEFAULT, BrowserProfile::PRIVATE]
+                        .contains(&profile.id.as_str()),
+                "A browser profile id uses lowercase letters, digits and hyphens"
+            );
+            anyhow::ensure!(
+                profiles.insert(profile.id.clone()),
+                "Duplicate browser profile id"
+            );
+            profile.name = profile
+                .name
+                .trim()
+                .chars()
+                .take(BrowserProfile::MAX_NAME)
+                .collect();
+            anyhow::ensure!(!profile.name.is_empty(), "A browser profile needs a name");
+        }
+        // The profile for new tabs follows those that exist.
+        if self.browser_profile != BrowserProfile::PRIVATE
+            && !profiles.contains(&self.browser_profile)
+        {
+            self.browser_profile = BrowserProfile::DEFAULT.into();
+        }
         anyhow::ensure!(
             self.window_zoom.is_finite() && Self::WINDOW_ZOOM_RANGE.contains(&self.window_zoom),
             "window_zoom must be between 0.2 and 5"

@@ -68,6 +68,15 @@ sidebar_width = 216.0
 
 # Restore workspace organization; every terminal starts a new process.
 restore_workspaces = true
+
+# The profile new browser tabs start in: "default" keeps sign-ins on this
+# computer, "private" keeps nothing, or the id of a profile below.
+# browser_profile = "default"
+
+# Further browser profiles, added from a browser tab's menu (at most 24).
+# [[browser_profiles]]
+# id = "profile-work"
+# name = "Work"
 # Always confirm terminal, workspace, SSH disconnect and app closing.
 confirm_close = true
 # Independently warn when processes are running (or cannot be checked).

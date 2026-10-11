@@ -4,9 +4,30 @@ use super::{
 };
 use cef::*;
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
+
+/// What Chromium answered over DevTools, for the main loop to act on once
+/// the message pump returns.
+pub(super) enum Reply {
+    Result {
+        target: Target,
+        /// From a recording's encoder page rather than the page in view.
+        encoder: bool,
+        id: i32,
+        success: bool,
+        body: Vec<u8>,
+    },
+    /// A frame of the page in view, for its recording.
+    Frame { target: Target, params: Vec<u8> },
+    /// A recording's encoder page is ready for its script.
+    Loaded { target: Target },
+}
+pub(super) type Replies = Arc<Mutex<Vec<Reply>>>;
 
 pub(super) struct Data {
     target: Target,
@@ -47,8 +68,42 @@ impl Data {
             );
         }
     }
+    pub(super) fn target(&self) -> Target {
+        self.target
+    }
+    pub(super) fn picking(&self) -> bool {
+        self.state.lock().is_ok_and(|s| s.picking)
+    }
     pub(super) fn closed(&self) -> bool {
         self.state.lock().is_ok_and(|s| s.closed)
+    }
+    /// Physical pixels of one logical point in this pane.
+    pub(super) fn scale(&self) -> f32 {
+        self.geometry.lock().map_or(1.0, |g| g.2)
+    }
+    /// Chromium here paints offscreen pages at one pixel per view unit
+    /// whatever scale the screen reports. The view is therefore sized in
+    /// physical pixels and the page zoomed by the display's scale, which gives
+    /// it the same layout and pixel ratio as a window on that display.
+    fn zoom(&self, browser: Option<&mut Browser>) {
+        let level = f64::from(self.scale()).ln() / 1.2f64.ln();
+        if let Some(host) = browser.and_then(|b| b.host())
+            && (host.zoom_level() - level).abs() > 1e-3
+        {
+            host.set_zoom_level(level);
+        }
+    }
+    fn icon(&self, width: u32, height: u32, pixels: Vec<u8>) {
+        self.output.put(
+            self.target,
+            6,
+            Event::Icon {
+                target: self.target,
+                width,
+                height,
+            },
+            pixels,
+        );
     }
     pub(super) fn resize(&self, width: u32, height: u32, scale: f32) {
         if let Ok(mut geometry) = self.geometry.lock() {
@@ -128,7 +183,6 @@ wrap_render_handler! {
         }
         fn screen_info(&self, _browser: Option<&mut Browser>, info: Option<&mut ScreenInfo>) -> i32 {
             if let (Some(info), Ok(size)) = (info, self.data.geometry.lock()) {
-                info.device_scale_factor = size.2;
                 info.rect = Rect { x: 0, y: 0, width: size.0 as i32, height: size.1 as i32 };
                 info.available_rect = info.rect.clone();
                 return 1;
@@ -166,7 +220,10 @@ wrap_render_handler! {
             if let (Some(rect), Ok(mut popup)) = (rect, self.data.popup.lock()) { *popup = rect.clone(); }
         }
         fn on_ime_composition_range_changed(&self, _browser: Option<&mut Browser>, _range: Option<&Range>, bounds: Option<&[Rect]>) {
-            self.data.update(|s| s.caret = bounds.and_then(|b| b.last()).map(|r| [r.x.saturating_add(r.width), r.y, 1, r.height.max(1)]));
+            // The view is in physical pixels; the pane places the caret in points.
+            let scale = self.data.scale();
+            let points = |v: i32| (v as f32 / scale) as i32;
+            self.data.update(|s| s.caret = bounds.and_then(|b| b.last()).map(|r| [points(r.x.saturating_add(r.width)), points(r.y), 1, points(r.height).max(1)]));
         }
         fn on_popup_show(&self, _browser: Option<&mut Browser>, show: i32) {
             if show == 0 {
@@ -186,12 +243,118 @@ wrap_display_handler! {
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
             if let Some(title) = title { self.data.update(|s| s.title = title.to_string()); }
         }
-        fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
+        fn on_address_change(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             if frame.is_some_and(|f| f.is_main() == 1) && let Some(url) = url {
-                self.data.update(|s| s.url = url.to_string());
+                let url = url.to_string();
+                // Chromium keeps zoom by site: a site new to this profile
+                // would otherwise open unzoomed.
+                self.data.zoom(browser);
+                let mut moved = false;
+                self.data.update(|s| { moved = site(&s.url) != site(&url); s.url = url; });
+                // Another site's icon does not stand for this one.
+                if moved { self.data.icon(0, 0, Vec::new()); }
+            }
+        }
+        fn on_cursor_change(&self, _browser: Option<&mut Browser>, _cursor: std::os::raw::c_ulong, type_: CursorType,
+            _custom: Option<&CursorInfo>) -> i32 {
+            let cursor = *type_.as_ref() as u32;
+            self.data.update(|s| s.cursor = cursor);
+            1
+        }
+        fn on_tooltip(&self, _browser: Option<&mut Browser>, text: Option<&mut CefString>) -> i32 {
+            let text = text.map(|text| said(&text.to_string())).filter(|text| !text.is_empty());
+            self.data.update(|s| s.tooltip = text);
+            1
+        }
+        fn on_status_message(&self, _browser: Option<&mut Browser>, value: Option<&CefString>) {
+            let link = value.map(|value| said(&value.to_string())).filter(|link| !link.is_empty());
+            self.data.update(|s| s.link = link);
+        }
+        fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
+            let url = icon_urls.and_then(|urls| std::mem::take(urls).into_iter().find(|url| super::valid_url(url)));
+            match (url, browser.and_then(|b| b.host())) {
+                (Some(url), Some(host)) => host.download_image(Some(&url.as_str().into()), 1, protocol::MAX_ICON, 0,
+                    Some(&mut Icon::new(self.data.clone()))),
+                _ => self.data.icon(0, 0, Vec::new()),
             }
         }
     }
+}
+
+/// A page's words for the pane to show, bounded and on one line.
+fn said(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(300)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// The scheme, host and port of an address.
+fn site(url: &str) -> &str {
+    let host = url.find("://").map_or(0, |at| at + 3);
+    &url[..url[host..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |end| host + end)]
+}
+
+wrap_download_image_callback! {
+    struct Icon {
+        data: Arc<Data>,
+    }
+    impl DownloadImageCallback {
+        fn on_download_image_finished(&self, _url: Option<&CefString>, _status: i32, image: Option<&mut Image>) {
+            let (mut width, mut height) = (0, 0);
+            let pixels = image.and_then(|image| image.as_bitmap(1.0, ColorType::RGBA_8888,
+                AlphaType::PREMULTIPLIED, Some(&mut width), Some(&mut height)));
+            let (width, height) = (width.max(0) as u32, height.max(0) as u32);
+            let len = width as usize * height as usize * 4;
+            let mut bytes = vec![0; len];
+            // A page's icon is a page's data: only a complete bitmap of a
+            // bounded size is read, and only a small one is passed on.
+            if let Some(pixels) = pixels
+                && (1..=MAX_SOURCE).contains(&width) && (1..=MAX_SOURCE).contains(&height)
+                && pixels.size() == len && pixels.data(Some(&mut bytes), 0) == len
+            {
+                let (width, height, bytes) = shrink(width, height, bytes);
+                self.data.icon(width, height, bytes);
+            } else {
+                self.data.icon(0, 0, Vec::new());
+            }
+        }
+    }
+}
+
+/// The largest icon read from Chromium, which may answer with one larger
+/// than it was asked for.
+const MAX_SOURCE: u32 = 512;
+
+/// An icon no larger than a tab can use, each pixel the mean of those it
+/// stands for. Alpha is premultiplied, so the mean needs no weighting.
+fn shrink(width: u32, height: u32, pixels: Vec<u8>) -> (u32, u32, Vec<u8>) {
+    let by = width.max(height).div_ceil(protocol::MAX_ICON);
+    if by <= 1 {
+        return (width, height, pixels);
+    }
+    let (small_width, small_height) = (width.div_ceil(by), height.div_ceil(by));
+    let mut small = Vec::with_capacity((small_width * small_height * 4) as usize);
+    for y in 0..small_height {
+        for x in 0..small_width {
+            let (mut sum, mut count) = ([0u32; 4], 0u32);
+            for row in y * by..((y + 1) * by).min(height) {
+                for column in x * by..((x + 1) * by).min(width) {
+                    let at = ((row * width + column) * 4) as usize;
+                    for (total, value) in sum.iter_mut().zip(&pixels[at..at + 4]) {
+                        *total += u32::from(*value);
+                    }
+                    count += 1;
+                }
+            }
+            small.extend(sum.map(|total| (total / count.max(1)) as u8));
+        }
+    }
+    (small_width, small_height, small)
 }
 
 wrap_load_handler! {
@@ -199,6 +362,9 @@ wrap_load_handler! {
         data: Arc<Data>,
     }
     impl LoadHandler {
+        fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition: TransitionType) {
+            if frame.is_some_and(|f| f.is_main() == 1) { self.data.zoom(browser); }
+        }
         fn on_loading_state_change(&self, _browser: Option<&mut Browser>, loading: i32, back: i32, forward: i32) {
             self.data.update(|s| { s.loading = loading != 0; s.back = back != 0; s.forward = forward != 0; });
         }
@@ -277,9 +443,126 @@ wrap_client! {
     }
 }
 
+wrap_dev_tools_message_observer! {
+    pub(super) struct Observer {
+        target: Target,
+        encoder: bool,
+        replies: Replies,
+    }
+    impl DevToolsMessageObserver {
+        fn on_dev_tools_method_result(&self, _browser: Option<&mut Browser>, id: i32, success: i32, result: Option<&[u8]>) {
+            if let Ok(mut replies) = self.replies.lock() {
+                replies.push(Reply::Result { target: self.target, encoder: self.encoder, id, success: success != 0,
+                    body: result.unwrap_or_default().to_vec() });
+            }
+        }
+        fn on_dev_tools_event(&self, _browser: Option<&mut Browser>, method: Option<&CefString>, params: Option<&[u8]>) {
+            if !self.encoder && method.is_some_and(|m| m.to_string() == "Page.screencastFrame")
+                && let (Some(params), Ok(mut replies)) = (params, self.replies.lock()) {
+                replies.push(Reply::Frame { target: self.target, params: params.to_vec() });
+            }
+        }
+    }
+}
+
+// Chromium opens a saved profile's files after the call that asks for it.
+wrap_request_context_handler! {
+    pub(super) struct Opened {
+        ready: Arc<AtomicBool>,
+    }
+    impl RequestContextHandler {
+        fn on_request_context_initialized(&self, _context: Option<&mut RequestContext>) {
+            self.ready.store(true, Ordering::Release);
+        }
+    }
+}
+
+wrap_set_cookie_callback! {
+    pub(super) struct Counted {
+        tally: Arc<Mutex<super::tools::Tally>>,
+        output: Arc<Output>,
+    }
+    impl SetCookieCallback {
+        fn on_complete(&self, success: i32) {
+            if let Ok(mut tally) = self.tally.lock() { tally.settle(&self.output, success != 0); }
+        }
+    }
+}
+
+// A recording's encoder is a blank page of Neptune's own that is never shown.
+wrap_render_handler! {
+    struct Unseen;
+    impl RenderHandler {
+        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+            if let Some(rect) = rect { rect.width = 16; rect.height = 16; }
+        }
+    }
+}
+wrap_load_handler! {
+    struct EncoderLoad {
+        target: Target,
+        replies: Replies,
+    }
+    impl LoadHandler {
+        fn on_loading_state_change(&self, _browser: Option<&mut Browser>, loading: i32, _back: i32, _forward: i32) {
+            if loading == 0 && let Ok(mut replies) = self.replies.lock() {
+                replies.push(Reply::Loaded { target: self.target });
+            }
+        }
+    }
+}
+wrap_life_span_handler! {
+    struct EncoderLife {
+        closed: Arc<AtomicBool>,
+    }
+    impl LifeSpanHandler {
+        fn on_before_close(&self, _browser: Option<&mut Browser>) { self.closed.store(true, Ordering::Release); }
+        fn on_before_popup(&self, _browser: Option<&mut Browser>, _frame: Option<&mut Frame>, _id: i32,
+            _url: Option<&CefString>, _name: Option<&CefString>, _disposition: WindowOpenDisposition,
+            _gesture: i32, _features: Option<&PopupFeatures>, _info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>, _settings: Option<&mut BrowserSettings>,
+            _extra: Option<&mut Option<DictionaryValue>>, _no_access: Option<&mut i32>) -> i32 { 1 }
+    }
+}
+wrap_client! {
+    pub(super) struct EncoderClient {
+        target: Target,
+        replies: Replies,
+        closed: Arc<AtomicBool>,
+    }
+    impl Client {
+        fn render_handler(&self) -> Option<RenderHandler> { Some(Unseen::new()) }
+        fn load_handler(&self) -> Option<LoadHandler> { Some(EncoderLoad::new(self.target, self.replies.clone())) }
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(EncoderLife::new(self.closed.clone())) }
+    }
+}
+
 // DevTools is a native CEF window with its own client. Its internal URLs,
 // frames and title must never replace the preview's state or pixel snapshot.
 wrap_client! {
     pub(super) struct ToolsClient;
     impl Client {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_icon_is_shrunk_to_what_a_tab_can_use() {
+        // A small one is passed on as it is.
+        assert_eq!(shrink(2, 1, vec![1; 8]), (2, 1, vec![1; 8]));
+        let mut pixels = vec![0; 128 * 128 * 4];
+        // Three of the top-left block of four are opaque grey.
+        for at in [0, 1, 128] {
+            pixels[at * 4..at * 4 + 4].copy_from_slice(&[200, 200, 200, 200]);
+        }
+        let (width, height, small) = shrink(128, 128, pixels);
+        assert_eq!((width, height, small.len()), (64, 64, 64 * 64 * 4));
+        assert_eq!(small[..8], [150, 150, 150, 150, 0, 0, 0, 0]);
+        // A side that does not divide keeps its last, narrower block.
+        let (width, height, small) = shrink(130, 65, vec![8; 130 * 65 * 4]);
+        assert_eq!((width, height), (44, 22));
+        assert!(small.iter().all(|value| *value == 8));
+    }
 }

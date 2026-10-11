@@ -11,6 +11,28 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Browser tabs stay signed in. They now open in a profile that keeps cookies
+  and site data on this computer; add more profiles from a tab's menu, or
+  choose **Private** for a tab that keeps nothing, as every tab did before.
+  Set `browser_profile = "private"` to keep that for all of them.
+- Cookies can be imported into a browser tab's profile from Chrome, Chromium,
+  Edge, Brave, Vivaldi, Opera, Arc and Firefox. Chromium-family browsers on
+  Windows and Safari are not supported.
+- **Pick an element** in a browser tab copies a description of the element you
+  click, with a picture of it, to paste to an agent or an issue.
+- **Record the page** in a browser tab saves a WebM video of the page to your
+  Videos folder.
+- Pages that set no background in a browser tab are now white, as in other
+  browsers.
+- Browser tabs are sharp on displays scaled above 100%, where pages were
+  painted at low resolution and stretched.
+- Scrolling a browser tab follows a touchpad directly and moves a mouse wheel's
+  usual distance; slow touchpad strokes were being dropped.
+- A browser tab shows the page's own icon, and turns while the page loads.
+- The pointer changes over links, text and other controls in a browser tab,
+  tooltips appear, and a hovered link shows where it leads.
+- Restored browser tabs open the page they were on instead of a blank one.
+  Private tabs still come back blank.
 - Browser tabs now open in the Linux AppImage on Ubuntu 24.04 and later, where
   they reported a stopped browser host. These systems block Chromium's sandbox
   for an AppImage, so previews there run without it and a blank tab says so;

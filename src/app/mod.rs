@@ -2,6 +2,7 @@
 //! workers own processes/storage, and caches consume immutable terminal snapshots.
 mod attached;
 mod attachments;
+mod browser;
 mod changes;
 mod closing;
 mod coordinator;
@@ -66,6 +67,7 @@ pub struct App {
     controller: Controller,
     sessions: SessionManager,
     browsers: crate::runtime::browser::Browsers,
+    browser_tools: browser::BrowserTools,
     renders: BTreeMap<PaneId, PaneRender>,
     config: Config,
     config_path: PathBuf,
@@ -267,7 +269,15 @@ impl App {
             file_location: None,
             file_opener: Default::default(),
             ports: Default::default(),
-            browsers: Default::default(),
+            browsers: {
+                let mut browsers = crate::runtime::browser::Browsers::default();
+                // A screenshot launch leaves nothing behind, a profile included.
+                if !ephemeral {
+                    browsers.store(data.join("browser"));
+                }
+                browsers
+            },
+            browser_tools: Default::default(),
             notifications: Default::default(),
             agents: Default::default(),
             delegation: Default::default(),
@@ -305,6 +315,7 @@ impl App {
                 self.execute(ctx, effects);
             }
         }
+        self.poll_browser_tools(ctx);
         if self.startup.is_none() && !self.ephemeral {
             self.usage.start(ctx);
         }
@@ -714,11 +725,21 @@ impl App {
                                 ..Default::default()
                             },
                             unsandboxed: false,
+                            profile: None,
+                            saved: false,
+                            sources: None,
+                            importing: false,
                             texture: None,
                             popup: None,
+                            icon: None,
                             failed: matches!(pane.lifecycle(), Lifecycle::Failed(_)),
                         },
                     );
+                    let browser = crate::runtime::browser::View {
+                        sources: self.browser_tools.sources(),
+                        importing: browser.importing || self.browser_tools.busy(),
+                        ..browser
+                    };
                     PanePresentation {
                         browser: Some(browser.clone()),
                         generation: pane.generation(),

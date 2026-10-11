@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Version 14 adds browser pane kinds. Browser addresses and profiles are never saved.
+/// Version 14 adds browser pane kinds. Browser addresses and profiles are never saved here.
 /// Version 13 adds projects: the identity of each, the workspace it works in
 /// and the panes whose agents its lead started. Nothing a project says or is
 /// asked is saved here. Version 12 adds what agents linked and attached in conversations that are

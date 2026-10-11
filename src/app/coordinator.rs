@@ -102,7 +102,12 @@ impl App {
             match effect {
                 Effect::StartBrowser { pane, generation } => {
                     self.renders.insert(pane, PaneRender::new(pane));
-                    if let Err(error) = self.browsers.start(ctx, pane, generation) {
+                    let profile = self
+                        .browser_tools
+                        .inherit
+                        .take()
+                        .unwrap_or_else(|| self.config.browser_profile());
+                    if let Err(error) = self.browsers.start(ctx, pane, generation, profile) {
                         self.dispatch(
                             ctx,
                             Command::SessionFailed {
@@ -543,8 +548,18 @@ impl App {
             Action::Disconnect(workspace) => self.request_close(ctx, Close::Connection(workspace)),
             Action::Split(pane, axis) => self.open_beside(ctx, pane, Some(axis)),
             Action::NewTab(pane) => self.open_beside(ctx, pane, None),
+            Action::BrowserTool(pane, generation, tool) => {
+                self.browser_tool(ctx, pane, generation, tool)
+            }
             Action::NewBrowser(pane, axis, url) => {
                 let previous = self.controller.model().active_pane();
+                // A browser opened from a browser stays in its profile.
+                self.browser_tools.inherit = self
+                    .controller
+                    .model()
+                    .pane(pane)
+                    .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+                    .map(|_| self.browsers.profile(pane).map(str::to_owned));
                 if let Some(workspace) = self.controller.model().workspace_for_pane(pane) {
                     self.dispatch(
                         ctx,
@@ -554,6 +569,7 @@ impl App {
                             axis,
                         },
                     );
+                    self.browser_tools.inherit = None;
                     if let Some(opened) = self.controller.model().active_pane()
                         && Some(opened) != previous
                         && opened != pane
@@ -1030,6 +1046,12 @@ impl App {
             .map(|metadata| metadata.cwd.clone())
             .or(cwd)
             .unwrap_or_default();
+        self.browser_tools.inherit = self
+            .controller
+            .model()
+            .pane(pane)
+            .filter(|p| p.kind() == neptune_model::PaneKind::Browser)
+            .map(|_| self.browsers.profile(pane).map(str::to_owned));
         self.dispatch(
             ctx,
             match axis {
@@ -1046,6 +1068,7 @@ impl App {
                 },
             },
         );
+        self.browser_tools.inherit = None;
         if let Some(url) = browser_url
             && let Some(opened) = self.controller.model().active_pane()
             && Some(opened) != previous

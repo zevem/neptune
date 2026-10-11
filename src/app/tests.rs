@@ -9,6 +9,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
     };
     let app = App {
         browsers: Default::default(),
+        browser_tools: Default::default(),
         browser_launch: None,
         controller: Controller::new(Model::default()),
         sessions: SessionManager::new(ResourcePolicy::default(), false),

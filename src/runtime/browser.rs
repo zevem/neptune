@@ -1,15 +1,18 @@
 //! Bounded process supervision and owned browser snapshots. No Chromium code
 //! is linked into the terminal executable or called during interactive frames.
 mod input;
+mod pick;
 mod pixels;
 pub(crate) mod protocol;
+mod tabs;
 
 use eframe::egui;
 use neptune_model::{Completion, PaneId};
 use protocol::{Command, Event, State, Target};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     process::{Command as Process, Stdio},
     sync::{
         Arc, Mutex,
@@ -24,9 +27,42 @@ pub(crate) struct View {
     pub state: State,
     pub texture: Option<egui::TextureId>,
     pub popup: Option<(egui::TextureId, egui::Rect)>,
+    /// The page's own icon, for its tab.
+    pub icon: Option<egui::TextureId>,
     pub failed: bool,
     /// This system allowed Chromium no sandbox, so the host runs without one.
     pub unsandboxed: bool,
+    /// The saved profile this browser keeps its cookies in, or none for a
+    /// private one.
+    pub profile: Option<String>,
+    /// This window holds the saved profiles; another Neptune may hold them.
+    pub saved: bool,
+    /// Other browsers found here to import cookies from, once looked for.
+    pub sources: Option<Arc<Vec<crate::platform::browser_import::Source>>>,
+    pub importing: bool,
+}
+
+/// The profile every Neptune has, kept in its data directory.
+pub(crate) const DEFAULT_PROFILE: &str = "default";
+
+/// What a browser finished for its user, for the application to hand over.
+pub(crate) enum Outcome {
+    /// An element's description for the clipboard, with its picture if kept.
+    Picked(String),
+    Recorded(Result<PathBuf, String>),
+    Imported {
+        imported: u32,
+        skipped: u32,
+    },
+}
+
+/// Where a window's browsers keep what outlives them.
+#[derive(Clone, Default)]
+struct Storage {
+    /// Saved profiles, held by one Neptune at a time.
+    profiles: Option<PathBuf>,
+    /// Pictures of picked elements.
+    captures: Option<PathBuf>,
 }
 #[derive(Clone)]
 pub(crate) struct Frame {
@@ -39,8 +75,14 @@ pub(crate) struct Frame {
 struct Incoming {
     states: BTreeMap<Target, State>,
     frames: BTreeMap<(Target, bool), Frame>,
+    /// A page's icon, or none where the page has none.
+    icons: BTreeMap<Target, Option<egui::ColorImage>>,
     failed: bool,
     unsandboxed: bool,
+    saved: bool,
+    picks: Vec<(Target, String, Option<PathBuf>)>,
+    recorded: Vec<(Target, Option<String>)>,
+    imported: Option<(u32, u32)>,
 }
 struct Bridge {
     sender: Option<mpsc::SyncSender<Command>>,
@@ -50,7 +92,7 @@ struct Bridge {
     done: Arc<AtomicBool>,
 }
 impl Bridge {
-    fn launch(ctx: egui::Context) -> Result<Self, &'static str> {
+    fn launch(ctx: egui::Context, storage: Storage) -> Result<Self, &'static str> {
         let (sender, receiver) = mpsc::sync_channel(64);
         let incoming = Arc::new(Mutex::new(Incoming::default()));
         let targets = Arc::new(Mutex::new(BTreeSet::new()));
@@ -65,7 +107,7 @@ impl Bridge {
         std::thread::Builder::new()
             .name("neptune-browser-host".into())
             .spawn(move || {
-                if run(receiver, updates.clone(), live, stop, ctx.clone()).is_err()
+                if run(receiver, updates.clone(), live, stop, ctx.clone(), storage).is_err()
                     && let Ok(mut incoming) = updates.lock()
                 {
                     incoming.failed = true;
@@ -103,6 +145,9 @@ struct Entry {
     state: State,
     texture: Option<egui::TextureHandle>,
     popup: Option<(egui::TextureHandle, egui::Rect)>,
+    icon: Option<egui::TextureHandle>,
+    /// What a wheel or touchpad moved short of a whole point.
+    wheel: egui::Vec2,
     opened: bool,
     completed: bool,
     failed: bool,
@@ -111,6 +156,9 @@ struct Entry {
     geometry: Option<(u32, u32, f32)>,
     frame_rate: Option<u32>,
     navigation: Option<String>,
+    profile: Option<String>,
+    /// The file a recording under way is saved to.
+    recording: Option<PathBuf>,
     buttons: u32,
     pointer_inside: bool,
     click: Option<(u8, Instant, egui::Pos2, i32)>,
@@ -122,8 +170,125 @@ pub(crate) struct Browsers {
     bridge: Option<Bridge>,
     frame_rate: Option<u32>,
     unsandboxed: bool,
+    saved: bool,
+    storage: Storage,
+    /// Cookies of an import the host has yet to be sent.
+    cookies: VecDeque<Command>,
+    outcomes: Vec<Outcome>,
+    /// The profile of the pane that last closed, or the one it was told to
+    /// change to: a restart opens the same pane again and keeps it.
+    resume: Option<(PaneId, Option<String>)>,
+    /// Where each tab that keeps its sign-ins is, for the next launch.
+    tabs: tabs::Tabs,
 }
 impl Browsers {
+    /// Keep saved profiles and captures under this directory. A window that
+    /// was given none keeps every browser in memory, as a test launch does.
+    pub fn store(&mut self, root: PathBuf) {
+        self.tabs = tabs::Tabs::open(&root);
+        self.storage = Storage {
+            captures: Some(root.join("captures")),
+            profiles: Some(root),
+        };
+    }
+    pub fn outcomes(&mut self) -> Vec<Outcome> {
+        std::mem::take(&mut self.outcomes)
+    }
+    fn entry(&mut self, pane: PaneId, generation: u64) -> Option<(&mut Entry, Target)> {
+        let target = Target {
+            pane: pane.get(),
+            generation,
+        };
+        self.entries
+            .get_mut(&pane)
+            .filter(|e| e.generation == generation && e.opened && !e.failed)
+            .map(|entry| (entry, target))
+    }
+    /// Start picking an element, or cancel a pick under way.
+    pub fn pick(&mut self, pane: PaneId, generation: u64) -> Result<(), &'static str> {
+        let Some((entry, target)) = self.entry(pane, generation) else {
+            return Ok(());
+        };
+        let active = !entry.state.picking;
+        self.send(Command::Pick { target, active })
+    }
+    /// Start recording the page, or end and save a recording under way.
+    pub fn record(&mut self, pane: PaneId, generation: u64) -> Result<(), &'static str> {
+        let directory = recordings();
+        let Some((entry, target)) = self.entry(pane, generation) else {
+            return Ok(());
+        };
+        if entry.state.recording || entry.recording.is_some() {
+            return self.send(Command::Record { target, path: None });
+        }
+        let directory = directory.ok_or("Neptune found no folder to save a recording in.")?;
+        std::fs::create_dir_all(&directory)
+            .map_err(|_| "The folder for recordings could not be made.")?;
+        let path = directory.join(format!("neptune-{}.webm", stamp()));
+        let name = path
+            .to_str()
+            .ok_or("The folder for recordings has a name Neptune cannot use.")?;
+        let command = Command::Record {
+            target,
+            path: Some(name.to_owned()),
+        };
+        entry.recording = Some(path);
+        if let Err(error) = self.send(command) {
+            if let Some((entry, _)) = self.entry(pane, generation) {
+                entry.recording = None;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    /// Give a saved profile cookies read from another browser. They are sent
+    /// as the host takes them; an [`Outcome::Imported`] follows.
+    pub fn import(&mut self, profile: &str, cookies: Vec<protocol::Cookie>) {
+        let mut parts = cookies.chunks(protocol::MAX_COOKIES).peekable();
+        if parts.peek().is_none() {
+            self.outcomes.push(Outcome::Imported {
+                imported: 0,
+                skipped: 0,
+            });
+        }
+        while let Some(part) = parts.next() {
+            self.cookies.push_back(Command::SetCookies {
+                profile: profile.to_owned(),
+                cookies: part.to_vec(),
+                last: parts.peek().is_none(),
+            });
+        }
+    }
+    pub fn importing(&self) -> bool {
+        !self.cookies.is_empty()
+    }
+    pub fn clear_cookies(&mut self, profile: &str) -> Result<(), &'static str> {
+        self.send(Command::ClearCookies {
+            profile: profile.to_owned(),
+        })
+    }
+    /// Forget a profile: its cookies go now, and what else it kept when the
+    /// browser host next starts, since a running one holds the files.
+    pub fn remove_profile(&mut self, profile: &str) {
+        if !protocol::valid_profile(profile) || profile == DEFAULT_PROFILE {
+            return;
+        }
+        let _ = self.clear_cookies(profile);
+        if let Some(root) = self.storage.profiles.as_ref().filter(|_| self.saved) {
+            let removed = root.join("removed");
+            let _ = std::fs::create_dir_all(&removed)
+                .and_then(|()| std::fs::write(removed.join(profile), []));
+        }
+    }
+    /// The saved profile a browser pane uses, if any.
+    pub fn profile(&self, pane: PaneId) -> Option<&str> {
+        self.entries.get(&pane)?.profile.as_deref()
+    }
+    /// Have a pane's next start use another profile. Chromium fixes a
+    /// browser's storage when it is made, so the caller restarts the pane.
+    pub fn switch(&mut self, pane: PaneId, profile: Option<String>) {
+        self.resume = Some((pane, profile));
+    }
     pub fn has_previews(&self) -> bool {
         !self.entries.is_empty()
     }
@@ -142,6 +307,7 @@ impl Browsers {
         ctx: &egui::Context,
         pane: PaneId,
         generation: u64,
+        profile: Option<String>,
     ) -> Result<(), &'static str> {
         let replacement =
             self.entries.contains_key(&pane) || self.closing.keys().any(|t| t.pane == pane.get());
@@ -150,7 +316,15 @@ impl Browsers {
                 "Browser capacity is reserved while previews are closing. Try again in a moment.",
             );
         }
-        self.close(pane);
+        self.release(pane);
+        // A tab the last run left opens where it was, in its profile; one
+        // being restarted keeps the profile it had or was changed to.
+        let restored = self.tabs.get(pane.get()).cloned();
+        let profile = match self.resume.take() {
+            Some((resumed, profile)) if resumed == pane => profile,
+            _ => restored.as_ref().map(|tab| tab.profile.clone()).or(profile),
+        }
+        .filter(|id| protocol::valid_profile(id));
         if self
             .bridge
             .as_ref()
@@ -160,7 +334,8 @@ impl Browsers {
             self.closing.clear();
         }
         if self.bridge.is_none() {
-            self.bridge = Some(Bridge::launch(ctx.clone())?);
+            self.bridge = Some(Bridge::launch(ctx.clone(), self.storage.clone())?);
+            self.saved = false;
         }
         self.entries.insert(
             pane,
@@ -168,6 +343,8 @@ impl Browsers {
                 generation,
                 state: State::default(),
                 texture: None,
+                icon: None,
+                wheel: egui::Vec2::ZERO,
                 popup: None,
                 opened: false,
                 completed: false,
@@ -176,7 +353,9 @@ impl Browsers {
                 focused: None,
                 geometry: None,
                 frame_rate: None,
-                navigation: None,
+                navigation: restored.map(|tab| tab.url),
+                profile,
+                recording: None,
                 buttons: 0,
                 pointer_inside: false,
                 click: None,
@@ -185,10 +364,24 @@ impl Browsers {
         ctx.request_repaint();
         Ok(())
     }
+    /// The pane is gone, and with it the page to come back to. A restart
+    /// names its page again when it opens.
     pub fn close(&mut self, pane: PaneId) {
-        if let Some(entry) = self.entries.remove(&pane)
-            && entry.opened
-        {
+        self.release(pane);
+        self.tabs.note(pane.get(), None);
+    }
+    fn release(&mut self, pane: PaneId) {
+        if let Some(entry) = self.entries.remove(&pane) {
+            if self
+                .resume
+                .as_ref()
+                .is_none_or(|(resumed, _)| *resumed != pane)
+            {
+                self.resume = Some((pane, entry.profile.clone()));
+            }
+            if !entry.opened {
+                return;
+            }
             self.closing.insert(
                 Target {
                     pane: pane.get(),
@@ -210,8 +403,13 @@ impl Browsers {
                 .popup
                 .as_ref()
                 .map(|(texture, rect)| (texture.id(), *rect)),
+            icon: entry.icon.as_ref().map(egui::TextureHandle::id),
             failed: entry.failed,
             unsandboxed: self.unsandboxed,
+            profile: entry.profile.clone().filter(|_| self.saved),
+            saved: self.saved,
+            sources: None,
+            importing: !self.cookies.is_empty(),
         })
     }
     pub fn address(&self, pane: PaneId, generation: u64) -> Option<String> {
@@ -284,12 +482,16 @@ impl Browsers {
         Ok(())
     }
     pub fn geometry(&mut self, pane: PaneId, generation: u64, size: egui::Vec2, scale: f32) {
-        let width = (size.x.max(1.0) as u32).min(protocol::MAX_SIDE);
-        let height = (size.y.max(1.0) as u32).min(protocol::MAX_SIDE);
+        // The page is painted in the pane's own physical pixels, so a frame
+        // meets the screen one to one. A pane too large for a frame is
+        // painted at a lower scale and stretched.
+        let points = size.max(egui::Vec2::splat(1.0));
         let scale = scale
-            .min((protocol::MAX_PIXELS as f32 / (width as f32 * height as f32)).sqrt() * 0.999)
-            .min(protocol::MAX_SIDE as f32 / width.max(height) as f32)
+            .min((protocol::MAX_PIXELS as f32 / (points.x * points.y)).sqrt() * 0.999)
+            .min(protocol::MAX_SIDE as f32 / points.max_elem())
             .clamp(0.25, 4.0);
+        let width = ((points.x * scale).round() as u32).clamp(1, protocol::MAX_SIDE);
+        let height = ((points.y * scale).round() as u32).clamp(1, protocol::MAX_SIDE);
         let target = Target {
             pane: pane.get(),
             generation,
@@ -327,6 +529,9 @@ impl Browsers {
             shown
         };
         let mut completions = Vec::new();
+        if let Some(wait) = self.tabs.settle() {
+            ctx.request_repaint_after(wait);
+        }
         if self
             .bridge
             .as_ref()
@@ -335,10 +540,11 @@ impl Browsers {
             self.bridge = None;
         }
         if self.bridge.is_none() && !self.entries.is_empty() {
-            match Bridge::launch(ctx.clone()) {
+            match Bridge::launch(ctx.clone(), self.storage.clone()) {
                 Ok(bridge) => {
                     self.bridge = Some(bridge);
                     self.unsandboxed = false;
+                    self.saved = false;
                 }
                 Err(error) => {
                     for (pane, entry) in &mut self.entries {
@@ -365,6 +571,31 @@ impl Browsers {
             .map(|mut data| std::mem::take(&mut *data));
         if let Some(incoming) = incoming {
             self.unsandboxed |= incoming.unsandboxed;
+            self.saved |= incoming.saved;
+            for (target, pick, screenshot) in incoming.picks {
+                if self
+                    .entries
+                    .get(&PaneId::new(target.pane))
+                    .is_some_and(|e| e.generation == target.generation)
+                    && let Some(said) = pick::describe(&pick, screenshot.as_deref())
+                {
+                    self.outcomes.push(Outcome::Picked(said));
+                }
+            }
+            for (target, error) in incoming.recorded {
+                if let Some(path) = self
+                    .entries
+                    .get_mut(&PaneId::new(target.pane))
+                    .filter(|e| e.generation == target.generation)
+                    .and_then(|e| e.recording.take())
+                {
+                    self.outcomes
+                        .push(Outcome::Recorded(error.map_or(Ok(path), Err)));
+                }
+            }
+            if let Some((imported, skipped)) = incoming.imported {
+                self.outcomes.push(Outcome::Imported { imported, skipped });
+            }
             for (target, state) in incoming.states {
                 if state.closed {
                     self.closing.remove(&target);
@@ -378,6 +609,24 @@ impl Browsers {
                     .filter(|e| e.generation == target.generation)
                 {
                     entry.state = state;
+                    // Only this window's saved profiles are remembered: a
+                    // private tab leaves no trace of where it went.
+                    if self.saved && entry.state.ready && !entry.state.closed {
+                        match &entry.profile {
+                            // A blank page on the way to one is not a move.
+                            Some(profile) if entry.state.url.starts_with("http") => {
+                                self.tabs.note(
+                                    target.pane,
+                                    Some(tabs::Tab {
+                                        url: entry.state.url.clone(),
+                                        profile: profile.clone(),
+                                    }),
+                                );
+                            }
+                            Some(_) => {}
+                            None => self.tabs.note(target.pane, None),
+                        }
+                    }
                     if entry.state.closed && !entry.failed {
                         entry.failed = true;
                         entry.state.error.get_or_insert_with(|| {
@@ -397,6 +646,21 @@ impl Browsers {
                     }
                 }
             }
+            for (target, icon) in incoming.icons {
+                if let Some(entry) = self
+                    .entries
+                    .get_mut(&PaneId::new(target.pane))
+                    .filter(|e| e.generation == target.generation)
+                {
+                    entry.icon = icon.map(|icon| {
+                        ctx.load_texture(
+                            format!("browser-icon-{}", target.pane),
+                            icon,
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                }
+            }
             for ((target, popup), frame) in incoming.frames {
                 let Some(entry) = self
                     .entries
@@ -413,7 +677,7 @@ impl Browsers {
                     let scale = entry.geometry.map_or(1.0, |g| g.2);
                     let size = egui::vec2(frame.size[0] as f32, frame.size[1] as f32) / scale;
                     let rect = egui::Rect::from_min_size(
-                        egui::pos2(frame.position[0] as f32, frame.position[1] as f32),
+                        egui::pos2(frame.position[0] as f32, frame.position[1] as f32) / scale,
                         size,
                     );
                     entry.popup = frame
@@ -439,7 +703,10 @@ impl Browsers {
                     if !entry.failed {
                         entry.failed = true;
                         entry.opened = false;
+                        entry.recording = None;
                         entry.state.loading = false;
+                        entry.state.picking = false;
+                        entry.state.recording = false;
                         entry.state.error = Some(
                             "The browser host stopped. Restart this preview to try again.".into(),
                         );
@@ -476,7 +743,11 @@ impl Browsers {
                 && let Ok(mut live) = bridge.targets.try_lock()
             {
                 live.insert(target);
-                if bridge.send(Command::Open { target }) {
+                // A host without the saved profiles opens it in memory.
+                if bridge.send(Command::Open {
+                    target,
+                    profile: entry.profile.clone(),
+                }) {
                     entry.opened = true;
                     reserved += 1;
                 }
@@ -516,6 +787,23 @@ impl Browsers {
                 entry.focused = Some(owns_focus);
             }
         }
+        // An import goes out as the host's queue has room for it.
+        for _ in 0..8 {
+            let Some(command) = self.cookies.pop_front() else {
+                break;
+            };
+            if let Some(sender) = &bridge.sender
+                && let Err(
+                    mpsc::TrySendError::Full(command) | mpsc::TrySendError::Disconnected(command),
+                ) = sender.try_send(command)
+            {
+                self.cookies.push_front(command);
+                break;
+            }
+        }
+        if !self.cookies.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(20));
+        }
         if let Ok(mut live) = bridge.targets.try_lock() {
             live.retain(|t| {
                 self.closing.contains_key(t)
@@ -537,6 +825,7 @@ impl Browsers {
         completions
     }
     pub fn shutdown(&mut self) {
+        self.tabs.flush();
         if let Some(mut bridge) = self.bridge.take() {
             bridge.stop();
             let deadline = Instant::now() + Duration::from_secs(6);
@@ -553,6 +842,7 @@ fn run(
     targets: Arc<Mutex<BTreeSet<Target>>>,
     stopping: Arc<AtomicBool>,
     ctx: egui::Context,
+    storage: Storage,
 ) -> std::io::Result<()> {
     let executable = std::env::var_os("NEPTUNE_BROWSER_HOST")
         .map(std::path::PathBuf::from)
@@ -589,7 +879,24 @@ fn run(
         use std::os::unix::fs::PermissionsExt;
         profile_builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    let profile = profile_builder.tempdir()?;
+    // Chromium lets one process use a profile directory. The Neptune that
+    // locks them first keeps saved profiles; any other runs as before, with
+    // browsers that forget.
+    let held = storage.profiles.as_deref().and_then(hold);
+    let profile = match &held {
+        Some(_) => None,
+        None => Some(profile_builder.tempdir()?),
+    };
+    let root = match (&profile, &storage.profiles) {
+        (Some(temporary), _) => temporary.path().to_path_buf(),
+        (None, Some(saved)) => saved.clone(),
+        (None, None) => return Err(std::io::Error::other("Browser profile unavailable")),
+    };
+    if held.is_some()
+        && let Ok(mut updates) = incoming.lock()
+    {
+        updates.saved = true;
+    }
     #[cfg(target_os = "linux")]
     let unsandboxed = sandbox_unavailable(&executable);
     let mut process = Process::new(executable);
@@ -607,8 +914,11 @@ fn run(
     if let Some(libraries) = bundled_libraries(process.get_program().as_ref()) {
         process.env("LD_LIBRARY_PATH", libraries);
     }
+    if held.is_some() {
+        process.env("NEPTUNE_BROWSER_SAVED", "1");
+    }
     process
-        .env("NEPTUNE_BROWSER_PROFILE", profile.path())
+        .env("NEPTUNE_BROWSER_PROFILE", &root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -674,7 +984,7 @@ fn run(
     let reader_ctx = ctx.clone();
     let reader = std::thread::Builder::new()
         .name("neptune-browser-output".into())
-        .spawn(move || read(stdout, incoming, targets, reader_ctx))?;
+        .spawn(move || read(stdout, incoming, targets, reader_ctx, storage.captures))?;
     let mut since = None;
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -704,6 +1014,62 @@ fn run(
     } else {
         Err(std::io::Error::other("Browser host stopped"))
     }
+}
+
+/// Take the saved profiles for this process, and finish removing those the
+/// user removed while a host still had their files open.
+fn hold(root: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)
+            .ok()?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(root).ok()?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("lock"))
+        .ok()?;
+    lock.try_lock().ok()?;
+    for removed in std::fs::read_dir(root.join("removed"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Some(id) = removed.file_name().to_str()
+            && protocol::valid_profile(id)
+            && id != DEFAULT_PROFILE
+        {
+            let profile = root.join(protocol::profile_directory(id));
+            if !profile.exists() || std::fs::remove_dir_all(&profile).is_ok() {
+                let _ = std::fs::remove_file(removed.path());
+            }
+        }
+    }
+    Some(lock)
+}
+
+/// Where recordings are saved: the user's videos, else beside their profile.
+fn recordings() -> Option<PathBuf> {
+    let user = directories::UserDirs::new()?;
+    Some(
+        user.video_dir()
+            .map_or_else(|| user.home_dir().join("Videos"), Path::to_path_buf)
+            .join("Neptune"),
+    )
+}
+
+/// A name for a file made now, unlike one made a moment ago.
+fn stamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis())
 }
 
 /// Whether this system allows Chromium neither of its Linux sandboxes: a
@@ -841,6 +1207,7 @@ fn read(
     incoming: Arc<Mutex<Incoming>>,
     targets: Arc<Mutex<BTreeSet<Target>>>,
     ctx: egui::Context,
+    captures: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut surfaces: BTreeMap<(Target, bool), pixels::Surface> = BTreeMap::new();
@@ -860,10 +1227,67 @@ fn read(
         let event: Event = serde_json::from_slice(&line)
             .map_err(|_| std::io::Error::other("Invalid browser message"))?;
         match event {
+            Event::Picked { target, pick } => {
+                if pick.len() > protocol::MAX_PICK {
+                    return Err(std::io::Error::other("Browser pick limit"));
+                }
+                if targets.lock().is_ok_and(|live| live.contains(&target)) {
+                    // The page script removed its marks and let a frame pass
+                    // before it answered, so this is the element alone.
+                    let screenshot = surfaces
+                        .get(&(target, false))
+                        .zip(captures.as_deref())
+                        .and_then(|(surface, directory)| {
+                            pick::capture(&pick, surface.image(), directory, stamp())
+                        });
+                    if let Ok(mut updates) = incoming.lock() {
+                        updates.picks.truncate(protocol::MAX_BROWSERS);
+                        updates.picks.push((target, pick, screenshot));
+                    }
+                }
+            }
+            Event::Recorded { target, error, .. } => {
+                if error.as_ref().is_some_and(|e| e.len() > 2048) {
+                    return Err(std::io::Error::other("Browser state limit"));
+                }
+                if let Ok(mut updates) = incoming.lock() {
+                    updates.recorded.truncate(protocol::MAX_BROWSERS);
+                    updates.recorded.push((target, error));
+                }
+            }
+            Event::Imported { imported, skipped } => {
+                if let Ok(mut updates) = incoming.lock() {
+                    updates.imported = Some((imported, skipped));
+                }
+            }
+            Event::Icon {
+                target,
+                width,
+                height,
+            } => {
+                if width > protocol::MAX_ICON || height > protocol::MAX_ICON {
+                    return Err(std::io::Error::other("Browser icon limit"));
+                }
+                let mut pixels = vec![0; width as usize * height as usize * 4];
+                reader.read_exact(&mut pixels)?;
+                let icon = (!pixels.is_empty()).then(|| {
+                    egui::ColorImage::from_rgba_premultiplied(
+                        [width as usize, height as usize],
+                        &pixels,
+                    )
+                });
+                if targets.lock().is_ok_and(|live| live.contains(&target))
+                    && let Ok(mut updates) = incoming.lock()
+                {
+                    updates.icons.insert(target, icon);
+                }
+            }
             Event::State { target, state } => {
                 if state.title.len() > 2048
                     || state.url.len() > protocol::MAX_URL
                     || state.error.as_ref().is_some_and(|e| e.len() > 2048)
+                    || state.tooltip.as_ref().is_some_and(|t| t.len() > 2048)
+                    || state.link.as_ref().is_some_and(|l| l.len() > 2048)
                 {
                     return Err(std::io::Error::other("Browser state limit"));
                 }
@@ -957,7 +1381,7 @@ mod tests {
         };
         let ctx = egui::Context::default();
         let pane = PaneId::new(3);
-        browsers.start(&ctx, pane, 1).unwrap();
+        browsers.start(&ctx, pane, 1, None).unwrap();
         (browsers, receiver, ctx, pane)
     }
     fn update(browsers: &Browsers, target: Target, state: State) {
@@ -1008,6 +1432,111 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(visible, [false, true]);
         }
+    }
+    #[test]
+    fn a_restored_tab_opens_its_page_in_its_profile_until_it_is_closed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("tabs.json"),
+            r#"{"version":1,"tabs":{"7":{"url":"https://example.com/a","profile":"profile-work"}}}"#,
+        )
+        .unwrap();
+        let (mut browsers, _receiver, ctx, _) = fixture();
+        browsers.store(root.path().into());
+        let (restored, new) = (PaneId::new(7), PaneId::new(8));
+        browsers
+            .start(&ctx, restored, 1, Some("default".into()))
+            .unwrap();
+        browsers
+            .start(&ctx, new, 1, Some("default".into()))
+            .unwrap();
+        let entry = &browsers.entries[&restored];
+        assert_eq!(entry.profile.as_deref(), Some("profile-work"));
+        assert_eq!(entry.navigation.as_deref(), Some("https://example.com/a"));
+        let entry = &browsers.entries[&new];
+        assert_eq!(entry.profile.as_deref(), Some("default"));
+        assert_eq!(entry.navigation, None);
+        // A restart keeps the page; closing the tab forgets it.
+        browsers.start(&ctx, restored, 2, None).unwrap();
+        assert!(browsers.entries[&restored].navigation.is_some());
+        browsers.close(restored);
+        browsers.tabs.flush();
+        assert!(
+            !std::fs::read_to_string(root.path().join("tabs.json"))
+                .unwrap()
+                .contains("example.com")
+        );
+    }
+    #[test]
+    fn a_page_is_sized_in_the_physical_pixels_of_its_pane() {
+        let (mut browsers, receiver, ctx, pane) = fixture();
+        browsers.poll(&ctx, &[pane], None);
+        receiver.try_iter().for_each(drop);
+        let sized = |browsers: &mut Browsers, size, scale| {
+            browsers.geometry(pane, 1, size, scale);
+            receiver.try_iter().find_map(|command| match command {
+                Command::Resize {
+                    width,
+                    height,
+                    scale,
+                    ..
+                } => Some((width, height, scale)),
+                _ => None,
+            })
+        };
+        // A pane of a fractional size covers whole pixels of the display.
+        assert_eq!(
+            sized(&mut browsers, egui::vec2(433.4, 300.0), 1.5),
+            Some((650, 450, 1.5))
+        );
+        assert_eq!(sized(&mut browsers, egui::vec2(433.4, 300.0), 1.5), None);
+        // One too large for a frame is painted at a lower scale.
+        let (width, height, scale) = sized(&mut browsers, egui::vec2(4000.0, 3000.0), 2.0).unwrap();
+        assert!(scale < 2.0);
+        assert!(protocol::frame_len(width, height).is_some());
+    }
+    #[test]
+    fn a_wheel_and_a_touchpad_scroll_a_page_as_they_do_a_browser() {
+        let (mut browsers, receiver, ctx, pane) = fixture();
+        browsers.poll(&ctx, &[pane], None);
+        receiver.try_iter().for_each(drop);
+        let target = Target {
+            pane: pane.get(),
+            generation: 1,
+        };
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let mut scroll = |unit, y: f32| {
+            let event = egui::Event::MouseWheel {
+                unit,
+                delta: egui::vec2(0.0, y),
+                modifiers: Default::default(),
+                phase: egui::TouchPhase::Move,
+            };
+            browsers
+                .input(
+                    target,
+                    rect,
+                    &[event],
+                    false,
+                    Default::default(),
+                    Some(egui::pos2(10.0, 10.0)),
+                )
+                .unwrap();
+            receiver.try_iter().find_map(|command| match command {
+                Command::Mouse {
+                    modifiers,
+                    kind: protocol::Mouse::Wheel { dy, .. },
+                    ..
+                } => Some((dy, modifiers & (1 << 14) != 0)),
+                _ => None,
+            })
+        };
+        // A notch is Chromium's own distance, left to it to ease.
+        assert_eq!(scroll(egui::MouseWheelUnit::Line, -1.0), Some((-53, false)));
+        // A slow stroke on a touchpad adds up rather than being dropped.
+        assert_eq!(scroll(egui::MouseWheelUnit::Point, 0.4), None);
+        assert_eq!(scroll(egui::MouseWheelUnit::Point, 0.4), Some((1, true)));
+        assert_eq!(scroll(egui::MouseWheelUnit::Point, 12.3), Some((12, true)));
     }
     #[test]
     fn browser_frame_rate_follows_display_and_retries_a_full_command_queue() {
@@ -1107,7 +1636,8 @@ mod tests {
                     wire.as_slice(),
                     incoming.clone(),
                     targets.clone(),
-                    ctx.clone()
+                    ctx.clone(),
+                    None,
                 )
                 .is_err()
             );
@@ -1148,7 +1678,7 @@ mod tests {
         let (mut browsers, receiver, ctx, pane) = fixture();
         browsers.poll(&ctx, &[pane], None);
         receiver.try_iter().for_each(drop);
-        browsers.start(&ctx, pane, 2).unwrap();
+        browsers.start(&ctx, pane, 2, None).unwrap();
         update(
             &browsers,
             Target {
@@ -1228,7 +1758,7 @@ mod tests {
             wire.push(b'\n');
             wire.extend(pixels);
         }
-        read(wire.as_slice(), incoming.clone(), targets, ctx).unwrap();
+        read(wire.as_slice(), incoming.clone(), targets, ctx, None).unwrap();
         let updates = incoming.lock().unwrap();
         let frame = &updates.frames[&(target, false)];
         assert_eq!(frame.image.size, [3, 1]);
@@ -1266,12 +1796,13 @@ mod tests {
                 data.as_slice(),
                 incoming.clone(),
                 targets.clone(),
-                ctx.clone()
+                ctx.clone(),
+                None,
             )
             .is_err()
         );
         let bytes = vec![b' '; protocol::MAX_MESSAGE + 1];
-        assert!(read(bytes.as_slice(), incoming, targets, ctx).is_err());
+        assert!(read(bytes.as_slice(), incoming, targets, ctx, None).is_err());
     }
     #[test]
     fn browser_disallowed_navigation_and_text_do_not_kill_transport() {
