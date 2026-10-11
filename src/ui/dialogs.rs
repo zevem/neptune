@@ -627,10 +627,20 @@ pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut 
         },
         _ => {}
     }
-    if let Some(error) = &state.error
-        && toast(ctx, p, error)
-    {
-        actions.push(Action::DismissError);
+    if let Some(error) = &state.error {
+        if toast(ctx, p, error) {
+            actions.push(Action::DismissError);
+        }
+    } else if let Some((said, shown)) = &state.notice {
+        // What was done is said for a while; what went wrong waits to be read.
+        let left = UiState::NOTICE_SECONDS - (ctx.input(|i| i.time) - shown);
+        if left <= 0.0
+            || super::controls::notice(ctx, p, said, (crate::icons::Icon::Check, p.green))
+        {
+            state.notice = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+        }
     }
     if let Some(level) = &state.level
         && !super::controls::level(ctx, p, level)

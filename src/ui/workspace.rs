@@ -618,13 +618,27 @@ fn tab(
     // A worktree's tab is named by its branch, and says what runs there
     // where another tab names its folder.
     let branch = presentation.worktree.as_ref().map(|tab| &tab.branch);
-    if presentation.browser.is_some() && right - left > 40.0 {
-        icons::paint(
-            &painter,
-            Rect::from_center_size(Pos2::new(left + 6.5, rect.center().y), Vec2::splat(13.0)),
-            Icon::Globe,
-            p.secondary,
-        );
+    if let Some(browser) = presentation
+        .browser
+        .as_ref()
+        .filter(|_| right - left > 40.0)
+    {
+        // A page on its way turns in its tab; one that has come shows its
+        // own icon, or the globe where it has none.
+        let mark =
+            Rect::from_center_size(Pos2::new(left + 6.5, rect.center().y), Vec2::splat(13.0));
+        if browser.state.loading {
+            super::browser::turning(&painter, mark, p.secondary);
+        } else if let Some(icon) = browser.icon {
+            painter.image(
+                icon,
+                mark.expand(0.5),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            icons::paint(&painter, mark, Icon::Globe, p.secondary);
+        }
         left += 18.0;
     }
     if branch.is_some() && right - left > 40.0 {

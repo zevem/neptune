@@ -882,11 +882,16 @@ fn general(
                 *config = Config {
                     custom_themes: config.custom_themes.clone(),
                     favorite_themes: config.favorite_themes.clone(),
+                    browser_profile: config.browser_profile.clone(),
+                    browser_profiles: config.browser_profiles.clone(),
                     ..Config::default()
                 };
             }
         });
-        rows.note(ui, "Custom themes and favorites are kept.");
+        rows.note(
+            ui,
+            "Custom themes, favorites and browser profiles are kept.",
+        );
     });
 }
 

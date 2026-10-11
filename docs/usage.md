@@ -110,13 +110,56 @@ shortcuts leave shell Ctrl+L and Ctrl+R available in terminals.
 A window supports eight browser panes. Hidden previews retain their pages and
 connections, and suspend painting. Closing a browser releases its page;
 **Restart preview** opens a fresh page at the current address after a helper
-failure. Browser tabs restore their layout with a blank address. URLs, history,
-cookies and page contents are session-local and never enter workspace saves.
-Each preview has its own in-memory profile. User-initiated popup links navigate
+failure. A restored browser tab opens the page it was on, in its profile; a
+private tab comes back blank. History and page contents are never saved. User-initiated popup links navigate
 the current preview; separate popup workflows, including some OAuth flows, need
 the external browser. Browser panes can move between local and SSH workspaces;
 their network access is always from this computer. Closing the terminal that
 owns an SSH forward closes that forward even if its browser remains open.
+
+### Profiles and sign-ins
+
+A browser tab opens in a **profile**, which keeps its cookies and site data on
+this computer, in Neptune's data directory, so a site you sign in to stays
+signed in after Neptune restarts. Every tab starts in **Default** unless you
+choose otherwise. **More browser actions → Profile** lists the profiles, adds
+one (up to 24), sets the profile new browser tabs start in, clears the current
+profile's cookies and removes a profile with its data. Changing a tab's profile
+reloads its page in the other profile. A browser opened from a browser, by a
+split or a new browser tab, stays in that one's profile.
+
+**Private** keeps nothing: each private tab has cookies of its own that go
+when the tab closes. Set `browser_profile = "private"` in the configuration
+for the earlier behaviour, where no browser tab keeps anything. Saved profiles
+belong to one Neptune process at a time. In a second Neptune running on the
+same data, browser tabs are private and the menu says so. A removed profile's data is deleted the next time browser tabs start.
+
+**Import cookies from** copies the cookies of a profile of another browser on
+this computer into the tab's profile: Chrome, Chromium, Edge, Brave, Vivaldi,
+Opera, Arc and Firefox where they are installed. Quit that browser first, then
+reload the page. Chromium-family cookies are decrypted with that browser's key
+from the system keyring, which may ask for permission. Only cookies are
+copied: passwords, history and other site data are not, and a site may still
+ask you to sign in again. Importing has been run on Linux only so far. It is unavailable for Chromium-family
+browsers on Windows, whose cookies are bound to the browser itself, and for
+Safari.
+
+### Picking an element
+
+**Pick an element** (the pointer button, the menu or the palette) lets you
+click one element of the page. Its tag, a selector, text, HTML, the styles
+that matter, the React component and source file where the page exposes them,
+and the path of a picture of it are copied as text, ready to paste to an agent
+or an issue. Escape cancels. Neptune keeps the 32 newest pictures in its data
+directory. The text comes from the page, so read it as you would the page.
+
+### Recording the page
+
+**Record the page** records what the page shows, with the pointer, until you
+press the button again, for ten minutes at most. The WebM video is saved to
+`Neptune` in your Videos folder and its path is copied. Sound is not recorded,
+and the recording follows the page, so a tab that is out of view records
+nothing new. Some players show no length for these files.
 
 Start with a preview split using `neptune --browser http://localhost:3000`.
 Source builds need the [browser helper and runtime](browser.md); installed

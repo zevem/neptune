@@ -26,6 +26,7 @@ impl Browsers {
         let mut buttons = entry.buttons;
         let mut inside = entry.pointer_inside;
         let mut click = entry.click;
+        let mut wheel_rest = entry.wheel;
         let mut commands = Vec::new();
         // Input proves that this web widget owns the interaction. Reconcile
         // focus before keys/clicks, including the first frame after a native
@@ -157,20 +158,21 @@ impl Browsers {
                     modifiers,
                     ..
                 } if pointer.is_some_and(|pos| rect.contains(pos)) => {
-                    let factor = match unit {
-                        egui::MouseWheelUnit::Point => 1.0,
-                        egui::MouseWheelUnit::Line => 40.0,
-                        egui::MouseWheelUnit::Page => rect.height(),
-                    };
+                    let (moved, precise) = wheel(*unit, *delta, rect.height());
+                    // Chromium takes whole pixels. What a slow touchpad
+                    // stroke moves short of one is kept for the next event
+                    // rather than lost.
+                    let whole = (wheel_rest + moved).round();
+                    wheel_rest += moved - whole;
                     let position = pointer.unwrap_or(rect.min) - rect.min;
-                    Some(Command::Mouse {
+                    (whole != egui::Vec2::ZERO).then(|| Command::Mouse {
                         target,
                         x: position.x as i32,
                         y: position.y as i32,
-                        modifiers: flags(*modifiers),
+                        modifiers: flags(*modifiers) | if precise { PRECISE_SCROLL } else { 0 },
                         kind: Mouse::Wheel {
-                            dx: (delta.x * factor) as i32,
-                            dy: (delta.y * factor) as i32,
+                            dx: whole.x as i32,
+                            dy: whole.y as i32,
                         },
                     })
                 }
@@ -181,6 +183,7 @@ impl Browsers {
             }
         }
         entry.buttons = buttons;
+        entry.wheel = wheel_rest;
         entry.pointer_inside = inside;
         entry.click = click;
         for command in commands {
@@ -191,6 +194,24 @@ impl Browsers {
             }
         }
         Ok(())
+    }
+}
+
+/// The points one notch of a wheel scrolls a page, as Chromium's own
+/// windows count it.
+const NOTCH: f32 = 53.0;
+/// `cef_event_flags_t`: the wheel deltas are a touchpad's own pixels, to
+/// follow as they come rather than to animate as the notches of a wheel.
+const PRECISE_SCROLL: u32 = 1 << 14;
+
+/// What a wheel event moves a page, in points, and whether it is a
+/// touchpad's own distance. A touchpad is followed as it comes; a wheel's
+/// notches are left to Chromium to ease.
+fn wheel(unit: egui::MouseWheelUnit, delta: egui::Vec2, page: f32) -> (egui::Vec2, bool) {
+    match unit {
+        egui::MouseWheelUnit::Point => (delta, true),
+        egui::MouseWheelUnit::Line => (delta * NOTCH, false),
+        egui::MouseWheelUnit::Page => (delta * page, false),
     }
 }
 

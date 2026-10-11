@@ -992,6 +992,11 @@ pub fn capsule(painter: &Painter, rect: Rect, p: Palette) {
 /// A non-blocking message in the window's top trailing corner, clear of pane
 /// status and the active prompt. Returns true when dismissed.
 pub fn toast(ctx: &egui::Context, p: Palette, message: &str) -> bool {
+    notice(ctx, p, message, (Icon::Warning, p.red))
+}
+
+/// A toast under another mark: something done, rather than something wrong.
+pub fn notice(ctx: &egui::Context, p: Palette, message: &str, mark: (Icon, Color32)) -> bool {
     let screen = ctx.content_rect();
     let mut dismissed = false;
     egui::Area::new(Id::new("neptune-toast"))
@@ -1018,7 +1023,7 @@ pub fn toast(ctx: &egui::Context, p: Palette, message: &str) -> bool {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 10.0;
                         let (_, icon) = ui.allocate_space(Vec2::splat(16.0));
-                        icons::paint(ui.painter(), icon, Icon::Warning, p.red);
+                        icons::paint(ui.painter(), icon, mark.0, mark.1);
                         let close = ui.available_width() - 38.0;
                         ui.scope(|ui| {
                             ui.set_max_width(close.max(80.0));

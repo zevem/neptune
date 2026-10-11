@@ -63,6 +63,10 @@ pub enum Icon {
     Play,
     Stop,
     Lock,
+    /// The pointer that picks an element in a page.
+    Pointer,
+    Record,
+    Person,
     /// The eight reactions a host has, each a small picture.
     ThumbUp,
     ThumbDown,
@@ -534,6 +538,31 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             ]);
             line(&[[10.0, 10.5], [10.3, 17.0]]);
             line(&[[14.0, 10.5], [13.7, 17.0]]);
+        }
+        Icon::Pointer => {
+            line(&[
+                [6.0, 3.5],
+                [6.0, 18.5],
+                [9.8, 15.0],
+                [12.6, 20.5],
+                [14.8, 19.4],
+                [12.0, 14.0],
+                [17.5, 14.0],
+                [6.0, 3.5],
+            ]);
+        }
+        Icon::Record => {
+            circle(12.0, 12.0, 8.0);
+            circle(12.0, 12.0, 2.5);
+        }
+        Icon::Person => {
+            circle(12.0, 8.5, 3.5);
+            let mut shoulders = Vec::new();
+            for step in 0..=8 {
+                let angle = std::f32::consts::PI * (1.0 + step as f32 / 8.0);
+                shoulders.push([12.0 + 6.5 * angle.cos(), 19.5 + 5.0 * angle.sin()]);
+            }
+            line(&shoulders);
         }
         Icon::Lock => {
             // A shackle over the body: a page reached over a secure connection.

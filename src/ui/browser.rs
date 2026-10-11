@@ -1,7 +1,7 @@
 //! Native navigation chrome around an owned browser frame.
 use super::{
     Action,
-    helpers::{self, ButtonKind, menu_item, menu_layout},
+    helpers::{self, ButtonKind, menu_item, menu_layout, menu_separator, menu_submenu},
     workspace::{Stage, StageOutput},
 };
 use crate::{
@@ -20,12 +20,94 @@ use eframe::egui::{
 use neptune_model::PaneId;
 
 /// Below this width the trailing actions fold into one "more" control.
-const WIDE: f32 = 340.0;
+const WIDE: f32 = 430.0;
 /// Height of the browser navigation band.
 const BAR_HEIGHT: f32 = 38.0;
 
 /// Side of a navigation control's target, as in a pane header.
 const CONTROL: f32 = 28.0;
+
+/// The pointer a page asks for, from Chromium's `cef_cursor_type_t`.
+fn cursor(kind: u32) -> egui::CursorIcon {
+    use egui::CursorIcon::*;
+    match kind {
+        1 => Crosshair,
+        2 => PointingHand,
+        3 => Text,
+        4 => Wait,
+        5 => Help,
+        6 => ResizeEast,
+        7 => ResizeNorth,
+        8 => ResizeNorthEast,
+        9 => ResizeNorthWest,
+        10 => ResizeSouth,
+        11 => ResizeSouthEast,
+        12 => ResizeSouthWest,
+        13 => ResizeWest,
+        14 => ResizeVertical,
+        15 => ResizeHorizontal,
+        16 => ResizeNeSw,
+        17 => ResizeNwSe,
+        18 => ResizeColumn,
+        19 => ResizeRow,
+        20..=28 | 43 | 44 => AllScroll,
+        29 => Move,
+        30 => VerticalText,
+        31 => Cell,
+        32 => ContextMenu,
+        33 => Alias,
+        34 => Progress,
+        35 => NoDrop,
+        36 => Copy,
+        37 => None,
+        38 => NotAllowed,
+        39 => ZoomIn,
+        40 => ZoomOut,
+        41 => Grab,
+        42 => Grabbing,
+        _ => Default,
+    }
+}
+
+/// The mark of a page on its way: an arc that turns while it loads.
+pub(super) fn turning(painter: &egui::Painter, rect: Rect, color: egui::Color32) {
+    let ctx = painter.ctx();
+    let start = ctx.input(|i| i.time) as f32 * std::f32::consts::TAU * 0.9;
+    let radius = rect.width().min(rect.height()) * 0.5 - 1.5;
+    let points = (0..=20)
+        .map(|step| {
+            let angle = start + step as f32 / 20.0 * std::f32::consts::TAU * 0.7;
+            rect.center() + radius * egui::vec2(angle.cos(), angle.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
+    ctx.request_repaint();
+}
+
+/// What a browser tab does besides navigation, for the application to carry out.
+#[derive(Clone)]
+pub enum Tool {
+    /// Start picking an element, or cancel a pick under way.
+    Pick,
+    /// Start recording the page, or end and save a recording under way.
+    Record,
+    /// Open this tab again in a saved profile, or a private one.
+    Profile(Option<String>),
+    /// Use this profile for new browser tabs.
+    DefaultProfile(Option<String>),
+    /// Make a profile and open this tab again in it.
+    NewProfile,
+    /// Remove this tab's profile and what it kept.
+    RemoveProfile,
+    ClearCookies,
+    /// Look for other browsers to import cookies from.
+    Sources,
+    /// Copy another browser profile's cookies into this tab's profile.
+    Import {
+        source: String,
+        directory: String,
+    },
+}
 
 #[derive(Default)]
 pub struct State {
@@ -258,6 +340,134 @@ fn placeholder(
     )
 }
 
+/// A line of a menu that says something and does nothing.
+fn menu_note(ui: &mut Ui, p: Palette, text: &str) {
+    let width = ui.available_width() - 20.0;
+    let galley = ui.painter().layout(
+        text.to_owned(),
+        theme::regular(11.5),
+        p.muted,
+        width.max(40.0),
+    );
+    let (_, rect) = ui.allocate_space(vec2(ui.available_width(), galley.size().y + 12.0));
+    ui.painter()
+        .galley(rect.min + vec2(10.0, 6.0), galley, Color32::PLACEHOLDER);
+    announce(ui, rect, ui.id().with(("menu-note", text)), text);
+}
+
+/// Where this tab keeps its cookies, and what can be done with them.
+fn profile_menu(
+    ui: &mut Ui,
+    p: Palette,
+    view: &View,
+    config: &crate::config::Config,
+    actions: &mut Vec<Action>,
+    tool: &dyn Fn(Tool) -> Action,
+) {
+    use crate::config::BrowserProfile;
+    if !view.saved {
+        // Another Neptune holds the saved profiles, or this one was given none.
+        menu_note(
+            ui,
+            p,
+            "Private tab. Saved profiles are in use by another Neptune window.",
+        );
+        return;
+    }
+    let current = view.profile.as_deref();
+    let listed = std::iter::once((Some(BrowserProfile::DEFAULT), "Default"))
+        .chain(
+            config
+                .browser_profiles
+                .iter()
+                .map(|profile| (Some(profile.id.as_str()), profile.name.as_str())),
+        )
+        .chain(std::iter::once((None, "Private")));
+    let label = format!("Profile: {}", config.browser_profile_name(current));
+    menu_submenu(ui, p, Icon::Person, &label, |ui| {
+        menu_layout(ui, 232.0);
+        for (id, name) in listed {
+            let icon = if id == current {
+                Icon::Check
+            } else if id.is_none() {
+                Icon::Lock
+            } else {
+                Icon::Person
+            };
+            if menu_item(ui, p, icon, name, "", false) {
+                actions.push(tool(Tool::Profile(id.map(str::to_owned))));
+                ui.close();
+            }
+        }
+        menu_separator(ui, p);
+        if config.browser_profiles.len() < BrowserProfile::MAX
+            && menu_item(ui, p, Icon::Plus, "New profile", "", false)
+        {
+            actions.push(tool(Tool::NewProfile));
+            ui.close();
+        }
+        if config.browser_profile() != current.map(str::to_owned)
+            && menu_item(ui, p, Icon::Star, "Use for new browser tabs", "", false)
+        {
+            actions.push(tool(Tool::DefaultProfile(current.map(str::to_owned))));
+            ui.close();
+        }
+        if current.is_some() && menu_item(ui, p, Icon::Eraser, "Clear cookies", "", false) {
+            actions.push(tool(Tool::ClearCookies));
+            ui.close();
+        }
+        if current.is_some_and(|id| id != BrowserProfile::DEFAULT)
+            && menu_item(ui, p, Icon::Trash, "Remove profile and its data", "", true)
+        {
+            actions.push(tool(Tool::RemoveProfile));
+            ui.close();
+        }
+    });
+    if current.is_none() {
+        return;
+    }
+    menu_submenu(ui, p, Icon::ArrowDown, "Import cookies from", |ui| {
+        menu_layout(ui, 264.0);
+        let Some(sources) = &view.sources else {
+            actions.push(tool(Tool::Sources));
+            menu_note(ui, p, "Looking for browsers…");
+            return;
+        };
+        if view.importing {
+            menu_note(ui, p, "Importing cookies…");
+            return;
+        }
+        if sources.is_empty() {
+            menu_note(ui, p, "No other browser with cookies was found.");
+            return;
+        }
+        for source in sources.iter() {
+            for profile in &source.profiles {
+                let mut label = if source.profiles.len() == 1 {
+                    source.name.to_owned()
+                } else {
+                    format!("{}: {}", source.name, profile.name)
+                };
+                if let Some(cookies) = profile.cookies {
+                    label.push_str(&format!(" ({cookies})"));
+                }
+                if menu_item(ui, p, Icon::Globe, &label, "", false) {
+                    actions.push(tool(Tool::Import {
+                        source: source.id.to_owned(),
+                        directory: profile.directory.clone(),
+                    }));
+                    ui.close();
+                }
+            }
+        }
+        menu_note(
+            ui,
+            p,
+            "Quit that browser first. Cookies are copied into this profile.",
+        );
+    });
+}
+
 pub(crate) fn show(
     ui: &mut Ui,
     rect: Rect,
@@ -331,7 +541,7 @@ pub(crate) fn show(
         },
     );
     let wide = rect.width() >= WIDE;
-    let extras = 6.0 + if wide { CONTROL * 2.0 } else { CONTROL };
+    let extras = 6.0 + if wide { CONTROL * 5.0 } else { CONTROL };
     let address = Rect::from_min_max(
         egui::pos2(x + 6.0, top),
         egui::pos2((toolbar.right() - extras - 6.0).max(x + 6.0), top + CONTROL),
@@ -464,10 +674,24 @@ pub(crate) fn show(
             Vec2::splat(CONTROL),
         )
     };
+    let tool = |tool| Action::BrowserTool(pane, generation, tool);
+    let (picking, recording) = (view.state.picking, view.state.recording);
+    let pick = if picking {
+        (Icon::Close, "Cancel picking")
+    } else {
+        (Icon::Pointer, "Pick an element")
+    };
+    let record = if recording {
+        (Icon::Stop, "Stop recording")
+    } else {
+        (Icon::Record, "Record the page")
+    };
+    // A page that failed or has yet to load has nothing to pick or record.
+    let page = inspectable && !blank && view.state.error.is_none();
     if wide {
         if button(
             ui,
-            trailing(2.0),
+            trailing(5.0),
             (Icon::ArrowUpRight, "Open in external browser", ""),
             external,
             p,
@@ -479,7 +703,7 @@ pub(crate) fn show(
         }
         if button(
             ui,
-            trailing(1.0),
+            trailing(4.0),
             (Icon::Code, "Developer tools", inspect_hint.as_str()),
             inspectable,
             p,
@@ -493,40 +717,87 @@ pub(crate) fn show(
                 Command::DevTools { target },
             ));
         }
-    } else if toolbar.width() >= CONTROL * 4.0 + 12.0 {
-        // A narrow pane lists the same actions, and only those it can take.
+        if button(
+            ui,
+            trailing(3.0),
+            (pick.0, pick.1, ""),
+            page || picking,
+            p,
+            pane,
+        )
+        .clicked()
+        {
+            actions.push(tool(Tool::Pick));
+        }
+        let bounds = trailing(2.0);
+        if button(
+            ui,
+            bounds,
+            (record.0, record.1, ""),
+            page || recording,
+            p,
+            pane,
+        )
+        .clicked()
+        {
+            actions.push(tool(Tool::Record));
+        }
+        if recording {
+            ui.painter()
+                .circle_filled(bounds.right_top() + vec2(-7.0, 7.0), 3.0, p.red);
+        }
+    }
+    if toolbar.width() >= CONTROL * 4.0 + 12.0 {
+        // A narrow pane lists every action here, and only those it can take.
         let more = button(
             ui,
             trailing(1.0),
             (Icon::Ellipsis, "More browser actions", ""),
-            external || inspectable,
+            view.state.ready && !view.failed,
             p,
             pane,
         );
+        if recording && !wide {
+            ui.painter()
+                .circle_filled(more.rect.right_top() + vec2(-7.0, 7.0), 3.0, p.red);
+        }
         egui::Popup::menu(&more).show(|ui| {
-            menu_layout(ui, 232.0);
-            if external
-                && menu_item(
-                    ui,
-                    p,
-                    Icon::ArrowUpRight,
-                    "Open in external browser",
-                    "",
-                    false,
-                )
-            {
-                open_external(actions);
-                ui.close();
+            menu_layout(ui, 248.0);
+            if !wide {
+                if external
+                    && menu_item(
+                        ui,
+                        p,
+                        Icon::ArrowUpRight,
+                        "Open in external browser",
+                        "",
+                        false,
+                    )
+                {
+                    open_external(actions);
+                    ui.close();
+                }
+                if inspectable
+                    && menu_item(ui, p, Icon::Code, "Developer tools", &inspect_hint, false)
+                {
+                    actions.push(Action::Browser(
+                        pane,
+                        generation,
+                        Command::DevTools { target },
+                    ));
+                    ui.close();
+                }
+                if (page || picking) && menu_item(ui, p, pick.0, pick.1, "", false) {
+                    actions.push(tool(Tool::Pick));
+                    ui.close();
+                }
+                if (page || recording) && menu_item(ui, p, record.0, record.1, "", false) {
+                    actions.push(tool(Tool::Record));
+                    ui.close();
+                }
+                menu_separator(ui, p);
             }
-            if inspectable && menu_item(ui, p, Icon::Code, "Developer tools", &inspect_hint, false)
-            {
-                actions.push(Action::Browser(
-                    pane,
-                    generation,
-                    Command::DevTools { target },
-                ));
-                ui.close();
-            }
+            profile_menu(ui, p, view, stage.config, actions, &tool);
         });
     }
     let response = ui.interact(
@@ -544,6 +815,15 @@ pub(crate) fn show(
     if response.clicked() || response.drag_started() {
         actions.push(Action::Focus(pane));
         response.request_focus();
+    }
+    // The page says what the pointer is over: a link's hand, a field's
+    // bar, the edge of something that resizes.
+    let over = response.hovered() && view.state.error.is_none() && view.texture.is_some();
+    if over {
+        ui.ctx().set_cursor_icon(cursor(view.state.cursor));
+        if let Some(tooltip) = &view.state.tooltip {
+            response.clone().on_hover_text_at_pointer(tooltip);
+        }
     }
     if selected && stage.keyboard {
         let focused = ui.memory(|m| m.focused());
@@ -603,6 +883,33 @@ pub(crate) fn show(
             Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+    }
+    if let Some(link) = view.state.link.as_ref().filter(|_| over) {
+        // Where a link leads, at the foot of the page as browsers say it.
+        let room = (content.width() * 0.7 - 20.0).max(40.0);
+        let galley = painter.layout_job(egui::text::LayoutJob {
+            wrap: egui::text::TextWrapping::truncate_at_width(room),
+            ..egui::text::LayoutJob::simple_singleline(
+                link.clone(),
+                egui::FontId::proportional(11.5),
+                p.secondary,
+            )
+        });
+        let chip = Rect::from_min_size(
+            Pos2::new(content.left(), content.bottom() - galley.size().y - 8.0),
+            galley.size() + vec2(16.0, 8.0),
+        );
+        painter.rect(
+            chip,
+            egui::CornerRadius {
+                ne: 6,
+                ..Default::default()
+            },
+            p.elevated,
+            egui::Stroke::new(1.0, p.border),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(chip.min + vec2(8.0, 4.0), galley, p.secondary);
     }
     if let Some(error) = &view.state.error {
         // What went wrong, in the pane's own surface, with the one way on.

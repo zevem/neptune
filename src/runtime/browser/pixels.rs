@@ -15,6 +15,9 @@ impl Surface {
     pub(super) fn size(&self) -> [usize; 2] {
         self.image.size
     }
+    pub(super) fn image(&self) -> &egui::ColorImage {
+        &self.image
+    }
 
     pub(super) fn update(&mut self, damage: Damage, bgra: &[u8]) {
         let size = self.image.size;
