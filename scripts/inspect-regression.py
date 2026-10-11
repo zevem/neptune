@@ -321,15 +321,15 @@ try:
     shot('15-close-cancelled')
     if args.restore:
         click(find(nodes, 'Close window', 'button'))
-        widget('Quit Neptune?', 'window')
+        widget('Close window?', 'window')
         close_nodes = tree('16-app-close-tree')
         shot('16-app-close-confirmation')
         try:
-            click(find(close_nodes, 'Quit', 'button'))
+            click(find(close_nodes, 'Close', 'button'))
         except RuntimeError as error:
             report['close_response'] = str(error)
         wait_until('graceful inspector shutdown', lambda: not endpoint_open())
-        check('graceful application close', True, 'native inspector endpoint closes after confirming app exit')
+        check('graceful application close', True, 'native inspector endpoint closes after confirming the last window closes')
         saved = state()
         report['saved_state_after_close'] = saved
         environment = os.environ.copy()
