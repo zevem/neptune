@@ -255,7 +255,7 @@ wrap_display_handler! {
                 if moved { self.data.icon(0, 0, Vec::new()); }
             }
         }
-        fn on_cursor_change(&self, _browser: Option<&mut Browser>, _cursor: std::os::raw::c_ulong, type_: CursorType,
+        fn on_cursor_change(&self, _browser: Option<&mut Browser>, _cursor: Pointer, type_: CursorType,
             _custom: Option<&CursorInfo>) -> i32 {
             let cursor = *type_.as_ref() as u32;
             self.data.update(|s| s.cursor = cursor);
@@ -280,6 +280,12 @@ wrap_display_handler! {
         }
     }
 }
+
+/// The platform's own cursor, which Chromium hands over beside its kind.
+#[cfg(not(target_os = "macos"))]
+type Pointer = cef::CursorHandle;
+#[cfg(target_os = "macos")]
+type Pointer = *mut u8;
 
 /// A page's words for the pane to show, bounded and on one line.
 fn said(text: &str) -> String {

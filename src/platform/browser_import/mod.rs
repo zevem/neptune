@@ -77,6 +77,7 @@ pub(crate) enum Failure {
     BrowserRunning,
     KeyringLocked,
     KeyringMissing,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     KeyringUnavailable,
     Unsupported,
     ReadFailed,
@@ -137,6 +138,7 @@ pub(super) struct Chromium {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     keychain: &'static str,
     /// The Secret Service item's `application` attribute.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     application: &'static str,
 }
 
