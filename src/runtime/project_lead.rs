@@ -2706,9 +2706,16 @@ exec sleep 30"#;
                 patience: Duration::from_millis(300),
             };
             let adapter = install("shims");
+            executable(
+                &adapter,
+                "#!/bin/sh\nexec '/old/neptune' --agent-run claude \"$@\"\n",
+            );
             let on_path = install("bin");
             let known = install("home/.local/bin");
             let elsewhere = install("opt/node/bin");
+            let mut filtered = search(&["shims", "bin"], &[], None);
+            filtered.shims = None;
+            assert_eq!(find(AgentKind::Claude, &filtered), Some(on_path.clone()));
             // `PATH` first, and never Neptune's own adapter.
             assert_eq!(
                 find(

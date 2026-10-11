@@ -54,6 +54,7 @@ const MAX_LINKS: usize = 64;
 const ENDPOINT: &str = "NEPTUNE_AGENT_ENDPOINT";
 const TOKEN: &str = "NEPTUNE_AGENT_TOKEN";
 pub(super) const SHIMS: &str = "NEPTUNE_AGENT_SHIMS";
+const ADAPTER_HEADER: &str = "#!/bin/sh\n# Neptune agent adapter\n";
 const RUN: &str = "NEPTUNE_AGENT_RUN";
 /// This executable, for hook commands that must read the same at every launch.
 const HELPER: &str = "NEPTUNE_AGENT_HELPER";
@@ -986,6 +987,15 @@ pub struct AgentBridge {
     listener: Mutex<Option<Listener>>,
     shared: Arc<Mutex<Shared>>,
 }
+#[cfg(unix)]
+fn adapter(kind: AgentKind, executable: &std::path::Path, directory: &std::path::Path) -> String {
+    format!(
+        "{ADAPTER_HEADER}export {SHIMS}={}\nexec {} --agent-run {} \"$@\"\n",
+        quote(&directory.to_string_lossy()),
+        quote(&executable.to_string_lossy()),
+        kind.executable()
+    )
+}
 impl AgentBridge {
     /// The listener every local caller reports to, started on first use.
     /// It binds a socket and writes the adapters, so only workers call it.
@@ -1007,14 +1017,7 @@ impl AgentBridge {
             std::fs::write(plugins.join("pi.js"), PI_EXTENSION)?;
             for kind in AgentKind::ALL {
                 let path = directory.path().join(kind.executable());
-                std::fs::write(
-                    &path,
-                    format!(
-                        "#!/bin/sh\nexec {} --agent-run {} \"$@\"\n",
-                        quote(&executable.to_string_lossy()),
-                        kind.executable()
-                    ),
-                )?;
+                std::fs::write(&path, adapter(kind, &executable, directory.path()))?;
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
             }
             let socket = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
@@ -3458,7 +3461,8 @@ fn resolve(provider: AgentKind) -> anyhow::Result<PathBuf> {
         std::env::var_os(SHIMS).map(PathBuf::from).as_deref(),
     )
 }
-/// The CLI itself in one of these folders, never the adapter in `shims`.
+/// The CLI itself, never a Neptune adapter, even if a child launcher removed
+/// `NEPTUNE_AGENT_SHIMS` or PATH names an older/aliased adapter directory.
 pub(super) fn resolve_in(
     provider: AgentKind,
     path: &std::ffi::OsStr,
@@ -3477,13 +3481,33 @@ pub(super) fn resolve_in(
                     continue;
                 }
             }
-            return Ok(candidate);
+            if !is_adapter(provider, &candidate) {
+                // An empty PATH entry finds a bare name in the current
+                // directory. Exec must not search PATH again for that name
+                // and pick an adapter we just skipped.
+                return Ok(std::path::absolute(candidate)?);
+            }
         }
     }
     anyhow::bail!(
         "{} is not installed or is not on PATH",
         provider.executable()
     )
+}
+fn is_adapter(provider: AgentKind, candidate: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(candidate) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    // Do not read an installed CLI's whole binary or script. Older adapters
+    // have only a shebang and an exec line, including the quoted helper path.
+    if file.take(32 * 1024).read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    bytes.starts_with(ADAPTER_HEADER.as_bytes())
+        || (bytes.starts_with(b"#!/bin/sh\nexec ")
+            && bytes
+                .ends_with(format!(" --agent-run {} \"$@\"\n", provider.executable()).as_bytes()))
 }
 /// Arguments that make an invocation something other than an interactive
 /// session: it is passed through untouched, here and on an SSH host.
@@ -6369,6 +6393,92 @@ mod tests {
             AgentKind::Codex,
             &["resume".into(), FIRST.into()]
         ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn resolution_rejects_old_adapters_without_their_environment() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let adapters = root.path().join("old-adapters");
+        let alias = root.path().join("alias");
+        let bin = root.path().join("neptune-agents-real-installation");
+        std::fs::create_dir(&adapters).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        symlink(&adapters, &alias).unwrap();
+        let path = std::env::join_paths([&alias, &adapters, &bin]).unwrap();
+        for kind in AgentKind::ALL {
+            let old = adapters.join(kind.executable());
+            std::fs::write(
+                &old,
+                format!(
+                    "#!/bin/sh\nexec '/an old install/neptune' --agent-run {} \"$@\"\n",
+                    kind.executable()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let real = bin.join(kind.executable());
+            // Other launch scripts and similarly named directories are valid.
+            std::fs::write(&real, "#!/bin/sh\nexec /installed/agent \"$@\"\n").unwrap();
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+            for shims in [None, Some(adapters.as_path()), Some(root.path())] {
+                assert_eq!(resolve_in(kind, &path, shims).unwrap(), real, "{kind:?}");
+            }
+            let only_adapters = std::env::join_paths([&alias, &adapters]).unwrap();
+            assert!(resolve_in(kind, &only_adapters, None).is_err(), "{kind:?}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn resolution_rejects_generated_adapters_without_their_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let bridge = AgentBridge::default();
+        let listener = bridge.listening().unwrap();
+        let adapters = listener.as_ref().unwrap().directory.path();
+        let bin = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([adapters, bin.path()]).unwrap();
+        for kind in AgentKind::ALL {
+            let real = bin.path().join(kind.executable());
+            std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(resolve_in(kind, &path, None).unwrap(), real, "{kind:?}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn generated_adapter_restores_its_directory_after_environment_filtering() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("an adapter's directory");
+        std::fs::create_dir(&directory).unwrap();
+        let helper = root.path().join("a helper's executable");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' \"$NEPTUNE_AGENT_SHIMS\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wrapper = directory.join("codex");
+        std::fs::write(&wrapper, adapter(AgentKind::Codex, &helper, &directory)).unwrap();
+        for inherited in [None, Some("/some other terminal")] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg(&wrapper)
+                .args(["app-server", "a quoted 'argument'"])
+                .env_clear();
+            if let Some(inherited) = inherited {
+                command.env(SHIMS, inherited);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "{}\n--agent-run\ncodex\napp-server\na quoted 'argument'\n",
+                    directory.display()
+                )
+            );
+        }
     }
     #[cfg(unix)]
     #[test]

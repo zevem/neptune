@@ -98,6 +98,14 @@ cannot discover agents launched before its adapters were installed. macOS uses
 the Unix adapter but still needs native verification; Linux/X11 is the verified
 host for this change.
 
+Child launchers may keep the adapters on `PATH` while filtering out
+`NEPTUNE_AGENT_SHIMS`. Neptune recognizes its own adapters independently of
+that variable, including adapters left by older installations, and searches
+past them for the installed CLI. Newly created adapters also restore their own
+directory variable. Batch commands such as `codex app-server` and
+`claude --print` still receive their original arguments and exit status.
+If no installed CLI remains on `PATH`, the launch reports that it is missing.
+
 ## Linked pull requests
 
 An agent started through the adapters is also given Neptune's tools. One is
