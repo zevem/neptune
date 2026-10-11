@@ -6,9 +6,16 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
+
+// A concurrent fork can retain another test's writable script descriptor until
+// exec, even after the writer closes it. Linux then rejects the script with
+// ETXTBSY. Serialize fixture writes and launches so no child inherits a writer.
+// See https://github.com/rust-lang/rust/issues/114554.
+static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 struct Launch(Child);
 impl Launch {
@@ -39,6 +46,7 @@ fn executable(path: &Path, text: &str) {
 }
 
 fn batch_without_shim_variable(provider: &str, args: &[&str], installed: bool) {
+    let _fixture_guard = FIXTURE_LOCK.lock().unwrap();
     let root = tempfile::tempdir().unwrap();
     let shims = root.path().join("adapters");
     let bin = root.path().join("bin");
