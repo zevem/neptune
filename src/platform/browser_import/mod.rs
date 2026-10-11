@@ -450,6 +450,20 @@ mod tests {
         }
     }
 
+    /// Where this platform keeps a Chromium browser, if it is read here.
+    fn kept(id: &str) -> Option<&'static str> {
+        CHROMIUM.iter().find(|b| b.id == id)?.directory()
+    }
+
+    /// A Firefox profile as this platform lays it out and as a listing names it.
+    fn fox(root: &Path, name: &str) -> (PathBuf, String) {
+        if cfg!(any(target_os = "macos", windows)) {
+            (root.join("Profiles").join(name), format!("Profiles/{name}"))
+        } else {
+            (root.join(name), name.to_owned())
+        }
+    }
+
     fn no_keys(_: &Chromium) -> Result<Keys, Failure> {
         Err(Failure::KeyringUnavailable)
     }
@@ -461,69 +475,87 @@ mod tests {
         assert_eq!(sources_in(&roots), []);
 
         // A browser directory without any cookie database is not a source.
-        std::fs::create_dir_all(roots.chromium.join("vivaldi/Default")).unwrap();
-        let chrome = roots.chromium.join("google-chrome");
-        chromium::tests::database(&chrome.join("Default/Network/Cookies"), 24);
-        firefox_db(&roots.firefox[0].join("one.default"), &["a", "b"]);
-        firefox_db(&roots.firefox[1].join("two.snap"), &["a"]);
+        if let (Some(vivaldi), Some(chrome)) = (kept("vivaldi"), kept("chrome")) {
+            std::fs::create_dir_all(roots.chromium.join(vivaldi).join("Default")).unwrap();
+            let chrome = roots.chromium.join(chrome);
+            chromium::tests::database(&chrome.join("Default/Network/Cookies"), 24);
+        }
+        let (one, one_listed) = fox(&roots.firefox[0], "one.default");
+        let (two, two_listed) = fox(&roots.firefox[1], "two.snap");
+        firefox_db(&one, &["a", "b"]);
+        firefox_db(&two, &["a"]);
         // The same directory under a second root would be unreachable by name.
-        firefox_db(&roots.firefox[1].join("one.default"), &[]);
+        firefox_db(&fox(&roots.firefox[1], "one.default").0, &[]);
 
-        let profile = |directory: &str, cookies| SourceProfile {
+        let profile = |directory: &str, name: &str, cookies| SourceProfile {
             directory: directory.into(),
-            name: directory.into(),
+            name: name.into(),
             cookies: Some(cookies),
         };
-        assert_eq!(
-            sources_in(&roots),
-            [
-                Source {
-                    id: "chrome",
-                    name: "Chrome",
-                    profiles: vec![profile("Default", 0)],
-                },
-                Source {
-                    id: "firefox",
-                    name: "Firefox",
-                    profiles: vec![profile("one.default", 2), profile("two.snap", 1)],
-                },
-            ]
-        );
+        let mut expected = Vec::new();
+        // Chromium browsers are not read on Windows, so none is listed there.
+        if kept("chrome").is_some() {
+            expected.push(Source {
+                id: "chrome",
+                name: "Chrome",
+                profiles: vec![profile("Default", "Default", 0)],
+            });
+        }
+        expected.push(Source {
+            id: "firefox",
+            name: "Firefox",
+            profiles: vec![
+                profile(&one_listed, "one.default", 2),
+                profile(&two_listed, "two.snap", 1),
+            ],
+        });
+        assert_eq!(sources_in(&roots), expected);
     }
 
     #[test]
     fn read_opens_only_a_directory_that_the_listing_names() {
         let home = tempfile::tempdir().unwrap();
         let roots = roots(home.path());
-        firefox_db(&roots.firefox[0].join("one.default"), &["a"]);
+        let (one, listed) = fox(&roots.firefox[0], "one.default");
+        firefox_db(&one, &["a"]);
         // A real profile that the listing does not reach.
         firefox_db(&home.path().join("outside"), &["secret"]);
-        chromium::tests::database(&roots.chromium.join("chromium/Default/Cookies"), 24);
+        if let Some(chromium) = kept("chromium") {
+            let db = roots.chromium.join(chromium).join("Default/Cookies");
+            chromium::tests::database(&db, 24);
+        }
 
         let outside = home.path().join("outside");
-        let read = |id, directory| read_in(&roots, id, directory, no_keys).map(|read| read.cookies);
-        assert_eq!(read("firefox", "one.default").unwrap().len(), 1);
+        let read = |id: &str, directory: &str| {
+            read_in(&roots, id, directory, no_keys).map(|read| read.cookies)
+        };
+        assert_eq!(read("firefox", &listed).unwrap().len(), 1);
         for directory in [
             "",
             ".",
             "../outside",
-            "one.default/../../outside",
-            "one.default/",
+            &format!("{listed}/../../outside"),
+            &format!("{listed}/../../../outside"),
+            &format!("{listed}/"),
             outside.to_str().unwrap(),
         ] {
             assert_eq!(read("firefox", directory), Err(Failure::NotFound));
         }
-        assert_eq!(read("chrome", "Default"), Err(Failure::NotFound));
         assert_eq!(read("safari", "Default"), Err(Failure::NotFound));
-        assert_eq!(
-            read("chromium", "../chromium/Default"),
-            Err(Failure::NotFound)
-        );
-        // Listed: the read proceeds as far as asking for the browser's key.
-        assert_eq!(
-            read("chromium", "Default"),
-            Err(Failure::KeyringUnavailable)
-        );
+        if let Some(chromium) = kept("chromium") {
+            assert_eq!(read("chrome", "Default"), Err(Failure::NotFound));
+            assert_eq!(
+                read("chromium", &format!("../{chromium}/Default")),
+                Err(Failure::NotFound)
+            );
+            // Listed: the read proceeds as far as asking for the browser's key.
+            assert_eq!(
+                read("chromium", "Default"),
+                Err(Failure::KeyringUnavailable)
+            );
+        } else {
+            assert_eq!(read("chromium", "Default"), Err(Failure::Unsupported));
+        }
         // Arc has no Linux build, so it is never listed here.
         let arc = read("arc", "Default");
         if cfg!(target_os = "macos") {
@@ -538,9 +570,9 @@ mod tests {
     fn a_running_browser_is_not_read() {
         let home = tempfile::tempdir().unwrap();
         let roots = roots(home.path());
-        let profile = roots.firefox[0].join("one.default");
+        let (profile, listed) = fox(&roots.firefox[0], "one.default");
         firefox_db(&profile, &["a"]);
-        let chromium = roots.chromium.join("chromium");
+        let chromium = roots.chromium.join(kept("chromium").unwrap());
         chromium::tests::database(&chromium.join("Default/Cookies"), 24);
         let me = std::process::id();
 
@@ -548,7 +580,7 @@ mod tests {
         // Another host's lock cannot be tested for liveness, so it holds.
         std::os::unix::fs::symlink(format!("elsewhere-{me}"), chromium.join("SingletonLock"))
             .unwrap();
-        for (id, directory) in [("firefox", "one.default"), ("chromium", "Default")] {
+        for (id, directory) in [("firefox", listed.as_str()), ("chromium", "Default")] {
             assert_eq!(
                 read_in(&roots, id, directory, no_keys).map(|read| read.cookies),
                 Err(Failure::BrowserRunning)
