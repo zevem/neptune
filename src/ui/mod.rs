@@ -28,7 +28,8 @@ pub mod workspace;
 pub mod worktrees;
 use crate::{config::Config, terminal::Cache};
 use neptune_model::{
-    Axis, Destination, PaneId, ProjectId, SidebarItem, SplitId, WorkspaceGroupId, WorkspaceId,
+    Axis, Destination, PaneId, ProjectId, SidebarItem, SplitId, WindowId, WorkspaceGroupId,
+    WorkspaceId,
 };
 use std::path::PathBuf;
 
@@ -38,6 +39,8 @@ pub enum Close {
     Workspace(WorkspaceId),
     /// The SSH connection of a workspace: its terminals return to local shells.
     Connection(WorkspaceId),
+    /// Close one native window and the workspaces it contains.
+    Window(WindowId),
     App,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -121,6 +124,8 @@ pub struct UiState {
     pub workspace_drag: chrome::WorkspaceDrag,
     /// An ungrouped workspace or folder moving in the top-level sidebar list.
     pub item_drag: chrome::SidebarDrag,
+    /// Row rectangles from this sidebar frame, in local egui points.
+    pub workspace_rows: Vec<(WorkspaceId, eframe::egui::Rect)>,
     /// A sidebar toggle still sliding into place.
     pub sidebar_slide: Option<chrome::SidebarSlide>,
     /// The terminal being carried by its header, as of the last frame.
@@ -141,6 +146,25 @@ pub struct UiState {
 impl UiState {
     /// How long a notice stays before it goes by itself.
     pub const NOTICE_SECONDS: f64 = 6.0;
+
+    /// The workspace held by a sidebar row, excluding rows settling after release.
+    pub fn dragging_workspace(&self) -> Option<WorkspaceId> {
+        self.workspace_drag
+            .workspace()
+            .or_else(|| self.item_drag.workspace())
+    }
+
+    /// A workspace or folder row is held by the pointer.
+    pub fn dragging_sidebar_row(&self) -> bool {
+        self.workspace_drag.active() || self.item_drag.active()
+    }
+
+    /// Cancel a row gesture before a sheet opens or the source disappears.
+    pub fn cancel_sidebar_drag(&mut self, ctx: &eframe::egui::Context) {
+        self.workspace_drag = Default::default();
+        self.item_drag = Default::default();
+        ctx.stop_dragging();
+    }
 
     /// Say that something the user asked for was done.
     pub fn say(&mut self, ctx: &eframe::egui::Context, said: String) {
@@ -167,6 +191,15 @@ pub enum Action {
     CloseWorkspace(WorkspaceId),
     SelectWorkspace(WorkspaceId),
     MoveWorkspace(WorkspaceId, usize),
+    /// Tear off this workspace, keeping its live terminals. Pointer coordinates
+    /// are local to the source viewport; a menu command has no pointer.
+    DetachWorkspace {
+        workspace: WorkspaceId,
+        pointer: Option<eframe::egui::Pos2>,
+        /// The original press relative to the workspace row.
+        grip: Option<eframe::egui::Vec2>,
+    },
+    MoveWorkspaceToWindow(WorkspaceId, WindowId),
     Focus(PaneId),
     Ratio(SplitId, f32),
     EvenSplit(SplitId),
@@ -228,7 +261,10 @@ pub enum Action {
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
+    /// Close the current native window through its captured close target.
     WindowClose,
+    /// Quit Neptune, confirming every terminal in every native window.
+    Quit,
     Create(PathBuf, Option<String>),
     SetName(WorkspaceId, String),
     Preferences(Config),

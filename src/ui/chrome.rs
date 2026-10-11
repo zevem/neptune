@@ -15,7 +15,7 @@ use eframe::egui::{
     emath::GuiRounding as _, style::ScrollAnimation, vec2,
 };
 use neptune_model::{
-    Destination, PaneId, SidebarItem, WorkspaceGroup, WorkspaceGroupId, WorkspaceId,
+    Destination, PaneId, SidebarItem, WindowId, WorkspaceGroup, WorkspaceGroupId, WorkspaceId,
 };
 
 /// What the chrome needs to know about the frame it surrounds.
@@ -24,6 +24,8 @@ pub struct ChromeView<'a> {
     pub workspaces: &'a [WorkspaceView],
     pub groups: &'a [WorkspaceGroup],
     pub sidebar_order: &'a [SidebarItem],
+    /// Other open windows, with their current workspace names for destinations.
+    pub windows: &'a [(WindowId, String)],
     pub active: Option<WorkspaceId>,
     pub pane: Option<PaneId>,
     pub pane_kind: neptune_model::PaneKind,
@@ -81,11 +83,28 @@ pub struct WorkspaceDrag {
     /// The row drawn above the others: held by the pointer, or settling into
     /// its place after release.
     lifted: Option<WorkspaceId>,
-    /// Where the pointer holds the lifted row, measured from the row's top.
+    /// Original press relative to the lifted row's top-left corner.
     /// `None` once the row is released or the drag is cancelled.
-    grip: Option<f32>,
+    grip: Option<Vec2>,
     /// Row tops relative to the list while a row is lifted; empty at rest.
     tops: Vec<(WorkspaceId, f32)>,
+    external: Option<ExternalDrag>,
+}
+
+#[derive(Clone, Copy)]
+struct ExternalDrag {
+    pointer: Pos2,
+    released: bool,
+}
+
+impl WorkspaceDrag {
+    pub(super) fn workspace(&self) -> Option<WorkspaceId> {
+        self.grip.and(self.lifted)
+    }
+
+    pub(super) fn active(&self) -> bool {
+        self.workspace().is_some()
+    }
 }
 
 /// Top-level workspaces and folders share a drag list. A folder moves with its
@@ -93,8 +112,131 @@ pub struct WorkspaceDrag {
 #[derive(Default)]
 pub struct SidebarDrag {
     lifted: Option<SidebarItem>,
-    grip: Option<f32>,
+    grip: Option<Vec2>,
     positions: Vec<(SidebarItem, f32, f32)>,
+    external: Option<ExternalDrag>,
+}
+
+impl SidebarDrag {
+    pub(super) fn workspace(&self) -> Option<WorkspaceId> {
+        match self.grip.and(self.lifted) {
+            Some(SidebarItem::Workspace(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub(super) fn active(&self) -> bool {
+        self.grip.is_some() && self.lifted.is_some()
+    }
+}
+
+impl UiState {
+    pub(crate) fn carry_workspace(
+        &mut self,
+        workspace: WorkspaceId,
+        grouped: bool,
+        pointer: Pos2,
+        grip: Vec2,
+    ) {
+        let external = Some(ExternalDrag {
+            pointer,
+            released: false,
+        });
+        if grouped {
+            self.item_drag = Default::default();
+            self.workspace_drag.lifted = Some(workspace);
+            self.workspace_drag.grip = Some(grip);
+            self.workspace_drag.external = external;
+        } else {
+            self.workspace_drag = Default::default();
+            self.item_drag.lifted = Some(SidebarItem::Workspace(workspace));
+            self.item_drag.grip = Some(grip);
+            self.item_drag.external = external;
+        }
+    }
+
+    pub(crate) fn finish_carried_workspace(&mut self) {
+        if let Some(external) = &mut self.workspace_drag.external {
+            external.released = true;
+        }
+        if let Some(external) = &mut self.item_drag.external {
+            external.released = true;
+        }
+    }
+
+    pub(crate) fn cancel_carried_workspace(&mut self) {
+        if self.workspace_drag.external.is_some() {
+            self.workspace_drag = Default::default();
+        }
+        if self.item_drag.external.is_some() {
+            self.item_drag = Default::default();
+        }
+    }
+}
+
+/// Hand a held workspace to the native host once it leaves its source list.
+/// Reordering remains a release gesture; detaching begins while the button is
+/// down so the new native window can take over the same drag.
+fn workspace_detach(
+    ui: &mut Ui,
+    sidebar: Rect,
+    view: &ChromeView,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
+    if state.workspace_drag.external.is_some() || state.item_drag.external.is_some() {
+        return;
+    }
+    if !state.dragging_sidebar_row() {
+        return;
+    }
+    if state.overlay != super::OverlayState::None
+        || !view.sidebar_open
+        || view.sidebar < 1.0
+        || !ui.input(|input| input.focused)
+        || state
+            .dragging_workspace()
+            .is_some_and(|id| !view.workspaces.iter().any(|w| w.id == id))
+        || ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+    {
+        state.cancel_sidebar_drag(ui.ctx());
+        return;
+    }
+    let Some(workspace) = state.dragging_workspace() else {
+        return;
+    };
+    let pointer = ui.input(|input| {
+        if !input.pointer.primary_down() && !input.pointer.primary_released() {
+            return None;
+        }
+        let pointer = input.pointer.interact_pos()?;
+        if !pointer.x.is_finite() || !pointer.y.is_finite() {
+            return None;
+        }
+        let outside = !sidebar.contains(pointer);
+        // Some native backends stop reporting motion as the pointer leaves.
+        // PointerGone alone is not a detach: its last position must be at the
+        // window edge, and the primary button must still be held.
+        let gone = input
+            .raw
+            .events
+            .iter()
+            .any(|event| matches!(event, egui::Event::PointerGone));
+        let edge = pointer.x <= view.window.left() + 8.0
+            || pointer.x >= view.window.right() - 8.0
+            || pointer.y <= view.window.top() + 8.0
+            || pointer.y >= view.window.bottom() - 8.0;
+        (outside || (input.pointer.primary_down() && gone && edge)).then_some(pointer)
+    });
+    if let Some(pointer) = pointer {
+        let grip = state.workspace_drag.grip.or(state.item_drag.grip);
+        state.cancel_sidebar_drag(ui.ctx());
+        actions.push(Action::DetachWorkspace {
+            workspace,
+            pointer: Some(pointer),
+            grip,
+        });
+    }
 }
 
 fn sidebar_drop_index(top: f32, heights: &[f32], origin: usize) -> usize {
@@ -688,6 +830,27 @@ fn workspace_menu(
         actions.push(Action::Rename(workspace.id));
         ui.close();
     }
+    if menu_item(ui, p, Icon::ArrowUpRight, "Move to new window", "", false) {
+        actions.push(Action::DetachWorkspace {
+            workspace: workspace.id,
+            pointer: None,
+            grip: None,
+        });
+        ui.close();
+    }
+    if !view.windows.is_empty() {
+        menu_submenu(ui, p, Icon::ArrowUpRight, "Move to window", |ui| {
+            menu_layout(ui, 210.0);
+            for (window, name) in view.windows {
+                ui.push_id(window, |ui| {
+                    if menu_item(ui, p, Icon::ArrowUpRight, name, "", false) {
+                        actions.push(Action::MoveWorkspaceToWindow(workspace.id, *window));
+                        ui.close();
+                    }
+                });
+            }
+        });
+    }
     if position > 0 && menu_item(ui, p, Icon::ArrowUp, "Move up", "", false) {
         actions.push(Action::MoveWorkspace(workspace.id, siblings[position - 1]));
         ui.close();
@@ -760,6 +923,7 @@ fn workspace_row(
     workspace: &WorkspaceView,
     view: &ChromeView,
     state: RowState,
+    geometry: &mut Vec<(WorkspaceId, Rect)>,
     actions: &mut Vec<Action>,
 ) -> egui::Response {
     let RowState {
@@ -771,6 +935,7 @@ fn workspace_row(
         pane_drag,
         accepts,
     } = state;
+    geometry.push((workspace.id, row));
     let response = ui.interact(
         row,
         ui.id().with(("workspace", workspace.id.get())),
@@ -1047,6 +1212,10 @@ fn workspace_row(
 
 /// The workspace rows. Dragging one lifts it out of the list: it follows the
 /// pointer while its neighbours ease aside, and takes the gap on release.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "row rendering also reports native drag anchors"
+)]
 fn workspace_rows(
     ui: &mut Ui,
     p: Palette,
@@ -1054,6 +1223,7 @@ fn workspace_rows(
     rows: &[&WorkspaceView],
     viewport: Rect,
     drag: &mut WorkspaceDrag,
+    geometry: &mut Vec<(WorkspaceId, Rect)>,
     actions: &mut Vec<Action>,
 ) {
     let count = rows.len();
@@ -1083,13 +1253,16 @@ fn workspace_rows(
 
     // The held row follows the pointer, kept inside the list and its viewport.
     let mut held = lifted.zip(drag.grip).map(|(origin, grip)| {
-        let pointer = ui.input(|input| input.pointer.latest_pos());
+        let pointer = drag
+            .external
+            .map(|drag| drag.pointer)
+            .or_else(|| ui.input(|input| input.pointer.latest_pos()));
         let low = (viewport.top() - list.top()).max(0.0);
         let high = ((count - 1) as f32 * ROW_STEP)
             .min(viewport.bottom() - list.top() - ROW_HEIGHT)
             .max(low);
         let top = pointer
-            .map(|pointer| pointer.y - grip - list.top())
+            .map(|pointer| pointer.y - grip.y - list.top())
             .or_else(|| shown(rows[origin].id, &drag.tops))
             .unwrap_or(origin as f32 * ROW_STEP)
             .clamp(low, high);
@@ -1187,10 +1360,14 @@ fn workspace_rows(
                 pane_drag: view.pane_drag,
                 accepts: Some(&workspace.remote) == machine,
             },
+            geometry,
             actions,
         );
         if let Some((origin, target)) = target.filter(|(origin, _)| *origin == index) {
-            if response.drag_stopped() {
+            if drag
+                .external
+                .map_or_else(|| response.drag_stopped(), |drag| drag.released)
+            {
                 if origin != target {
                     let global_target = view
                         .workspaces
@@ -1200,8 +1377,9 @@ fn workspace_rows(
                     actions.push(Action::MoveWorkspace(workspace.id, global_target));
                 }
                 drag.grip = None;
+                drag.external = None;
                 ui.ctx().request_repaint();
-            } else if response.dragged() {
+            } else if drag.external.is_some() || response.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
             } else {
                 // The pointer was released while the row was not shown.
@@ -1212,7 +1390,7 @@ fn workspace_rows(
             && let Some(press) = ui.input(|input| input.pointer.press_origin())
         {
             drag.lifted = Some(workspace.id);
-            drag.grip = Some(press.y - response.rect.top());
+            drag.grip = Some(press - response.rect.min);
             ui.ctx().request_repaint();
         }
     }
@@ -1450,6 +1628,7 @@ fn workspace_group(
     viewport: Rect,
     drag: &mut WorkspaceDrag,
     dragging: bool,
+    geometry: &mut Vec<(WorkspaceId, Rect)>,
     actions: &mut Vec<Action>,
 ) -> egui::Response {
     let mut collapse = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -1507,6 +1686,7 @@ fn workspace_group(
                         &rows,
                         viewport.intersect(ui.clip_rect()),
                         child_drag,
+                        geometry,
                         actions,
                     );
                 }
@@ -1529,6 +1709,7 @@ fn sidebar_item(
     workspace_drag: &mut WorkspaceDrag,
     lift: f32,
     dragging: bool,
+    geometry: &mut Vec<(WorkspaceId, Rect)>,
     actions: &mut Vec<Action>,
 ) -> Option<egui::Response> {
     match item {
@@ -1542,6 +1723,7 @@ fn sidebar_item(
                 viewport,
                 workspace_drag,
                 dragging,
+                geometry,
                 actions,
             ))
         }
@@ -1572,12 +1754,17 @@ fn sidebar_item(
                     pane_drag: view.pane_drag,
                     accepts: Some(&workspace.remote) == machine,
                 },
+                geometry,
                 actions,
             ))
         }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "sidebar rendering also reports native drag anchors"
+)]
 fn workspace_list(
     ui: &mut Ui,
     p: Palette,
@@ -1585,6 +1772,7 @@ fn workspace_list(
     viewport: Rect,
     workspace_drag: &mut WorkspaceDrag,
     drag: &mut SidebarDrag,
+    geometry: &mut Vec<(WorkspaceId, Rect)>,
     actions: &mut Vec<Action>,
 ) {
     let items = view.sidebar_order;
@@ -1606,6 +1794,7 @@ fn workspace_list(
     if origin.is_none() {
         drag.lifted = None;
         drag.grip = None;
+        drag.external = None;
     }
     ui.spacing_mut().item_spacing.y = GROUP_GAP;
     let spacing = GROUP_GAP;
@@ -1669,6 +1858,7 @@ fn workspace_list(
                 workspace_drag,
                 lift,
                 false,
+                geometry,
                 actions,
             ) {
                 let height = match item {
@@ -1681,7 +1871,7 @@ fn workspace_list(
                     && let Some(press) = ui.input(|input| input.pointer.press_origin())
                 {
                     drag.lifted = Some(item);
-                    drag.grip = Some(press.y - response.rect.top());
+                    drag.grip = Some(press - response.rect.min);
                     *workspace_drag = WorkspaceDrag::default();
                     ui.ctx().request_repaint();
                 }
@@ -1701,7 +1891,10 @@ fn workspace_list(
         vec2(ui.available_width(), heights.iter().sum::<f32>()),
     );
     let mut held = origin.zip(drag.grip).map(|(origin, grip)| {
-        let pointer = ui.input(|input| input.pointer.latest_pos());
+        let pointer = drag
+            .external
+            .map(|drag| drag.pointer)
+            .or_else(|| ui.input(|input| input.pointer.latest_pos()));
         let low = (viewport.top() - list.top()).max(0.0);
         let high = (list.height() - heights[origin])
             .min(
@@ -1714,7 +1907,7 @@ fn workspace_list(
             )
             .max(low);
         let top = pointer
-            .map_or(0.0, |pos| pos.y - grip - list.top())
+            .map_or(0.0, |pos| pos.y - grip.y - list.top())
             .clamp(low, high);
         if let Some(pointer) = pointer {
             let over = if list.top() < viewport.top() - 0.5 {
@@ -1843,6 +2036,7 @@ fn workspace_list(
             },
             lift,
             held.is_some(),
+            geometry,
             actions,
         );
         let height = match item {
@@ -1854,13 +2048,17 @@ fn workspace_list(
             continue;
         };
         if let Some(target) = target.filter(|_| Some(index) == origin) {
-            if response.drag_stopped() {
+            if drag
+                .external
+                .map_or_else(|| response.drag_stopped(), |drag| drag.released)
+            {
                 if index != target {
                     actions.push(Action::MoveSidebarItem(item, target));
                 }
                 drag.grip = None;
+                drag.external = None;
                 ui.ctx().request_repaint();
-            } else if response.dragged() {
+            } else if drag.external.is_some() || response.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
             } else {
                 drag.grip = None;
@@ -1870,7 +2068,7 @@ fn workspace_list(
             && let Some(press) = ui.input(|input| input.pointer.press_origin())
         {
             drag.lifted = Some(item);
-            drag.grip = Some(press.y - response.rect.top());
+            drag.grip = Some(press - response.rect.min);
             *workspace_drag = WorkspaceDrag::default();
             ui.ctx().request_repaint();
         }
@@ -1925,7 +2123,10 @@ pub fn sidebar(
     state: &mut UiState,
     actions: &mut Vec<Action>,
 ) {
-    let drag = &mut state.sidebar_drag;
+    state.workspace_rows.clear();
+    // Read the captured row before the list can discard a response after a
+    // native PointerGone, then again after it can start a new drag this frame.
+    workspace_detach(ui, rect, view, state, actions);
     let strip = Rect::from_min_size(rect.min, vec2(rect.width(), metrics::TOOLBAR_HEIGHT));
     drag_region(ui, strip, "sidebar-drag");
     // Register the backdrop first so workspace and folder menus take precedence.
@@ -1960,11 +2161,13 @@ pub fn sidebar(
                         viewport,
                         &mut state.workspace_drag,
                         &mut state.item_drag,
+                        &mut state.workspace_rows,
                         actions,
                     );
                 });
         },
     );
+    workspace_detach(ui, rect, view, state, actions);
 
     // Footer: the primary creation action, with preferences beside it.
     let create = Rect::from_min_max(
@@ -2040,6 +2243,7 @@ pub fn sidebar(
     if view.sidebar < 1.0 {
         return;
     }
+    let drag = &mut state.sidebar_drag;
     let handle = Rect::from_min_max(
         Pos2::new(rect.right() - 3.0, strip.bottom()),
         Pos2::new(rect.right() + 3.0, rect.bottom() - 12.0),
@@ -2186,6 +2390,7 @@ mod tests {
                 workspaces: &views,
                 groups: &self.groups,
                 sidebar_order: &self.sidebar_order,
+                windows: &[],
                 active: views.first().map(|workspace| workspace.id),
                 pane: None,
                 pane_kind: neptune_model::PaneKind::Terminal,
@@ -2785,6 +2990,151 @@ mod tests {
         assert_eq!(sidebar.order, [1, 2, 3]);
     }
 
+    fn detached(actions: &[Action]) -> Vec<(WorkspaceId, Option<Pos2>)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::DetachWorkspace {
+                    workspace, pointer, ..
+                } => Some((*workspace, *pointer)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_workspace_leaving_the_sidebar_detaches_while_held_once_without_reordering() {
+        let mut sidebar = Fixture::new(&[1, 2, 3]);
+        let to = Pos2::new(280.0, row(2).y);
+        sidebar.carry(row(0), to);
+        let detach = detached(&sidebar.actions);
+        assert_eq!(detach.len(), 1);
+        assert_eq!(detach[0].0, WorkspaceId::new(1));
+        assert!(detach[0].1.is_some_and(|pointer| pointer.x > 216.0));
+        assert!(sidebar.ctx.input(|input| input.pointer.primary_down()));
+        assert!(!sidebar.state.dragging_sidebar_row());
+        sidebar.frame(vec![button(to, false)]);
+        sidebar.frame(vec![]);
+        assert_eq!(detached(&sidebar.actions), detach);
+        assert!(sidebar.moves().is_empty());
+        assert_eq!(sidebar.order, [1, 2, 3]);
+    }
+
+    #[test]
+    fn motion_and_release_beyond_the_sidebar_in_one_frame_still_detach_without_reordering() {
+        let mut sidebar = Fixture::new(&[1, 2, 3]);
+        sidebar.carry(row(0), Pos2::new(210.0, row(2).y));
+        let outside = Pos2::new(280.0, row(2).y);
+        sidebar.frame(vec![Event::PointerMoved(outside), button(outside, false)]);
+        assert_eq!(
+            detached(&sidebar.actions),
+            [(WorkspaceId::new(1), Some(outside))]
+        );
+        assert!(sidebar.moves().is_empty());
+    }
+
+    #[test]
+    fn a_grouped_workspace_detaches_but_its_folder_never_does() {
+        let mut sidebar = Fixture::new(&[1, 2, 3]);
+        sidebar.membership = vec![(2, WorkspaceGroupId::new(7)), (3, WorkspaceGroupId::new(7))];
+        sidebar.folders(&[(7, false)]);
+        let from = sidebar.folder(7) + vec2(0.0, GROUP_HEIGHT * 0.5 + GROUP_GAP + ROW_HEIGHT * 0.5);
+        let to = Pos2::new(280.0, from.y);
+        sidebar.carry(from, to);
+        assert_eq!(
+            detached(&sidebar.actions)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [WorkspaceId::new(2)]
+        );
+        sidebar.frame(vec![button(to, false)]);
+        assert!(sidebar.moves().is_empty());
+        assert!(sidebar.group_moves().is_empty());
+
+        let mut sidebar = Fixture::new(&[1, 2]);
+        sidebar.folders(&[(7, true)]);
+        let from = sidebar.folder(7);
+        let to = Pos2::new(280.0, from.y);
+        sidebar.carry(from, to);
+        sidebar.frame(vec![button(to, false)]);
+        assert!(detached(&sidebar.actions).is_empty());
+    }
+
+    #[test]
+    fn approaching_the_sidebar_edge_preserves_normal_workspace_reordering() {
+        let mut sidebar = Fixture::new(&[1, 2, 3]);
+        let near = Pos2::new(210.0, row(2).y);
+        sidebar.carry(row(0), near);
+        assert!(detached(&sidebar.actions).is_empty());
+        assert!(sidebar.state.dragging_sidebar_row());
+        sidebar.frame(vec![Event::PointerMoved(row(2))]);
+        sidebar.frame(vec![button(row(2), false)]);
+        assert_eq!(sidebar.moves(), [(1, 2)]);
+        assert!(detached(&sidebar.actions).is_empty());
+    }
+
+    #[test]
+    fn escape_or_an_opening_sheet_cancels_before_a_workspace_can_detach() {
+        for sheet in [false, true] {
+            let mut sidebar = Fixture::new(&[1, 2]);
+            let near = Pos2::new(210.0, row(1).y);
+            sidebar.carry(row(0), near);
+            if sheet {
+                sidebar.state.overlay = super::super::OverlayState::Settings;
+                sidebar.frame(vec![]);
+            } else {
+                sidebar.frame(vec![Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }]);
+                assert!(!sidebar.escape_passed);
+            }
+            assert!(!sidebar.state.dragging_sidebar_row());
+            let outside = Pos2::new(280.0, near.y);
+            sidebar.frame(vec![Event::PointerMoved(outside)]);
+            sidebar.frame(vec![button(outside, false)]);
+            assert!(detached(&sidebar.actions).is_empty());
+            assert!(sidebar.moves().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_workspace_removed_during_its_drag_cannot_detach_a_replacement_row() {
+        let mut sidebar = Fixture::new(&[1, 2, 3]);
+        sidebar.carry(row(0), Pos2::new(210.0, row(1).y));
+        sidebar.order.remove(0);
+        sidebar.sidebar_order.remove(0);
+        let outside = Pos2::new(280.0, row(1).y);
+        sidebar.frame(vec![Event::PointerMoved(outside)]);
+        sidebar.frame(vec![button(outside, false)]);
+        assert!(detached(&sidebar.actions).is_empty());
+        assert!(sidebar.moves().is_empty());
+        assert!(!sidebar.state.dragging_sidebar_row());
+    }
+
+    #[test]
+    fn losing_pointer_motion_at_the_window_edge_detaches_only_a_held_workspace() {
+        let mut sidebar = Fixture::new(&[1, 2]);
+        let edge = Pos2::new(1.0, row(1).y);
+        sidebar.carry(row(0), edge);
+        assert!(detached(&sidebar.actions).is_empty());
+        sidebar.frame(vec![Event::PointerGone]);
+        assert_eq!(
+            detached(&sidebar.actions),
+            [(WorkspaceId::new(1), Some(edge))]
+        );
+
+        let mut sidebar = Fixture::new(&[1, 2]);
+        let middle = Pos2::new(120.0, row(1).y);
+        sidebar.carry(row(0), middle);
+        sidebar.frame(vec![Event::PointerGone]);
+        assert!(detached(&sidebar.actions).is_empty());
+    }
+
     #[test]
     fn a_toggled_sidebar_eases_to_rest_and_reverses_from_where_it_is() {
         let hide = SidebarSlide::toggled(None, true, 10.0);
@@ -2853,6 +3203,7 @@ mod tests {
                                 SidebarItem::Workspace(WorkspaceId::new(2)),
                                 SidebarItem::Workspace(WorkspaceId::new(3)),
                             ],
+                            windows: &[],
                             active: Some(WorkspaceId::new(1)),
                             pane: Some(pane),
                             pane_kind: neptune_model::PaneKind::Terminal,

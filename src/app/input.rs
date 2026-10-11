@@ -203,6 +203,8 @@ impl App {
 impl App {
     pub(super) fn terminal_owns_shortcuts(&self, ctx: &egui::Context) -> bool {
         self.ui.overlay == OverlayState::None
+            && !self.workspace_drag_active()
+            && !self.ui.dragging_sidebar_row()
             && !egui::Popup::is_any_open(ctx)
             && ctx.memory(|memory| {
                 memory.focused().is_none() || memory.focused() == self.terminal_focus
@@ -360,7 +362,7 @@ impl App {
                 // a message never takes a key the shell is waiting for, and is
                 // dismissed by Escape only when there is no terminal to
                 // receive it.
-                let search = ui::search::input_id();
+                let search = ui::controls::viewport_id(ctx, ui::search::input_id());
                 let searching = self.ui.search_open
                     && ctx.memory(|memory| {
                         memory.has_focus(search) || memory.had_focus_last_frame(search)
@@ -369,6 +371,10 @@ impl App {
                 // before the sheet is.
                 if egui::Popup::is_any_open(ctx) {
                     egui::Popup::close_all(ctx);
+                } else if self.workspace_drag_active() {
+                    self.cancel_workspace_drag(ctx);
+                } else if self.ui.dragging_sidebar_row() {
+                    self.ui.cancel_sidebar_drag(ctx);
                 } else if self.ui.pane_drag.is_some() {
                     self.cancel_pane_drag(ctx);
                 } else if self.ui.overlay != OverlayState::None {
@@ -544,7 +550,9 @@ impl App {
                 .controller
                 .model()
                 .workspaces()
-                .get(index)
+                .iter()
+                .filter(|workspace| workspace.window() == self.controller.model().current_window())
+                .nth(index)
                 .map(|workspace| Action::SelectWorkspace(workspace.id()));
         }
         Some(match binding {
@@ -601,7 +609,15 @@ impl App {
                 )
             }
             NextWorkspace | PreviousWorkspace => {
-                let workspaces = self.controller.model().workspaces();
+                let workspaces: Vec<_> = self
+                    .controller
+                    .model()
+                    .workspaces()
+                    .iter()
+                    .filter(|workspace| {
+                        workspace.window() == self.controller.model().current_window()
+                    })
+                    .collect();
                 if workspaces.is_empty() {
                     return None;
                 }

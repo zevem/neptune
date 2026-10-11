@@ -1219,7 +1219,10 @@ mod tests {
                 Error::UnknownProject(ProjectId::new(4)),
                 "Project 4 does not exist",
             ),
-            (Error::ProjectLimit, "A window can have 8 projects"),
+            (
+                Error::ProjectLimit,
+                "Neptune can have 8 projects across its windows",
+            ),
             (Error::ProjectExists, "This workspace already has a project"),
             (
                 Error::ProjectAgentLimit,

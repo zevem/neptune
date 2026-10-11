@@ -15,5 +15,6 @@ pub(crate) mod ports;
 pub mod shells;
 pub mod updates;
 pub mod window;
+pub(crate) mod workspace_drag;
 
 pub mod notifications;

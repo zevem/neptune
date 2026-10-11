@@ -5,6 +5,7 @@ A native Rust terminal for focused work. GPU rendering, real shell sessions, and
 [Project overview](../README.md) · [Installation](installation.md)
 
 - [Workspaces and terminals](#workspaces-and-terminals)
+- [Multiple windows](#multiple-windows)
 - [Workspace groups](#workspace-groups)
 - [SSH workspaces](#ssh-workspaces)
 - [Dev servers and ports](#dev-servers-and-ports)
@@ -29,6 +30,42 @@ Hold Command on macOS, Ctrl on Linux/Windows, or Alt to reveal small shortcut hi
 New workspace opens and selects a fresh shell at `~` immediately. Rename it later by double-clicking its sidebar row or choosing Rename workspace from its menu or the command palette.
 
 The directory beneath a local workspace's name follows its focused terminal. Switching between tabs or split panes updates that directory; inactive workspaces show their last focused terminal's directory. Long paths are shortened to fit the sidebar. SSH workspaces show their host there. When that directory is inside a Git repository, its branch follows the path (or the short name of the commit, when no branch is checked out), with a dot while the repository has changes that are not committed. The branch is read again every five seconds while the sidebar is in view, less often while another window is the active one, and not at all while Neptune is minimized.
+
+## Multiple windows
+
+Drag a workspace row out of the sidebar to open it in another native Neptune
+window. Keep holding to move that window, including to another monitor. The
+workspace's terminals, browser tabs, split layout and running processes stay
+with it. Dragging within the sidebar still reorders workspaces; Escape cancels
+before the workspace moves out.
+
+On Linux/X11, a workspace becomes a floating window as soon as the pointer
+leaves the sidebar, with the row held at the original grab position. Entering
+another Neptune window's sidebar joins it immediately, without releasing. Keep
+holding to reorder the row or pull it out again; release to leave it there. A
+window with its sidebar hidden receives the workspace in its top toolbar. The
+carried window stays above its replacement while held. Other native backends
+currently use the menu or palette to combine windows.
+
+The workspace menu offers **Move to new window**, and the command palette offers
+**Move workspace to new window** when the sidebar is hidden. To bring a workspace
+back or combine windows without dragging, choose a destination under **Move to
+window** in its menu, or the corresponding **Move workspace to …** palette command. The workspace
+keeps its group. Each window shows its own workspaces and remembers its selected
+workspace and sidebar visibility; an emptied window closes. The operating
+system controls placement where its compositor restricts application positioning.
+
+Closing one window closes its workspaces and checks only their terminals for
+running processes. Other windows keep working. **Quit Neptune** in the palette
+quits all windows and checks every terminal. Closing the last visible window
+also quits Neptune. Quitting retains the organization for the next launch;
+closing a workspace or a window while others remain removes its workspaces from
+the saved organization. All windows share Neptune's session and resource limits.
+
+With workspace restoration enabled, Neptune reopens the saved windows,
+workspaces, tabs and splits with fresh shells in their remembered directories.
+Live processes and terminal contents are not restored. Settings and themes are
+shared by every window. See [storage and restoration](#storage-and-restoration).
 
 ## Workspace groups
 
@@ -107,7 +144,7 @@ Ctrl+Shift+I (Cmd+Alt+I on macOS) for developer tools, and Ctrl/Cmd+Shift+L for 
 existing Find shortcut searches the page while a browser is focused. Browser
 shortcuts leave shell Ctrl+L and Ctrl+R available in terminals.
 
-A window supports eight browser panes. Hidden previews retain their pages and
+Neptune supports eight browser panes across its open windows. Hidden previews retain their pages and
 connections, and suspend painting. Closing a browser releases its page;
 **Restart preview** opens a fresh page at the current address after a helper
 failure. A restored browser tab opens the page it was on, in its profile; a
@@ -171,7 +208,7 @@ Preferences has two independent switches, both enabled by default:
 **Confirm before closing terminals** always asks before closing; **Warn about
 running processes** asks when a terminal has an active job, even if the first
 switch is off. They apply to terminals, whole workspaces, SSH disconnects and
-quitting Neptune, including terminals in hidden workspaces. One confirmation
+closing windows and quitting Neptune, including terminals in hidden workspaces. One confirmation
 covers the whole action; Cancel preserves the sessions. Process checks do not
 show a dialog or dim the window until confirmation is needed; Escape can cancel
 a pending check.
@@ -388,7 +425,14 @@ protection. A migration failure stops startup and preserves the original files.
 Existing Neptune storage takes precedence. Explicit `--data-root` and screenshot
 launches bypass migration.
 
-Neptune also remembers the window's size and maximized state when closed. Window state is saved as `window.json` in the data directory, independently of workspace restoration; `--no-restore` and `restore_workspaces = false` only affect workspaces. Use `--size WIDTHxHEIGHT` to override the saved geometry and start with a non-maximized window. Screenshot launches use the default or explicit size and do not save window state.
+Workspace organization is saved in `workspaces.json`, including which window
+holds each workspace, each window's selected workspace and sidebar visibility.
+Restoration reopens windows with fresh shells; it does not restore running
+processes or monitor placement. Damaged organization is copied aside before it
+can be replaced, and an unreadable or unsupported future schema remains
+protected from writes.
+
+Neptune also remembers the main window's size and maximized state when closed. Window state is saved as `window.json` in the data directory, independently of workspace restoration; `--no-restore` and `restore_workspaces = false` only affect workspaces and their window organization. Restored extra windows use the remembered normal size; the operating system places them. Use `--size WIDTHxHEIGHT` to override the saved geometry and start with a non-maximized window. Screenshot launches use the default or explicit size and do not save window state.
 
 Each [project](#projects) keeps its chat, shared context and watches in `projects/<key>/` in the data directory, apart from workspace state: `--no-restore` and `restore_workspaces = false` do not delete it, and removing the project does. See [what a project stores](projects.md#what-is-stored-and-how-to-delete-it).
 
@@ -455,6 +499,11 @@ Use Ctrl+Shift on Linux/Windows and Command on macOS: T opens a tab beside the f
 Paste also takes a picture: when the clipboard holds a screenshot or another image instead of text, Neptune saves it as a PNG and pastes the file's path. Use the paste shortcut on Linux and Windows, or **Paste** in the terminal's menu or the command palette on any platform. A shell gets the path to use in a command; Claude Code and Codex attach the image a pasted path names. Plain Ctrl+V still goes to the program in the terminal, so an agent that reads the clipboard itself keeps doing so. Neptune keeps the 32 most recent pasted pictures in `pasted-images` beside its settings, readable only by your account, and removes older ones. A picture pasted into a [project's](#projects) message field is kept there too.
 
 Drag files from a file manager or another application onto a terminal to paste their paths, quoted for the shell and separated by spaces. While the files are held over the window, the terminal that will take them is highlighted and says what the drop does; with several terminals in view, that is the one under the pointer on Linux, and the focused one on macOS and Windows or while the files are over the sidebar or toolbar. Dropping on a terminal focuses it. A terminal whose shell has exited, and the window while a sheet or the command palette is open, take no files. Files held over a [project's](#projects) chat are attached to the message to its lead instead. Over SSH the pasted path still names a file on this computer.
+
+On native Wayland, file-manager drops work only in the original native window;
+additional windows currently cannot receive them. Paste a file path or use the
+project's **Attach files** picker there. File and folder pickers from additional
+windows open without a parent window.
 
 ## Updates
 

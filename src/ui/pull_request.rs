@@ -3149,7 +3149,8 @@ fn line_box(
     let field = Rect::from_min_max(inner.min, Pos2::new(inner.right(), inner.bottom() - 30.0));
     let idle = shown.acting.is_none();
     let ready = idle && !state.note.trim().is_empty() && state.note.chars().count() <= MAX_COMMENT;
-    let focused = ui.memory(|memory| memory.has_focus(composer_id()));
+    let composer = super::controls::viewport_id(ui.ctx(), composer_id());
+    let focused = ui.memory(|memory| memory.has_focus(composer));
     let mut add = focused
         && !composing
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
@@ -3215,7 +3216,7 @@ fn line_box(
     } else if cancelled {
         state.line = None;
         state.composer = None;
-        ui.memory_mut(|memory| memory.surrender_focus(composer_id()));
+        ui.memory_mut(|memory| memory.surrender_focus(composer));
     }
 }
 
@@ -3604,7 +3605,8 @@ fn composer(
         && !long
         && (said || (kind == Composer::Review && (verdict == Verdict::Approved || waiting > 0)));
     // The platform's command key with Enter sends, as in any comment field.
-    let focused = ui.memory(|memory| memory.has_focus(composer_id()));
+    let composer = super::controls::viewport_id(ui.ctx(), composer_id());
+    let focused = ui.memory(|memory| memory.has_focus(composer));
     let mut send = focused
         && !view.composing
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
@@ -3742,7 +3744,7 @@ fn composer(
     if closed {
         state.composer = None;
         state.line = None;
-        ui.memory_mut(|memory| memory.surrender_focus(composer_id()));
+        ui.memory_mut(|memory| memory.surrender_focus(composer));
     }
 }
 

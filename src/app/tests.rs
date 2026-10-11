@@ -82,6 +82,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         swallowed_paste: None,
         shortcut_keys: Default::default(),
         shortcut_modifiers: egui::Modifiers::NONE,
+        windows: Default::default(),
     };
     (app, sender)
 }
@@ -503,12 +504,16 @@ fn hidden_window_close_shows_the_confirmation() {
     app.startup = None;
     let ctx = egui::Context::default();
     let commands = hidden_tick(&mut app, &ctx, true);
-    assert_eq!(app.ui.overlay, OverlayState::ConfirmClose(Close::App));
+    assert_eq!(
+        app.ui.overlay,
+        OverlayState::ConfirmClose(Close::Window(neptune_model::WindowId::ROOT))
+    );
     assert!(!app.exit_approved);
     assert_eq!(
         commands,
         [
             egui::ViewportCommand::CancelClose,
+            egui::ViewportCommand::Visible(true),
             egui::ViewportCommand::Minimized(false),
             egui::ViewportCommand::Focus,
         ]

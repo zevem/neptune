@@ -1,6 +1,7 @@
 use neptune_model::{
     Axis, Layout, Limits, Model, PaneId, PaneSpec, ProjectId, ProjectKey, ProjectSpec, SidebarItem,
-    SplitId, WorkspaceGroupId, WorkspaceGroupSpec, WorkspaceId, WorkspaceSpec,
+    SplitId, WindowId, WindowSpec, WorkspaceGroupId, WorkspaceGroupSpec, WorkspaceId,
+    WorkspaceSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Version 15 adds native window membership and each window's selected workspace
+/// and sidebar visibility. Window geometry remains a separate desktop file.
 /// Version 14 adds browser pane kinds. Browser addresses and profiles are never saved here.
 /// Version 13 adds projects: the identity of each, the workspace it works in
 /// and the panes whose agents its lead started. Nothing a project says or is
@@ -19,8 +22,8 @@ use std::{
 /// earlier build would take for damage. Version 9 added the pane whose agent
 /// started a pane's agent. Version 8 added workspace group default
 /// directories and the pull requests an agent linked to its pane. Versions
-/// 1–13 remain readable.
-pub const SCHEMA_VERSION: u32 = 14;
+/// 1–14 remain readable.
+pub const SCHEMA_VERSION: u32 = 15;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -38,9 +41,43 @@ pub struct StateSnapshot {
     pub projects: Vec<SavedProject>,
     pub active: Option<WorkspaceId>,
     pub sidebar: bool,
+    /// Omitted by versions 1–14, whose workspaces all belong to the root window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<Vec<SavedWindow>>,
     /// From schema version 12.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversations: Vec<SavedConversation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedWindow {
+    pub id: WindowId,
+    pub workspaces: Vec<WorkspaceId>,
+    pub active: Option<WorkspaceId>,
+    pub sidebar: bool,
+}
+
+impl From<WindowSpec> for SavedWindow {
+    fn from(spec: WindowSpec) -> Self {
+        Self {
+            id: spec.id,
+            workspaces: spec.workspaces,
+            active: spec.active,
+            sidebar: spec.sidebar,
+        }
+    }
+}
+
+impl From<SavedWindow> for WindowSpec {
+    fn from(saved: SavedWindow) -> Self {
+        Self {
+            id: saved.id,
+            workspaces: saved.workspaces,
+            active: saved.active,
+            sidebar: saved.sidebar,
+        }
+    }
 }
 
 /// The pull requests and files of a conversation no pane shows now, kept
@@ -237,6 +274,7 @@ impl StateSnapshot {
     pub fn from_model(model: &Model) -> Self {
         Self {
             version: SCHEMA_VERSION,
+            windows: Some(model.window_specs().into_iter().map(Into::into).collect()),
             workspaces: model
                 .workspaces()
                 .iter()
@@ -303,8 +341,12 @@ impl StateSnapshot {
                     paused: project.paused(),
                 })
                 .collect(),
-            active: model.active_workspace(),
-            sidebar: model.sidebar(),
+            active: model
+                .window(WindowId::ROOT)
+                .and_then(neptune_model::Window::active_workspace),
+            sidebar: model
+                .window(WindowId::ROOT)
+                .is_none_or(neptune_model::Window::sidebar),
             conversations: model
                 .conversations()
                 .iter()
@@ -340,6 +382,7 @@ impl StateSnapshot {
     /// Conversion enforces the same invariants as new commands without checking
     /// directories; callers can use it for headless snapshots and round trips.
     pub fn into_model(self, limits: Limits) -> Result<Model, neptune_model::Error> {
+        let windows = self.windows;
         let projects = self
             .projects
             .iter()
@@ -370,6 +413,10 @@ impl StateSnapshot {
             self.sidebar,
             limits,
         )
+        .and_then(|model| match windows {
+            Some(windows) => model.with_windows(windows.into_iter().map(Into::into).collect()),
+            None => Ok(model),
+        })
         .map(|model| model.with_conversations(conversations))
     }
 }
@@ -554,15 +601,32 @@ pub fn load_state(path: &Path, limits: Limits) -> LoadReport {
             report.diagnostics.push(format!("Unsupported workspace schema version {version} in {}; preserving original and disabling state saves", path.display()));
             return report;
         }
-        match serde_json::from_value::<StateSnapshot>(value) {
+        match serde_json::from_value::<StateSnapshot>(value.clone()) {
             Ok(snapshot) => {
                 report.migrated = snapshot.version != SCHEMA_VERSION;
                 restore_versioned(snapshot, limits, &mut report);
             }
-            Err(error) => report.diagnostics.push(format!(
-                "Invalid workspace schema in {}: {error}",
-                path.display()
-            )),
+            Err(error) => {
+                // Window metadata must not strand otherwise valid directories
+                // and layouts. Future versions were rejected above; recovery
+                // of this supported format still protects the original bytes.
+                let mut without_windows = value;
+                let removed = without_windows
+                    .as_object_mut()
+                    .and_then(|object| object.remove("windows"));
+                if version_number >= 15
+                    && removed.is_some()
+                    && let Ok(snapshot) = serde_json::from_value::<StateSnapshot>(without_windows)
+                {
+                    report.diagnostics.push(format!("Invalid window organization in {}: {error}; restored workspaces in the main window", path.display()));
+                    restore_versioned(snapshot, limits, &mut report);
+                } else {
+                    report.diagnostics.push(format!(
+                        "Invalid workspace schema in {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
         }
     } else {
         match serde_json::from_value::<LegacyState>(value) {
@@ -893,7 +957,13 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                 limits,
             ) {
                 Ok(model) => {
-                    let model = model.with_conversations(conversations);
+                    let model = restore_windows(
+                        model,
+                        snapshot.windows,
+                        snapshot.version,
+                        &mut report.diagnostics,
+                    )
+                    .with_conversations(conversations);
                     if model.conversations().len() != snapshot.conversations.len() {
                         report.diagnostics.push(
                             "Left out conversations whose links could not be restored".into(),
@@ -909,6 +979,105 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
         Err(error) => report
             .diagnostics
             .push(format!("Workspace state validation failed: {error}")),
+    }
+}
+
+/// Recover valid workspace organization without letting an invalid window row
+/// discard a workspace whose terminals passed the normal restoration boundary.
+fn restore_windows(
+    model: Model,
+    saved: Option<Vec<SavedWindow>>,
+    version: u32,
+    diagnostics: &mut Vec<String>,
+) -> Model {
+    let Some(saved) = saved else {
+        if version >= 15 {
+            diagnostics
+                .push("Missing window organization; restored workspaces in the main window".into());
+        }
+        return model;
+    };
+    let mut windows = Vec::new();
+    let mut ids = HashSet::new();
+    let mut assigned = HashSet::new();
+    let mut child_count = 0;
+    for saved in saved {
+        if saved.id.get() == 0 || saved.id.get() == u64::MAX || !ids.insert(saved.id) {
+            diagnostics.push(format!("Skipped invalid or duplicate window {}", saved.id));
+            continue;
+        }
+        if saved.id != WindowId::ROOT {
+            if child_count >= model.limits().workspaces {
+                diagnostics.push(format!(
+                    "Skipped window {} beyond the window limit",
+                    saved.id
+                ));
+                continue;
+            }
+            child_count += 1;
+        }
+        let mut workspaces = Vec::new();
+        for id in saved.workspaces {
+            if model.workspace(id).is_none() || !assigned.insert(id) {
+                diagnostics.push(format!(
+                    "Window {}: skipped unavailable or duplicate workspace {id}",
+                    saved.id
+                ));
+            } else {
+                workspaces.push(id);
+            }
+        }
+        let active = saved.active.filter(|id| workspaces.contains(id));
+        if saved.id != WindowId::ROOT && workspaces.is_empty() {
+            diagnostics.push(format!("Skipped empty window {}", saved.id));
+            child_count -= 1;
+            continue;
+        }
+        if active != saved.active || (active.is_none() && !workspaces.is_empty()) {
+            diagnostics.push(format!(
+                "Window {}: selected its first remaining workspace",
+                saved.id
+            ));
+        }
+        windows.push(WindowSpec {
+            id: saved.id,
+            active: active.or_else(|| workspaces.first().copied()),
+            workspaces,
+            sidebar: saved.sidebar,
+        });
+    }
+    if !windows.iter().any(|window| window.id == WindowId::ROOT) {
+        diagnostics.push("Missing main window; restored its organization".into());
+        windows.push(WindowSpec {
+            id: WindowId::ROOT,
+            workspaces: Vec::new(),
+            active: None,
+            sidebar: model.sidebar(),
+        });
+    }
+    if let Some(root) = windows
+        .iter_mut()
+        .find(|window| window.id == WindowId::ROOT)
+    {
+        for workspace in model.workspaces() {
+            if assigned.insert(workspace.id()) {
+                diagnostics.push(format!(
+                    "Workspace {}: missing window membership; restored in the main window",
+                    workspace.id()
+                ));
+                root.workspaces.push(workspace.id());
+            }
+        }
+        root.active = root.active.or_else(|| root.workspaces.first().copied());
+    }
+    match model.clone().with_windows(windows) {
+        Ok(restored) => restored,
+        Err(error) => {
+            diagnostics.push(format!(
+                "Window organization validation failed: {error}; restored in the main window"
+            ));
+            model
+        }
     }
 }
 
@@ -1159,6 +1328,16 @@ fn preserve_original(path: &Path, bytes: &[u8], report: &mut LoadReport) {
 }
 
 #[cfg(test)]
+fn recovery(directory: &Path, path: &Path) -> Vec<Vec<u8>> {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|file| file != path)
+        .map(|file| std::fs::read(file).unwrap())
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use neptune_model::{Command, Controller};
@@ -1192,6 +1371,188 @@ mod tests {
             })
             .unwrap();
         StateSnapshot::from_model(controller.model())
+    }
+
+    #[test]
+    fn native_windows_round_trip_membership_and_selections_and_restore_fresh_shells() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut controller =
+            Controller::new(sample(root.path()).into_model(Limits::default()).unwrap());
+        let moved = controller.model().active_workspace().unwrap();
+        controller
+            .dispatch(Command::AddWorkspace {
+                cwd: root.path().into(),
+                name: "stays".into(),
+                group: None,
+                remote: None,
+            })
+            .unwrap();
+        let stays = controller.model().active_workspace().unwrap();
+        controller
+            .dispatch(Command::DetachWorkspace(moved))
+            .unwrap();
+        let child = controller.model().workspace(moved).unwrap().window();
+        controller
+            .dispatch(Command::SetWindowContext(child))
+            .unwrap();
+        controller.dispatch(Command::SetSidebar(false)).unwrap();
+        let pane = controller.model().active_pane().unwrap();
+        controller.dispatch(Command::RestartPane(pane)).unwrap();
+        controller
+            .dispatch(Command::SessionStarted {
+                pane,
+                generation: 2,
+            })
+            .unwrap();
+        let snapshot = StateSnapshot::from_model(controller.model());
+        assert_eq!(snapshot.active, Some(stays));
+        assert!(snapshot.sidebar);
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let restored = report.model.unwrap();
+        assert_eq!(restored.current_window(), WindowId::ROOT);
+        assert_eq!(restored.active_workspace(), Some(stays));
+        assert_eq!(
+            restored.window(child).unwrap().active_workspace(),
+            Some(moved)
+        );
+        assert!(!restored.window(child).unwrap().sidebar());
+        assert_eq!(restored.workspace(moved).unwrap().window(), child);
+        assert_eq!(restored.pane(pane).unwrap().generation(), 1);
+        assert_eq!(
+            restored.pane(pane).unwrap().lifecycle(),
+            &neptune_model::Lifecycle::Starting
+        );
+        assert_eq!(
+            StateSnapshot::from_model(&restored)
+                .into_model(Limits::default())
+                .unwrap()
+                .window_specs(),
+            restored.window_specs()
+        );
+    }
+
+    #[test]
+    fn version_fourteen_without_windows_adopts_the_main_window_without_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut value = serde_json::to_value(sample(root.path())).unwrap();
+        value["version"] = 14.into();
+        value.as_object_mut().unwrap().remove("windows");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.migrated);
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let model = report.model.unwrap();
+        assert_eq!(model.windows().len(), 1);
+        assert!(
+            model
+                .workspaces()
+                .iter()
+                .all(|workspace| workspace.window() == WindowId::ROOT)
+        );
+        assert!(recovery(root.path(), &path).is_empty());
+    }
+
+    #[test]
+    fn damaged_window_membership_preserves_workspaces_and_original_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut snapshot = sample(root.path());
+        let workspace = snapshot.workspaces[0].id;
+        snapshot.windows = Some(vec![
+            SavedWindow {
+                id: WindowId::new(2),
+                workspaces: vec![workspace, workspace, WorkspaceId::new(99)],
+                active: Some(WorkspaceId::new(99)),
+                sidebar: false,
+            },
+            SavedWindow {
+                id: WindowId::new(2),
+                workspaces: Vec::new(),
+                active: None,
+                sidebar: true,
+            },
+        ]);
+        let original = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write);
+        assert!(!report.diagnostics.is_empty());
+        let model = report.model.unwrap();
+        assert_eq!(
+            model.workspace(workspace).unwrap().window(),
+            WindowId::new(2)
+        );
+        assert_eq!(model.workspace(workspace).unwrap().panes().len(), 2);
+        assert!(model.window(WindowId::ROOT).is_some());
+        assert_eq!(
+            model.window(WindowId::new(2)).unwrap().active_workspace(),
+            Some(workspace)
+        );
+        assert_eq!(recovery(root.path(), &path), [original]);
+    }
+
+    #[test]
+    fn missing_current_window_rows_recover_membership_before_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut snapshot = sample(root.path());
+        snapshot.windows = None;
+        let original = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write);
+        assert!(report.model.is_some());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("Missing window organization"))
+        );
+        assert_eq!(recovery(root.path(), &path), [original]);
+    }
+
+    #[test]
+    fn malformed_window_metadata_recovers_the_valid_workspace_and_preserves_the_original() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut value = serde_json::to_value(sample(root.path())).unwrap();
+        value["windows"] = serde_json::json!([{ "id": "broken" }]);
+        let original = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.can_write);
+        let model = report.model.unwrap();
+        assert_eq!(model.workspaces().len(), 1);
+        assert_eq!(model.workspaces()[0].panes().len(), 2);
+        assert_eq!(model.workspaces()[0].window(), WindowId::ROOT);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("Invalid window organization"))
+        );
+        assert_eq!(recovery(root.path(), &path), [original]);
+    }
+
+    #[test]
+    fn malformed_windows_in_a_future_schema_never_trigger_lossy_recovery_or_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut value = serde_json::to_value(sample(root.path())).unwrap();
+        value["version"] = (SCHEMA_VERSION + 1).into();
+        value["windows"] = serde_json::json!([{ "id": "future" }]);
+        let original = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(!report.can_write);
+        assert!(report.model.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(recovery(root.path(), &path).is_empty());
     }
 
     #[test]
@@ -1902,15 +2263,6 @@ mod project_tests {
             })
             .unwrap();
     }
-    fn recovery(directory: &Path, path: &Path) -> Vec<Vec<u8>> {
-        std::fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|file| file != path)
-            .map(|file| std::fs::read(file).unwrap())
-            .collect()
-    }
-
     #[test]
     fn a_project_and_its_agents_round_trip_and_nothing_it_says_is_saved() {
         let root = tempfile::tempdir().unwrap();

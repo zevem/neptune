@@ -1,7 +1,7 @@
 use crate::{
     Axis, Edge, Error, Layout, Lifecycle, Model, Pane, PaneId, PaneKind, Project, ProjectId,
-    ProjectKey, Remote, SidebarItem, SplitId, Workspace, WorkspaceGroup, WorkspaceGroupId,
-    WorkspaceId,
+    ProjectKey, Remote, SidebarItem, SplitId, Window, WindowId, Workspace, WorkspaceGroup,
+    WorkspaceGroupId, WorkspaceId,
 };
 use std::path::PathBuf;
 
@@ -23,6 +23,17 @@ pub enum Destination {
 /// are created rather than resolved against whichever pane is active later.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    /// Chooses the desktop viewport being rendered or receiving input. This
+    /// changes no durable selection and emits no effects.
+    SetWindowContext(WindowId),
+    /// Moves the workspace, with every live pane untouched, to a new window.
+    DetachWorkspace(WorkspaceId),
+    MoveWorkspaceToWindow {
+        workspace: WorkspaceId,
+        window: WindowId,
+    },
+    /// Closes the workspaces of this window. The root window identity remains.
+    CloseWindow(WindowId),
     AddWorkspace {
         cwd: PathBuf,
         name: String,
@@ -362,6 +373,71 @@ impl Controller {
         let mut effects = Vec::new();
         let mut dirty = false;
         match command {
+            Command::SetWindowContext(window) => {
+                self.model.set_window_context(window)?;
+                return Ok(Vec::new());
+            }
+            Command::DetachWorkspace(workspace) => {
+                let source = self
+                    .model
+                    .workspace(workspace)
+                    .ok_or(Error::UnknownWorkspace(workspace))?
+                    .window;
+                let replaces_source = source != WindowId::ROOT
+                    && self
+                        .model
+                        .workspaces
+                        .iter()
+                        .filter(|item| item.window == source)
+                        .count()
+                        == 1;
+                if self.model.windows.len() >= self.model.limits.workspaces.saturating_add(1)
+                    && !replaces_source
+                {
+                    return Err(Error::WindowLimit);
+                }
+                let window = WindowId::new(self.model.next_window);
+                let next = self
+                    .model
+                    .next_window
+                    .checked_add(1)
+                    .ok_or(Error::IdentityExhausted)?;
+                let sidebar = self.model.window(source).is_none_or(Window::sidebar);
+                self.model.windows.push(Window {
+                    id: window,
+                    active: Some(workspace),
+                    sidebar,
+                });
+                self.assign_workspace_window(workspace, window)?;
+                self.model.next_window = next;
+                dirty = true;
+            }
+            Command::MoveWorkspaceToWindow { workspace, window } => {
+                dirty = self.assign_workspace_window(workspace, window)?;
+            }
+            Command::CloseWindow(window) => {
+                if self.model.window(window).is_none() {
+                    return Err(Error::UnknownWindow(window));
+                }
+                let workspaces: Vec<_> = self
+                    .model
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| workspace.window == window)
+                    .map(Workspace::id)
+                    .collect();
+                for workspace in workspaces {
+                    self.close_workspace(workspace, &mut effects)?;
+                    dirty = true;
+                }
+                if window != WindowId::ROOT {
+                    self.model.windows.retain(|item| item.id != window);
+                    if self.model.current_window == window {
+                        self.model.set_window_context(WindowId::ROOT)?;
+                    }
+                    dirty = true;
+                }
+            }
             Command::AddWorkspace {
                 cwd,
                 name,
@@ -406,6 +482,7 @@ impl Controller {
                 self.model.next_pane = next_pane;
                 self.model.workspaces.push(Workspace {
                     id,
+                    window: self.model.current_window,
                     group,
                     name,
                     cwd: cwd.clone(),
@@ -427,7 +504,7 @@ impl Controller {
                     layout: Layout::pane(pane_id),
                     active: pane_id,
                 });
-                self.model.active = Some(id);
+                self.model.select_workspace(id)?;
                 effects.push(Effect::StartSession {
                     pane: pane_id,
                     generation: 1,
@@ -554,11 +631,13 @@ impl Controller {
                 dirty = self.move_sidebar_item(item, index)?;
             }
             Command::SelectWorkspace(id) => {
-                if self.model.workspace(id).is_none() {
-                    return Err(Error::UnknownWorkspace(id));
-                }
-                if self.model.active != Some(id) {
-                    self.model.active = Some(id);
+                let owner = self
+                    .model
+                    .workspace(id)
+                    .ok_or(Error::UnknownWorkspace(id))?
+                    .window;
+                if self.model.window(owner).and_then(Window::active_workspace) != Some(id) {
+                    self.model.select_workspace(id)?;
                     dirty = true;
                 }
                 if let Some(group) = self.model.workspace(id).and_then(Workspace::group) {
@@ -637,7 +716,13 @@ impl Controller {
                 dirty = true;
             }
             Command::FocusPane { workspace, pane } => {
-                let was_active = self.model.active == Some(workspace);
+                let owner = self
+                    .model
+                    .workspace(workspace)
+                    .ok_or(Error::UnknownWorkspace(workspace))?
+                    .window;
+                let was_active =
+                    self.model.window(owner).and_then(Window::active_workspace) == Some(workspace);
                 let ws = self.model.workspace_mut(workspace)?;
                 if ws.pane(pane).is_none() {
                     return Err(Error::UnknownPane(pane));
@@ -646,7 +731,7 @@ impl Controller {
                 dirty = ws.reveal(pane) || ws.active != pane || !was_active;
                 ws.active = pane;
                 ws.layout.show(pane);
-                self.model.active = Some(workspace);
+                self.model.select_workspace(workspace)?;
             }
             Command::MovePane { pane, destination } => dirty = self.move_pane(pane, destination)?,
             Command::ClosePane(pane) => {
@@ -1226,6 +1311,7 @@ impl Controller {
         if dirty {
             self.model.order_workspaces();
         }
+        self.model.sync_windows();
         let new_focus = self.model.active_pane();
         if old_focus != new_focus {
             if let Some(group) = self
@@ -1269,6 +1355,52 @@ impl Controller {
             return Err(Error::TotalPaneLimit);
         }
         Ok(())
+    }
+
+    fn assign_workspace_window(
+        &mut self,
+        workspace: WorkspaceId,
+        window: WindowId,
+    ) -> Result<bool, Error> {
+        if self.model.window(window).is_none() {
+            return Err(Error::UnknownWindow(window));
+        }
+        let position = self
+            .model
+            .workspaces
+            .iter()
+            .position(|item| item.id == workspace)
+            .ok_or(Error::UnknownWorkspace(workspace))?;
+        let source = self.model.workspaces[position].window;
+        if source == window {
+            return Ok(false);
+        }
+        let replacement = self
+            .model
+            .workspaces
+            .iter()
+            .skip(position + 1)
+            .find(|item| item.window == source)
+            .or_else(|| {
+                self.model
+                    .workspaces
+                    .iter()
+                    .take(position)
+                    .rev()
+                    .find(|item| item.window == source)
+            })
+            .map(Workspace::id);
+        if let Some(source_window) = self.model.windows.iter_mut().find(|item| item.id == source)
+            && source_window.active == Some(workspace)
+        {
+            source_window.active = replacement;
+        }
+        if self.model.current_window == source && self.model.active == Some(workspace) {
+            self.model.active = replacement;
+        }
+        self.model.workspaces[position].window = window;
+        self.model.select_workspace(workspace)?;
+        Ok(true)
     }
 
     /// Opens a pane beside `pane`: across a split of its tab group, or as the
@@ -1344,7 +1476,7 @@ impl Controller {
         });
         ws.active = id;
         let remote = ws.remote.clone();
-        self.model.active = Some(workspace);
+        self.model.select_workspace(workspace)?;
         self.model.next_pane = next_pane;
         if axis.is_some() {
             self.model.next_split = next_split;
@@ -1482,7 +1614,7 @@ impl Controller {
             if ws.panes.is_empty() {
                 self.model.workspaces.retain(|item| item.id != source);
                 if self.model.active == Some(source) {
-                    self.model.active = Some(destination);
+                    self.model.select_workspace(destination)?;
                 }
             } else {
                 ws.remove_from_layout(pane)?;
@@ -1542,18 +1674,39 @@ impl Controller {
             .position(|item| item.id == workspace)
             .ok_or(Error::UnknownWorkspace(workspace))?;
         let removed = self.model.workspaces.remove(position);
+        let owner = removed.window;
         for pane in removed.panes {
             effects.push(Effect::StopSession {
                 pane: pane.id,
                 generation: pane.generation,
             });
         }
+        let replacement = self
+            .model
+            .workspaces
+            .iter()
+            .skip(position)
+            .find(|item| item.window == owner)
+            .or_else(|| {
+                self.model
+                    .workspaces
+                    .iter()
+                    .take(position)
+                    .rev()
+                    .find(|item| item.window == owner)
+            })
+            .map(Workspace::id);
+        if let Some(window) = self
+            .model
+            .windows
+            .iter_mut()
+            .find(|window| window.id == owner)
+            && window.active == Some(workspace)
+        {
+            window.active = replacement;
+        }
         if self.model.active == Some(workspace) {
-            self.model.active = self
-                .model
-                .workspaces
-                .get(position.min(self.model.workspaces.len().saturating_sub(1)))
-                .map(Workspace::id);
+            self.model.active = replacement;
         }
         Ok(())
     }

@@ -44,7 +44,7 @@ can open any of them, read along and type.
   [GitHub CLI](agent-sessions.md#pull-request-status) signed in for pull
   request watches and status.
 
-A workspace has at most one project, and a window at most eight.
+A workspace has at most one project, and Neptune at most eight across its windows.
 
 ## Start a project
 
@@ -456,7 +456,7 @@ reports none, and agents' usage is not counted.
 
 | Limit | Value |
 | --- | --- |
-| Projects in a window | 8, one per workspace |
+| Projects across Neptune's windows | 8, one per workspace |
 | Agents a project has open at once | 6, within the 16 terminals of a workspace |
 | Agents a project starts in a day | 40 |
 | Agents a project agent can start itself | Allowed; those cannot start more |

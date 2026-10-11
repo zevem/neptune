@@ -1,5 +1,6 @@
 use crate::{
-    Layout, PaneId, Project, ProjectId, ProjectSpec, Remote, WorkspaceGroupId, WorkspaceId,
+    Layout, PaneId, Project, ProjectId, ProjectSpec, Remote, Window, WindowId, WindowSpec,
+    WorkspaceGroupId, WorkspaceId,
 };
 use std::{
     collections::HashSet,
@@ -8,6 +9,9 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    UnknownWindow(WindowId),
+    WindowLimit,
+    InvalidWindows,
     UnknownWorkspace(WorkspaceId),
     UnknownWorkspaceGroup(WorkspaceGroupId),
     WorkspaceGroupLimit,
@@ -42,6 +46,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownWindow(id) => write!(f, "Window {id} does not exist"),
+            Self::WindowLimit => f.write_str("Window limit reached"),
+            Self::InvalidWindows => f.write_str("Every workspace must belong to exactly one window, with a valid active workspace"),
             Self::UnknownWorkspace(id) => write!(f, "Workspace {id} does not exist"),
             Self::UnknownWorkspaceGroup(id) => write!(f, "Workspace group {id} does not exist"),
             Self::WorkspaceGroupLimit => f.write_str("Workspace group limit reached"),
@@ -52,7 +59,7 @@ impl std::fmt::Display for Error {
             Self::WorkspaceLimit => f.write_str("Workspace limit reached"),
             Self::PaneLimit => f.write_str("Workspace pane limit reached"),
             Self::TotalPaneLimit => f.write_str("Total pane limit reached"),
-            Self::BrowserLimit => f.write_str("A window can have at most eight browser panes"),
+            Self::BrowserLimit => f.write_str("Neptune can have at most eight browser panes across its windows"),
             Self::InvalidLayout(reason) => write!(f, "Invalid layout: {reason}"),
             Self::InvalidRatio => f.write_str("Split ratio must be finite and between 0.1 and 0.9"),
             Self::InvalidIdentity => f.write_str("Identities must be nonzero and unique"),
@@ -78,7 +85,7 @@ impl std::fmt::Display for Error {
                 f.write_str("A worktree needs a local workspace, a branch and its own directory")
             }
             Self::UnknownProject(id) => write!(f, "Project {id} does not exist"),
-            Self::ProjectLimit => write!(f, "A window can have {} projects", Project::MAX),
+            Self::ProjectLimit => write!(f, "Neptune can have {} projects across its windows", Project::MAX),
             Self::ProjectExists => f.write_str("This workspace already has a project"),
             Self::ProjectAgentLimit => write!(
                 f,
@@ -242,6 +249,7 @@ pub struct WorkspaceSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workspace {
     pub(crate) id: WorkspaceId,
+    pub(crate) window: WindowId,
     pub(crate) group: Option<WorkspaceGroupId>,
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
@@ -253,6 +261,9 @@ pub struct Workspace {
 impl Workspace {
     pub fn id(&self) -> WorkspaceId {
         self.id
+    }
+    pub fn window(&self) -> WindowId {
+        self.window
     }
     pub fn group(&self) -> Option<WorkspaceGroupId> {
         self.group
@@ -392,6 +403,9 @@ pub struct Model {
     pub(crate) projects: Vec<Project>,
     pub(crate) active: Option<WorkspaceId>,
     pub(crate) sidebar: bool,
+    pub(crate) windows: Vec<Window>,
+    pub(crate) current_window: WindowId,
+    pub(crate) next_window: u64,
     pub(crate) next_workspace: u64,
     pub(crate) next_group: u64,
     pub(crate) next_pane: u64,
@@ -415,6 +429,13 @@ impl Model {
             projects: Vec::new(),
             active: None,
             sidebar: true,
+            windows: vec![Window {
+                id: WindowId::ROOT,
+                active: None,
+                sidebar: true,
+            }],
+            current_window: WindowId::ROOT,
+            next_window: 2,
             next_workspace: 1,
             next_group: 1,
             next_pane: 1,
@@ -440,6 +461,162 @@ impl Model {
     }
     pub fn workspaces(&self) -> &[Workspace] {
         &self.workspaces
+    }
+    pub fn windows(&self) -> &[Window] {
+        &self.windows
+    }
+    pub fn window(&self, id: WindowId) -> Option<&Window> {
+        self.windows.iter().find(|window| window.id == id)
+    }
+    pub fn current_window(&self) -> WindowId {
+        self.current_window
+    }
+
+    /// Adopts window organization after the normal workspace restore boundary.
+    /// Omission preserves the historical single-window organization.
+    pub fn with_windows(mut self, specs: Vec<WindowSpec>) -> Result<Self, Error> {
+        if specs.is_empty() || !specs.iter().any(|spec| spec.id == WindowId::ROOT) {
+            return Err(Error::InvalidWindows);
+        }
+        if specs.len() > self.workspaces.len().saturating_add(1) {
+            return Err(Error::WindowLimit);
+        }
+        let mut ids = HashSet::new();
+        let mut assigned = HashSet::new();
+        let mut next_window = 2;
+        for spec in &specs {
+            if spec.id.get() == 0 || !ids.insert(spec.id) {
+                return Err(Error::InvalidIdentity);
+            }
+            next_window = next_window.max(
+                spec.id
+                    .get()
+                    .checked_add(1)
+                    .ok_or(Error::IdentityExhausted)?,
+            );
+            if spec.id != WindowId::ROOT && spec.workspaces.is_empty() {
+                return Err(Error::InvalidWindows);
+            }
+            for workspace in &spec.workspaces {
+                if self.workspace(*workspace).is_none() {
+                    return Err(Error::UnknownWorkspace(*workspace));
+                }
+                if !assigned.insert(*workspace) {
+                    return Err(Error::InvalidWindows);
+                }
+            }
+            if spec.active.is_some_and(|id| !spec.workspaces.contains(&id)) {
+                return Err(Error::InvalidWindows);
+            }
+        }
+        if assigned.len() != self.workspaces.len() {
+            return Err(Error::InvalidWindows);
+        }
+        self.windows.clear();
+        for spec in specs {
+            for id in &spec.workspaces {
+                self.workspace_mut(*id)?.window = spec.id;
+            }
+            self.windows.push(Window {
+                id: spec.id,
+                active: spec.active.or_else(|| spec.workspaces.first().copied()),
+                sidebar: spec.sidebar,
+            });
+        }
+        self.next_window = next_window;
+        self.current_window = WindowId::ROOT;
+        if let Some((active, sidebar)) = self
+            .window(WindowId::ROOT)
+            .map(|root| (root.active, root.sidebar))
+        {
+            self.active = active;
+            self.sidebar = sidebar;
+        }
+        Ok(self)
+    }
+
+    pub fn window_specs(&self) -> Vec<WindowSpec> {
+        self.windows
+            .iter()
+            .map(|window| WindowSpec {
+                id: window.id,
+                workspaces: self
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| workspace.window == window.id)
+                    .map(Workspace::id)
+                    .collect(),
+                active: window.active,
+                sidebar: window.sidebar,
+            })
+            .collect()
+    }
+
+    pub(crate) fn set_window_context(&mut self, id: WindowId) -> Result<(), Error> {
+        let window = self.window(id).ok_or(Error::UnknownWindow(id))?;
+        let active = window.active;
+        let sidebar = window.sidebar;
+        self.current_window = id;
+        self.active = active;
+        self.sidebar = sidebar;
+        Ok(())
+    }
+
+    /// Selection belongs to the target's window. Background work must never
+    /// retarget another native window's terminal input.
+    pub(crate) fn select_workspace(&mut self, id: WorkspaceId) -> Result<(), Error> {
+        let owner = self
+            .workspace(id)
+            .ok_or(Error::UnknownWorkspace(id))?
+            .window;
+        if let Some(window) = self.windows.iter_mut().find(|window| window.id == owner) {
+            window.active = Some(id);
+        }
+        if owner == self.current_window {
+            self.active = Some(id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync_windows(&mut self) {
+        if let Some(current) = self
+            .windows
+            .iter_mut()
+            .find(|window| window.id == self.current_window)
+        {
+            current.active = self.active;
+            current.sidebar = self.sidebar;
+        }
+        for window in &mut self.windows {
+            if !window.active.is_some_and(|id| {
+                self.workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == id && workspace.window == window.id)
+            }) {
+                window.active = self
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.window == window.id)
+                    .map(Workspace::id);
+            }
+        }
+        self.windows.retain(|window| {
+            window.id == WindowId::ROOT
+                || self
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.window == window.id)
+        });
+        if self.window(self.current_window).is_none() {
+            self.current_window = WindowId::ROOT;
+        }
+        if let Some((active, sidebar)) = self
+            .window(self.current_window)
+            .map(|current| (current.active, current.sidebar))
+        {
+            self.active = active;
+            self.sidebar = sidebar;
+        }
     }
     pub fn groups(&self) -> &[WorkspaceGroup] {
         &self.groups
@@ -807,6 +984,7 @@ impl Model {
             );
             model.workspaces.push(Workspace {
                 id: spec.id,
+                window: WindowId::ROOT,
                 group: spec.group,
                 name: spec.name,
                 cwd: spec.cwd,
@@ -924,6 +1102,7 @@ impl Model {
         model.order_workspaces();
         model.active = active.or_else(|| model.workspaces.first().map(Workspace::id));
         model.sidebar = sidebar;
+        model.sync_windows();
         Ok(model)
     }
 
@@ -989,6 +1168,7 @@ impl Model {
             self.sidebar_order = order;
             self.order_workspaces();
             self.active = active.or_else(|| self.workspaces.first().map(Workspace::id));
+            self.sync_windows();
         }
         Ok(self)
     }

@@ -47,7 +47,16 @@ fn remote_label(destination: &str) -> String {
 
 impl App {
     pub(super) fn dispatch(&mut self, ctx: &egui::Context, command: Command) {
-        match self.controller.dispatch(command) {
+        let edits = match &command {
+            Command::DetachWorkspace(workspace)
+            | Command::MoveWorkspaceToWindow { workspace, .. } => {
+                self.take_workspace_project_edits(*workspace)
+            }
+            _ => None,
+        };
+        let result = self.controller.dispatch(command);
+        self.restore_workspace_project_edits(edits);
+        match result {
             Ok(effects) => self.execute(ctx, effects),
             Err(error) => self.ui.error = Some(error.to_string()),
         }
@@ -185,7 +194,7 @@ impl App {
                         generation,
                         replacement,
                         launch,
-                        Arc::new(move || wake.request_repaint()),
+                        Arc::new(move || wake.request_repaint_of(egui::ViewportId::ROOT)),
                     ) {
                         self.diagnostics
                             .failure("start", Some(pane), Some(generation), "Runtime");
@@ -214,29 +223,22 @@ impl App {
                     }
                     if let Some(id) = old
                         && let Some(session) = self.sessions.get(id)
+                        && let Some(render) = self.renders.get_mut(&id)
+                        && let Some(button) = render.mouse_button.take()
                     {
-                        let _ = session.focus(false);
-                        if let Some(render) = self.renders.get_mut(&id)
-                            && let Some(button) = render.mouse_button.take()
-                        {
-                            let (col, row, _) = render.mouse_cell.unwrap_or((0, 0, None));
-                            if let Some(bytes) = crate::input::mouse(
-                                button,
-                                col,
-                                row,
-                                false,
-                                Default::default(),
-                                render.cache.mode,
-                            ) {
-                                let _ = session.write(&bytes);
-                            }
+                        let (col, row, _) = render.mouse_cell.unwrap_or((0, 0, None));
+                        if let Some(bytes) = crate::input::mouse(
+                            button,
+                            col,
+                            row,
+                            false,
+                            Default::default(),
+                            render.cache.mode,
+                        ) {
+                            let _ = session.write(&bytes);
                         }
                     }
-                    if let Some(id) = new
-                        && let Some(session) = self.sessions.get(id)
-                    {
-                        let _ = session.focus(Self::window_has_focus(ctx));
-                    }
+                    self.reconcile_native_focus(ctx);
                 }
                 Effect::ResetSearch => {
                     self.search_point = None;
@@ -501,7 +503,7 @@ impl App {
             }
             Action::RemoveGroup(group) => self.dispatch(ctx, Command::RemoveWorkspaceGroup(group)),
             Action::MoveSidebarItem(item, index) => {
-                self.dispatch(ctx, Command::MoveSidebarItem { item, index })
+                self.move_visible_sidebar_item(ctx, item, index)
             }
             Action::SshInGroup(group) => {
                 if self.controller.model().group(group).is_some() {
@@ -612,6 +614,7 @@ impl App {
             }
             Action::SelectWorkspace(id) => {
                 self.dispatch(ctx, Command::SelectWorkspace(id));
+                self.reveal_workspace_window(ctx, id);
                 if self.controller.model().active_workspace() == Some(id)
                     && let Some(pane) = self.controller.model().active_pane()
                 {
@@ -619,12 +622,21 @@ impl App {
                 }
             }
             Action::MoveWorkspace(workspace, index) => {
-                self.dispatch(ctx, Command::MoveWorkspace { workspace, index })
+                self.move_visible_workspace(ctx, workspace, index)
+            }
+            Action::DetachWorkspace {
+                workspace,
+                pointer,
+                grip,
+            } => self.detach_workspace(ctx, workspace, pointer, grip),
+            Action::MoveWorkspaceToWindow(workspace, window) => {
+                self.move_workspace_to_window(ctx, workspace, window)
             }
             Action::Focus(pane) => {
                 self.notifications.acknowledge(Some(pane));
                 if let Some(workspace) = self.controller.model().workspace_for_pane(pane) {
                     self.dispatch(ctx, Command::FocusPane { workspace, pane });
+                    self.reveal_workspace_window(ctx, workspace);
                 }
             }
             Action::Ratio(split, ratio) => {
@@ -641,7 +653,11 @@ impl App {
             Action::CloseWorkspace(id) => self.request_close(ctx, Close::Workspace(id)),
             Action::WindowClose => {
                 self.relaunch = false;
-                self.request_close(ctx, Close::App)
+                self.request_close(ctx, Close::Window(self.controller.model().current_window()))
+            }
+            Action::Quit => {
+                self.relaunch = false;
+                self.request_close(ctx, Close::App);
             }
             Action::New => {
                 if let Some(dirs) = directories::BaseDirs::new() {
@@ -810,7 +826,8 @@ impl App {
             }
             Action::CopyHints(pane) => self.start_hints(ctx, pane),
             Action::Find => {
-                let editing = ctx.memory(|memory| memory.has_focus(ui::search::input_id()));
+                let search = ui::controls::viewport_id(ctx, ui::search::input_id());
+                let editing = ctx.memory(|memory| memory.has_focus(search));
                 if self.ui.search_open && !editing {
                     // Search is open but the terminal has the keyboard: return
                     // to the field instead of closing it.

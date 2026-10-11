@@ -5,7 +5,7 @@
 use super::Action;
 use super::helpers::{
     animate, bare_text_edit, compact_path, elided, field_frame, galley_at, menu_item, menu_layout,
-    menu_separator, place,
+    menu_separator, place, viewport_id,
 };
 use crate::{
     icons::{self, Icon},
@@ -480,14 +480,14 @@ fn tree_row(
                     _ => name,
                 };
                 let mut editor =
-                    egui::text_edit::TextEditState::load(ui.ctx(), edit_id()).unwrap_or_default();
+                    egui::text_edit::TextEditState::load(ui.ctx(), response.id).unwrap_or_default();
                 editor
                     .cursor
                     .set_char_range(Some(egui::text::CCursorRange::two(
                         egui::text::CCursor::new(0),
                         egui::text::CCursor::new(stem),
                     )));
-                editor.store(ui.ctx(), edit_id());
+                editor.store(ui.ctx(), response.id);
             }
             if response.changed() && edit.error.take().is_some() {
                 events.push(Event::Retyped);
@@ -507,7 +507,7 @@ fn tree_row(
                 } else {
                     Event::CancelEdit
                 });
-            } else if !ui.memory(|memory| memory.has_focus(edit_id())) {
+            } else if !ui.memory(|memory| memory.has_focus(response.id)) {
                 // Another surface took the keyboard without a frame in between.
                 // The window losing focus is not that: the name stays.
                 events.push(Event::CancelEdit);
@@ -1096,7 +1096,12 @@ pub fn show(
     actions: &mut Vec<Action>,
 ) {
     let mut events = Vec::new();
-    let mut child = ui.new_child(UiBuilder::new().id_salt("file-explorer").max_rect(rect));
+    let builder = if ui.ctx().viewport_id() == egui::ViewportId::ROOT {
+        UiBuilder::new().id_salt("file-explorer")
+    } else {
+        UiBuilder::new().id_salt(("file-explorer", ui.ctx().viewport_id()))
+    };
+    let mut child = ui.new_child(builder.max_rect(rect));
     child.set_clip_rect(rect.expand2(vec2(4.0, 0.0)).intersect(view.window));
     child.multiply_opacity(view.reveal);
     contents(&mut child, rect, p, view, state, &mut events);
@@ -1243,9 +1248,10 @@ fn contents(
     let filtering = state.filters || view.search.is_some();
     if !filtering {
         // A hidden field must not keep the keyboard.
+        let id = viewport_id(ui.ctx(), exclude_id());
         ui.memory_mut(|memory| {
-            if memory.has_focus(exclude_id()) {
-                memory.surrender_focus(exclude_id());
+            if memory.has_focus(id) {
+                memory.surrender_focus(id);
             }
         });
     }

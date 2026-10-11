@@ -1737,11 +1737,12 @@ fn project(
     let draft = state.drafts.entry(project.id).or_default();
     // Files alone are a message: Enter in the field sends them, which the
     // field itself would not ask for without words.
+    let composer = super::controls::viewport_id(ui.ctx(), chat::composer_id());
     let bare = files > 0
         && !project.locked
         && draft.trim().is_empty()
         && !composing
-        && ui.memory(|memory| memory.has_focus(chat::composer_id()))
+        && ui.memory(|memory| memory.has_focus(composer))
         && chat::take_enter(ui);
     let mut entered = false;
     ui.add_enabled_ui(!project.locked, |ui| {

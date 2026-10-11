@@ -20,6 +20,7 @@ impl App {
             .iter()
             .filter(|workspace| match close {
                 Close::Workspace(id) | Close::Connection(id) => workspace.id() == id,
+                Close::Window(id) => workspace.window() == id,
                 _ => true,
             })
             .flat_map(|workspace| workspace.panes())
@@ -185,8 +186,11 @@ impl App {
         match target {
             Close::App => {
                 self.exit_approved = true;
-                crate::platform::window::send(ctx, crate::platform::window::WindowOperation::Close);
+                // Quit can be requested from any window. Closing a child
+                // viewport alone would leave the application running.
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
             }
+            Close::Window(window) => self.close_window(ctx, window),
             Close::Pane(pane) => self.dispatch(ctx, Command::ClosePane(pane)),
             Close::Workspace(workspace) => self.dispatch(ctx, Command::CloseWorkspace(workspace)),
             Close::Connection(workspace) => self.dispatch(
@@ -558,6 +562,113 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_window_captures_hidden_tabs_and_preserves_sibling_windows() {
+        let (mut app, ctx, root, sibling) = setup();
+        app.controller
+            .dispatch(Command::AddWorkspace {
+                cwd: root.path().into(),
+                name: "Detached".into(),
+                remote: None,
+                group: None,
+            })
+            .unwrap();
+        let workspace = app.controller.model().active_workspace().unwrap();
+        let hidden = app.controller.model().active_pane().unwrap();
+        app.controller
+            .dispatch(Command::AddTab {
+                workspace,
+                pane: hidden,
+                cwd: root.path().into(),
+            })
+            .unwrap();
+        let shown = app.controller.model().active_pane().unwrap();
+        app.controller
+            .dispatch(Command::DetachWorkspace(workspace))
+            .unwrap();
+        let window = app
+            .controller
+            .model()
+            .workspace(workspace)
+            .unwrap()
+            .window();
+        let target = Close::Window(window);
+        assert_eq!(app.close_panes(target), vec![(hidden, 1), (shown, 1)]);
+
+        app.request_close(&ctx, target);
+        assert_eq!(app.ui.close_status, CloseStatus::Unknown);
+        app.confirm_close(&ctx, target);
+        assert!(app.controller.model().pane(hidden).is_none());
+        assert!(app.controller.model().pane(shown).is_none());
+        assert!(app.controller.model().pane(sibling).is_some());
+        assert!(!app.exit_approved);
+    }
+
+    #[test]
+    fn a_window_close_rechecks_workspaces_moved_in_while_process_checks_run() {
+        let (mut app, ctx, root, original) = setup();
+        let workspace = app.controller.model().active_workspace().unwrap();
+        app.controller
+            .dispatch(Command::AddWorkspace {
+                cwd: root.path().into(),
+                name: "Sibling".into(),
+                remote: None,
+                group: None,
+            })
+            .unwrap();
+        let incoming_workspace = app.controller.model().active_workspace().unwrap();
+        let incoming = app.controller.model().active_pane().unwrap();
+        app.controller
+            .dispatch(Command::DetachWorkspace(workspace))
+            .unwrap();
+        let window = app
+            .controller
+            .model()
+            .workspace(workspace)
+            .unwrap()
+            .window();
+        let target = Close::Window(window);
+        app.config.confirm_close = false;
+        let sender = observation(&mut app, target);
+        app.controller
+            .dispatch(Command::MoveWorkspaceToWindow {
+                workspace: incoming_workspace,
+                window,
+            })
+            .unwrap();
+        sender.send(ProcessActivity::Idle).unwrap();
+        app.poll_close(&ctx);
+
+        assert!(app.controller.model().pane(original).is_some());
+        assert!(app.controller.model().pane(incoming).is_some());
+        assert_eq!(app.ui.close_status, CloseStatus::Unknown);
+        assert_eq!(
+            app.pending_close.as_ref().unwrap().panes,
+            vec![(original, 1), (incoming, 1)]
+        );
+        app.action(&ctx, Action::CancelClose);
+        assert!(app.controller.model().pane(original).is_some());
+        assert!(app.controller.model().pane(incoming).is_some());
+    }
+
+    #[test]
+    fn quitting_from_a_child_window_closes_the_native_root() {
+        let (mut app, ctx, _root, _pane) = setup();
+        let child = egui::ViewportId::from_hash_of("detached-test-window");
+        let mut input = egui::RawInput {
+            viewport_id: child,
+            ..Default::default()
+        };
+        input.viewports.insert(child, egui::ViewportInfo::default());
+        let output = ctx.run_logic(&input, |ctx| app.finish_close(ctx, Close::App));
+        assert!(app.exit_approved);
+        assert_eq!(
+            output.viewport_commands.get(&egui::ViewportId::ROOT),
+            Some(&vec![egui::ViewportCommand::Close])
+        );
+        assert!(output.viewport_commands.get(&child).is_none());
+    }
+
+    #[test]
     fn restarting_for_an_update_asks_only_about_processes_and_a_plain_close_forgets_it() {
         let (mut app, ctx, _root, _pane) = setup();
         app.config.warn_running_processes = false;
@@ -577,7 +688,10 @@ mod tests {
         assert!(app.relaunch && !app.exit_approved);
         // Closing the window instead quits without starting the new version.
         app.action(&ctx, Action::WindowClose);
-        app.action(&ctx, Action::Confirm(Close::App));
+        app.action(
+            &ctx,
+            Action::Confirm(Close::Window(neptune_model::WindowId::ROOT)),
+        );
         assert!(!app.relaunch && app.exit_approved);
     }
 }

@@ -517,17 +517,15 @@ impl Browsers {
             entry.geometry = Some(geometry);
         }
     }
+    /// Reconciles browsers across all native windows. The caller supplies the
+    /// aggregate visible panes and the pane whose window owns keyboard focus;
+    /// the context may belong to a hidden coordinator window.
     pub fn poll(
         &mut self,
         ctx: &egui::Context,
         shown: &[PaneId],
         focused: Option<PaneId>,
     ) -> Vec<Completion> {
-        let shown = if ctx.input(|input| input.viewport().visible()) == Some(false) {
-            &[][..]
-        } else {
-            shown
-        };
         let mut completions = Vec::new();
         if let Some(wait) = self.tabs.settle() {
             ctx.request_repaint_after(wait);
@@ -777,7 +775,7 @@ impl Browsers {
             if entry.visible != Some(visible) && bridge.send(Command::Visible { target, visible }) {
                 entry.visible = Some(visible);
             }
-            let owns_focus = visible && focused == Some(*pane) && ctx.input(|i| i.focused);
+            let owns_focus = visible && focused == Some(*pane);
             if entry.focused != Some(owns_focus)
                 && bridge.send(Command::Focus {
                     target,
@@ -1396,7 +1394,7 @@ mod tests {
             .insert(target, state);
     }
     #[test]
-    fn browser_pauses_painting_in_hidden_windows_and_resumes_on_restore() {
+    fn browser_pauses_painting_when_no_window_shows_it_and_resumes_when_visible() {
         let (mut browsers, receiver, ctx, pane) = fixture();
         browsers.poll(&ctx, &[pane], Some(pane));
         receiver.try_iter().for_each(drop);
@@ -1406,7 +1404,7 @@ mod tests {
             viewport.minimized = Some(!occluded);
             viewport.occluded = Some(occluded);
             let _ = ctx.run_logic(&input, |ctx| {
-                browsers.poll(ctx, &[pane], Some(pane));
+                browsers.poll(ctx, &[], None);
             });
             assert_eq!(browsers.entries[&pane].visible, Some(false));
             input
@@ -1432,6 +1430,51 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(visible, [false, true]);
         }
+    }
+
+    #[test]
+    fn a_hidden_coordinator_does_not_hide_or_defocus_a_visible_child_browser() {
+        let (mut browsers, receiver, ctx, pane) = fixture();
+        browsers.poll(&ctx, &[pane], Some(pane));
+        receiver.try_iter().for_each(drop);
+        let mut input = egui::RawInput {
+            focused: false,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(true);
+        let child = egui::ViewportId::from_hash_of("browser-child");
+        input.viewports.insert(
+            child,
+            egui::ViewportInfo {
+                focused: Some(true),
+                minimized: Some(false),
+                ..Default::default()
+            },
+        );
+        let _ = ctx.run_logic(&input, |ctx| {
+            browsers.poll(ctx, &[pane], Some(pane));
+        });
+        assert_eq!(browsers.entries[&pane].visible, Some(true));
+        assert_eq!(browsers.entries[&pane].focused, Some(true));
+        assert!(!receiver.try_iter().any(|command| matches!(
+            command,
+            Command::Visible { visible: false, .. } | Command::Focus { focused: false, .. }
+        )));
+
+        input.viewport_id = child;
+        input.focused = true;
+        let _ = ctx.run_logic(&input, |ctx| {
+            browsers.poll(ctx, &[pane], Some(pane));
+        });
+        assert!(
+            !receiver
+                .try_iter()
+                .any(|command| matches!(command, Command::Visible { .. } | Command::Focus { .. }))
+        );
     }
     #[test]
     fn a_restored_tab_opens_its_page_in_its_profile_until_it_is_closed() {

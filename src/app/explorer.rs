@@ -1522,13 +1522,16 @@ impl App {
     /// whether the key was the explorer's.
     pub(super) fn explorer_escape(&mut self, ctx: &egui::Context) -> bool {
         use ui::explorer::{edit_id, exclude_id, query_id};
+        let edit = ui::controls::viewport_id(ctx, edit_id());
+        let query = ui::controls::viewport_id(ctx, query_id());
+        let exclude = ui::controls::viewport_id(ctx, exclude_id());
         // The toolkit has already taken focus from the field for this key.
         let held =
             |id| ctx.memory(|memory| memory.has_focus(id) || memory.had_focus_last_frame(id));
         if self.ui.explorer.edit.is_some() {
             // A name field that scrolled out of view lost the keyboard; the
             // key is then the shell's, and the unfinished name is dropped.
-            let typing = held(edit_id())
+            let typing = held(edit)
                 || self
                     .ui
                     .explorer
@@ -1537,15 +1540,15 @@ impl App {
                     .is_some_and(|edit| edit.focus);
             self.ui.explorer.edit = None;
             self.explorer.dirty = true;
-            ctx.memory_mut(|memory| memory.surrender_focus(edit_id()));
+            ctx.memory_mut(|memory| memory.surrender_focus(edit));
             if !typing {
                 return false;
             }
-        } else if held(query_id()) && !self.ui.explorer.query.is_empty() {
+        } else if held(query) && !self.ui.explorer.query.is_empty() {
             self.ui.explorer.query.clear();
             self.explorer_event(ctx, Event::SearchChanged);
-            ctx.memory_mut(|memory| memory.request_focus(query_id()));
-        } else if let Some(id) = [query_id(), exclude_id()].into_iter().find(|id| held(*id)) {
+            ctx.memory_mut(|memory| memory.request_focus(query));
+        } else if let Some(id) = [query, exclude].into_iter().find(|id| held(*id)) {
             ctx.memory_mut(|memory| memory.surrender_focus(id));
         } else if self.explorer_text_selected() {
             self.ui.explorer.source_selection.reset();
@@ -1688,11 +1691,11 @@ impl App {
     /// dropped, and a field that is leaving must not keep the keyboard.
     pub(super) fn leave_explorer(&mut self, ctx: &egui::Context) {
         self.ui.explorer.edit = None;
+        use ui::explorer::{edit_id, exclude_id, query_id};
+        let ids =
+            [query_id(), exclude_id(), edit_id()].map(|id| ui::controls::viewport_id(ctx, id));
         ctx.memory_mut(|memory| {
-            if let Some(id) = memory.focused().filter(|id| {
-                use ui::explorer::{edit_id, exclude_id, query_id};
-                [query_id(), exclude_id(), edit_id()].contains(id)
-            }) {
+            if let Some(id) = memory.focused().filter(|id| ids.contains(id)) {
                 memory.surrender_focus(id);
             }
         });

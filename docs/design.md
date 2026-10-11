@@ -140,6 +140,27 @@ icon buttons keep a 28-point target around a 16-point glyph.
   edge scrolls a long list, Escape puts it back, and nothing is saved before
   release. "Move up" and "Move down" in the row menu and the command palette
   reorder without a pointer and take effect at once.
+  Dragging a workspace beyond the sidebar transfers it into another
+  native window while the pointer is held. The workspace retains its terminals,
+  browser tabs, group, split identities and running sessions. "Move to new
+  window" in its menu and "Move workspace to new window" in the palette offer
+  the same action without dragging; "Move to window" names the existing
+  destinations. Each window lists only its own workspaces, retains its selected
+  workspace and sidebar visibility, and closes when emptied. Settings and
+  themes remain shared. Native window placement follows the operating system's
+  compositor rules.
+  A carried workspace stays above the replacement window until release, with
+  the original grab point anchored to its actual row geometry. Entering another
+  window's sidebar joins immediately, retaining sessions and the held gesture:
+  the row can reorder there or detach again before release. A hidden sidebar
+  receives the workspace in its toolbar. No border marks a pending drop. Native
+  pointer observation runs only during the gesture, outside interactive frames.
+  The native surface that received the press stays mapped throughout the gesture;
+  on joining, it adopts the receiving window's sidebar and geometry. Held
+  transfers run before the frame enumerates native windows, so a handoff cannot
+  retire that surface between frames.
+  Application-controlled dragging currently covers Linux/X11; other native
+  backends use the menu and palette to join windows.
   While a terminal is carried, every other workspace's row on the same machine
   is a drop destination and takes the accent under the pointer.
   The sidebar yields to terminal content below 820 points of window width.
@@ -488,7 +509,10 @@ icon buttons keep a 28-point target around a 16-point glyph.
   rounded shape. The confirming action sits at the trailing edge; destructive
   confirmations are red and are never the Enter default. Each close target has
   its own title and consequence ("Close terminal?", "Close workspace?",
-  "Disconnect from SSH?", "Quit Neptune?"). The SSH sheet asks only for a host,
+  "Close window?", "Disconnect from SSH?", "Quit Neptune?"). Closing a window
+  targets its own workspaces; Quit Neptune targets all windows. Both capture
+  their targets and apply the existing process checks and cancel behavior. The
+  last visible window's close acts as Quit and preserves restoration. The SSH sheet asks only for a host,
   states that connecting an existing workspace restarts its terminals, and
   names the problem in place of that note while the host is unusable.
 - **Software update.** The sheet leads with the version on offer, the

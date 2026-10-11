@@ -46,6 +46,56 @@ Use the [isolated native harness](#native-inspection) below for interactive revi
 
 Developer inspection is opt-in through the `inspection` feature. `neptune-inspect` exposes the native accessibility tree and supports `screenshot`, `key`, `text`, `click`, `context` (secondary click), `double-click`, `drag`, `press`, `release`, and `resize` commands for repeatable native visual review. The normal release binary has no inspection listener. Independent launches must follow [the run-isolation rules](../scripts/AGENTS.md).
 
+Inspection protocol v1 does not carry a viewport ID. With multiple native windows,
+requests and replies can come from different viewport passes, so the tree and
+screenshot do not reliably describe the same window. Review detached windows
+with native OS input and screenshots targeted at the exact task-owned window ID;
+on Linux/X11, pass that ID to the [native verification tools](verification.md#native-application-verification).
+
+The native integration exposes a window handle only for its original viewport.
+File and folder pickers requested by additional windows therefore open without
+a native parent. The supplemental Linux file-drag listener also belongs to the
+original native surface. X11 child windows use toolkit file-drop events; native
+Wayland child-window file drops require additional toolkit support and are
+currently unavailable. Workspace tear-off keeps the pressed native surface with
+the moving workspace so its compositor move can use the original pointer press.
+
+Workspace tear-off has a focused Linux/X11 workflow using actual pointer and
+keyboard input, a fresh data root, and native windows matched to the exact owned
+process PID. It measures the bootstrap window's display scale before converting
+logical UI points to native X11 pixels:
+
+```sh
+python3 scripts/native-workspace-windows.py --output artifacts/native-workspace-windows
+```
+
+Run it sequentially with other desktop input tests. It checks held drags from
+the original and a child window, unchanged live shell identity, closing the
+original native window while a sibling stays usable, and moving a workspace
+back into an existing window. Inspect its native captures, including the row
+menu and destination submenu, detach/rejoin/quit palette commands, narrow
+detached window and close confirmation. Inspection is used only before the first
+tear-off; later input and screenshots target exact X11 window IDs. History
+markers in the captures need visual review. The harness focuses its owned native
+window and calibrates actual XTest pointer motion before pressing. Startup motion
+retries are bounded and recorded; clicks require a validated row position. For a
+second monitor at the same scale, pass a
+physical X11 desktop point and monitor rectangle chosen from that host's layout:
+
+```sh
+python3 scripts/native-workspace-windows.py --drag-to-native-point X,Y --drag-to-native-region LEFT,TOP,RIGHT,BOTTOM
+```
+
+That optional first tear-off requests motion to the supplied point and verifies
+that the same held native window's center enters the supplied monitor rectangle.
+It records actual window geometry and pointer samples, captures the held window,
+then moves back and waits for its center to leave that rectangle. Pointer queries
+can lag during the window manager's grab, so they serve as diagnostics rather
+than exact position assertions. Return motion uses the adapter's last requested
+point rather than the possibly stale query. The harness does not discover
+monitors or verify mixed-DPI scale transitions. This workflow does not establish
+Wayland, macOS or Windows correctness.
+
 Native regression runs own their process, temporary data directory, and inspection
 endpoint; they never use your saved workspaces:
 

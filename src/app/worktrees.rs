@@ -4,12 +4,23 @@ use super::projects::Briefing;
 use super::*;
 use crate::runtime::worktrees::{Event as GitEvent, Request};
 use crate::ui::worktrees::{Event, Probe, Removal, Tab};
-use neptune_model::{AgentKind, ProjectId, Worktree};
+use neptune_model::{AgentKind, ProjectId, WindowId, Worktree};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Target {
+    window: WindowId,
+    pane: PaneId,
+    generation: u64,
+}
+struct Probing {
+    target: Target,
+    cwd: PathBuf,
+}
 
 /// The worktree git is making: the terminal its tab follows and what runs
-/// in it. Captured when Create is pressed, whatever is focused by then.
+/// in it. The sheet's terminal stays the target through focus and restart.
 struct Creating {
-    pane: PaneId,
+    target: Target,
     /// Where git was asked from, with the branch: what its answer names.
     cwd: PathBuf,
     branch: String,
@@ -32,9 +43,11 @@ pub(super) struct Worktrees {
     watched: Vec<Worktree>,
     /// Those whose branch is merged with nothing uncommitted, and into what.
     finished: BTreeMap<PathBuf, String>,
-    /// The directory the open sheet asked about.
-    probing: Option<PathBuf>,
+    /// Each window's sheet retains its own terminal and directory.
+    probing: BTreeMap<WindowId, Probing>,
     creating: Option<Creating>,
+    /// Removal errors return to the sheet that requested them.
+    removing: BTreeMap<PathBuf, WindowId>,
     /// What projects wait for, in the order it was asked.
     asked: Vec<Asked>,
 }
@@ -63,11 +76,10 @@ impl App {
 
     fn git(&mut self, ctx: &egui::Context, request: Request) -> bool {
         let wake = ctx.clone();
-        match self
-            .worktrees
-            .git
-            .request(request, Arc::new(move || wake.request_repaint()))
-        {
+        match self.worktrees.git.request(
+            request,
+            Arc::new(move || wake.request_repaint_of(egui::ViewportId::ROOT)),
+        ) {
             Ok(()) => true,
             Err(error) => {
                 self.ui.error = Some(error);
@@ -78,8 +90,41 @@ impl App {
 
     /// Leaves either sheet. A worktree already being made still opens.
     pub(super) fn close_worktree_sheet(&mut self) {
-        self.worktrees.probing = None;
+        self.worktrees.probing.remove(&self.presentation_window());
         self.ui.worktree.removal = None;
+    }
+
+    fn worktree_target_alive(&self, target: Target) -> bool {
+        self.controller
+            .model()
+            .pane(target.pane)
+            .is_some_and(|pane| pane.generation() == target.generation)
+            && self.remote_of(target.pane).is_none()
+    }
+
+    fn worktree_target_window(&self, target: Target) -> WindowId {
+        let model = self.controller.model();
+        model
+            .pane(target.pane)
+            .filter(|pane| pane.generation() == target.generation)
+            .and_then(|_| model.workspace_for_pane(target.pane))
+            .and_then(|workspace| model.workspace(workspace))
+            .map_or(target.window, |workspace| workspace.window())
+    }
+
+    fn worktree_busy(&mut self, busy: bool) {
+        let windows: Vec<_> = self
+            .controller
+            .model()
+            .windows()
+            .iter()
+            .map(|window| window.id())
+            .collect();
+        for window in windows {
+            if let Some(ui) = self.window_ui_state_mut(window) {
+                ui.worktree.creating = busy;
+            }
+        }
     }
 
     pub(super) fn worktree_event(&mut self, ctx: &egui::Context, event: Event) {
@@ -89,6 +134,11 @@ impl App {
                 // repository it can add a worktree to.
                 let Some(item) = self.controller.model().pane(pane) else {
                     return;
+                };
+                let target = Target {
+                    window: self.presentation_window(),
+                    pane,
+                    generation: item.generation(),
                 };
                 if self.remote_of(pane).is_some() {
                     self.ui.error = Some("Worktrees are made for terminals on this machine".into());
@@ -110,18 +160,33 @@ impl App {
                 self.ui.worktree.removal = None;
                 self.ui.overlay = OverlayState::NewWorktree(pane);
                 self.ui.overlay_focus = true;
-                self.worktrees.probing = Some(cwd.clone());
+                self.worktrees.probing.insert(
+                    target.window,
+                    Probing {
+                        target,
+                        cwd: cwd.clone(),
+                    },
+                );
                 if !self.git(ctx, Request::Probe { cwd }) {
                     self.ui.overlay = OverlayState::None;
+                    self.close_worktree_sheet();
                 }
             }
             Event::Create { branch, agent } => {
                 let OverlayState::NewWorktree(pane) = self.ui.overlay else {
                     return;
                 };
-                let Some(cwd) = self.worktrees.probing.clone() else {
+                let Some(probing) = self.worktrees.probing.get(&self.presentation_window()) else {
                     return;
                 };
+                let target = probing.target;
+                if target.pane != pane || !self.worktree_target_alive(target) {
+                    self.ui.worktree.error = Some(
+                        "The terminal this sheet was opened from has closed or restarted".into(),
+                    );
+                    return;
+                }
+                let cwd = probing.cwd.clone();
                 if self.worktrees.creating.is_some() {
                     return;
                 }
@@ -132,10 +197,10 @@ impl App {
                         branch: branch.clone(),
                     },
                 ) {
-                    self.ui.worktree.creating = true;
+                    self.worktree_busy(true);
                     self.ui.worktree.error = None;
                     self.worktrees.creating = Some(Creating {
-                        pane,
+                        target,
                         cwd,
                         branch,
                         agent,
@@ -146,9 +211,18 @@ impl App {
                 let OverlayState::NewWorktree(pane) = self.ui.overlay else {
                     return;
                 };
+                let Some(target) = self
+                    .worktrees
+                    .probing
+                    .get(&self.presentation_window())
+                    .map(|probing| probing.target)
+                    .filter(|target| target.pane == pane)
+                else {
+                    return;
+                };
                 self.close_worktree_sheet();
                 self.ui.overlay = OverlayState::None;
-                self.open_worktree(ctx, pane, worktree, agent);
+                self.open_worktree(ctx, target, worktree, agent);
             }
             Event::RemoveOf(pane) => {
                 if let Some(worktree) = self
@@ -162,7 +236,7 @@ impl App {
                 }
             }
             Event::Remove(worktree) => {
-                self.worktrees.probing = None;
+                self.worktrees.probing.remove(&self.presentation_window());
                 if self.git(ctx, Request::Inspect(worktree.clone())) {
                     self.ui.worktree.removal = Some(Removal {
                         worktree,
@@ -178,6 +252,16 @@ impl App {
                 let Some(removal) = self.ui.worktree.removal.take() else {
                     return;
                 };
+                if self.worktrees.removing.contains_key(&removal.worktree.path)
+                    || self.worktrees.removing.len() >= MAX_ASKED
+                {
+                    self.ui.worktree.removal = Some(removal);
+                    self.ui.error = Some(
+                        "Neptune is still removing other worktrees; try again in a moment".into(),
+                    );
+                    return;
+                }
+                let owner = self.presentation_window();
                 self.ui.overlay = OverlayState::None;
                 // A shell holds its directory open on Windows, so there the
                 // terminals go first. Elsewhere they stay until git is done,
@@ -185,13 +269,16 @@ impl App {
                 if cfg!(windows) {
                     self.close_worktree_terminals(ctx, &removal.worktree);
                 }
-                self.git(
+                let path = removal.worktree.path.clone();
+                if self.git(
                     ctx,
                     Request::Remove {
                         worktree: removal.worktree,
                         discard,
                     },
-                );
+                ) {
+                    self.worktrees.removing.insert(path, owner);
+                }
             }
         }
     }
@@ -215,6 +302,11 @@ impl App {
         let Some(item) = self.controller.model().pane(pane) else {
             return Err("Open a terminal first.");
         };
+        let target = Target {
+            window: self.presentation_window(),
+            pane,
+            generation: item.generation(),
+        };
         let cwd = self
             .sessions
             .get(pane)
@@ -234,11 +326,12 @@ impl App {
             return Err("Could not start git.");
         }
         self.worktrees.creating = Some(Creating {
-            pane,
+            target,
             cwd,
             branch,
             agent,
         });
+        self.worktree_busy(true);
         Ok(())
     }
 
@@ -271,7 +364,7 @@ impl App {
                 cwd: cwd.clone(),
                 branch: branch.clone(),
             },
-            Arc::new(move || wake.request_repaint()),
+            Arc::new(move || wake.request_repaint_of(egui::ViewportId::ROOT)),
         );
         match asked {
             Ok(()) => {
@@ -286,42 +379,47 @@ impl App {
         }
     }
 
-    /// Opens `worktree` in a new tab that follows `pane` and starts `agent`
+    /// Opens `worktree` in a new tab that follows the captured terminal and starts `agent`
     /// there. Tabs already in the worktree are left as they are: several
     /// agents, of either CLI, can work in one worktree.
     fn open_worktree(
         &mut self,
         ctx: &egui::Context,
-        pane: PaneId,
+        target: Target,
         worktree: Worktree,
         agent: AgentKind,
     ) {
+        if !self.worktree_target_alive(target) {
+            if let Some(ui) = self.window_ui_state_mut(target.window) {
+                ui.error = Some(format!(
+                    "The worktree of {} is ready, but its source terminal has closed or restarted",
+                    worktree.branch
+                ));
+            }
+            return;
+        }
         let model = self.controller.model();
-        // The terminal it was asked from, or the focused one if that closed.
-        let local = |pane: &PaneId| model.pane(*pane).is_some() && self.remote_of(*pane).is_none();
-        let Some(pane) = Some(pane)
-            .filter(local)
-            .or_else(|| model.active_pane().filter(local))
-        else {
-            self.ui.error = Some(format!(
-                "The worktree of {} is ready, but there is no local terminal to open it beside",
-                worktree.branch
-            ));
+        let Some(workspace) = model.workspace_for_pane(target.pane) else {
             return;
         };
-        let Some(workspace) = model.workspace_for_pane(pane) else {
-            return;
-        };
+        let owner = model
+            .workspace(workspace)
+            .map(|workspace| workspace.window());
+        let previous = self.presentation_window();
+        if let Some(owner) = owner {
+            self.enter_window(owner);
+        }
         self.dispatch(
             ctx,
             Command::OpenWorktree {
                 workspace,
-                pane,
+                pane: target.pane,
                 worktree,
                 // The adapters that start a CLI exist on Unix only.
                 agent: cfg!(unix).then_some(agent),
             },
         );
+        self.enter_window(previous);
     }
 
     fn close_worktree_terminals(&mut self, ctx: &egui::Context, worktree: &Worktree) {
@@ -338,8 +436,145 @@ impl App {
             .map(|pane| pane.id())
             .collect();
         // The sheet that asked said they close; nothing asks again.
+        let previous = self.presentation_window();
         for pane in panes {
+            let owner = self
+                .controller
+                .model()
+                .workspace_for_pane(pane)
+                .and_then(|workspace| self.controller.model().workspace(workspace))
+                .map(|workspace| workspace.window());
+            if let Some(owner) = owner {
+                self.enter_window(owner);
+            }
             self.dispatch(ctx, Command::ClosePane(pane));
+        }
+        self.enter_window(previous);
+    }
+
+    fn worktree_answer(&mut self, ctx: &egui::Context, event: GitEvent) {
+        match event {
+            GitEvent::Probed { cwd, result } => {
+                let targets: Vec<_> = self
+                    .worktrees
+                    .probing
+                    .values()
+                    .filter(|probing| probing.cwd == cwd)
+                    .map(|probing| probing.target)
+                    .collect();
+                for target in targets {
+                    if !self.worktree_target_alive(target) {
+                        continue;
+                    }
+                    if let Some(ui) = self.window_ui_state_mut(target.window)
+                        && ui.overlay == OverlayState::NewWorktree(target.pane)
+                    {
+                        ui.worktree.repository = match result.clone() {
+                            Ok(repository) => Probe::Found(repository),
+                            Err(error) => Probe::Failed(error),
+                        };
+                    }
+                }
+            }
+            GitEvent::Created {
+                cwd,
+                branch,
+                result,
+            } => {
+                // The sheet's own request first, then a project's: git
+                // answers in the order it was asked, and two that ask
+                // for one branch are given the same worktree.
+                let Some(creating) = self
+                    .worktrees
+                    .creating
+                    .take_if(|creating| creating.branch == branch && creating.cwd == cwd)
+                else {
+                    if let Some(at) = self
+                        .worktrees
+                        .asked
+                        .iter()
+                        .position(|asked| asked.branch == branch && asked.cwd == cwd)
+                    {
+                        let asked = self.worktrees.asked.remove(at);
+                        self.worktree_made(ctx, *asked.briefing, result);
+                    }
+                    return;
+                };
+                self.worktree_busy(false);
+                let target = creating.target;
+                let owner = self.worktree_target_window(target);
+                let sheet = self
+                    .worktrees
+                    .probing
+                    .get(&target.window)
+                    .is_some_and(|probing| probing.target == target)
+                    && self
+                        .window_ui_state(target.window)
+                        .is_some_and(|ui| ui.overlay == OverlayState::NewWorktree(target.pane));
+                match result {
+                    Ok(worktree) => {
+                        if sheet {
+                            self.worktrees.probing.remove(&target.window);
+                            if let Some(ui) = self.window_ui_state_mut(target.window) {
+                                ui.worktree.removal = None;
+                                ui.overlay = OverlayState::None;
+                            }
+                        }
+                        self.open_worktree(ctx, target, worktree, creating.agent);
+                    }
+                    Err(error) if sheet && owner == target.window => {
+                        if let Some(ui) = self.window_ui_state_mut(owner) {
+                            ui.worktree.error = Some(error);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(ui) = self.window_ui_state_mut(owner) {
+                            ui.error =
+                                Some(format!("Could not make the worktree of {branch}: {error}"));
+                        }
+                    }
+                }
+            }
+            GitEvent::Inspected { path, result } => {
+                let windows: Vec<_> = self
+                    .controller
+                    .model()
+                    .windows()
+                    .iter()
+                    .map(|window| window.id())
+                    .collect();
+                for window in windows {
+                    if let Some(ui) = self.window_ui_state_mut(window)
+                        && ui.overlay == OverlayState::RemoveWorktree
+                        && let Some(removal) = &mut ui.worktree.removal
+                        && removal.worktree.path == path
+                    {
+                        removal.condition = Some(result.clone());
+                    }
+                }
+            }
+            GitEvent::Removed { worktree, result } => {
+                let owner = self.worktrees.removing.remove(&worktree.path);
+                if let Err(error) = &result
+                    && let Some(owner) = owner
+                    && let Some(ui) = self.window_ui_state_mut(owner)
+                {
+                    ui.error = Some(format!(
+                        "Could not remove the worktree of {}: {error}",
+                        worktree.branch
+                    ));
+                }
+                // Its terminals have nowhere left to be.
+                if result.is_ok() || !worktree.path.exists() {
+                    self.close_worktree_terminals(ctx, &worktree);
+                }
+            }
+            GitEvent::Finished { path, merged } => {
+                match merged {
+                    Some(into) => self.worktrees.finished.insert(path, into),
+                    None => self.worktrees.finished.remove(&path),
+                };
+            }
         }
     }
 
@@ -347,85 +582,12 @@ impl App {
     /// worktrees are open, so that it looks at those and no others.
     pub(super) fn poll_worktrees(&mut self, ctx: &egui::Context) {
         for event in self.worktrees.git.drain() {
-            match event {
-                GitEvent::Probed { cwd, result } => {
-                    if self.worktrees.probing.as_ref() == Some(&cwd)
-                        && matches!(self.ui.overlay, OverlayState::NewWorktree(_))
-                    {
-                        self.ui.worktree.repository = match result {
-                            Ok(repository) => Probe::Found(repository),
-                            Err(error) => Probe::Failed(error),
-                        };
-                    }
-                }
-                GitEvent::Created {
-                    cwd,
-                    branch,
-                    result,
-                } => {
-                    // The sheet's own request first, then a project's: git
-                    // answers in the order it was asked, and two that ask
-                    // for one branch are given the same worktree.
-                    let Some(creating) = self
-                        .worktrees
-                        .creating
-                        .take_if(|creating| creating.branch == branch && creating.cwd == cwd)
-                    else {
-                        if let Some(at) = self
-                            .worktrees
-                            .asked
-                            .iter()
-                            .position(|asked| asked.branch == branch && asked.cwd == cwd)
-                        {
-                            let asked = self.worktrees.asked.remove(at);
-                            self.worktree_made(ctx, *asked.briefing, result);
-                        }
-                        continue;
-                    };
-                    self.ui.worktree.creating = false;
-                    let sheet = self.ui.overlay == OverlayState::NewWorktree(creating.pane);
-                    match result {
-                        Ok(worktree) => {
-                            if sheet {
-                                self.close_worktree_sheet();
-                                self.ui.overlay = OverlayState::None;
-                            }
-                            self.open_worktree(ctx, creating.pane, worktree, creating.agent);
-                        }
-                        Err(error) if sheet => self.ui.worktree.error = Some(error),
-                        Err(error) => {
-                            self.ui.error =
-                                Some(format!("Could not make the worktree of {branch}: {error}"))
-                        }
-                    }
-                }
-                GitEvent::Inspected { path, result } => {
-                    if let Some(removal) = &mut self.ui.worktree.removal
-                        && removal.worktree.path == path
-                    {
-                        removal.condition = Some(result);
-                    }
-                }
-                GitEvent::Removed { worktree, result } => {
-                    if let Err(error) = &result {
-                        self.ui.error = Some(format!(
-                            "Could not remove the worktree of {}: {error}",
-                            worktree.branch
-                        ));
-                    }
-                    // Its terminals have nowhere left to be.
-                    if result.is_ok() || !worktree.path.exists() {
-                        self.close_worktree_terminals(ctx, &worktree);
-                    }
-                }
-                GitEvent::Finished { path, merged } => {
-                    match merged {
-                        Some(into) => self.worktrees.finished.insert(path, into),
-                        None => self.worktrees.finished.remove(&path),
-                    };
-                }
-            }
+            self.worktree_answer(ctx, event);
         }
+        let model = self.controller.model();
+        self.worktrees
+            .probing
+            .retain(|window, _| model.window(*window).is_some());
         let mut open: Vec<Worktree> = Vec::new();
         for pane in self
             .controller
@@ -454,6 +616,347 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn windows_fixture(directory: &std::path::Path) -> (App, Target, Target) {
+        let (mut app, _) = super::super::tests::fixture(directory);
+        app.startup = None;
+        app.command = None;
+        let mut panes = Vec::new();
+        for name in ["Root", "Child"] {
+            app.controller
+                .dispatch(Command::AddWorkspace {
+                    group: None,
+                    cwd: directory.join(name),
+                    name: name.into(),
+                    remote: None,
+                })
+                .unwrap();
+            panes.push(app.controller.model().active_pane().unwrap());
+        }
+        let workspace = app.controller.model().workspace_for_pane(panes[1]).unwrap();
+        app.controller
+            .dispatch(Command::DetachWorkspace(workspace))
+            .unwrap();
+        let child = app
+            .controller
+            .model()
+            .workspace(workspace)
+            .unwrap()
+            .window();
+        let root_target = Target {
+            window: WindowId::ROOT,
+            pane: panes[0],
+            generation: 1,
+        };
+        let child_target = Target {
+            window: child,
+            pane: panes[1],
+            generation: 1,
+        };
+        app.enter_window(child);
+        app.enter_window(WindowId::ROOT);
+        (app, root_target, child_target)
+    }
+
+    fn sheet(app: &mut App, target: Target, cwd: PathBuf) {
+        app.worktrees
+            .probing
+            .insert(target.window, Probing { target, cwd });
+        let ui = app.window_ui_state_mut(target.window).unwrap();
+        ui.overlay = OverlayState::NewWorktree(target.pane);
+        ui.worktree.repository = Probe::Looking;
+    }
+
+    fn tree(directory: &std::path::Path) -> Worktree {
+        Worktree {
+            repository: directory.join("repository"),
+            path: directory.join("repository.worktrees/fix-login"),
+            branch: "fix-login".into(),
+            start: "a".repeat(40),
+        }
+    }
+
+    fn creating(app: &mut App, target: Target, cwd: PathBuf, branch: &str) {
+        app.worktrees.creating = Some(Creating {
+            target,
+            cwd,
+            branch: branch.into(),
+            agent: AgentKind::Codex,
+        });
+        app.worktree_busy(true);
+    }
+
+    #[test]
+    fn closing_the_root_sheet_does_not_cancel_a_child_repository_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, root, child) = windows_fixture(directory.path());
+        let root_cwd = directory.path().join("root");
+        let child_cwd = directory.path().join("child");
+        sheet(&mut app, root, root_cwd);
+        sheet(&mut app, child, child_cwd.clone());
+        app.close_worktree_sheet();
+        app.ui.overlay = OverlayState::None;
+        app.worktree_answer(
+            &egui::Context::default(),
+            GitEvent::Probed {
+                cwd: child_cwd,
+                result: Err("Child repository missing".into()),
+            },
+        );
+        assert!(!app.worktrees.probing.contains_key(&root.window));
+        assert!(app.worktrees.probing.contains_key(&child.window));
+        assert!(
+            matches!(&app.window_ui_state(child.window).unwrap().worktree.repository,
+            Probe::Failed(error) if error == "Child repository missing")
+        );
+        assert!(matches!(app.ui.worktree.repository, Probe::Looking));
+    }
+
+    #[test]
+    fn simultaneous_window_probes_update_only_the_matching_sheets() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, root, child) = windows_fixture(directory.path());
+        let root_cwd = directory.path().join("root");
+        let child_cwd = directory.path().join("child");
+        sheet(&mut app, root, root_cwd.clone());
+        sheet(&mut app, child, child_cwd.clone());
+        let ctx = egui::Context::default();
+        app.worktree_answer(
+            &ctx,
+            GitEvent::Probed {
+                cwd: child_cwd,
+                result: Err("Child".into()),
+            },
+        );
+        assert!(matches!(app.ui.worktree.repository, Probe::Looking));
+        app.worktree_answer(
+            &ctx,
+            GitEvent::Probed {
+                cwd: root_cwd,
+                result: Err("Root".into()),
+            },
+        );
+        assert!(matches!(&app.ui.worktree.repository, Probe::Failed(error) if error == "Root"));
+        assert!(
+            matches!(&app.window_ui_state(child.window).unwrap().worktree.repository,
+            Probe::Failed(error) if error == "Child")
+        );
+    }
+
+    #[test]
+    fn a_child_creation_completion_opens_its_tab_and_preserves_the_root_sheet() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, root, child) = windows_fixture(directory.path());
+        let ctx = egui::Context::default();
+        let cwd = directory.path().join("child");
+        let worktree = tree(directory.path());
+        sheet(&mut app, child, cwd.clone());
+        app.ui.overlay = OverlayState::Settings;
+        creating(&mut app, child, cwd.clone(), &worktree.branch);
+        app.worktree_answer(
+            &ctx,
+            GitEvent::Created {
+                cwd,
+                branch: worktree.branch.clone(),
+                result: Ok(worktree.clone()),
+            },
+        );
+        assert_eq!(app.presentation_window(), root.window);
+        assert_eq!(app.ui.overlay, OverlayState::Settings);
+        assert_eq!(app.controller.model().active_pane(), Some(root.pane));
+        let child_window = app.controller.model().window(child.window).unwrap();
+        let workspace = app
+            .controller
+            .model()
+            .workspace(child_window.active_workspace().unwrap())
+            .unwrap();
+        assert_eq!(workspace.panes().len(), 2);
+        assert_eq!(
+            app.controller
+                .model()
+                .pane(workspace.active())
+                .unwrap()
+                .worktree(),
+            Some(&worktree)
+        );
+        assert_eq!(
+            app.window_ui_state(child.window).unwrap().overlay,
+            OverlayState::None
+        );
+        assert!(app.worktrees.creating.is_none());
+    }
+
+    #[test]
+    fn a_child_creation_failure_updates_its_sheet_and_releases_other_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, root, child) = windows_fixture(directory.path());
+        let cwd = directory.path().join("child");
+        sheet(&mut app, root, directory.path().join("root"));
+        sheet(&mut app, child, cwd.clone());
+        creating(&mut app, child, cwd.clone(), "fix-login");
+        app.worktree_answer(
+            &egui::Context::default(),
+            GitEvent::Created {
+                cwd,
+                branch: "fix-login".into(),
+                result: Err("Branch is checked out".into()),
+            },
+        );
+        let ui = app.window_ui_state(child.window).unwrap();
+        assert_eq!(ui.overlay, OverlayState::NewWorktree(child.pane));
+        assert_eq!(ui.worktree.error.as_deref(), Some("Branch is checked out"));
+        assert!(!ui.worktree.creating);
+        assert_eq!(app.ui.overlay, OverlayState::NewWorktree(root.pane));
+        assert!(app.ui.worktree.error.is_none());
+        assert!(!app.ui.worktree.creating);
+    }
+
+    #[test]
+    fn a_creation_failure_follows_its_surviving_source_after_a_child_rejoins() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, root, child) = windows_fixture(directory.path());
+        let cwd = directory.path().join("child");
+        sheet(&mut app, child, cwd.clone());
+        creating(&mut app, child, cwd.clone(), "fix-login");
+        app.ui.overlay = OverlayState::Settings;
+        let workspace = app
+            .controller
+            .model()
+            .workspace_for_pane(child.pane)
+            .unwrap();
+        app.controller
+            .dispatch(Command::MoveWorkspaceToWindow {
+                workspace,
+                window: root.window,
+            })
+            .unwrap();
+        assert!(app.controller.model().window(child.window).is_none());
+        app.worktree_answer(
+            &egui::Context::default(),
+            GitEvent::Created {
+                cwd,
+                branch: "fix-login".into(),
+                result: Err("Branch is checked out".into()),
+            },
+        );
+        assert_eq!(app.ui.overlay, OverlayState::Settings);
+        assert_eq!(
+            app.ui.error.as_deref(),
+            Some("Could not make the worktree of fix-login: Branch is checked out")
+        );
+        assert!(app.worktrees.creating.is_none());
+    }
+
+    #[test]
+    fn a_closed_or_restarted_create_target_does_not_retarget_another_terminal() {
+        for restart in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, root, child) = windows_fixture(directory.path());
+            let cwd = directory.path().join("child");
+            let worktree = tree(directory.path());
+            sheet(&mut app, child, cwd.clone());
+            app.ui.overlay = OverlayState::Settings;
+            creating(&mut app, child, cwd.clone(), &worktree.branch);
+            app.controller
+                .dispatch(if restart {
+                    Command::RestartPane(child.pane)
+                } else {
+                    Command::ClosePane(child.pane)
+                })
+                .unwrap();
+            let count = app.controller.model().pane_count();
+            app.worktree_answer(
+                &egui::Context::default(),
+                GitEvent::Created {
+                    cwd,
+                    branch: worktree.branch.clone(),
+                    result: Ok(worktree),
+                },
+            );
+            assert_eq!(app.controller.model().pane_count(), count);
+            assert_eq!(app.controller.model().active_pane(), Some(root.pane));
+            assert_eq!(app.ui.overlay, OverlayState::Settings);
+            assert!(app.ui.error.is_none());
+            if restart {
+                assert!(
+                    app.window_ui_state(child.window)
+                        .unwrap()
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("source terminal")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn child_removal_checks_and_errors_do_not_update_the_root_sheet() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, root, child) = windows_fixture(directory.path());
+        let worktree = tree(directory.path());
+        std::fs::create_dir_all(&worktree.path).unwrap();
+        for (target, path) in [
+            (root, directory.path().join("other")),
+            (child, worktree.path.clone()),
+        ] {
+            let ui = app.window_ui_state_mut(target.window).unwrap();
+            ui.overlay = OverlayState::RemoveWorktree;
+            ui.worktree.removal = Some(Removal {
+                worktree: Worktree {
+                    path,
+                    ..worktree.clone()
+                },
+                condition: None,
+            });
+        }
+        let ctx = egui::Context::default();
+        app.worktree_answer(
+            &ctx,
+            GitEvent::Inspected {
+                path: worktree.path.clone(),
+                result: Ok(Default::default()),
+            },
+        );
+        assert!(
+            app.window_ui_state(child.window)
+                .unwrap()
+                .worktree
+                .removal
+                .as_ref()
+                .unwrap()
+                .condition
+                .is_some()
+        );
+        assert!(
+            app.ui
+                .worktree
+                .removal
+                .as_ref()
+                .unwrap()
+                .condition
+                .is_none()
+        );
+        app.worktrees
+            .removing
+            .insert(worktree.path.clone(), child.window);
+        app.worktree_answer(
+            &ctx,
+            GitEvent::Removed {
+                worktree,
+                result: Err("Changes remain".into()),
+            },
+        );
+        assert!(
+            app.window_ui_state(child.window)
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Changes remain")
+        );
+        assert!(app.ui.error.is_none());
+    }
 
     fn git(directory: &std::path::Path, arguments: &[&str]) -> String {
         let output = std::process::Command::new("git")

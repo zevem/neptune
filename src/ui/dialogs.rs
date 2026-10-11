@@ -345,6 +345,11 @@ pub fn close_copy(close: Close) -> (&'static str, &'static str, &'static str) {
             "Every terminal in this workspace will close, and running processes will stop.",
             "Close",
         ),
+        Close::Window(_) => (
+            "Close window?",
+            "Every terminal in this window will close, and running processes will stop.",
+            "Close",
+        ),
         Close::Connection(_) => (
             "Disconnect from SSH?",
             "Every terminal in this workspace restarts as a local shell. Processes running in them will stop.",
@@ -395,6 +400,9 @@ fn confirm_close(
                 Close::Pane(_) => "Closing this terminal will stop the process.",
                 Close::Workspace(_) => {
                     "Closing this workspace will close its terminals and stop their processes."
+                }
+                Close::Window(_) => {
+                    "Closing this window will close its terminals and stop their processes."
                 }
                 Close::Connection(_) => {
                     "Disconnecting will stop these connections and restart the terminals as local shells."
@@ -653,13 +661,14 @@ pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut 
 mod tests {
     use super::*;
     use egui::Pos2;
-    use neptune_model::{PaneId, WorkspaceId};
+    use neptune_model::{PaneId, WindowId, WorkspaceId};
 
     #[test]
     fn close_checks_render_nothing_until_confirmation_is_needed() {
         for close in [
             Close::Pane(PaneId::new(1)),
             Close::Workspace(WorkspaceId::new(1)),
+            Close::Window(WindowId::new(2)),
             Close::Connection(WorkspaceId::new(1)),
             Close::App,
         ] {
@@ -1008,10 +1017,13 @@ mod tests {
     fn each_close_target_names_its_own_consequence() {
         let pane = close_copy(Close::Pane(PaneId::new(1)));
         let workspace = close_copy(Close::Workspace(WorkspaceId::new(1)));
+        let window = close_copy(Close::Window(WindowId::new(2)));
         let app = close_copy(Close::App);
         let connection = close_copy(Close::Connection(WorkspaceId::new(1)));
         assert_eq!(pane.0, "Close terminal?");
         assert_ne!(pane.0, workspace.0);
+        assert_eq!(window.0, "Close window?");
+        assert_ne!(window.1, workspace.1);
         assert_ne!(workspace.1, app.1);
         assert_ne!(connection.1, workspace.1);
         assert_eq!(

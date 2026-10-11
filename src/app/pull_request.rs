@@ -836,8 +836,9 @@ impl App {
     /// keyboard. What was typed in it stays.
     pub(super) fn leave_pull_request(&mut self, ctx: &egui::Context) {
         self.ui.pull_request.focus = false;
+        let ids = ui::pull_request::field_ids().map(|id| ui::controls::viewport_id(ctx, id));
         ctx.memory_mut(|memory| {
-            for id in ui::pull_request::field_ids() {
+            for id in ids {
                 if memory.has_focus(id) {
                     memory.surrender_focus(id);
                 }
@@ -853,17 +854,18 @@ impl App {
             |id| ctx.memory(|memory| memory.has_focus(id) || memory.had_focus_last_frame(id));
         let Some(id) = ui::pull_request::field_ids()
             .into_iter()
+            .map(|id| ui::controls::viewport_id(ctx, id))
             .find(|id| held(*id))
         else {
             return false;
         };
         let tab = &mut self.ui.pull_request;
-        if id == ui::pull_request::composer_id() {
+        if id == ui::controls::viewport_id(ctx, ui::pull_request::composer_id()) {
             tab.composer = None;
             tab.line = None;
-        } else if id == ui::pull_request::reply_id() {
+        } else if id == ui::controls::viewport_id(ctx, ui::pull_request::reply_id()) {
             tab.replying = None;
-        } else if id == ui::pull_request::rewrite_id() {
+        } else if id == ui::controls::viewport_id(ctx, ui::pull_request::rewrite_id()) {
             tab.rewriting = None;
         } else {
             tab.editing = None;

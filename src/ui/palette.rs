@@ -11,7 +11,7 @@ use eframe::egui::{
     self, Align, Align2, Id, Key, Layout, Modifiers, Pos2, Rect, Sense, Vec2, WidgetInfo,
     WidgetType, vec2,
 };
-use neptune_model::{Axis, Destination, FocusDirection, PaneId, WorkspaceId};
+use neptune_model::{Axis, Destination, FocusDirection, PaneId, WindowId, WorkspaceId};
 
 pub struct PaletteView<'a> {
     pub pane: Option<PaneId>,
@@ -31,6 +31,8 @@ pub struct PaletteView<'a> {
     pub layout: Option<&'a neptune_model::Layout>,
     pub workspaces: &'a [WorkspaceView],
     pub groups: &'a [neptune_model::WorkspaceGroup],
+    /// Other native windows which can take the active workspace.
+    pub windows: &'a [(WindowId, String)],
     pub active: Option<WorkspaceId>,
     pub config: &'a Config,
     pub zoomed: bool,
@@ -76,6 +78,13 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         "Subscription usage",
         "",
         [Action::Usage],
+    ));
+    list.push(command(
+        "Application",
+        Icon::Close,
+        "Quit Neptune",
+        "",
+        [Action::Quit],
     ));
     if let Some(pane) = view.pane {
         for port in view.ports {
@@ -477,6 +486,17 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 "",
                 [Action::Rename(active)],
             ),
+            command(
+                "Workspace",
+                Icon::ArrowUpRight,
+                "Move workspace to new window",
+                "",
+                [Action::DetachWorkspace {
+                    workspace: active,
+                    pointer: None,
+                    grip: None,
+                }],
+            ),
             if remote {
                 command(
                     "Workspace",
@@ -502,6 +522,18 @@ fn commands(view: &PaletteView) -> Vec<Command> {
                 [Action::CloseWorkspace(active)],
             ),
         ]);
+        for (window, name) in view.windows {
+            list.push(Command {
+                target: window.get(),
+                ..command(
+                    "Workspace",
+                    Icon::ArrowUpRight,
+                    format!("Move workspace to {name}"),
+                    "",
+                    [Action::MoveWorkspaceToWindow(active, *window)],
+                )
+            });
+        }
         // Reordering by keyboard; the sidebar offers the same by dragging.
         if let Some(workspace) = view.workspaces.iter().find(|w| w.id == active) {
             let siblings: Vec<usize> = view
@@ -1007,6 +1039,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quitting_neptune_is_available_without_a_workspace_or_terminal() {
+        let config = Config::default();
+        let list = commands(&view(&config, &[]));
+        let quit = list
+            .iter()
+            .find(|command| command.title == "Quit Neptune")
+            .unwrap();
+        assert_eq!(quit.group, "Application");
+        assert!(matches!(quit.actions.as_slice(), [Action::Quit]));
+        assert!(matches(quit, "quit"));
+    }
+
+    #[test]
+    fn quitting_neptune_keeps_application_scope_with_other_windows_open() {
+        let config = Config::default();
+        let windows = [(WindowId::new(2), "app".into())];
+        let list = commands(&PaletteView {
+            active: Some(WorkspaceId::new(7)),
+            windows: &windows,
+            ..view(&config, &[])
+        });
+        let quit: Vec<_> = list
+            .iter()
+            .filter(|command| command.title == "Quit Neptune")
+            .collect();
+        assert_eq!(quit.len(), 1);
+        assert!(matches!(quit[0].actions.as_slice(), [Action::Quit]));
+    }
+
+    #[test]
     fn group_directory_commands_capture_each_group_even_with_duplicate_names() {
         let config = Config::default();
         let model = neptune_model::Model::restore_grouped(
@@ -1053,6 +1115,7 @@ mod tests {
             layout: None,
             workspaces,
             groups: &[],
+            windows: &[],
             active: None,
             config,
             zoomed: false,
@@ -1135,6 +1198,59 @@ mod tests {
             !commands(&view(&config, &workspaces))
                 .iter()
                 .any(|command| command.title == "Dismiss message")
+        );
+    }
+
+    #[test]
+    fn workspace_window_commands_capture_the_workspace_and_same_named_window_identities() {
+        let config = Config::default();
+        let workspace = WorkspaceId::new(7);
+        let windows = [
+            (WindowId::new(2), "app".into()),
+            (WindowId::new(3), "app".into()),
+        ];
+        let list = commands(&PaletteView {
+            active: Some(workspace),
+            windows: &windows,
+            ..view(&config, &[])
+        });
+        let detach = list
+            .iter()
+            .find(|command| command.title == "Move workspace to new window")
+            .unwrap();
+        assert!(
+            matches!(detach.actions.as_slice(), [Action::DetachWorkspace {workspace: target, pointer: None, ..}] if *target == workspace)
+        );
+        let moves: Vec<_> = list
+            .iter()
+            .filter(|command| command.title == "Move workspace to app")
+            .collect();
+        assert_eq!(
+            moves
+                .iter()
+                .map(|command| command.target)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        for (command, (window, _)) in moves.iter().zip(&windows) {
+            assert!(
+                matches!(command.actions.as_slice(), [Action::MoveWorkspaceToWindow(target, destination)] if *target == workspace && destination == window)
+            );
+        }
+        assert!(
+            commands(&PaletteView {
+                windows: &windows,
+                ..view(&config, &[])
+            })
+            .iter()
+            .all(|command| {
+                !command.actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        Action::DetachWorkspace { .. } | Action::MoveWorkspaceToWindow(..)
+                    )
+                })
+            })
         );
     }
 

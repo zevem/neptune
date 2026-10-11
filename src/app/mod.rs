@@ -21,6 +21,7 @@ mod pull_request;
 mod ssh;
 #[cfg(test)]
 mod tests;
+mod windows;
 mod worktrees;
 use crate::{
     Launch,
@@ -156,6 +157,7 @@ pub struct App {
     /// Host shortcuts held until release, including after modifiers or UI change.
     shortcut_keys: std::collections::HashSet<egui::Key>,
     shortcut_modifiers: egui::Modifiers,
+    windows: windows::Windows,
 }
 impl App {
     pub fn new(
@@ -300,38 +302,27 @@ impl App {
             swallowed_paste: None,
             shortcut_keys: Default::default(),
             shortcut_modifiers: egui::Modifiers::NONE,
+            windows: Default::default(),
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
-        let shown = self.shown();
-        let focused = if self.ui.overlay == OverlayState::None && self.terminal_owns_shortcuts(ctx)
-        {
-            self.controller.model().active_pane()
-        } else {
-            None
-        };
+        let local_window = self.viewport_of(self.presentation_window()) == ctx.viewport_id()
+            && (ctx.viewport_id() != egui::ViewportId::ROOT || self.host_exists());
+        let shown = self.visible_panes(ctx);
+        let focused = self.focused_pane(ctx);
         for completion in self.browsers.poll(ctx, &shown, focused) {
             if let Ok(effects) = self.controller.complete(completion) {
                 self.execute(ctx, effects);
             }
         }
-        self.poll_browser_tools(ctx);
+        if local_window {
+            self.poll_browser_tools(ctx);
+        }
         if self.startup.is_none() && !self.ephemeral {
             self.usage.start(ctx);
         }
         self.usage.poll();
-        let focused = Self::window_has_focus(ctx);
-        if self.window_focused != Some(focused) {
-            let reported = self
-                .controller
-                .model()
-                .active_pane()
-                .and_then(|pane| self.sessions.get(pane))
-                .is_none_or(|session| session.focus(focused).is_ok());
-            if reported {
-                self.window_focused = Some(focused);
-            }
-        }
+        self.reconcile_native_focus(ctx);
         self.updates.configure(self.config.release_channel);
         if self.updates.poll(
             ctx,
@@ -342,7 +333,9 @@ impl App {
         ) {
             self.restart_updated(ctx);
         }
-        self.poll_file_location(ctx);
+        if local_window {
+            self.poll_file_location(ctx);
+        }
         if let Some(Err(error)) = self.editor_opener.poll() {
             self.ui.error = Some(error.into());
         }
@@ -391,8 +384,7 @@ impl App {
                     }
                     if let Some(session) = self.sessions.get(pane) {
                         set_session_palette(session, Palette::for_config(&self.config));
-                        let _ = session
-                            .focus(focused && self.controller.model().active_pane() == Some(pane));
+                        let _ = session.focus(self.pane_native_focused(ctx, pane));
                     }
                     self.dispatch(ctx, Command::SessionStarted { pane, generation });
                     self.diagnostics
@@ -437,15 +429,14 @@ impl App {
                 },
             );
         }
-        // The workspace in view is the one whose pull requests have chips:
-        // they come first. Then those projects follow for their leads, as
-        // far as one round reads.
+        // All native windows have visible chips. Keep a stable aggregate set
+        // so polling a sibling cannot replace the root window's watched links.
         let model = self.controller.model();
         self.pull_requests.watch(
             model
-                .active_workspace()
-                .and_then(|id| model.workspace(id))
-                .into_iter()
+                .windows()
+                .iter()
+                .filter_map(|window| window.active_workspace().and_then(|id| model.workspace(id)))
                 .flat_map(|workspace| workspace.panes())
                 .flat_map(|pane| pane.pull_requests().iter().cloned())
                 .chain(self.projects.links(model)),
@@ -498,11 +489,8 @@ impl App {
             for event in session.drain_events() {
                 match event {
                     terminal_core::TerminalEvent::Notification(notification) => {
-                        let focused = ctx.input(|i| i.focused)
-                            && self.controller.model().active_pane() == Some(pane);
-                        let visible = ctx
-                            .input(|i| i.focused && !i.viewport().minimized.unwrap_or(false))
-                            && self.shown().contains(&pane);
+                        let focused = self.focused_pane(ctx) == Some(pane);
+                        let visible = self.visible_panes(ctx).contains(&pane);
                         if matches!(
                             notification.occasion,
                             terminal_core::NotificationOccasion::Unfocused
@@ -550,11 +538,15 @@ impl App {
         self.poll_projects(ctx);
         self.poll_attachments(ctx);
         self.poll_attached(ctx);
-        self.poll_explorer(ctx);
-        self.poll_changes(ctx);
-        self.poll_pull_request(ctx);
+        if local_window {
+            self.poll_explorer(ctx);
+            self.poll_changes(ctx);
+            self.poll_pull_request(ctx);
+        }
         self.poll_saves(ctx);
-        self.poll_search(ctx);
+        if local_window {
+            self.poll_search(ctx);
+        }
         if self.diagnostics.enabled() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
@@ -564,9 +556,6 @@ impl App {
         {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
-    }
-    fn window_has_focus(ctx: &egui::Context) -> bool {
-        ctx.input(|input| input.focused && !input.viewport().minimized.unwrap_or(false))
     }
     fn complete_startup(&mut self, ctx: &egui::Context, startup: Startup) {
         self.startup = None;
@@ -583,6 +572,7 @@ impl App {
             self.ui.error = Some(errors.join("\n"));
         }
         self.controller = Controller::new(startup.report.model.unwrap_or_default());
+        self.adopt_restored_host();
         let repaint = ctx.clone();
         match PersistenceWriter::new(
             self.state_path.clone(),
@@ -654,6 +644,7 @@ impl App {
             .model()
             .workspaces()
             .iter()
+            .filter(|w| w.window() == self.controller.model().current_window())
             .map(|w| {
                 let (unread, latest) = self
                     .notifications
@@ -1023,6 +1014,10 @@ impl eframe::App for App {
         egui::Rgba::TRANSPARENT.to_array()
     }
     fn raw_input_hook(&mut self, _: &egui::Context, raw_input: &mut egui::RawInput) {
+        if !self.host_exists() {
+            return;
+        }
+        self.enter_window(self.host_window());
         crate::input::drop_redundant_preedits(&mut raw_input.events, &mut self.ime_composing);
         self.swallowed_paste = self.paste_chord.swallowed(&raw_input.events);
     }
@@ -1031,8 +1026,18 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         use crate::platform::window::{self, WindowOperation};
         self.frame_started = Instant::now();
+        self.reconcile_empty_host(ctx);
+        self.enter_window(self.host_window());
         self.file_drag.attach(frame, ctx);
-        self.poll_directory(ctx);
+        self.attach_workspace_pointer(frame);
+        self.finish_workspace_raise(ctx);
+        // Resolve held window transfers before enumerating child viewports.
+        // Changing their owners inside a child callback can omit the pressed
+        // native surface from this frame and let eframe destroy it.
+        self.poll_workspace_drag(ctx);
+        if self.host_exists() {
+            self.poll_directory(ctx);
+        }
         self.poll_worktrees(ctx);
         if self.browsers.has_previews() {
             self.browsers.display_rate(
@@ -1052,22 +1057,61 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && !self.exit_approved {
             window::send(ctx, WindowOperation::CancelClose);
             self.relaunch = false;
-            self.request_close(ctx, Close::App);
+            let close = if self.host_exists() {
+                Close::Window(self.host_window())
+            } else {
+                Close::App
+            };
+            self.request_close(ctx, close);
             // A close from the taskbar can reach a hidden window. Show the
             // confirmation rather than leave it unanswerable.
-            if self.ui.overlay == OverlayState::ConfirmClose(Close::App)
-                && !ctx.input(|i| i.focused)
-            {
-                window::send(ctx, WindowOperation::Show);
+            if self.ui.overlay == OverlayState::ConfirmClose(close) && !ctx.input(|i| i.focused) {
+                ctx.send_viewport_cmd_to(
+                    self.viewport_of(self.host_window()),
+                    egui::ViewportCommand::Visible(true),
+                );
+                ctx.send_viewport_cmd_to(
+                    self.viewport_of(self.host_window()),
+                    egui::ViewportCommand::Minimized(false),
+                );
+                ctx.send_viewport_cmd_to(
+                    self.viewport_of(self.host_window()),
+                    egui::ViewportCommand::Focus,
+                );
             }
         }
+        self.poll_hidden_windows(ctx);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        self.enter_window(self.host_window());
+        if self.host_exists() {
+            self.window_ui(ui);
+        }
+        self.show_windows(ui.ctx());
+    }
+    fn on_exit(&mut self) {
+        self.exit();
+    }
+}
+impl App {
+    fn window_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.observe_window(&ctx, ui.max_rect().size());
+        let window = self.presentation_window();
+        let workspace_drag_released = self.take_workspace_drag_release(&ctx);
+        if self.presentation_window() != window
+            || self.controller.model().window(window).is_none()
+            || self.viewport_of(window) != ctx.viewport_id()
+        {
+            return;
+        }
+        self.reconcile_window_selection();
+        if ctx.viewport_id() == egui::ViewportId::ROOT {
+            self.observe_window(&ctx, ui.max_rect().size());
+        }
         self.paste_into_composer(&ctx);
         self.shortcuts(&ctx);
         self.release_closed_overlay_focus(&ctx);
+        self.sync_carried_workspace(&ctx);
         // Sampled before widgets run: a menu that closes on this frame's key
         // press still owns that key.
         let menu_open = egui::Popup::is_any_open(&ctx);
@@ -1086,6 +1130,9 @@ impl eframe::App for App {
         if self.ui.pane_drag.is_some() && self.ui.overlay != OverlayState::None {
             self.cancel_pane_drag(&ctx);
         }
+        if self.ui.overlay != OverlayState::None {
+            self.ui.cancel_sidebar_drag(&ctx);
+        }
         let p = Palette::for_config(&self.config);
         let bounds = ui.max_rect();
         // Windows 11 clips the window to its own smaller rounded corner and
@@ -1102,6 +1149,38 @@ impl eframe::App for App {
         ui.painter().rect_filled(bounds, radius, p.chrome);
         let mut actions = Vec::new();
         let views = self.views();
+        let sidebar_order: Vec<_> = self
+            .controller
+            .model()
+            .sidebar_order()
+            .iter()
+            .copied()
+            .filter(|item| match item {
+                neptune_model::SidebarItem::Workspace(id) => {
+                    views.iter().any(|workspace| workspace.id == *id)
+                }
+                neptune_model::SidebarItem::Group(_) => true,
+            })
+            .collect();
+        let window_destinations: Vec<_> = self
+            .controller
+            .model()
+            .windows()
+            .iter()
+            .filter(|window| {
+                window.id() != self.controller.model().current_window()
+                    && window.active_workspace().is_some()
+            })
+            .map(|window| {
+                (
+                    window.id(),
+                    window
+                        .active_workspace()
+                        .and_then(|id| self.controller.model().workspace(id))
+                        .map_or_else(|| "Neptune".into(), |workspace| workspace.name().to_owned()),
+                )
+            })
+            .collect();
         let active = self.controller.model().active_workspace();
         let active_pane = self.controller.model().active_pane();
         let presentations = self.presentations();
@@ -1158,6 +1237,7 @@ impl eframe::App for App {
             // Neither an edge drag nor a row drag can finish once the sidebar
             // is leaving.
             self.ui.sidebar_drag = None;
+            self.ui.workspace_rows.clear();
             self.ui.workspace_drag = Default::default();
             self.ui.item_drag = Default::default();
         }
@@ -1198,7 +1278,8 @@ impl eframe::App for App {
             // A message being written goes on in the tab. Its field takes
             // the keyboard there: left to the closing sheet, what is typed
             // next would reach the shell.
-            let writing = ctx.memory(|memory| memory.has_focus(ui::chat::composer_id()));
+            let composer = ui::controls::viewport_id(&ctx, ui::chat::composer_id());
+            let writing = ctx.memory(|memory| memory.has_focus(composer));
             self.ui.overlay = OverlayState::None;
             self.panel_event(&ctx, ui::panel::Event::Show(ui::panel::Tab::Project));
             if writing {
@@ -1237,7 +1318,8 @@ impl eframe::App for App {
             keybindings: &self.config.keybindings,
             workspaces: &views,
             groups: self.controller.model().groups(),
-            sidebar_order: self.controller.model().sidebar_order(),
+            sidebar_order: &sidebar_order,
+            windows: &window_destinations,
             active,
             pane: active_pane,
             pane_kind: active_pane
@@ -1279,6 +1361,20 @@ impl eframe::App for App {
         );
         ui::chrome::toolbar(ui, toolbar, p, &chrome, &mut self.ui, &mut actions);
         ui::chrome::leading_controls(ui, p, &chrome, &mut actions);
+        self.workspace_drop_zones(
+            &ctx,
+            (sidebar_open && reveal >= 1.0).then(|| {
+                Rect::from_min_size(bounds.min, Vec2::new(sidebar_width, bounds.height()))
+            }),
+            toolbar,
+        );
+        self.position_carried_workspace(&ctx);
+        let sidebar_pointer_owned = workspace_drag_released
+            || self.workspace_drag_active()
+            || self.ui.dragging_sidebar_row()
+            || actions
+                .iter()
+                .any(|action| matches!(action, Action::DetachWorkspace { .. }));
         let footer = Rect::from_min_max(
             Pos2::new(
                 bounds.left() + edge,
@@ -1306,7 +1402,7 @@ impl eframe::App for App {
             drawn: stage_from(edge, panel_edge),
             settled: stage_from(rest, panel_rest),
         };
-        let visible = self.shown();
+        let visible = self.visible_panes(&ctx);
         let cache_limit =
             self.sessions.policy().max_sessions * self.sessions.policy().cache_bytes_per_session;
         let mut cache_bytes = self
@@ -1343,7 +1439,7 @@ impl eframe::App for App {
                 active: workspace.active(),
                 multiple: layout.panes().len() > 1,
                 zoomed: self.ui.zoomed,
-                keyboard: !overlay,
+                keyboard: !overlay && !sidebar_pointer_owned,
                 previous_terminal: self.terminal_focus,
                 config: &self.config,
                 p,
@@ -1470,9 +1566,13 @@ impl eframe::App for App {
         // dropped; any other focused widget owns typing.
         let focused = ctx.memory(|memory| memory.focused());
         let in_transit = focused.is_some() && focused == self.terminal_focus;
-        let context = if self.ui.overlay != OverlayState::None || menu_open {
+        let context = if self.ui.overlay != OverlayState::None
+            || menu_open
+            || sidebar_pointer_owned
+            || self.controller.model().current_window() != self.presentation_window()
+        {
             crate::input::RoutingContext::Overlay
-        } else if focused == Some(ui::search::input_id()) {
+        } else if focused == Some(ui::controls::viewport_id(&ctx, ui::search::input_id())) {
             crate::input::RoutingContext::TerminalSearch
         } else if focused.is_some() && focused != output.active_terminal && !in_transit {
             crate::input::RoutingContext::TextField
@@ -1494,7 +1594,11 @@ impl eframe::App for App {
         for (pane, generation, rect) in output.browser_bodies {
             self.browsers
                 .geometry(pane, generation, rect.size(), ctx.pixels_per_point());
-            if self.ui.overlay == OverlayState::None && !menu_open && self.ui.pane_drag.is_none() {
+            if self.ui.overlay == OverlayState::None
+                && !menu_open
+                && self.ui.pane_drag.is_none()
+                && !sidebar_pointer_owned
+            {
                 let keyboard = self.controller.model().active_pane() == Some(pane)
                     && matches!(context, crate::input::RoutingContext::TerminalPane(_));
                 let events = self.terminal_events(&ctx);
@@ -1656,6 +1760,7 @@ impl eframe::App for App {
                         .and_then(|id| self.controller.model().workspace(id))
                         .map(|workspace| workspace.layout()),
                     workspaces: &views,
+                    windows: &window_destinations,
                     groups: self.controller.model().groups(),
                     active: self.controller.model().active_workspace(),
                     config: &self.config,
@@ -1719,8 +1824,10 @@ impl eframe::App for App {
         }
         ui::helpers::resize_edges(ui, bounds);
         self.release_closed_overlay_focus(&ctx);
+        self.sync_carried_workspace(&ctx);
+        self.record_window_keyboard(&ctx);
     }
-    fn on_exit(&mut self) {
+    fn exit(&mut self) {
         self.browsers.shutdown();
         self.usage.shutdown();
         // Leads are let go first, so each has until the shells have closed

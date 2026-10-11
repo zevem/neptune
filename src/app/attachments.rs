@@ -8,7 +8,7 @@ use crate::{
     platform::clipboard::{self, Image},
     projects::transcript::{Attachment, MAX_ATTACHMENTS, MAX_PATH, MAX_PICTURE},
 };
-use neptune_model::ProjectId;
+use neptune_model::{ProjectId, WindowId};
 use std::path::Path;
 
 /// Pasted pictures kept for the programs they were given to.
@@ -24,6 +24,7 @@ enum Target {
 }
 
 struct ImagePaste {
+    window: WindowId,
     target: Target,
     quiet: bool,
     /// The saved picture, or why there is none; `None` for an empty clipboard.
@@ -37,13 +38,13 @@ pub(super) struct Attachments {
     /// One picture is read at a time; further requests wait for the user.
     reading: bool,
     /// The file picker is open for a lead's message.
-    picking: Option<(ProjectId, mpsc::Receiver<Vec<PathBuf>>)>,
+    picking: Option<(WindowId, ProjectId, mpsc::Receiver<Vec<PathBuf>>)>,
     /// Files for a lead's message as a worker found them.
     looked: (mpsc::Sender<Looked>, mpsc::Receiver<Looked>),
 }
 /// What a worker found where the files for a lead's message should be:
 /// each as it is attached, or why it is not.
-type Looked = (ProjectId, Vec<Result<Attachment, String>>);
+type Looked = (WindowId, ProjectId, Vec<Result<Attachment, String>>);
 
 impl Attachments {
     pub(super) fn new(directory: PathBuf) -> Self {
@@ -60,6 +61,14 @@ impl Attachments {
 }
 
 impl App {
+    fn lead_attachment_window(&self, project: ProjectId) -> Option<WindowId> {
+        let model = self.controller.model();
+        let project = model.project(project)?;
+        model
+            .workspace(project.workspace())
+            .map(|workspace| workspace.window())
+    }
+
     /// Pastes the clipboard's text, or the path of a saved copy of its picture.
     /// `quiet` leaves an empty clipboard unreported, as for a key chord.
     pub(super) fn paste_clipboard(&mut self, ctx: &egui::Context, pane: PaneId, quiet: bool) {
@@ -135,6 +144,7 @@ impl App {
         let directory = self.attachments.directory.clone();
         let sender = self.attachments.sender.clone();
         let wake = ctx.clone();
+        let window = self.presentation_window();
         let spawned = std::thread::Builder::new()
             .name("neptune-paste-image".into())
             .spawn(move || {
@@ -143,11 +153,12 @@ impl App {
                     Err(_) => Err(None),
                 };
                 let _ = sender.send(ImagePaste {
+                    window,
                     target,
                     quiet,
                     result,
                 });
-                wake.request_repaint();
+                wake.request_repaint_of(egui::ViewportId::ROOT);
             });
         match spawned {
             Ok(_) => self.attachments.reading = true,
@@ -164,15 +175,31 @@ impl App {
             {
                 continue;
             }
+            let window = match paste.target {
+                Target::Lead(project) => self.lead_attachment_window(project),
+                Target::Pane { pane, .. } => {
+                    let model = self.controller.model();
+                    model
+                        .workspace_for_pane(pane)
+                        .and_then(|workspace| model.workspace(workspace))
+                        .map(|workspace| workspace.window())
+                }
+            };
             match (paste.result, paste.target) {
-                (Ok(path), Target::Lead(project)) => self.attach_files(ctx, project, vec![path]),
+                (Ok(path), Target::Lead(project)) => {
+                    self.attach_files_for_window(ctx, paste.window, project, vec![path])
+                }
                 (Ok(path), Target::Pane { pane, .. }) => self.paste_paths(pane, &[path]),
                 (Err(None), _) if paste.quiet => {}
                 (Err(None), _) => {
-                    self.ui.error = Some("The clipboard has no text or image to paste".into());
+                    if let Some(ui) = window.and_then(|window| self.window_ui_state_mut(window)) {
+                        ui.error = Some("The clipboard has no text or image to paste".into());
+                    }
                 }
                 (Err(Some(error)), _) => {
-                    self.ui.error = Some(format!("Could not save the pasted image: {error}"));
+                    if let Some(ui) = window.and_then(|window| self.window_ui_state_mut(window)) {
+                        ui.error = Some(format!("Could not save the pasted image: {error}"));
+                    }
                 }
             }
         }
@@ -180,17 +207,17 @@ impl App {
             .attachments
             .picking
             .as_ref()
-            .map(|(project, picked)| (*project, picked.try_recv()))
+            .map(|(window, project, picked)| (*window, *project, picked.try_recv()))
         {
-            Some((project, Ok(files))) => {
+            Some((window, project, Ok(files))) => {
                 self.attachments.picking = None;
-                self.attach_files(ctx, project, files);
+                self.attach_files_for_window(ctx, window, project, files);
             }
-            Some((_, Err(mpsc::TryRecvError::Disconnected))) => self.attachments.picking = None,
+            Some((_, _, Err(mpsc::TryRecvError::Disconnected))) => self.attachments.picking = None,
             _ => {}
         }
-        while let Ok((project, found)) = self.attachments.looked.1.try_recv() {
-            self.attached_to_lead(project, found);
+        while let Ok((window, project, found)) = self.attachments.looked.1.try_recv() {
+            self.attached_to_lead(window, project, found);
         }
     }
 
@@ -198,9 +225,8 @@ impl App {
     /// on the clipboard attaches the picture there. Text is the field's own
     /// to paste.
     pub(super) fn paste_into_composer(&mut self, ctx: &egui::Context) {
-        if self.swallowed_paste.is_none()
-            || !ctx.memory(|memory| memory.has_focus(ui::chat::composer_id()))
-        {
+        let composer = ui::controls::viewport_id(ctx, ui::chat::composer_id());
+        if self.swallowed_paste.is_none() || !ctx.memory(|memory| memory.has_focus(composer)) {
             return;
         }
         // The field in view is that of the project in front.
@@ -222,7 +248,8 @@ impl App {
         ctx: &egui::Context,
         drag: crate::platform::file_drag::FileDrag,
     ) -> crate::platform::file_drag::FileDrag {
-        let writing = ctx.memory(|memory| memory.has_focus(ui::chat::composer_id()));
+        let composer = ui::controls::viewport_id(ctx, ui::chat::composer_id());
+        let writing = ctx.memory(|memory| memory.has_focus(composer));
         // Another sheet or the palette over the chat owns the window.
         let free = matches!(self.ui.overlay, OverlayState::None | OverlayState::Project);
         let over = self
@@ -254,7 +281,9 @@ impl App {
             return;
         }
         match self.folder_picker.open_files(ctx.clone()) {
-            Ok(picked) => self.attachments.picking = Some((project, picked)),
+            Ok(picked) => {
+                self.attachments.picking = Some((self.presentation_window(), project, picked))
+            }
             Err(error) => self.ui.error = Some(error),
         }
     }
@@ -265,6 +294,16 @@ impl App {
     pub(super) fn attach_files(
         &mut self,
         ctx: &egui::Context,
+        project: ProjectId,
+        files: Vec<PathBuf>,
+    ) {
+        self.attach_files_for_window(ctx, self.presentation_window(), project, files);
+    }
+
+    fn attach_files_for_window(
+        &mut self,
+        ctx: &egui::Context,
+        window: WindowId,
         project: ProjectId,
         mut files: Vec<PathBuf>,
     ) {
@@ -283,22 +322,33 @@ impl App {
                 if over {
                     found.push(Err(too_many()));
                 }
-                let _ = sender.send((project, found));
-                wake.request_repaint();
+                let _ = sender.send((window, project, found));
+                wake.request_repaint_of(egui::ViewportId::ROOT);
             });
-        if let Err(error) = spawned {
-            self.ui.error = Some(format!("Could not read the files: {error}"));
+        if let Err(error) = spawned
+            && let Some(window) = self.lead_attachment_window(project)
+            && let Some(ui) = self.window_ui_state_mut(window)
+        {
+            ui.error = Some(format!("Could not read the files: {error}"));
         }
     }
 
     /// Puts what was found over the field of `project`'s message, and says
     /// what was left out and why.
-    fn attached_to_lead(&mut self, project: ProjectId, found: Vec<Result<Attachment, String>>) {
-        // The project was removed meanwhile.
-        if self.controller.model().project(project).is_none() {
+    fn attached_to_lead(
+        &mut self,
+        _window: WindowId,
+        project: ProjectId,
+        found: Vec<Result<Attachment, String>>,
+    ) {
+        // The project may have moved while its picker or worker was pending.
+        let Some(window) = self.lead_attachment_window(project) else {
             return;
-        }
-        let attached = self.ui.project.attached.entry(project).or_default();
+        };
+        let Some(ui) = self.window_ui_state_mut(window) else {
+            return;
+        };
+        let attached = ui.project.attached.entry(project).or_default();
         let mut refused = Vec::new();
         for file in found {
             match file {
@@ -311,10 +361,10 @@ impl App {
         }
         refused.dedup();
         if !refused.is_empty() {
-            self.ui.error = Some(refused.join(" "));
+            ui.error = Some(refused.join(" "));
         }
         // What was attached is sent from the field, with Enter.
-        self.ui.project.focus = true;
+        ui.project.focus = true;
     }
 
     /// Pastes files as shell words, each followed by a space so that the
@@ -433,6 +483,238 @@ fn save_image(directory: &Path, image: &Image) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn lead_attachment_completions_follow_the_projects_window() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, _sender) = crate::app::tests::fixture(root.path());
+        let ctx = egui::Context::default();
+        app.startup = None;
+        for name in ["root", "child"] {
+            app.controller
+                .dispatch(Command::AddWorkspace {
+                    group: None,
+                    cwd: root.path().into(),
+                    name: name.into(),
+                    remote: None,
+                })
+                .unwrap();
+        }
+        let workspace = app.controller.model().active_workspace().unwrap();
+        app.controller
+            .dispatch(Command::AddProject {
+                workspace,
+                name: "child project".into(),
+                key: neptune_model::ProjectKey::parse("0123456789abcdef").unwrap(),
+                lead: neptune_model::AgentKind::Codex,
+            })
+            .unwrap();
+        let project = app.controller.model().project_of(workspace).unwrap().id();
+        app.controller
+            .dispatch(Command::DetachWorkspace(workspace))
+            .unwrap();
+        let window = app
+            .controller
+            .model()
+            .workspace(workspace)
+            .unwrap()
+            .window();
+        app.enter_window(window);
+        app.ui.project.goal = "child draft".into();
+        let file = root.path().join("notes.txt");
+        std::fs::write(&file, "notes").unwrap();
+        app.attach_files(&ctx, project, vec![file.clone()]);
+        app.enter_window(WindowId::ROOT);
+        app.ui.project.goal = "root draft".into();
+        let settle = |app: &mut App, expected| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.poll_attachments(&ctx);
+                if app
+                    .window_ui_state(window)
+                    .unwrap()
+                    .project
+                    .attached
+                    .get(&project)
+                    .map_or(0, Vec::len)
+                    == expected
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "attachment did not reach its window"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        settle(&mut app, 1);
+        assert!(app.ui.project.attached.is_empty());
+        assert_eq!(app.ui.project.goal, "root draft");
+        assert_eq!(
+            app.window_ui_state(window).unwrap().project.goal,
+            "child draft"
+        );
+
+        // The picker and the image pipeline keep their owner through the
+        // second file-reading worker, even when a sibling polls completion.
+        let picked = root.path().join("picked.txt");
+        std::fs::write(&picked, "picked").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        app.attachments.picking = Some((window, project, receiver));
+        sender.send(vec![picked]).unwrap();
+        settle(&mut app, 2);
+        let pasted = root.path().join("pasted.txt");
+        std::fs::write(&pasted, "pasted").unwrap();
+        app.attachments
+            .sender
+            .send(ImagePaste {
+                window,
+                target: Target::Lead(project),
+                quiet: true,
+                result: Ok(pasted),
+            })
+            .unwrap();
+        settle(&mut app, 3);
+        app.attachments
+            .looked
+            .0
+            .send((window, project, vec![Err("file could not be read".into())]))
+            .unwrap();
+        app.poll_attachments(&ctx);
+        assert_eq!(app.ui.error, None);
+        assert_eq!(
+            app.window_ui_state(window).unwrap().error.as_deref(),
+            Some("file could not be read")
+        );
+
+        // Its project survives a rejoin, so late files follow that project.
+        app.controller
+            .dispatch(Command::MoveWorkspaceToWindow {
+                workspace,
+                window: WindowId::ROOT,
+            })
+            .unwrap();
+        app.attachments
+            .looked
+            .0
+            .send((window, project, vec![look(&file)]))
+            .unwrap();
+        app.poll_attachments(&ctx);
+        assert_eq!(app.ui.project.attached[&project], [look(&file).unwrap()]);
+    }
+
+    #[test]
+    fn pending_picker_images_and_file_reads_follow_a_rejoined_project() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, _) = crate::app::tests::fixture(root.path());
+        app.startup = None;
+        for name in ["root", "child"] {
+            app.controller
+                .dispatch(Command::AddWorkspace {
+                    group: None,
+                    cwd: root.path().into(),
+                    name: name.into(),
+                    remote: None,
+                })
+                .unwrap();
+        }
+        let workspace = app.controller.model().active_workspace().unwrap();
+        app.controller
+            .dispatch(Command::AddProject {
+                workspace,
+                name: "child project".into(),
+                key: neptune_model::ProjectKey::parse("0123456789abcdef").unwrap(),
+                lead: neptune_model::AgentKind::Codex,
+            })
+            .unwrap();
+        let project = app.controller.model().project_of(workspace).unwrap().id();
+        app.controller
+            .dispatch(Command::DetachWorkspace(workspace))
+            .unwrap();
+        let origin = app
+            .controller
+            .model()
+            .workspace(workspace)
+            .unwrap()
+            .window();
+        app.enter_window(origin);
+        app.enter_window(WindowId::ROOT);
+        app.ui.project.goal = "root creation draft".into();
+        let files = ["picked.txt", "pasted.txt", "read.txt"].map(|name| {
+            let path = root.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        });
+        let (picked, receiver) = mpsc::channel();
+        app.attachments.picking = Some((origin, project, receiver));
+        picked.send(vec![files[0].clone()]).unwrap();
+        app.attachments
+            .sender
+            .send(ImagePaste {
+                window: origin,
+                target: Target::Lead(project),
+                quiet: false,
+                result: Ok(files[1].clone()),
+            })
+            .unwrap();
+        app.attachments
+            .looked
+            .0
+            .send((
+                origin,
+                project,
+                vec![look(&files[2]), Err("unreadable file".into())],
+            ))
+            .unwrap();
+        app.controller
+            .dispatch(Command::MoveWorkspaceToWindow {
+                workspace,
+                window: WindowId::ROOT,
+            })
+            .unwrap();
+        assert!(app.controller.model().window(origin).is_none());
+
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll_attachments(&ctx);
+            if app
+                .ui
+                .project
+                .attached
+                .get(&project)
+                .is_some_and(|files| files.len() == 3)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pending attachments did not follow the project"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for path in &files {
+            assert!(app.ui.project.attached[&project].contains(&look(path).unwrap()));
+        }
+        assert_eq!(app.ui.error.as_deref(), Some("unreadable file"));
+        assert_eq!(app.ui.project.goal, "root creation draft");
+
+        app.attachments
+            .sender
+            .send(ImagePaste {
+                window: origin,
+                target: Target::Lead(project),
+                quiet: false,
+                result: Err(Some("image could not be saved".into())),
+            })
+            .unwrap();
+        app.poll_attachments(&ctx);
+        assert_eq!(
+            app.ui.error.as_deref(),
+            Some("Could not save the pasted image: image could not be saved")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn dropped_files_and_pasted_pictures_reach_the_shell_as_single_words() {
@@ -482,6 +764,7 @@ mod tests {
         // one for the running terminal is pasted as its path.
         let generation = app.sessions.generation(first).unwrap();
         let paste = |generation, name: &str| ImagePaste {
+            window: WindowId::ROOT,
             target: Target::Pane {
                 pane: first,
                 generation,
@@ -500,6 +783,7 @@ mod tests {
 
         // An empty clipboard is reported from the menu, not for a key chord.
         let empty = |quiet| ImagePaste {
+            window: WindowId::ROOT,
             target: Target::Pane {
                 pane: first,
                 generation,
@@ -513,6 +797,69 @@ mod tests {
         sender.send(empty(false)).unwrap();
         app.poll_attachments(&ctx);
         assert!(app.ui.error.is_some());
+
+        // A live pane's late clipboard error follows its workspace, rather
+        // than the window the paste was requested from.
+        app.ui.error = None;
+        let workspace = app.controller.model().workspace_for_pane(first).unwrap();
+        app.controller
+            .dispatch(Command::AddWorkspace {
+                group: None,
+                cwd: root.path().into(),
+                name: "Sibling".into(),
+                remote: None,
+            })
+            .unwrap();
+        sender.send(empty(false)).unwrap();
+        app.controller
+            .dispatch(Command::DetachWorkspace(workspace))
+            .unwrap();
+        let child = app
+            .controller
+            .model()
+            .workspace(workspace)
+            .unwrap()
+            .window();
+        app.poll_attachments(&ctx);
+        assert!(app.ui.error.is_none());
+        assert_eq!(
+            app.window_ui_state(child).unwrap().error.as_deref(),
+            Some("The clipboard has no text or image to paste")
+        );
+        app.window_ui_state_mut(child).unwrap().error = None;
+
+        let failed = |generation| ImagePaste {
+            window: child,
+            target: Target::Pane {
+                pane: first,
+                generation,
+            },
+            quiet: false,
+            result: Err(Some("image could not be saved".into())),
+        };
+        sender.send(failed(generation)).unwrap();
+        app.controller
+            .dispatch(Command::MoveWorkspaceToWindow {
+                workspace,
+                window: WindowId::ROOT,
+            })
+            .unwrap();
+        assert!(app.controller.model().window(child).is_none());
+        app.poll_attachments(&ctx);
+        assert_eq!(
+            app.ui.error.as_deref(),
+            Some("Could not save the pasted image: image could not be saved")
+        );
+        assert_eq!(app.sessions.generation(first), Some(generation));
+        assert!(app.sessions.get(first).is_some());
+
+        // Routing to a new window cannot authorize a stale session's paste.
+        app.ui.error = None;
+        app.dispatch(&ctx, Command::RestartPane(first));
+        assert_ne!(app.sessions.generation(first), Some(generation));
+        sender.send(failed(generation)).unwrap();
+        app.poll_attachments(&ctx);
+        assert!(app.ui.error.is_none());
     }
 
     #[cfg(not(windows))]
@@ -654,9 +1001,9 @@ mod tests {
         let looked = |app: &mut App| {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                if let Ok((to, found)) = app.attachments.looked.1.try_recv() {
+                if let Ok((window, to, found)) = app.attachments.looked.1.try_recv() {
                     assert!(to == project && found.len() == 1 && found[0].is_err());
-                    app.attached_to_lead(to, found);
+                    app.attached_to_lead(window, to, found);
                     break;
                 }
                 assert!(Instant::now() < deadline, "the files were not looked at");
@@ -669,6 +1016,7 @@ mod tests {
         app.attachments
             .sender
             .send(ImagePaste {
+                window: WindowId::ROOT,
                 target: Target::Lead(project),
                 quiet: true,
                 result: Ok(root.path().join("paste-0000000000001.png")),

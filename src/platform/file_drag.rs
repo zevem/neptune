@@ -56,7 +56,7 @@ impl FileDragSource {
         #[allow(unused_mut)]
         let mut drag = ctx.input(|input| FileDrag {
             hovering: !input.raw.hovered_files.is_empty(),
-            pointer: None,
+            pointer: input.pointer.latest_pos(),
             dropped: input
                 .raw
                 .dropped_files
@@ -65,7 +65,12 @@ impl FileDragSource {
                 .collect(),
         });
         #[cfg(target_os = "linux")]
-        if let Some(display) = &mut self.display {
+        if ctx.viewport_id() == egui::ViewportId::ROOT
+            && let Some(display) = &mut self.display
+        {
+            // This display source is attached to the root's native surface;
+            // its coordinates and Wayland transfers belong only to that
+            // window. Child windows use their own toolkit events above.
             display.poll(ctx, &mut drag);
         }
         drag
@@ -428,6 +433,50 @@ mod linux {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_file_drags_do_not_consume_the_roots_wayland_transfer() {
+        let ctx = egui::Context::default();
+        let child = egui::ViewportId::from_hash_of("file-drag-child");
+        let (sender, signals) = std::sync::mpsc::sync_channel(1);
+        let root_file = PathBuf::from("/tmp/root.png");
+        sender
+            .send(linux::wayland::Signal::Dropped(vec![root_file.clone()]))
+            .unwrap();
+        let mut source = FileDragSource {
+            display: Some(linux::Display::Wayland {
+                signals,
+                hover: Some((15.0, 25.0)),
+            }),
+            attached: true,
+        };
+        let pointer = egui::pos2(300.0, 80.0);
+        let mut input = egui::RawInput {
+            viewport_id: child,
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(640.0, 400.0),
+            )),
+            hovered_files: vec![egui::HoveredFile {
+                path: Some(PathBuf::from("/tmp/child.png")),
+                ..Default::default()
+            }],
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..Default::default()
+        };
+        input.viewports.insert(child, egui::ViewportInfo::default());
+        let mut drag = FileDrag::default();
+        let mut output = ctx.run_ui(input, |ui| drag = source.poll(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(drag.hovering);
+        assert_eq!(drag.pointer, Some(pointer));
+        assert!(drag.dropped.is_empty());
+
+        let mut output = ctx.run_ui(Default::default(), |ui| drag = source.poll(ui.ctx()));
+        output.textures_delta.clear();
+        assert_eq!(drag.dropped, vec![root_file]);
+        assert_eq!(drag.pointer, Some(egui::pos2(15.0, 25.0)));
+    }
 
     #[test]
     fn wayland_files_are_dropped_where_they_were_last_held() {

@@ -11,6 +11,8 @@ browser tabs preview websites alongside terminals.
 ## Features
 
 - Workspaces, tabs, split panes, and groups with drag-and-drop organization.
+- [Workspace windows](docs/usage.md#multiple-windows): drag a workspace out of
+  the sidebar to keep its running terminals in another native window.
 - Local shells and SSH workspaces backed by real PTY sessions.
 - Scrollback, terminal search, selection/clipboard, and a command palette.
 - [Custom keybindings](docs/usage.md#custom-keybindings) configured in TOML.

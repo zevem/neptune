@@ -311,7 +311,7 @@ fn strip_contents(
     painter.rect_filled(band, RADIUS, p.elevated);
     painter.rect_stroke(band, RADIUS, Stroke::new(1.0, p.border), StrokeKind::Inside);
     let scroll = ctx.animate_value_with_time(
-        Id::new("image-view-strip-scroll"),
+        Id::new((ctx.viewport_id(), "image-view-strip-scroll")),
         strip_scroll(band, thumbs.len(), current),
         0.16,
     );

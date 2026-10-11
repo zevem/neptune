@@ -4,7 +4,7 @@
 //! Neptune reports is in an outlined card. Enter sends and Shift+Enter breaks
 //! the line; the field asks for the keyboard only when told to, so an input
 //! method's composition is never interrupted.
-use super::helpers::{elided, field_frame, focus_ring, galley_at, place};
+use super::helpers::{elided, field_frame, focus_ring, galley_at, place, viewport_id};
 use super::{Action, markup};
 use crate::{
     icons::{self, Icon},
@@ -100,6 +100,7 @@ pub fn editor(ui: &mut Ui, p: Palette, rect: Rect, editor: Editor) -> (Response,
         trailing,
         newline,
     } = editor;
+    let field_id = viewport_id(ui.ctx(), id);
     let composing = composing
         || ui.input(|input| {
             input
@@ -110,7 +111,7 @@ pub fn editor(ui: &mut Ui, p: Palette, rect: Rect, editor: Editor) -> (Response,
     // Before the field runs: it would otherwise do nothing with the key, and
     // the key must not reach anything behind it.
     let entered =
-        !newline && ui.memory(|memory| memory.has_focus(id)) && !composing && take_enter(ui);
+        !newline && ui.memory(|memory| memory.has_focus(field_id)) && !composing && take_enter(ui);
     let breaks = if newline {
         Modifiers::NONE
     } else {
@@ -125,16 +126,16 @@ pub fn editor(ui: &mut Ui, p: Palette, rect: Rect, editor: Editor) -> (Response,
         ui,
         inner,
         Layout::top_down(Align::Min),
-        ("project-editor", id),
+        ("project-editor", field_id),
         |ui| {
             egui::ScrollArea::vertical()
-                .id_salt(("project-editor-scroll", id))
+                .id_salt(("project-editor-scroll", field_id))
                 .max_height(inner.height())
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(text)
-                            .id(id)
+                            .id(field_id)
                             .hint_text(hint)
                             .font(theme::regular(13.0))
                             .frame(Frame::NONE)

@@ -11,8 +11,8 @@ Linux packaging removes unmapped debug and static symbol sections from its CEF
 copy; the downloaded SDK remains intact.
 
 The pure model owns `PaneKind`, generation, lifecycle and layout. Its existing
-move/split/close commands remain the layout authority. Workspace schema 14
-stores pane kind, defaults earlier panes to terminals and restores browsers
+move/split/close commands remain the layout authority. Workspace schema 15
+retains the pane kind introduced in version 14, defaults earlier panes to terminals and restores browsers
 blank. Addresses, history and page contents are never serialized in workspace
 state. The address and profile of each tab in a saved profile are kept beside
 the profiles, in `<data>/browser/tabs.json` (at most 64 tabs, written off the
@@ -21,8 +21,8 @@ private tab is never written there and closing a tab forgets it. Tabs were
 restored blank until this was asked for. The configuration names the browser profiles; their cookies and site
 data are Chromium's own files under the data directory.
 
-The desktop supervises one helper per window, with a maximum of eight browser
-panes. Pipe commands are bounded to 64; messages are capped at 512 KiB and
+The desktop supervises one helper shared by its native windows, with a maximum
+of eight browser panes across those windows. Pipe commands are bounded to 64; messages are capped at 512 KiB and
 text operations at 64 KiB. On Linux the worker attempts a bounded 1 MiB pixel
 pipe capacity to reduce large-frame context switches; restricted kernels retain
 the original OS capacity. The helper uses a binary buffered pipe writer without

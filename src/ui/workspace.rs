@@ -1455,7 +1455,7 @@ pub fn pane_drag(ui: &mut Ui, stage: &Stage, output: &StageOutput, actions: &mut
     }
 
     // The preview glides between drop areas and fades where it was released.
-    let preview = Id::new("pane-drop-preview");
+    let preview = Id::new((ctx.viewport_id(), "pane-drop-preview"));
     let opacity = animate(&ctx, preview, target.is_some(), 0.12);
     let shown = ctx.data(|data| data.get_temp::<Rect>(preview));
     let area = match (target, shown) {
@@ -1561,7 +1561,7 @@ pub fn file_drop(
     }
 
     // The highlight glides between terminals and fades once the files leave.
-    let preview = Id::new("file-drop-preview");
+    let preview = Id::new((ctx.viewport_id(), "file-drop-preview"));
     let target = target.filter(|_| drag.hovering);
     let opacity = animate(&ctx, preview, target.is_some(), 0.12);
     let shown = ctx.data(|data| data.get_temp::<(PaneId, Rect)>(preview));

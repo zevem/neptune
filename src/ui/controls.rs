@@ -12,10 +12,28 @@ use eframe::egui::{
 };
 use std::{ops::RangeInclusive, sync::Arc};
 
+/// Window-local state for a control whose public identity predates viewports.
+/// Keep original-window IDs stable for callers and inspection fixtures.
+pub fn viewport_id(ctx: &egui::Context, id: Id) -> Id {
+    let viewport = ctx.viewport_id();
+    if viewport == egui::ViewportId::ROOT {
+        id
+    } else {
+        id.with(("viewport", viewport))
+    }
+}
+
 /// Ease-out progress of a boolean state. Repaints only while it is moving, so
 /// a settled interface stays idle.
 pub fn animate(ctx: &egui::Context, id: Id, on: bool, seconds: f32) -> f32 {
-    ctx.animate_bool_with_time_and_easing(id, on, seconds, egui::emath::easing::cubic_out)
+    // Context's animation manager is shared by every native viewport. A
+    // sheet opening in one window must not animate another window's scrim.
+    ctx.animate_bool_with_time_and_easing(
+        id.with(ctx.viewport_id()),
+        on,
+        seconds,
+        egui::emath::easing::cubic_out,
+    )
 }
 
 /// Lays out controls inside an already allocated rectangle. Unlike a scope, it
@@ -434,6 +452,7 @@ pub fn stepper(
 /// editor `id` holds the keyboard. A field whose text cannot be used is
 /// outlined in the problem colour instead.
 pub fn field_frame(ui: &Ui, p: Palette, rect: Rect, id: Id, valid: bool) {
+    let id = viewport_id(ui.ctx(), id);
     let focused = ui.memory(|memory| memory.has_focus(id));
     let radius = metrics::CONTROL_RADIUS;
     let painter = ui.painter();
@@ -483,6 +502,7 @@ pub fn text_field(
 /// A field showing the current choice that opens a list of the others. The
 /// caller shows the list with `egui::Popup::menu` on the returned response.
 pub fn select(ui: &mut Ui, p: Palette, id: Id, value: &str, label: &str, width: f32) -> Response {
+    let id = viewport_id(ui.ctx(), id);
     let (_, rect) = ui.allocate_space(vec2(width, metrics::CONTROL_HEIGHT));
     let response = ui.interact(rect, id, Sense::click());
     response.widget_info(|| WidgetInfo::labeled(WidgetType::ComboBox, ui.is_enabled(), label));
@@ -533,7 +553,7 @@ pub fn bare_text_edit(
 ) -> Response {
     ui.add(
         egui::TextEdit::singleline(text)
-            .id(id)
+            .id(viewport_id(ui.ctx(), id))
             .hint_text(hint)
             .font(theme::regular(size))
             .frame(Frame::NONE)
@@ -574,7 +594,7 @@ pub fn sheet<R>(
     placement: SheetPlacement,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> SheetOutput<R> {
-    let id = Id::new(("sheet", title));
+    let id = viewport_id(ctx, Id::new(("sheet", title)));
     let screen = ctx.content_rect();
     let width = width.min(screen.width() - 24.0).max(120.0);
     let area = egui::Modal::default_area(id);
@@ -999,7 +1019,7 @@ pub fn toast(ctx: &egui::Context, p: Palette, message: &str) -> bool {
 pub fn notice(ctx: &egui::Context, p: Palette, message: &str, mark: (Icon, Color32)) -> bool {
     let screen = ctx.content_rect();
     let mut dismissed = false;
-    egui::Area::new(Id::new("neptune-toast"))
+    egui::Area::new(viewport_id(ctx, Id::new("neptune-toast")))
         // Above sheets, so a failure reported during a dialog stays reachable.
         .order(egui::Order::Tooltip)
         .anchor(
@@ -1080,7 +1100,7 @@ pub fn level(ctx: &egui::Context, p: Palette, level: &Level) -> bool {
     } else {
         ctx.request_repaint();
     }
-    egui::Area::new(Id::new("neptune-level"))
+    egui::Area::new(viewport_id(ctx, Id::new("neptune-level")))
         .order(egui::Order::Tooltip)
         .interactable(false)
         .anchor(Align2::CENTER_TOP, vec2(0.0, metrics::TOOLBAR_HEIGHT + 8.0))
@@ -1120,6 +1140,78 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use eframe::egui::{Event, Modifiers, PointerButton};
+
+    #[test]
+    fn sibling_editors_keep_separate_cursor_state_and_original_public_ids() {
+        let ctx = context();
+        let child = egui::ViewportId::from_hash_of("editor-child");
+        let public = Id::new("palette-input");
+        let mut ids = Vec::new();
+        for (viewport, value, selected) in [
+            (egui::ViewportId::ROOT, "root text", 4),
+            (child, "child text", 2),
+        ] {
+            let mut input = egui::RawInput {
+                viewport_id: viewport,
+                ..Default::default()
+            };
+            input.viewports.insert(child, egui::ViewportInfo::default());
+            let mut editor_id = None;
+            let mut output = ctx.run_ui(input, |ui| {
+                let mut text = value.to_owned();
+                let response = bare_text_edit(ui, public, &mut text, "", 13.0, 200.0);
+                assert_eq!(response.id, viewport_id(ui.ctx(), public));
+                let mut state =
+                    egui::text_edit::TextEditState::load(ui.ctx(), response.id).unwrap_or_default();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(selected),
+                    )));
+                state.store(ui.ctx(), response.id);
+                editor_id = Some(response.id);
+            });
+            output.textures_delta.clear();
+            ids.push(editor_id.unwrap());
+        }
+        assert_eq!(ids[0], public);
+        assert_ne!(ids[0], ids[1]);
+        for (id, selected) in ids.into_iter().zip([4, 2]) {
+            let state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+            let cursor = state.cursor.char_range().unwrap();
+            assert_eq!(
+                cursor.primary.index.max(cursor.secondary.index),
+                egui::text::CharIndex(selected)
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_windows_can_keep_opposite_scrim_animation_states() {
+        let ctx = egui::Context::default();
+        let child = egui::ViewportId::from_hash_of("scrim-child");
+        for (viewport, dim, time) in [
+            (egui::ViewportId::ROOT, false, 0.0),
+            (child, true, 0.016),
+            (egui::ViewportId::ROOT, false, 0.032),
+            (child, true, 0.048),
+        ] {
+            let mut input = egui::RawInput {
+                viewport_id: viewport,
+                time: Some(time),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(640.0, 400.0))),
+                ..Default::default()
+            };
+            input.viewports.insert(child, egui::ViewportInfo::default());
+            let mut opacity = 0.0;
+            let mut output = ctx.run_ui(input, |ui| {
+                opacity = animate(ui.ctx(), Id::new("overlay-scrim"), dim, 0.16);
+            });
+            output.textures_delta.clear();
+            assert_eq!(opacity, if dim { 1.0 } else { 0.0 });
+        }
+    }
 
     #[test]
     fn a_level_chip_holds_then_fades_out() {

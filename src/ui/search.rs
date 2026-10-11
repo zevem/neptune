@@ -23,7 +23,8 @@ pub fn show(
     state: &mut UiState,
     actions: &mut Vec<Action>,
 ) {
-    let focused = ui.memory(|memory| memory.has_focus(input_id()));
+    let id = super::controls::viewport_id(ui.ctx(), input_id());
+    let focused = ui.memory(|memory| memory.has_focus(id));
     let radius = metrics::CONTROL_RADIUS;
     let painter = ui.painter().clone();
     painter.rect_filled(field, radius, p.control);

@@ -51,7 +51,7 @@ use crate::{
 use eframe::egui;
 use neptune_model::{
     AgentKind, AgentSession, Command, PaneId, Project, ProjectId, ProjectKey, PullRequest,
-    WorkspaceId, Worktree,
+    WindowId, WorkspaceId, Worktree,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1140,6 +1140,7 @@ impl Installed {
 }
 /// A project being made: its folder first, off the frame.
 struct Creating {
+    window: WindowId,
     workspace: WorkspaceId,
     name: String,
     goal: String,
@@ -2117,11 +2118,13 @@ impl App {
     pub(super) fn leave_project(&mut self, ctx: &egui::Context) {
         self.ui.project.focus = false;
         self.ui.project.show_agents = false;
+        let ids: Vec<_> = [ui::chat::composer_id(), ui::chat::goal_id()]
+            .into_iter()
+            .chain(ui::project::field_ids())
+            .map(|id| ui::controls::viewport_id(ctx, id))
+            .collect();
         ctx.memory_mut(|memory| {
-            for id in [ui::chat::composer_id(), ui::chat::goal_id()]
-                .into_iter()
-                .chain(ui::project::field_ids())
-            {
+            for id in ids {
                 if memory.has_focus(id) {
                     memory.surrender_focus(id);
                 }
@@ -2138,6 +2141,7 @@ impl App {
         match [ui::chat::composer_id(), ui::chat::goal_id()]
             .into_iter()
             .chain(ui::project::field_ids())
+            .map(|id| ui::controls::viewport_id(ctx, id))
             .find(|id| held(*id))
         {
             Some(id) => {
@@ -3243,7 +3247,7 @@ impl App {
         }
         if model.projects().len() >= Project::MAX {
             self.ui.error = Some(format!(
-                "This window already has {} projects. Remove one to start another.",
+                "Neptune already has {} projects across its windows. Remove one to start another.",
                 Project::MAX
             ));
             return;
@@ -3255,6 +3259,7 @@ impl App {
         self.wake_for_projects(ctx);
         if self.projects.store.create() {
             self.projects.creating = Some(Creating {
+                window: self.presentation_window(),
                 workspace,
                 name: if name.is_empty() {
                     "Project".into()
@@ -3293,10 +3298,12 @@ impl App {
                     None,
                     &format!("{:?}", error.kind()),
                 );
-                self.ui.error = Some(format!(
-                    "Could not make the project's folder under Neptune's data: {}.",
-                    error.kind()
-                ));
+                if let Some(ui) = self.window_ui_state_mut(creating.window) {
+                    ui.error = Some(format!(
+                        "Could not make the project's folder under Neptune's data: {}.",
+                        error.kind()
+                    ));
+                }
                 return;
             }
         };
@@ -3312,7 +3319,9 @@ impl App {
                 // The workspace closed or changed meanwhile. The folder
                 // that was made for nothing goes, off the frame.
                 self.projects.removals.push(key);
-                self.ui.error = Some(format!("Could not start the project: {error}."));
+                if let Some(ui) = self.window_ui_state_mut(creating.window) {
+                    ui.error = Some(format!("Could not start the project: {error}."));
+                }
                 return;
             }
         }
@@ -3336,12 +3345,14 @@ impl App {
             attachments: Vec::new(),
         });
         self.projects.runs.insert(project, run);
-        self.ui.project.goal.clear();
-        self.ui.project.lead_settings = LeadSettings::default();
-        self.ui.project.lead_options = false;
-        self.ui.project.custom = None;
-        self.ui.project.shown = ui::chat::PAGE;
-        self.ui.project.focus = self.ui.panel.open && self.ui.panel.tab == ui::panel::Tab::Project;
+        if let Some(ui) = self.window_ui_state_mut(creating.window) {
+            ui.project.goal.clear();
+            ui.project.lead_settings = LeadSettings::default();
+            ui.project.lead_options = false;
+            ui.project.custom = None;
+            ui.project.shown = ui::chat::PAGE;
+            ui.project.focus = ui.panel.open && ui.panel.tab == ui::panel::Tab::Project;
+        }
         ctx.request_repaint();
     }
 
@@ -4741,6 +4752,60 @@ mod tests {
             .unwrap();
         app.controller.model().active_workspace().unwrap()
     }
+
+    #[test]
+    fn project_creation_completion_updates_the_requesting_windows_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, ctx, _leads) = application(root.path());
+        workspace(&mut app, root.path(), "root");
+        let child_workspace = workspace(&mut app, root.path(), "child");
+        app.controller
+            .dispatch(Command::DetachWorkspace(child_workspace))
+            .unwrap();
+        let window = app
+            .controller
+            .model()
+            .workspace(child_workspace)
+            .unwrap()
+            .window();
+        app.enter_window(window);
+        app.ui.project.goal = "child goal".into();
+        app.create_project(
+            &ctx,
+            child_workspace,
+            "child goal".into(),
+            AgentKind::Codex,
+            LeadSettings::default(),
+        );
+        app.enter_window(WindowId::ROOT);
+        app.ui.project.goal = "root draft".into();
+        tick(&mut app, &ctx, Instant::now());
+        assert!(app.controller.model().project_of(child_workspace).is_some());
+        assert_eq!(app.ui.project.goal, "root draft");
+        assert!(app.window_ui_state(window).unwrap().project.goal.is_empty());
+
+        // A failed folder creation also reports back to the captured window.
+        app.projects.creating = Some(Creating {
+            window,
+            workspace: child_workspace,
+            name: "another".into(),
+            goal: "goal".into(),
+            lead: AgentKind::Codex,
+            directory: root.path().into(),
+            settings: LeadSettings::default(),
+        });
+        app.created(&ctx, Err(std::io::ErrorKind::PermissionDenied.into()));
+        assert_eq!(app.ui.error, None);
+        assert!(
+            app.window_ui_state(window)
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Could not make the project's folder")
+        );
+    }
+
     /// A project as a restored window has one: in the model, with no lead.
     fn project(app: &mut App, workspace: WorkspaceId, key: u64) -> ProjectId {
         app.controller

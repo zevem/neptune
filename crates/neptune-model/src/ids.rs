@@ -31,3 +31,9 @@ identity!(WorkspaceGroupId);
 identity!(SplitId);
 identity!(SessionGeneration);
 identity!(ProjectId);
+identity!(WindowId);
+
+impl WindowId {
+    /// The original native window; retained even when its workspace list is empty.
+    pub const ROOT: Self = Self::new(1);
+}
