@@ -3128,6 +3128,11 @@ pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
                 if let Some(signal) = signal(provider, &hook) {
                     let _ = send(Event::Activity { signal }, &run);
                 }
+                if let Some(context) = hook_context(provider, &hook, Role::from_env()) {
+                    let mut output = std::io::stdout().lock();
+                    serde_json::to_writer(&mut output, &context)?;
+                    output.write_all(b"\n")?;
+                }
             }
             Ok(Some(0))
         }
@@ -3294,6 +3299,28 @@ struct Hook {
     trigger: Option<String>,
     /// What the agent last said, read only for one another agent started.
     last_assistant_message: Option<String>,
+}
+/// Reassert the PR workflow at startup, resume, clear, compaction and each
+/// submitted turn. Both CLIs accept this additive hook output; it leaves
+/// their system prompts and the user's settings intact. Only static guidance
+/// goes back to the CLI, never hook input or terminal contents.
+fn hook_context(provider: AgentKind, hook: &Hook, role: Role) -> Option<serde_json::Value> {
+    if !matches!(provider, AgentKind::Claude | AgentKind::Codex)
+        || role == Role::Lead
+        || hook.agent_id.is_some()
+        || !matches!(
+            hook.hook_event_name.as_str(),
+            "SessionStart" | "UserPromptSubmit"
+        )
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": hook.hook_event_name,
+            "additionalContext": super::agent_mcp::PULL_REQUEST_INSTRUCTIONS,
+        }
+    }))
 }
 /// What a hook means for the agent's activity, if anything.
 fn signal(provider: AgentKind, hook: &Hook) -> Option<Signal> {
@@ -3915,6 +3942,74 @@ mod tests {
         Signal::ToolDone {
             tool: tool.map(str::to_owned),
             subagent,
+        }
+    }
+    #[test]
+    fn pr_linking_context_reaches_new_resumed_compacted_and_submitted_turns() {
+        for provider in [AgentKind::Claude, AgentKind::Codex] {
+            for role in [Role::Agent, Role::Spawned, Role::Member] {
+                for source in ["startup", "resume", "clear", "compact"] {
+                    let start = Hook {
+                        source: Some(source.into()),
+                        ..hook("SessionStart")
+                    };
+                    let output = hook_context(provider, &start, role).unwrap();
+                    assert_eq!(
+                        output["hookSpecificOutput"]["hookEventName"],
+                        "SessionStart"
+                    );
+                    assert!(
+                        output["hookSpecificOutput"]["additionalContext"]
+                            .as_str()
+                            .unwrap()
+                            .contains("must call it")
+                    );
+                }
+                let prompt: Hook = serde_json::from_value(serde_json::json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "private prompt",
+                    "cwd": "/private/path",
+                    "session_id": "private-session",
+                    "tool_input": {"command": "private command"},
+                    "tool_response": {"stdout": "private output"},
+                }))
+                .unwrap();
+                let output = hook_context(provider, &prompt, role).unwrap();
+                assert_eq!(
+                    output,
+                    serde_json::json!({"hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": super::super::agent_mcp::PULL_REQUEST_INSTRUCTIONS,
+                    }})
+                );
+                assert!(!output.to_string().contains("private"));
+            }
+        }
+    }
+    #[test]
+    fn pr_linking_context_is_not_given_to_leads_native_subagents_or_activity_hooks() {
+        for provider in [AgentKind::Claude, AgentKind::Codex] {
+            for event in ["SessionStart", "UserPromptSubmit"] {
+                assert!(hook_context(provider, &hook(event), Role::Lead).is_none());
+                let subagent = Hook {
+                    agent_id: Some("child".into()),
+                    ..hook(event)
+                };
+                assert!(hook_context(provider, &subagent, Role::Agent).is_none());
+            }
+            for event in activity_hooks(provider) {
+                if *event != "UserPromptSubmit" {
+                    assert!(hook_context(provider, &hook(event), Role::Agent).is_none());
+                }
+            }
+        }
+        for provider in [
+            AgentKind::Gemini,
+            AgentKind::Opencode,
+            AgentKind::Pi,
+            AgentKind::Omp,
+        ] {
+            assert!(hook_context(provider, &hook("SessionStart"), Role::Agent).is_none());
         }
     }
     #[test]

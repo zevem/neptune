@@ -59,10 +59,15 @@ const MAX_WRITE: usize = crate::projects::context::MAX_WRITE;
 const MAX_DECISION: usize = crate::projects::context::MAX_DECISION;
 const MAX_NOTE: usize = crate::projects::context::MAX_NOTE;
 
-const INSTRUCTIONS: &str = "This terminal runs in Neptune, which shows the pull requests you link next to the terminal's tab. \
-Call link_pull_request with the pull request's URL right after you create a pull request, and when you start work on an existing one. \
-Link every pull request of a stack. Linking the same pull request again is safe.\n\n\
-Neptune also lists the files you attach on this terminal's tab, where the user opens them and looks at images at full size. \
+/// Shared by MCP discovery and the CLI's additive context hooks, so the
+/// obligation reaches a turn even when no Neptune tool is called.
+pub(super) const PULL_REQUEST_INSTRUCTIONS: &str = "This terminal runs in Neptune. \
+When Neptune's link_pull_request tool is available, you must call it with the full pull request URL right after creating a pull request or starting work on an existing one. \
+Creating or updating a pull request through gh, gh stack, another CLI or a host API does not link it to this terminal tab. \
+Link every pull request you create or work on, including every layer of a stack. \
+Before finishing pull request work, ensure each one is linked; call link_pull_request again if unsure, since linking the same pull request is safe. \
+Do not link unrelated pull requests mentioned only as background. If linking fails, report the failure instead of claiming it is linked.";
+const INSTRUCTIONS: &str = "Neptune also lists the files you attach on this terminal's tab, where the user opens them and looks at images at full size. \
 A path printed in a terminal does not show the user an image: call attach_file with the path of each screenshot, image, recording, report or other file you make for the user to look at, \
 and whenever the user asks you to attach, show or share a file. Give each a short title that says what it shows. Attaching the same file again is safe.\n\n\
 Neptune can also start another coding agent, Claude Code or Codex, in a terminal of its own, so that you can hand it part of the work. \
@@ -129,12 +134,13 @@ fn offered(role: Role) -> &'static [&'static str] {
     }
 }
 fn instructions(role: Role) -> String {
-    match role {
-        Role::Agent => INSTRUCTIONS.to_owned(),
-        Role::Spawned => format!("{INSTRUCTIONS}{SPAWNED_INSTRUCTIONS}"),
-        Role::Member => format!("{INSTRUCTIONS}{MEMBER_INSTRUCTIONS}"),
-        Role::Lead => LEAD_INSTRUCTIONS.to_owned(),
-    }
+    let extra = match role {
+        Role::Agent => "",
+        Role::Spawned => SPAWNED_INSTRUCTIONS,
+        Role::Member => MEMBER_INSTRUCTIONS,
+        Role::Lead => return LEAD_INSTRUCTIONS.to_owned(),
+    };
+    format!("{PULL_REQUEST_INSTRUCTIONS}\n\n{INSTRUCTIONS}{extra}")
 }
 /// The tools a launch allows without asking: those that read, link, attach
 /// or answer, and a project's agent adding to its project's notes, which
@@ -162,11 +168,13 @@ fn tools(role: Role) -> Vec<Value> {
         "type": "integer",
         "description": "The number spawn_agent gave the agent",
     });
+    let mut link_hints = hints(false, false, false);
+    link_hints["idempotentHint"] = true.into();
     let mut tools = vec![
         json!({
             "name": LINK,
-            "annotations": hints(false, false, false),
-            "description": "Link a pull request you created or are working on to this Neptune terminal tab, where its number opens it in the browser.",
+            "annotations": link_hints,
+            "description": format!("{PULL_REQUEST_INSTRUCTIONS} The linked number opens the pull request in Neptune's Pull request panel."),
             "inputSchema": {
                 "type": "object",
                 "properties": {"url": {
@@ -1707,6 +1715,42 @@ mod tests {
             replies: replies.iter().map(|reply| (*reply).to_owned()).collect(),
             reopens: false,
             title: None,
+        }
+    }
+
+    #[test]
+    fn tool_discovery_tells_agents_to_link_prs_created_outside_neptune() {
+        // Clients can expose tools without including initialize.instructions
+        // in the model's context. Discovery must carry the linking obligation.
+        for role in [Role::Agent, Role::Spawned, Role::Member] {
+            let mut host = Fake::default();
+            let mut output = Vec::new();
+            serve(
+                Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n"),
+                &mut output,
+                &mut host,
+                role,
+            )
+            .unwrap();
+            let answer: Value = serde_json::from_slice(&output).unwrap();
+            let tool = answer["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == LINK)
+                .unwrap();
+            let description = tool["description"].as_str().unwrap();
+            assert_eq!(tool["annotations"]["idempotentHint"], true);
+            assert!(
+                description.contains("right after")
+                    && description.contains("gh")
+                    && description.contains("API")
+                    && description.contains("stack")
+                    && description.contains("Before finishing")
+                    && description.contains("report the failure")
+                    && description.contains("unrelated"),
+                "Tool discovery must require linking PRs created through gh or an API, including stacks: {description}"
+            );
         }
     }
 

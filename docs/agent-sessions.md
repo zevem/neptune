@@ -108,12 +108,28 @@ If no installed CLI remains on `PATH`, the launch reports that it is missing.
 
 ## Linked pull requests
 
-An agent started through the adapters is also given Neptune's tools. One is
+Local Claude Code and Codex started through the adapters are also given
+Neptune's tools. One is
 `link_pull_request`, with a pull request's address
-(`https://host/owner/repo/pull/N`). Its instructions ask the agent to call it
-after it creates a pull request and when it starts work on an existing one,
-including every pull request of a stack. The terminal's tab then shows the pull
-request's number beside its close control; clicking the number opens the pull
+(`https://host/owner/repo/pull/N`). The tool description and server instructions
+require the agent to call it immediately after creating a pull request or
+starting work on an existing one, including every layer of a stack. They
+explicitly explain that `gh`, `gh stack`, other CLIs and host APIs do not
+register a pull request with Neptune. Before finishing pull request work, the
+agent is told to ensure every pull request from that work is linked, to link
+again if unsure (duplicates are safe), and to report a failed link. Pull
+requests mentioned only as background should not be linked.
+
+Neptune also supplies this reminder through the existing **SessionStart** and
+**UserPromptSubmit** hooks, so it reaches startup, resume, a new conversation,
+compaction and each submitted turn even when the agent has not called a Neptune
+tool. The hook returns only static instructions as additional context, without
+replacing the CLI's system prompt or user settings. Disabled, untrusted or
+overridden hooks cannot provide the reminder; the MCP tool description still
+carries the requirement when Neptune's tools are available.
+
+Once linked, the terminal's tab shows the pull request's number beside its
+close control; clicking the number opens the pull
 request in the right panel's [Pull request tab](usage.md#pull-requests), and
 Ctrl-click (Command-click on macOS) in the default browser. A terminal alone in view has no tab, so the
 toolbar shows its numbers after the title. One or two pull requests are shown
