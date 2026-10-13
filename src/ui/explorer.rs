@@ -5,7 +5,7 @@
 use super::Action;
 use super::helpers::{
     animate, bare_text_edit, compact_path, elided, field_frame, galley_at, menu_item, menu_layout,
-    menu_separator, place, viewport_id,
+    menu_separator, place, segmented, viewport_id,
 };
 use crate::{
     icons::{self, Icon},
@@ -26,6 +26,13 @@ pub const DEFAULT_EXCLUDE: &str =
     "**/node_modules/**, **/.git/**, **/dist/**, **/target/**, **/build/**";
 const ROW: f32 = 26.0;
 const INDENT: f32 = 14.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchMode {
+    #[default]
+    Names,
+    Text,
+}
 
 pub fn query_id() -> Id {
     Id::new("explorer-query")
@@ -67,6 +74,7 @@ pub enum ScrollTarget {
 
 pub struct State {
     pub query: String,
+    pub search_mode: SearchMode,
     pub exclude: String,
     /// The exclusion field is shown without a search.
     pub filters: bool,
@@ -91,6 +99,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             query: String::new(),
+            search_mode: SearchMode::Names,
             exclude: DEFAULT_EXCLUDE.into(),
             filters: false,
             edit: None,
@@ -113,6 +122,11 @@ pub enum Event {
     Expand(PathBuf, bool),
     /// Preview a file.
     Select(PathBuf),
+    SelectMatch {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    },
     FollowLink {
         path: PathBuf,
         anchor: Option<String>,
@@ -182,6 +196,15 @@ pub struct Hit {
     /// The folder that holds it, from the root.
     pub folder: String,
     pub dir: bool,
+    pub text: Option<TextMatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextMatch {
+    pub line: u32,
+    pub column: u32,
+    pub snippet: String,
+    pub highlight: std::ops::Range<usize>,
 }
 
 pub struct SearchView<'a> {
@@ -189,6 +212,8 @@ pub struct SearchView<'a> {
     pub running: bool,
     /// The search stopped at its limit.
     pub truncated: bool,
+    pub skipped: usize,
+    pub failed: bool,
 }
 
 pub enum PreviewBody<'a> {
@@ -574,14 +599,40 @@ fn tree_row(
 }
 
 fn hit_row(ui: &mut Ui, rect: Rect, p: Palette, hit: &Hit, state: &State, events: &mut Vec<Event>) {
-    let response = ui.interact(rect, Id::new(("explorer-hit", &hit.path)), Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &hit.name));
+    let response = ui.interact(
+        rect,
+        Id::new((
+            "explorer-hit",
+            &hit.path,
+            hit.text.as_ref().map(|text| text.line),
+        )),
+        Sense::click(),
+    );
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Button,
+            true,
+            hit.text.as_ref().map_or_else(
+                || hit.name.clone(),
+                |text| format!("{}, line {}: {}", hit.name, text.line, text.snippet),
+            ),
+        )
+    });
     let selected = state
         .selected
         .as_ref()
-        .is_some_and(|(path, _)| *path == hit.path);
+        .is_some_and(|(path, _)| *path == hit.path)
+        && hit.text.as_ref().is_none_or(|text| {
+            state
+                .preview_location
+                .is_some_and(|(line, _)| line == text.line)
+        });
     row_surface(ui, rect, p, &response, selected);
-    let middle = rect.center().y;
+    let middle = if hit.text.is_some() {
+        rect.top() + 13.0
+    } else {
+        rect.center().y
+    };
     let painter = ui.painter();
     icons::paint(
         painter,
@@ -607,9 +658,101 @@ fn hit_row(ui: &mut Ui, rect: Rect, p: Palette, hit: &Hit, state: &State, events
             ),
         );
     }
+    if let Some(text) = &hit.text {
+        let line = ui.painter().layout_no_wrap(
+            format!("{}", text.line),
+            egui::FontId::monospace(10.5),
+            p.muted,
+        );
+        let used = line.size().x + 8.0;
+        galley_at(painter, Pos2::new(left, rect.top() + 34.0), line);
+        let font = egui::FontId::monospace(11.5);
+        let room = (budget - used).max(0.0);
+        let prefix = &text.snippet[..text.highlight.start];
+        let matched = &text.snippet[text.highlight.clone()];
+        let match_width = painter
+            .layout_no_wrap(matched.chars().take(16).collect(), font.clone(), p.fg)
+            .size()
+            .x;
+        let prefix_room = room - match_width.min(room * 0.75);
+        let mut start = 0;
+        if painter
+            .layout_no_wrap(prefix.to_owned(), font.clone(), p.secondary)
+            .size()
+            .x
+            > prefix_room
+        {
+            // Keep a little context, but reserve room for the match itself.
+            // Only visible rows do this bounded work, and the full snippet
+            // remains available to assistive technology.
+            start = prefix.len();
+            for (index, _) in prefix.char_indices().rev().take(8) {
+                let context = format!("…{}", &prefix[index..]);
+                if painter
+                    .layout_no_wrap(context, font.clone(), p.secondary)
+                    .size()
+                    .x
+                    > prefix_room
+                {
+                    break;
+                }
+                start = index;
+            }
+        }
+        let mut job = egui::text::LayoutJob {
+            wrap: egui::text::TextWrapping::truncate_at_width(room),
+            ..Default::default()
+        };
+        if start > 0 {
+            job.append(
+                "…",
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: p.secondary,
+                    ..Default::default()
+                },
+            );
+        }
+        for (part, highlighted) in [
+            (&text.snippet[start..text.highlight.start], false),
+            (matched, true),
+            (&text.snippet[text.highlight.end..], false),
+        ] {
+            job.append(
+                part,
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: if highlighted {
+                        p.selection_text.unwrap_or(p.fg)
+                    } else {
+                        p.secondary
+                    },
+                    background: if highlighted {
+                        p.selection
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        galley_at(
+            painter,
+            Pos2::new(left + used, rect.top() + 34.0),
+            painter.layout_job(job),
+        );
+    }
     if response.clicked() {
         events.push(if hit.dir {
             Event::ShowInTree(hit.path.clone(), true)
+        } else if let Some(text) = &hit.text {
+            Event::SelectMatch {
+                path: hit.path.clone(),
+                line: text.line,
+                column: text.column,
+            }
         } else {
             Event::Select(hit.path.clone())
         });
@@ -643,10 +786,32 @@ fn list(
     ui.spacing_mut().item_spacing = Vec2::ZERO;
     let ui = &mut ui;
     if let Some(search) = &view.search {
-        let status = if search.running && search.hits.is_empty() {
+        let status = if search.failed {
+            "Could not start search. Try Refresh.".to_owned()
+        } else if search.running && search.hits.is_empty() {
             "Searching…".to_owned()
         } else if search.hits.is_empty() {
-            "No files match".to_owned()
+            if state.search_mode == SearchMode::Text {
+                "No matching text"
+            } else {
+                "No files match"
+            }
+            .to_owned()
+        } else if state.search_mode == SearchMode::Text {
+            let files = search
+                .hits
+                .iter()
+                .map(|hit| &hit.path)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            format!(
+                "{} matching line{} in {} file{}{}",
+                search.hits.len(),
+                if search.hits.len() == 1 { "" } else { "s" },
+                files,
+                if files == 1 { "" } else { "s" },
+                if search.running { "…" } else { "" }
+            )
         } else {
             format!(
                 "{}{} result{}{}",
@@ -657,19 +822,70 @@ fn list(
             )
         };
         let (_, line) = ui.allocate_space(vec2(ui.available_width(), 20.0));
-        ui.painter().text(
-            Pos2::new(line.left() + 6.0, line.center().y),
-            Align2::LEFT_CENTER,
-            status,
-            theme::regular(11.0),
-            p.muted,
+        ui.interact(line, ui.id().with("search-summary"), Sense::hover())
+            .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &status));
+        galley_at(
+            ui.painter(),
+            line.left_center() + vec2(6.0, 0.0),
+            elided(
+                ui.painter(),
+                &status,
+                theme::regular(11.0),
+                p.muted,
+                line.width() - 12.0,
+            ),
         );
+        if search.truncated || search.skipped > 0 {
+            let (_, line) = ui.allocate_space(vec2(ui.available_width(), 20.0));
+            let note = match (search.truncated, search.skipped) {
+                (true, 0) => "Search limit reached · refine your search".to_owned(),
+                (false, count) => {
+                    format!("{count} item{} skipped", if count == 1 { "" } else { "s" })
+                }
+                (true, count) => format!(
+                    "Search limited · {count} item{} skipped",
+                    if count == 1 { "" } else { "s" }
+                ),
+            };
+            galley_at(
+                ui.painter(),
+                line.left_center() + vec2(6.0, 0.0),
+                elided(
+                    ui.painter(),
+                    &note,
+                    theme::regular(11.0),
+                    p.muted,
+                    line.width() - 12.0,
+                ),
+            );
+            let coverage = ui.interact(line, ui.id().with("search-coverage"), Sense::hover());
+            coverage.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &note));
+            coverage
+                .on_hover_text("Search is bounded to 2,000 matching lines, 8 MiB per file, 512 MiB total and 20 seconds. Each folder lists up to 10,000 entries. Binary, non-UTF-8, unreadable items and links to folders are skipped. Exclusions apply to both search modes.");
+        }
+        let height = if state.search_mode == SearchMode::Text {
+            52.0
+        } else {
+            ROW
+        };
+        if !search.running && !search.failed && search.hits.is_empty() {
+            centered_note(
+                ui,
+                ui.available_rect_before_wrap(),
+                p,
+                "Try another search or adjust the files to exclude.",
+            );
+        }
         egui::ScrollArea::vertical()
-            .id_salt("explorer-hits")
+            .id_salt((
+                "explorer-hits",
+                state.search_mode == SearchMode::Text,
+                &state.query,
+            ))
             .auto_shrink([false, false])
-            .show_rows(ui, ROW, search.hits.len(), |ui, range| {
+            .show_rows(ui, height, search.hits.len(), |ui, range| {
                 for hit in &search.hits[range] {
-                    let (_, rect) = ui.allocate_space(vec2(ui.available_width(), ROW));
+                    let (_, rect) = ui.allocate_space(vec2(ui.available_width(), height));
                     hit_row(ui, rect, p, hit, state, events);
                 }
             });
@@ -1188,9 +1404,32 @@ fn contents(
     )
     .on_hover_text(compact_path(root));
 
-    // Search, with the exclusions a search uses under it.
-    let field = Rect::from_min_size(
+    let mode = Rect::from_min_size(
         Pos2::new(inner.left(), header.bottom() + 2.0),
+        vec2(inner.width(), 28.0),
+    );
+    let mode_changed = place(
+        ui,
+        mode,
+        Layout::left_to_right(Align::Center),
+        "explorer-search-mode",
+        |ui| {
+            segmented(
+                ui,
+                p,
+                "Search by",
+                &mut state.search_mode,
+                &[(SearchMode::Names, "Names"), (SearchMode::Text, "Text")],
+                mode.width(),
+            )
+        },
+    );
+    if mode_changed {
+        events.push(Event::SearchChanged);
+    }
+    // Search, with optional exclusions below it.
+    let field = Rect::from_min_size(
+        Pos2::new(inner.left(), mode.bottom() + 6.0),
         vec2(inner.width(), metrics::CONTROL_HEIGHT),
     );
     field_frame(ui, p, field, query_id(), true);
@@ -1231,21 +1470,49 @@ fn contents(
                         ui,
                         query_id(),
                         &mut state.query,
-                        "Search files",
+                        if state.search_mode == SearchMode::Text {
+                            "Find text in files"
+                        } else {
+                            "Search files"
+                        },
                         12.5,
                         input.width(),
                     )
                 },
             );
+            response.widget_info(|| {
+                WidgetInfo::labeled(
+                    WidgetType::TextEdit,
+                    true,
+                    if state.search_mode == SearchMode::Text {
+                        "Find text in files"
+                    } else {
+                        "Search files"
+                    },
+                )
+            });
             response
-                .widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Search files"));
+                .clone()
+                .on_hover_text(if state.search_mode == SearchMode::Text {
+                    "Find literal text in UTF-8 files under this folder, ignoring case. Search exclusions apply."
+                } else {
+                    "Find files by name or path. Use * and ? for patterns."
+                });
+            if state.query.chars().count() > 256 {
+                state.query = state.query.chars().take(256).collect();
+            }
             if response.changed() {
                 events.push(Event::SearchChanged);
             }
             keep_focus_on_enter(ui, &response);
+            // Request after the field handles the mode button's pointer event,
+            // which would otherwise surrender the newly requested focus.
+            if mode_changed {
+                response.request_focus();
+            }
         },
     );
-    let filtering = state.filters || view.search.is_some();
+    let filtering = state.filters;
     if !filtering {
         // A hidden field must not keep the keyboard.
         let id = viewport_id(ui.ctx(), exclude_id());
@@ -1443,7 +1710,7 @@ mod tests {
     fn row(index: usize) -> Pos2 {
         Pos2::new(
             WINDOW.right() - DEFAULT_WIDTH + 80.0,
-            44.0 + 30.0 + 2.0 + 30.0 + 6.0 + ROW * (index as f32 + 0.5),
+            44.0 + 30.0 + 2.0 + 28.0 + 6.0 + 30.0 + 6.0 + ROW * (index as f32 + 0.5),
         )
     }
 
@@ -1622,6 +1889,120 @@ mod tests {
             !leaked,
             "Enter stayed in the frame's input for the terminal"
         );
+    }
+
+    #[test]
+    fn long_prefixes_keep_the_match_visible_at_the_minimum_panel_width() {
+        let ctx = context();
+        for prefix in ["x".repeat(41), "界".repeat(41)] {
+            let snippet = format!("{prefix}needle with context after it");
+            let hit = Hit {
+                path: "/p/notes.txt".into(),
+                name: "notes.txt".into(),
+                folder: String::new(),
+                dir: false,
+                text: Some(TextMatch {
+                    line: 600_000,
+                    column: 900,
+                    highlight: prefix.len()..prefix.len() + 6,
+                    snippet,
+                }),
+            };
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                hit_row(
+                    ui,
+                    Rect::from_min_size(Pos2::ZERO, vec2(206.0, 52.0)),
+                    Palette::for_config(&crate::config::Config::default()),
+                    &hit,
+                    &State::default(),
+                    &mut Vec::new(),
+                );
+            });
+            output.textures_delta.clear();
+            let visible = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().contains("needle") => Some(
+                        text.galley
+                            .rows
+                            .iter()
+                            .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                visible.contains("needle"),
+                "the match was clipped: {visible}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_mode_focuses_the_query_and_same_file_results_keep_distinct_line_targets() {
+        let ctx = context();
+        let hits = [2, 8].map(|line| Hit {
+            path: "/p/notes.txt".into(),
+            name: "notes.txt".into(),
+            folder: String::new(),
+            dir: false,
+            text: Some(TextMatch {
+                line,
+                column: 3,
+                snippet: "a needle here".into(),
+                highlight: 2..8,
+            }),
+        });
+        let view = View {
+            root: Some(Path::new("/p")),
+            notice: "",
+            rows: &[],
+            search: Some(SearchView {
+                hits: &hits,
+                running: false,
+                truncated: false,
+                skipped: 0,
+                failed: false,
+            }),
+            preview: None,
+            reveal: 1.0,
+            window: WINDOW,
+        };
+        let mut state = State {
+            query: "needle".into(),
+            ..Default::default()
+        };
+        run(&ctx, vec![], &view, &mut state);
+        let left = WINDOW.right() - DEFAULT_WIDTH + 6.0;
+        let text = Pos2::new(left + (DEFAULT_WIDTH - 14.0) * 0.75, 90.0);
+        let mut events = Vec::new();
+        for input in click(text, PointerButton::Primary) {
+            events.extend(run(&ctx, input, &view, &mut state));
+        }
+        assert_eq!(events, [Event::SearchChanged]);
+        assert_eq!(state.search_mode, SearchMode::Text);
+        run(&ctx, vec![], &view, &mut state);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(query_id()));
+        for (index, line) in [2, 8].into_iter().enumerate() {
+            let pos = Pos2::new(
+                left + 70.0,
+                44.0 + 30.0 + 2.0 + 28.0 + 6.0 + 30.0 + 6.0 + 20.0 + 52.0 * (index as f32 + 0.5),
+            );
+            let mut events = Vec::new();
+            for input in click(pos, PointerButton::Primary) {
+                events.extend(run(&ctx, input, &view, &mut state));
+            }
+            assert_eq!(
+                events,
+                [Event::SelectMatch {
+                    path: "/p/notes.txt".into(),
+                    line,
+                    column: 3
+                }]
+            );
+        }
     }
 
     #[test]
