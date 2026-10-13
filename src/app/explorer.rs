@@ -6,9 +6,11 @@ use crate::{
     platform::files::Handoff,
     ui::explorer::{
         Edit, EditKind, Event, Hit, PreviewBody, PreviewView, Row, RowKind, ScrollTarget,
-        SearchView,
+        SearchMode, SearchView,
     },
 };
+
+mod content;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::Path,
@@ -102,6 +104,7 @@ enum Reply {
         hits: Vec<Hit>,
         done: bool,
         truncated: bool,
+        skipped: usize,
     },
     Preview {
         request: u64,
@@ -155,8 +158,19 @@ struct Search {
     hits: Vec<Hit>,
     running: bool,
     truncated: bool,
+    skipped: usize,
+    failed: bool,
+    worker: Option<mpsc::SyncSender<SearchJob>>,
+    pending: Option<SearchJob>,
     /// When the search for the latest typing starts.
     due: Option<f64>,
+}
+
+struct SearchJob {
+    root: PathBuf,
+    query: Query,
+    exclude: Globs,
+    generation: u64,
 }
 
 pub(super) struct Explorer {
@@ -203,6 +217,12 @@ impl Default for Explorer {
             preview: None,
             search: Search::default(),
         }
+    }
+}
+
+impl Drop for Search {
+    fn drop(&mut self) {
+        self.current.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -806,6 +826,7 @@ fn wildcard(pattern: &str, name: &str) -> bool {
 enum Query {
     Glob(Vec<String>),
     Words(Vec<String>),
+    Text(content::Query),
 }
 
 impl Query {
@@ -835,6 +856,7 @@ impl Query {
                 words.iter().all(|word| whole.contains(word.as_str()))
                     && (named.peek().is_none() || named.any(|word| name.contains(word.as_str())))
             }
+            Self::Text(_) => false,
         }
     }
 }
@@ -855,17 +877,28 @@ fn search_worker(
     let mut sent = Instant::now();
     let (mut found, mut seen) = (0, 0);
     let mut truncated = false;
+    let mut skipped = 0;
+    let mut bytes = 0;
+    let started = Instant::now();
     let cancelled = || current.load(Ordering::Relaxed) != search;
     'walk: while let Some((dir, names)) = queue.pop_front() {
-        let Listing::Loaded { entries, .. } = list(&dir) else {
+        if cancelled() {
+            return;
+        }
+        let Listing::Loaded { entries, more } = list(&dir) else {
+            skipped += 1;
             continue;
         };
+        truncated |= more > 0;
         for entry in entries.iter() {
             if cancelled() {
                 return;
             }
             seen += 1;
-            if found >= MAX_HITS || seen > MAX_SEARCHED {
+            if found >= MAX_HITS
+                || seen > MAX_SEARCHED
+                || started.elapsed() > Duration::from_secs(20)
+            {
                 truncated = true;
                 break 'walk;
             }
@@ -883,10 +916,38 @@ fn search_worker(
                     name: entry.name.clone(),
                     folder: names.join("/"),
                     dir: entry.dir,
+                    text: None,
                 });
+            }
+            if let Query::Text(query) = &query
+                && !entry.dir
+            {
+                let result = content::search(
+                    &entry.path,
+                    query,
+                    MAX_HITS - found,
+                    &|| cancelled() || started.elapsed() > Duration::from_secs(20),
+                    &mut bytes,
+                );
+                truncated |= result.limited;
+                skipped += usize::from(result.skipped);
+                found += result.matches.len();
+                batch.extend(result.matches.into_iter().map(|text| Hit {
+                    path: entry.path.clone(),
+                    name: entry.name.clone(),
+                    folder: names.join("/"),
+                    dir: false,
+                    text: Some(text),
+                }));
+                if bytes >= content::TOTAL_BYTES || started.elapsed() > Duration::from_secs(20) {
+                    truncated = true;
+                    break 'walk;
+                }
             }
             if entry.dir && !entry.link {
                 queue.push_back((entry.path.clone(), path));
+            } else if entry.dir && entry.link && matches!(query, Query::Text(_)) {
+                skipped += 1;
             }
         }
         if !batch.is_empty() && (batch.len() >= 64 || sent.elapsed() > Duration::from_millis(80)) {
@@ -896,7 +957,8 @@ fn search_worker(
                     search,
                     hits,
                     done: false,
-                    truncated: false,
+                    truncated,
+                    skipped,
                 })
                 .is_err()
             {
@@ -912,6 +974,7 @@ fn search_worker(
             hits: batch,
             done: true,
             truncated,
+            skipped,
         });
         wake.request_repaint();
     }
@@ -997,6 +1060,7 @@ impl Explorer {
     }
 
     fn set_root(&mut self, ctx: &egui::Context, root: Option<PathBuf>) {
+        self.cancel_search();
         if let Some(root) = &root {
             self.dirs.retain(|dir, _| dir.starts_with(root));
             self.list(ctx, root);
@@ -1063,23 +1127,80 @@ impl Explorer {
         self.search.hits.clear();
         self.search.running = false;
         self.search.truncated = false;
+        self.search.skipped = 0;
+        self.search.failed = false;
+        self.search.pending = None;
         self.search.due = None;
     }
 
-    fn start_search(&mut self, ctx: &egui::Context, query: &str, exclude: &str) {
+    fn start_search(&mut self, ctx: &egui::Context, query: &str, exclude: &str, mode: SearchMode) {
         self.cancel_search();
-        let (Some(root), Some(query)) = (self.root.clone(), Query::parse(query)) else {
+        let Some(root) = self.root.clone() else {
             return;
         };
-        let search = self.search.current.load(Ordering::Relaxed);
-        let current = self.search.current.clone();
-        let exclude = Globs::parse(exclude);
-        let replies = self.replies.0.clone();
-        let wake = ctx.clone();
-        self.search.running = std::thread::Builder::new()
-            .name("neptune-explorer-search".into())
-            .spawn(move || search_worker(root, query, exclude, search, current, replies, wake))
-            .is_ok();
+        let query = match mode {
+            SearchMode::Names => match Query::parse(query) {
+                Some(query) => query,
+                None => return,
+            },
+            SearchMode::Text => Query::Text(content::Query::new(query)),
+        };
+        if self.search.worker.is_none() {
+            let (sender, requests) = mpsc::sync_channel::<SearchJob>(1);
+            let current = self.search.current.clone();
+            let replies = self.replies.0.clone();
+            let wake = ctx.clone();
+            if std::thread::Builder::new()
+                .name("neptune-explorer-search".into())
+                .spawn(move || {
+                    while let Ok(job) = requests.recv() {
+                        search_worker(
+                            job.root,
+                            job.query,
+                            job.exclude,
+                            job.generation,
+                            current.clone(),
+                            replies.clone(),
+                            wake.clone(),
+                        );
+                    }
+                })
+                .is_err()
+            {
+                self.search.failed = true;
+                return;
+            }
+            self.search.worker = Some(sender);
+        }
+        self.search.running = true;
+        self.search.pending = Some(SearchJob {
+            root,
+            query,
+            exclude: Globs::parse(exclude),
+            generation: self.search.current.load(Ordering::Relaxed),
+        });
+        self.submit_search(ctx);
+    }
+
+    fn submit_search(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.search.pending.take() else {
+            return;
+        };
+        let Some(worker) = &self.search.worker else {
+            return;
+        };
+        match worker.try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(job)) => {
+                self.search.pending = Some(job);
+                ctx.request_repaint_after(Duration::from_millis(20));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.search.worker = None;
+                self.search.running = false;
+                self.search.failed = true;
+            }
+        }
     }
 
     /// Opens every folder between the root and `path`, so its row exists.
@@ -1139,6 +1260,8 @@ impl Explorer {
                 hits: &self.search.hits,
                 running: self.search.running || self.search.due.is_some(),
                 truncated: self.search.truncated,
+                skipped: self.search.skipped,
+                failed: self.search.failed,
             }),
             preview: self.preview.as_ref().map(|preview| PreviewView {
                 path: &preview.path,
@@ -1312,12 +1435,14 @@ impl App {
                     hits,
                     done,
                     truncated,
+                    skipped,
                 } => {
                     let explorer = &mut self.explorer;
                     if explorer.search.current.load(Ordering::Relaxed) == search {
                         explorer.search.hits.extend(hits);
                         explorer.search.running = !done;
                         explorer.search.truncated = truncated;
+                        explorer.search.skipped = skipped;
                     }
                 }
                 Reply::Preview {
@@ -1456,11 +1581,12 @@ impl App {
             if now >= due {
                 let state = &self.ui.explorer;
                 self.explorer
-                    .start_search(ctx, &state.query, &state.exclude);
+                    .start_search(ctx, &state.query, &state.exclude, state.search_mode);
             } else {
                 ctx.request_repaint_after(Duration::from_secs_f64(due - now));
             }
         }
+        self.explorer.submit_search(ctx);
         if self.explorer.dirty {
             let (mut shown, missing) = self.explorer.rebuild(self.ui.explorer.edit.as_ref());
             // A name cannot be typed for a folder the tree no longer shows.
@@ -1501,6 +1627,7 @@ impl App {
 
     /// The panel left view: nothing is read again until it returns.
     pub(super) fn rest_explorer(&mut self, ctx: &egui::Context) {
+        self.explorer.cancel_search();
         self.explorer.cancel_preview_work();
         if self.explorer.watched_file.take().is_some() {
             self.explorer.request(ctx, Request::WatchFile(None));
@@ -1508,12 +1635,12 @@ impl App {
         if !self.explorer.watched.is_empty() {
             self.explorer.watched.clear();
             self.explorer.request(ctx, Request::Watch(Vec::new()));
+        }
+        if self.explorer.root.take().is_some() {
             // What is shown next is read afresh.
-            self.explorer.root = None;
             self.explorer.dirs = HashMap::new();
             self.explorer.rows = Vec::new();
             self.explorer.requested = HashSet::new();
-            self.explorer.cancel_search();
             self.explorer.dirty = true;
         }
     }
@@ -1724,6 +1851,12 @@ impl App {
                 self.ui.explorer.scroll_to = None;
                 self.explorer.show_preview(ctx, path, false);
             }
+            Event::SelectMatch { path, line, column } => {
+                self.explorer_event(ctx, Event::Select(path));
+                self.ui.explorer.markdown_preview = false;
+                self.ui.explorer.preview_location = Some((line, column));
+                self.ui.explorer.preview_jump = true;
+            }
             Event::FollowLink { path, anchor } => {
                 let loaded = self.explorer.preview.as_ref().is_some_and(|preview| {
                     preview.path == path
@@ -1866,6 +1999,7 @@ impl App {
                 self.ui.explorer.scroll_to = None;
                 self.ui.explorer.edit = None;
                 self.explorer.dirty = true;
+                self.explorer.cancel_search();
                 if self.ui.explorer.query.trim().is_empty() {
                     self.explorer.cancel_search();
                 } else {
@@ -3179,6 +3313,142 @@ mod tests {
         assert!(!root.join("journal").exists());
         assert!(app.ui.explorer.selected.is_none() && app.explorer.preview.is_none());
         assert!(app.ui.error.is_none(), "{:?}", app.ui.error);
+    }
+
+    #[test]
+    fn text_search_reads_collapsed_and_hidden_files_and_opens_the_matching_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (path, text) in [
+            (
+                "src/nested/notes.md",
+                "# Notes\n🪐 A literal [NEEDLE] here\nAnother [needle]",
+            ),
+            (".env", "KEY=[needle]"),
+            ("node_modules/package/index.js", "[needle]"),
+            ("name-[needle].txt", "No text match"),
+        ] {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        std::fs::write(root.join("image.bin"), b"[needle]\0").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root, root.join("loop")).unwrap();
+        let (mut app, ctx) = opened(root);
+        app.ui.explorer.search_mode = SearchMode::Text;
+        app.ui.explorer.query = "[needle]".into();
+        act(&mut app, &ctx, Event::SearchChanged);
+        settle(&mut app, &ctx, "text search", |app| {
+            !app.explorer.search.running
+                && app.explorer.search.due.is_none()
+                && app.explorer.search.hits.len() == 3
+        });
+        assert!(app.explorer.search.skipped >= 1);
+        assert!(
+            app.explorer
+                .search
+                .hits
+                .iter()
+                .all(|hit| hit.text.is_some())
+        );
+        assert!(!app.explorer.expanded.contains(&root.join("src")));
+        let hit = app
+            .explorer
+            .search
+            .hits
+            .iter()
+            .find(|hit| hit.text.as_ref().unwrap().line == 2)
+            .unwrap()
+            .clone();
+        let text = hit.text.unwrap();
+        assert_eq!((text.line, text.column), (2, 13));
+        act(
+            &mut app,
+            &ctx,
+            Event::SelectMatch {
+                path: hit.path.clone(),
+                line: text.line,
+                column: text.column,
+            },
+        );
+        settle(&mut app, &ctx, "matching source", |app| {
+            app.explorer
+                .preview
+                .as_ref()
+                .is_some_and(|preview| matches!(preview.body, Body::Text { .. }))
+        });
+        assert_eq!(app.ui.explorer.preview_location, Some((2, 13)));
+        assert!(!app.ui.explorer.markdown_preview);
+        assert_eq!(app.ui.explorer.query, "[needle]");
+
+        app.ui.explorer.exclude.clear();
+        act(&mut app, &ctx, Event::SearchChanged);
+        settle(&mut app, &ctx, "unexcluded search", |app| {
+            !app.explorer.search.running
+                && app.explorer.search.due.is_none()
+                && app.explorer.search.hits.len() == 4
+        });
+        act(&mut app, &ctx, Event::Refresh);
+        settle(&mut app, &ctx, "refreshed search", |app| {
+            !app.explorer.search.running
+                && app.explorer.search.due.is_none()
+                && app.explorer.search.hits.len() == 4
+        });
+
+        // Query changes invalidate replies immediately, before the debounce.
+        let old = app.explorer.search.current.load(Ordering::Relaxed);
+        let hits = app.explorer.search.hits.clone();
+        app.ui.explorer.query = "absent text".into();
+        act(&mut app, &ctx, Event::SearchChanged);
+        app.explorer
+            .replies
+            .0
+            .send(Reply::Hits {
+                search: old,
+                hits,
+                done: true,
+                truncated: false,
+                skipped: 0,
+            })
+            .unwrap();
+        app.poll_explorer(&ctx);
+        assert!(app.explorer.search.hits.is_empty());
+        settle(&mut app, &ctx, "empty text search", |app| {
+            !app.explorer.search.running && app.explorer.search.due.is_none()
+        });
+        assert!(app.explorer.search.hits.is_empty());
+
+        app.ui.explorer.query = "[needle]".into();
+        act(&mut app, &ctx, Event::SearchChanged);
+        app.rest_explorer(&ctx);
+        assert!(app.explorer.search.due.is_none());
+        assert!(app.explorer.search.pending.is_none());
+        assert!(!app.explorer.search.running);
+        settle(&mut app, &ctx, "search resumed with Files", |app| {
+            !app.explorer.search.running
+                && app.explorer.search.due.is_none()
+                && app.explorer.search.hits.len() == 4
+        });
+        let old = app.explorer.search.current.load(Ordering::Relaxed);
+        let hits = app.explorer.search.hits.clone();
+        let next_folder = tempfile::tempdir().unwrap();
+        app.explorer.set_root(&ctx, Some(next_folder.path().into()));
+        app.explorer
+            .replies
+            .0
+            .send(Reply::Hits {
+                search: old,
+                hits,
+                done: true,
+                truncated: false,
+                skipped: 0,
+            })
+            .unwrap();
+        app.poll_explorer(&ctx);
+        assert!(
+            app.explorer.search.hits.is_empty(),
+            "the previous folder cannot populate the new one"
+        );
     }
 
     #[test]
