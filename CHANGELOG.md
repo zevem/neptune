@@ -11,6 +11,23 @@ their preparation records remain in Git history.
 
 ### What's New
 
+## [0.1.0-rc.6] - 2026-10-13
+
+### What's New
+
+- Move workspaces between native windows without restarting their terminals,
+  agents or browser tabs. Drag a workspace out of the sidebar to open a window,
+  and on Linux/X11 into another window's sidebar to join it. Other platforms
+  use **Move to window** in the workspace menu or command palette to combine
+  windows. Window organization is saved and restored with fresh sessions when
+  Neptune starts again.
+- Pictures in a pull request's description and comments open in Neptune's image
+  viewer, with zoom and pan controls, when the picture is shown in the panel.
+- Agents launched from another agent no longer recursively start Neptune's
+  launchers when the child filters its environment. A missing installed CLI is
+  reported instead.
+- Claude Code and Codex receive reminders to link the pull requests they work on
+  to their terminal, including after resuming or compacting a conversation.
 - Browser tabs stay signed in. They now open in a profile that keeps cookies
   and site data on this computer; add more profiles from a tab's menu, or
   choose **Private** for a tab that keeps nothing, as every tab did before.
@@ -45,6 +62,45 @@ their preparation records remain in Git history.
   such as Ubuntu 26.04, Fedora 44 and Arch, where it reported that it could
   not start its renderer. It uses the system's Wayland libraries, which those
   drivers require.
+
+### Acceptance notes and known limitations
+
+- Full native acceptance on every platform remains pending; this is a release
+  candidate for acceptance testing, not a production-stable release.
+- Saved workspaces now use schema version 15 to retain window organization.
+  Earlier workspace files still load, but RC5 and earlier cannot restore or
+  save over layouts written by this version. Back up workspace state before
+  testing if you need to return to an earlier candidate. Restoration starts
+  fresh shells and SSH connections; running commands and process memory are
+  not restored. Browser tabs reopen their last page in their selected profile;
+  private tabs restore blank.
+- Browser previews include a separate Chromium runtime, increasing installer
+  size. On Linux hosts that block the AppImage's Chromium sandbox, previews run
+  without it and the blank tab displays a warning; see the
+  [installation guide](https://github.com/zevem/neptune/blob/v0.1.0-rc.6/docs/installation.md#browser-previews-and-chromiums-sandbox)
+  for enabling it. The DEB includes the sandbox helper. A browser startup
+  failure leaves terminals usable. Browser sandbox, clipboard, IME, DPI and
+  installer behavior still need native acceptance on macOS and Windows.
+- Projects require Claude Code or Codex installed and signed in, and a local
+  workspace; they are not available on Windows yet. Pull request actions require
+  the GitHub CLI (`gh`) signed in with the necessary repository permissions.
+- Windows installers remain unsigned and may show an unverified-publisher or
+  SmartScreen warning. Both macOS installers require signing and notarization;
+  all installers are covered by signed update metadata and build attestations.
+- Linux x64 packages require glibc 2.35 or newer and working host graphics
+  drivers. Browser-downloaded AppImages need execute permission before launch;
+  enable it in file Properties or run `chmod u+x` on the downloaded file.
+- In-place updates remain unverified on macOS. The reported intermittent native
+  Wayland freeze still needs a capture of the blocking state; XWayland checks
+  do not establish native Wayland acceptance. File-manager drops on native
+  Wayland currently work only in the original window.
+- SSH requires an installed OpenSSH client and a POSIX remote shell. Remote
+  directory tracking is integrated for zsh; other shells need OSC 7 integration.
+- Kitty graphics and comprehensive complex-script shaping remain unsupported.
+  Keypad identity and some keyboard-layout information depend on the window
+  toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
+- Automatic updates never downgrade. After this candidate is published, select
+  Beta in Preferences → Updates to receive it; private drafts are not offered.
 
 ## [0.1.0-rc.5] - 2026-10-10
 
