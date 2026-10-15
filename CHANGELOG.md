@@ -11,6 +11,9 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- On macOS, opening a browser tab no longer adds a second, bouncing Neptune
+  icon to the Dock.
+
 ## [0.1.0-rc.6] - 2026-10-13
 
 ### What's New
