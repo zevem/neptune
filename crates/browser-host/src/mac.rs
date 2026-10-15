@@ -4,7 +4,7 @@ use objc2::{
     ClassType, DefinedClass, MainThreadMarker, define_class, msg_send,
     runtime::{Bool, NSObjectProtocol},
 };
-use objc2_app_kit::{NSApp, NSApplication, NSEvent};
+use objc2_app_kit::{NSApp, NSApplication, NSApplicationActivationPolicy, NSEvent};
 use std::cell::Cell;
 
 #[derive(Default)]
@@ -34,8 +34,13 @@ define_class! {
     unsafe impl CefAppProtocol for BrowserApplication {}
 }
 pub fn initialize() {
-    let _: objc2::rc::Retained<BrowserApplication> =
+    let application: objc2::rc::Retained<BrowserApplication> =
         unsafe { msg_send![BrowserApplication::class(), sharedApplication] };
     let marker = MainThreadMarker::new().expect("Browser application requires the main thread");
     assert!(NSApp(marker).isKindOfClass(BrowserApplication::class()));
+    // This executable lives in Neptune.app/Contents/MacOS, so AppKit applies
+    // Neptune's Info.plist and would give the windowless host a second,
+    // bouncing Neptune Dock tile. Accessory keeps it out of the Dock and the
+    // app switcher while still letting DevTools open its window.
+    application.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }

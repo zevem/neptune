@@ -173,7 +173,9 @@ runtime, since a newer system's modules do not load into it.
 
 macOS packaging places the CEF framework and role-specific helper apps in
 `Contents/Frameworks`, initializes the helper sandbox before loading CEF and
-signs nested browser executables with Chromium JIT entitlements. Windows uses
+signs nested browser executables with Chromium JIT entitlements. The helper
+apps declare `LSUIElement`; the host shares Neptune's `Info.plist` and makes
+itself an accessory application, so neither adds a Dock icon. Windows uses
 CEF's sandbox `bootstrapc.exe`, renamed `neptune_browser.exe`, with the Rust
 `neptune_browser.dll`. For a Windows development launch, prepare the private
 `browser/` payload using `package-common.browser_payload` beside Neptune.
