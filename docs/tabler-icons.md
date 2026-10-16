@@ -1,5 +1,8 @@
 # Tabler icon migration
 
+Provider/branding exclusions below correct the original `098c515` migration.
+See the [restoration verification](tabler-icons-verification.md).
+
 ## Reference approach
 
 The ai-video-editor checkout was reviewed read-only before implementing this
@@ -22,9 +25,9 @@ Neptune follows its pinned **Tabler Icons 3.49.0** approach:
 
 The website uses explicit, tree-shakeable `@tabler/icons-react` **3.49.0**
 imports behind its existing semantic helper, with the same glyph mapping,
-size props and `currentColor` inheritance. Application/site raster formats
-are generated from the official `planet` SVG, keeping platform sizes, blue ink,
-white native backing, transparent corners and 100-pixel macOS padding.
+size props and `currentColor` inheritance. Provider marks and Neptune app/site
+branding are deliberate exclusions: their original assets and rendering from
+before `098c515` are restored, not approximated with Tabler glyphs.
 
 ## Complete original native icon mapping
 
@@ -101,13 +104,13 @@ Website names shared with these controls use the same Tabler icon.
 
 ## Marks and icons outside the original enum
 
-| Old custom icon | Tabler replacement |
+| Old custom icon / artwork | Replacement or preserved original |
 | --- | --- |
-| Application, Dock, taskbar, site, favicon and marketing planet artwork | `planet`, generated in existing platform formats |
-| Claude provider mark | `sparkles`, retaining Claude orange |
-| Codex provider mark | `brand-openai`, retaining caller ink |
-| OpenCode provider mark | `terminal-2`, retaining caller ink |
-| pi provider mark | `math-pi`, retaining caller ink |
+| Application, Dock, taskbar, site, favicon and marketing artwork | Original supplied Neptune brand artwork, restored byte-for-byte |
+| Claude provider mark | Original SVG/PNG mask and rendering; Claude orange |
+| Codex provider mark | Original SVG/PNG mask and rendering; caller ink |
+| OpenCode provider mark | Original SVG/PNG mask and rendering; caller ink |
+| pi provider mark | Original SVG/PNG mask and rendering; caller ink |
 | Website GitHub silhouette | `brand-github` |
 | Window traffic-light close/minimize/maximize strokes | `x` / `minus` / `plus`; colored button surfaces retained |
 | Animated folder disclosure chevron | Rotated `chevron-right`; existing openness animation retained |
@@ -122,12 +125,23 @@ Website names shared with these controls use the same Tabler icon.
 
 ## Matches and deliberate exclusions
 
-Tabler 3.49.0 has no exact Claude, OpenCode or pi brand marks, so their closest
-semantic glyphs replace the bespoke artwork. `eye` replaces the original
-two-eye reaction picture; the reaction still sends the same Eyes value.
-The original waved planet brand artwork has no exact upstream match; `planet`
-is the closest subject match. Gemini and Omp still have no provider glyph,
-matching the previous behavior. No custom icon paths or provider masks remain.
+Provider identity must remain exactly as before this migration. The original
+Claude, Codex, OpenCode and pi SVGs, raster masks, rasterizer and native cached
+texture renderer are retained. The website retains its original Claude/Codex
+embedded masks, colors, sizing and provider call sites. Gemini and Omp still
+have no native provider glyph, matching the previous behavior. No AI provider
+mark is replaced by a generic Tabler glyph. Provider-only glyphs and the unused
+`planet` glyph have been removed from the native subset.
+
+The supplied Neptune artwork is explicitly documented in [the asset guide](../assets/README.md)
+as app identity and external branding, not terminal UI. Restore all three
+originals plus their native platform, website and favicon exports, with the
+original Pillow-only exporter; do not reinterpret them as Tabler `planet`.
+
+The old two-eye drawing belongs to the GitHub pull-request reaction control
+(`Emoji::Eyes` → `Icon::Eyes`), not app/provider branding. It therefore stays on
+Tabler `eye`; it sends the same Eyes reaction. Tabler 3.49.0 has no exact
+two-eye reaction glyph, so this remains an approximate UI-icon match.
 
 Terminal output/title protocols, keyboard shortcut notation (including command
 and arrow keys), diff/math punctuation, fetched browser favicons, identity
@@ -138,9 +152,11 @@ are data or UI surfaces rather than custom icons and are intentionally retained.
 
 See the [asset manifest and generator instructions](../assets/icons/tabler/README.md).
 
-`python3 scripts/export-logo.py` regenerates all platform/site raster icons
-from the pinned SVG (Pillow, PyGObject/librsvg and pycairo are maintenance-only
-requirements). Native packages copy the Tabler MIT notice to
+`python3 scripts/export-logo.py` regenerates platform/site raster copies from
+the supplied original PNG artwork (Pillow only).
+`python3 scripts/export-provider-icons.py` regenerates the original provider
+masks; see [provider provenance](../assets/icons/providers/README.md).
+Native packages copy the Tabler MIT notice to
 `icons/Tabler-LICENSE.txt`; packaging fails if it is missing.
 The [third-party notices](../THIRD-PARTY-NOTICES.md) cover the shared assets
 and website package.

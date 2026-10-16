@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { AgentMark, GitHubMark, Icon, NeptuneMark, TABLER_ICONS, type IconName } from "../src/components/icons";
+import { GitHubMark, Icon, NeptuneMark, TABLER_ICONS, type IconName } from "../src/components/icons";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -22,7 +22,7 @@ const mapping: Record<IconName, string> = {
   paperclip: "paperclip", agents: "hierarchy", file: "file", warning: "alert-triangle",
   play: "player-play-filled", pause: "player-pause-filled", lock: "lock",
   circle: "circle", circleDot: "circle-dot", circleFilled: "circle-filled",
-  loader: "loader-2", cornerDownRight: "corner-down-right", sparkles: "sparkles", brandOpenai: "brand-openai",
+  loader: "loader-2", cornerDownRight: "corner-down-right",
 };
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -55,10 +55,8 @@ test("every shared glyph uses its official mapping and preserves size, classes a
   }
 });
 
-test("brand helpers retain their public sizing and match native official glyphs", () => {
+test("GitHub uses the official glyph and Neptune retains the supplied raster mark", () => {
   assert.ok(renderToStaticMarkup(createElement(GitHubMark, { size: 15 })).includes("tabler-icon-brand-github"));
-  assert.ok(renderToStaticMarkup(createElement(AgentMark, { kind: "claude", size: 13 })).includes("tabler-icon-sparkles"));
-  assert.ok(renderToStaticMarkup(createElement(AgentMark, { kind: "codex", size: 13 })).includes("tabler-icon-brand-openai"));
   const mark = renderToStaticMarkup(createElement(NeptuneMark, { size: 24 }));
   assert.ok(mark.includes('width="24" height="24"'));
   assert.ok(mark.includes('src="/neptune-logo.png"'));
@@ -74,10 +72,16 @@ function sourceFiles(directory: string): string[] {
 test("website functional icons have no custom SVG paths or Unicode drawings", () => {
   for (const path of sourceFiles(join(root, "src"))) {
     const source = readFileSync(path, "utf8");
-    // These remaining SVG paths are an architecture connector and CPU chart,
-    // not icons; controls, data visualizations and literal key labels stay intact.
-    if (!path.endsWith("/site/internals.tsx")) assert.doesNotMatch(source, /<svg|<path\b/);
-    assert.doesNotMatch(source, /[✻●⎿›•✔]/u);
+    // Provider trademarks are original artwork, separately pinned by providers.test.
+    // The other remaining SVG paths are an architecture connector and CPU chart.
+    const functionalSource = path.endsWith("/icons.tsx")
+      ? source.split("/**\n * The marks of the CLI agents")[0]
+      : source;
+    if (!path.endsWith("/site/internals.tsx")) assert.doesNotMatch(functionalSource, /<svg|<path\b/);
+    assert.doesNotMatch(source, /[●⎿›•✔]/u);
+    if (!path.endsWith("/neptune/shell.ts") && !path.endsWith("/neptune/tour.ts")) {
+      assert.doesNotMatch(source, /✻/u);
+    }
     assert.ok(!source.includes("GLYPHS"));
   }
 });

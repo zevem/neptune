@@ -30,7 +30,7 @@
       "unicode": "ebef",
       "sha256": "ea232ff7461f39a6c65c5919c0f9b28de29d2586730a9eeef2b2428526ceb069",
       "upstream_icon_version": "1.7",
-      "meaning": "Terminal shell; reused as the Opencode provider fallback because Tabler 3.49.0 has no Opencode brand glyph."
+      "meaning": "Terminal shell."
     },
     {
       "icon": "Plus",
@@ -679,17 +679,6 @@
       "meaning": "GitHub eyes reaction: the official eye is the closest direct looking/watching metaphor; no two-eyes reaction glyph."
     },
     {
-      "icon": "Planet",
-      "style": "outline",
-      "name": "planet",
-      "file": "outline/planet.svg",
-      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/planet.svg",
-      "unicode": "ec08",
-      "sha256": "f5deee6a208d67e2163b206ccf88670d35bc2a0aca98011a28e558327a167754",
-      "upstream_icon_version": "1.8",
-      "meaning": "Official ringed planet replaces the Neptune brand mark without modifying upstream paths."
-    },
-    {
       "icon": "GitHub",
       "style": "outline",
       "name": "brand-github",
@@ -820,39 +809,6 @@
       "unicode": "eba6",
       "sha256": "0914f31c851cbffa1a105241e8e94107abb147b2ee2b2326e3d6d25c1ff0451e",
       "upstream_icon_version": "1.4"
-    },
-    {
-      "icon": "Sparkles",
-      "style": "outline",
-      "name": "sparkles",
-      "file": "outline/sparkles.svg",
-      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/sparkles.svg",
-      "unicode": "f6d7",
-      "sha256": "fb229226d919ddddc8c09d3269b748f437b5f0dd46072209cb8f3046e84b38fe",
-      "upstream_icon_version": "2.1",
-      "meaning": "Claude provider fallback: no brand-claude or brand-anthropic glyph exists in pinned Tabler 3.49.0; retain Claude orange (#d97757)."
-    },
-    {
-      "icon": "BrandOpenAi",
-      "style": "outline",
-      "name": "brand-openai",
-      "file": "outline/brand-openai.svg",
-      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/brand-openai.svg",
-      "unicode": "f78e",
-      "sha256": "184f2ab9be7d33f12c35ef061b745d77b317eeeb245c3ca34a08b87bb7021013",
-      "upstream_icon_version": "2.5",
-      "meaning": "Official OpenAI brand identifies Codex; drawn in caller ink."
-    },
-    {
-      "icon": "MathPi",
-      "style": "outline",
-      "name": "math-pi",
-      "file": "outline/math-pi.svg",
-      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/math-pi.svg",
-      "unicode": "f4ee",
-      "sha256": "9a75cdfea2e6ba463c41b24fbf21e635bce8153e00b8b031315bcb610f79a6a0",
-      "upstream_icon_version": "1.100",
-      "meaning": "Official pi symbol identifies Pi; drawn in caller ink."
     }
   ]
 }

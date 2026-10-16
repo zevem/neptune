@@ -624,8 +624,10 @@ use sentence case.
 Icons use official Tabler Icons 3.49.0 shapes on their 24-point grid, with
 rounded outline strokes and filled transport controls. Small dedicated font
 subsets are embedded for native rendering; they never join terminal or text
-font fallbacks. Recolour a glyph for state; do not swap assets. Provider
-indicators use the closest Tabler glyph, with Claude Code retaining its orange.
+font fallbacks. Recolour a glyph for state; do not swap assets. An agent
+mark is the exception: it keeps its original provider artwork, bundled as a
+mask and tinted like an icon, except Claude Code, which keeps its orange.
+Neptune app/site logos retain the supplied brand artwork, not a UI glyph.
 Widgets keep their original icon bounds, hover/focus surfaces, tooltips and
 accessible names. The [icon manifest](../assets/icons/tabler/README.md) records
 sources and regeneration; the website uses the same pinned Tabler version.

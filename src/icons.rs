@@ -1,12 +1,13 @@
 //! Official Tabler Icons 3.49.0, embedded as dedicated native font subsets.
 //!
 //! Source SVGs, exhaustive mappings, regeneration and MIT notices live in
-//! assets/icons/tabler. No icon file is loaded or decoded during a frame.
+//! assets/icons/tabler. Provider marks retain their own bundled PNG masks,
+//! decoded and cached once for each physical-pixel size.
 
 use eframe::egui::{
-    Align2, Color32, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Painter, Pos2,
-    Rect, Response, Sense, Shape, StrokeKind, Ui, WidgetInfo, WidgetType, emath::TSTransform,
-    epaint::TextShape, vec2,
+    Align2, Color32, ColorImage, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id,
+    Painter, Pos2, Rect, Response, Sense, Shape, StrokeKind, TextureHandle, TextureOptions, Ui,
+    WidgetInfo, WidgetType, emath::TSTransform, epaint::TextShape, pos2, vec2,
 };
 use neptune_model::AgentKind;
 
@@ -80,8 +81,6 @@ pub enum Icon {
     Heart,
     Rocket,
     Eyes,
-    /// The official ringed-planet glyph used for Neptune branding.
-    Planet,
     GitHub,
     ChevronUp,
     ArrowRight,
@@ -95,10 +94,6 @@ pub enum Icon {
     CircleCheck,
     Square,
     Checkbox,
-    /// Claude fallback: the pinned Tabler release has no Claude brand glyph.
-    Sparkles,
-    BrandOpenAi,
-    MathPi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -194,17 +189,69 @@ pub fn paint_rotated(painter: &Painter, rect: Rect, icon: Icon, color: Color32, 
     painter.add(shape);
 }
 
-/// Paint an official Tabler equivalent for a CLI agent, preserving its tint.
-/// Gemini and Omp still return false and leave the caller's fallback unchanged.
+/// Paint a CLI agent's own mark into its visual bounds, in `ink` unless the
+/// mark has a colour of its own. Reports `false`, painting nothing, for an
+/// agent without one.
+///
+/// The marks are bundled masks, scaled once for each size they are shown at.
 pub fn paint_provider(painter: &Painter, rect: Rect, kind: AgentKind, ink: Color32) -> bool {
-    let (icon, tint) = match kind {
-        AgentKind::Claude => (Icon::Sparkles, Color32::from_rgb(0xd9, 0x77, 0x57)),
-        AgentKind::Codex => (Icon::BrandOpenAi, ink),
-        AgentKind::Opencode => (Icon::Terminal, ink),
-        AgentKind::Pi => (Icon::MathPi, ink),
+    let (name, mask, tint) = match kind {
+        AgentKind::Claude => (
+            "claude",
+            include_bytes!("../assets/icons/providers/claude.png").as_slice(),
+            Color32::from_rgb(0xd9, 0x77, 0x57),
+        ),
+        AgentKind::Codex => (
+            "codex",
+            include_bytes!("../assets/icons/providers/codex.png").as_slice(),
+            ink,
+        ),
+        AgentKind::Opencode => (
+            "opencode",
+            include_bytes!("../assets/icons/providers/opencode.png").as_slice(),
+            ink,
+        ),
+        AgentKind::Pi => (
+            "pi",
+            include_bytes!("../assets/icons/providers/pi.png").as_slice(),
+            ink,
+        ),
         AgentKind::Gemini | AgentKind::Omp => return false,
     };
-    paint(painter, rect, icon, tint);
+    let ctx = painter.ctx();
+    let side = rect.width().min(rect.height());
+    let pixels = (side * ctx.pixels_per_point()).round().max(1.0) as u32;
+    let id = Id::new(("provider-mark", name, pixels));
+    let texture = ctx
+        .data(|data| data.get_temp::<TextureHandle>(id))
+        .or_else(|| {
+            let mask = image::load_from_memory(mask).ok()?.resize_exact(
+                pixels,
+                pixels,
+                image::imageops::FilterType::Lanczos3,
+            );
+            let rgba: Vec<u8> = mask
+                .to_rgba8()
+                .pixels()
+                .flat_map(|pixel| [255, 255, 255, pixel[3]])
+                .collect();
+            let texture = ctx.load_texture(
+                format!("provider-mark-{name}"),
+                ColorImage::from_rgba_unmultiplied([pixels as usize; 2], &rgba),
+                TextureOptions::LINEAR,
+            );
+            ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+            Some(texture)
+        });
+    let Some(texture) = texture else {
+        return false;
+    };
+    painter.image(
+        texture.id(),
+        Rect::from_center_size(rect.center(), vec2(side, side)),
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        tint,
+    );
     true
 }
 
@@ -369,6 +416,97 @@ mod tests {
                 AgentKind::Pi
             ]
         );
+    }
+
+    #[test]
+    fn provider_marks_keep_original_tints_bounds_and_physical_pixel_cache() {
+        for pixels_per_point in [1.0, 2.0] {
+            // Provider marks do not depend on the Tabler font families.
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
+            let rect = Rect::from_center_size(Pos2::new(64.0, 64.0), vec2(21.0, 13.25));
+            let square = Rect::from_center_size(rect.center(), vec2(13.25, 13.25));
+            let pixels = (13.25_f32 * pixels_per_point).round() as usize;
+            let mut expected = Vec::new();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                for (kind, name) in [
+                    (AgentKind::Claude, "claude"),
+                    (AgentKind::Codex, "codex"),
+                    (AgentKind::Opencode, "opencode"),
+                    (AgentKind::Pi, "pi"),
+                ] {
+                    let key = Id::new(("provider-mark", name, pixels as u32));
+                    assert!(paint_provider(&painter, rect, kind, Color32::WHITE));
+                    let texture = ctx
+                        .data(|data| data.get_temp::<TextureHandle>(key))
+                        .unwrap();
+                    assert_eq!(texture.size(), [pixels; 2]);
+                    assert!(paint_provider(&painter, rect, kind, Color32::LIGHT_GREEN));
+                    let cached = ctx
+                        .data(|data| data.get_temp::<TextureHandle>(key))
+                        .unwrap();
+                    assert_eq!(texture.id(), cached.id());
+                    expected.push((kind, texture.id()));
+                }
+            });
+            for (kind, texture_id) in expected {
+                let uploads = output
+                    .textures_delta
+                    .set
+                    .iter()
+                    .filter(|(id, _)| **id == texture_id)
+                    .count();
+                assert_eq!(uploads, 1, "{kind:?} uploaded its mask more than once");
+                let meshes: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        Shape::Mesh(mesh) if mesh.texture_id == texture_id => Some(mesh),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(meshes.len(), 2);
+                for (mesh, ink) in meshes.iter().zip([Color32::WHITE, Color32::LIGHT_GREEN]) {
+                    assert_eq!(mesh.calc_bounds(), square);
+                    let tint = if kind == AgentKind::Claude {
+                        Color32::from_rgb(0xd9, 0x77, 0x57)
+                    } else {
+                        ink
+                    };
+                    assert!(mesh.vertices.iter().all(|vertex| vertex.color == tint));
+                    assert_eq!(mesh.vertices[0].uv, pos2(0.0, 0.0));
+                    assert_eq!(mesh.vertices[3].uv, pos2(1.0, 1.0));
+                }
+            }
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn unsupported_providers_paint_nothing_and_allocate_no_mask_textures() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
+            let rect = Rect::from_center_size(Pos2::new(64.0, 64.0), vec2(13.0, 13.0));
+            for kind in [AgentKind::Gemini, AgentKind::Omp] {
+                assert!(!paint_provider(&painter, rect, kind, Color32::WHITE));
+            }
+        });
+        assert!(
+            output
+                .shapes
+                .iter()
+                .all(|shape| !matches!(shape.shape, Shape::Mesh(_) | Shape::Text(_)))
+        );
+        assert!(
+            output
+                .textures_delta
+                .set
+                .iter()
+                .all(|(id, _)| matches!(id, egui::TextureId::Managed(0)))
+        );
+        output.textures_delta.clear();
     }
 
     fn title_controls_frame(ctx: &egui::Context, events: Vec<Event>) -> Response {

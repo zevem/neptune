@@ -36,17 +36,19 @@ so it follows the app's own sources:
   in [`src/icons.rs`](../src/icons.rs). Explicit imports keep the bundle limited
   to used glyphs; icons retain the upstream 24-point grid, 2-point rounded
   strokes, `currentColor`, caller sizes and theme/hover classes. Playback uses
-  the official filled variants. GitHub uses `brand-github`, Codex
-  `brand-openai`, and Claude `sparkles` (there is no `brand-claude` in 3.49.0).
+  the official filled variants; GitHub uses `brand-github`. AI provider marks
+  retain their original filled Claude and Codex artwork, not Tabler substitutes,
+  and inherit the caller's color. Their CLI banners retain the original `✻`
+  and `>_` terminal text and colors. These provider trademarks belong to their
+  owners and are not covered by Neptune's license.
 - `src/components/neptune/` mirrors the chrome, panes, palette and sheets under
   [`src/ui/`](../src/ui), and a small model of
   [`crates/neptune-model`](../crates/neptune-model).
 
 When the app's look or behaviour changes, update the matching file here.
 
-Website branding uses the official Tabler 3.49.0 `planet` glyph, stored as
-[`assets/branding/neptune-icon.png`](../assets/branding/neptune-icon.png), with
-Neptune's existing colors, backing and export sizes.
+Website branding uses the supplied `Icon.png`, stored as
+[`assets/branding/neptune-icon.png`](../assets/branding/neptune-icon.png).
 Run `python3 scripts/export-logo.py` from the repository root to refresh the
 navigation/footer logo, favicon and touch icon. The same logo is used in sharing
 metadata. Native app icons use the separate platform logos documented in

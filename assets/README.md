@@ -1,30 +1,30 @@
 # Assets
 
-Tabler icon sources, generated platform artwork and bundled fonts live here.
-All icon shapes come from pinned official Tabler Icons 3.49.0 assets; the
-[manifest and regeneration notes](icons/tabler/README.md) record their provenance.
-The [migration mapping](../docs/tabler-icons.md) lists every replaced icon and
-explains the few approximate matches.
+Project artwork, designs and bundled fonts live here.
 
-| Generated artwork | Use |
-| --- | --- |
-| [`branding/neptune-logo.png`](branding/neptune-logo.png) | Blue Tabler `planet` on a white rounded tile, for Linux/Windows app/taskbar icons |
-| [`branding/neptune-macos-logo.png`](branding/neptune-macos-logo.png) | Same tile with the existing 100-pixel macOS Finder/Dock padding |
-| [`branding/neptune-icon.png`](branding/neptune-icon.png) | Blue Tabler `planet` on transparency, for website, metadata and README |
+The supplied originals have distinct uses:
+
+| Source | Supplied name | Use |
+| --- | --- | --- |
+| [`branding/neptune-logo.png`](branding/neptune-logo.png) | Logo.png | Linux and Windows app/taskbar icons |
+| [`branding/neptune-macos-logo.png`](branding/neptune-macos-logo.png) | MacOS Logo.png | macOS Finder/Dock icon, with its supplied padding preserved |
+| [`branding/neptune-icon.png`](branding/neptune-icon.png) | Icon.png | Website, marketing, sharing metadata and README |
 
 - `icons/` contains Linux/Windows PNGs from 16 to 1024 pixels and a Windows ICO
   with sizes through 256 pixels, exported from `neptune-logo.png`. The macOS ICNS
   has Retina sizes through 1024 pixels, exported from `neptune-macos-logo.png`
   without adding padding.
-- [`icons/tabler/`](icons/tabler/README.md) contains the native UI font subsets,
-  official SVGs, exhaustive glyph mapping and MIT notice. Provider indicators
-  use these glyphs too; no separate provider masks are decoded.
+- [`icons/providers/`](icons/providers/README.md) contains the marks of the CLI
+  agents a terminal tab can show.
+- [`icons/tabler/`](icons/tabler/README.md) contains the pinned Tabler 3.49.0
+  native UI font subsets, official SVGs, mapping and MIT notice. Provider marks
+  and supplied Neptune branding are not part of that migration.
 - [`fonts/`](fonts/README.md) contains the bundled typefaces and their licenses.
 
 Regenerate the icons and website copies from the repository root:
 
 ```sh
-# Requires Pillow, PyGObject with librsvg, and pycairo.
+python3 -m pip install Pillow
 python3 scripts/export-logo.py
 ```
 

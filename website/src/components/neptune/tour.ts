@@ -171,14 +171,14 @@ const done = (text: string): Line => row("  ", { icon: "cornerDownRight", t: " "
 
 const CLAUDE_BANNER: Line[] = [
   out(""),
-  row({ icon: "sparkles", t: " ", c: 3 }, { t: "Claude Code", b: true }),
+  row({ t: "✻ ", c: 3 }, { t: "Claude Code", b: true }),
   row({ t: "  ~/code/neptune", c: "muted" }),
   out(""),
 ];
 const ASK = "Add a --json flag to neptune-inspect. Ask Codex for the tests.";
 
 const CODEX_TASK: Line[] = [
-  row({ icon: "brandOpenai", t: " ", c: "muted" }, { t: "OpenAI Codex", b: true }),
+  row({ t: ">_ ", c: "muted" }, { t: "OpenAI Codex", b: true }),
   row({ t: "   ~/code/neptune", c: "muted" }),
   out(""),
   row({ icon: "chevronRight", t: " ", c: "muted" }, "Write tests for neptune-inspect --json"),

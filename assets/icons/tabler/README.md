@@ -13,11 +13,11 @@ notice is preserved in [LICENSE.txt](LICENSE.txt).
 
 ## Native rendering
 
-The application embeds outline.ttf (79 glyphs, 21,408 bytes) and filled.ttf
+The application embeds outline.ttf (75 glyphs, 19,900 bytes) and filled.ttf
 (4 glyphs, 1,360 bytes). Dedicated font families do not alter terminal or UI text
 fallbacks. Call `icons::register_fonts` when constructing every font definition
 set, including asynchronously discovered system fonts, before `ctx.set_fonts`.
-There is no per-frame file access, image decoding or SVG parsing.
+Tabler glyphs need no per-frame file access, image decoding or SVG parsing.
 
 The font subsets preserve upstream contour coordinates and the full 24×24
 cell. The generator recalculates bounds and corrects left side bearings to the
@@ -34,22 +34,35 @@ to preserve a legacy dot's ink diameter, its nominal rectangle is 1.2 times that
 diameter. Shapes, hit areas, tooltips, accessible names and interaction state
 remain the caller's responsibility.
 
-## Provider equivalents
+## Provider marks
 
-| Agent | Official Tabler glyph | Tint and rationale |
-| --- | --- | --- |
-| Claude | sparkles | Keep Claude orange (#d97757); no Claude or Anthropic brand glyph exists in 3.49.0. |
-| Codex | brand-openai | Caller ink; official OpenAI brand. |
-| Opencode | terminal-2 | Caller ink; closest CLI metaphor, because no Opencode brand glyph exists. |
-| Pi | math-pi | Caller ink; the official pi symbol. |
-| Gemini / Omp | none | Existing false/no-paint contract is unchanged, preserving caller fallbacks. |
+CLI provider marks are separate from the Tabler UI icon subset. Native terminal
+tabs retain the original [bundled provider artwork](../providers/README.md) and
+PNG-mask renderer from before the Tabler migration. Masks are resized with
+Lanczos3 and cached at each physical-pixel size; Claude retains its orange
+(#d97757), and Codex, Opencode and Pi use the caller's ink. Gemini and Omp return
+false without painting or changing the caller's fallback.
+
+Provider-only substitute glyphs (`sparkles`, `brand-openai`, `math-pi`) are not
+included. `terminal-2` remains the non-provider Terminal UI icon. The unused
+`planet` branding glyph is also omitted; all other UI mappings, including the
+Eyes reaction's Tabler `eye`, remain unchanged.
+
+The original SVG/PNG bytes and complete provider render contract are pinned by:
+
+```sh
+python3 -m unittest discover -s scripts -p test_provider_icons.py
+```
+
+Native `icons::tests` additionally cover provider tints, square bounds,
+physical-pixel sizing, texture-cache reuse and the no-mark/no-paint contract.
 
 ## Complete mapping
 
 | Native variant | Tabler name | Style | Meaning / substitution rationale |
 | --- | --- | --- | --- |
 | `Icon::Bell` | `bell` | outline | Direct semantic equivalent. |
-| `Icon::Terminal` | `terminal-2` | outline | Terminal shell; reused as the Opencode provider fallback because Tabler 3.49.0 has no Opencode brand glyph. |
+| `Icon::Terminal` | `terminal-2` | outline | Terminal shell. |
 | `Icon::Plus` | `plus` | outline | Direct semantic equivalent. |
 | `Icon::Close` | `x` | outline | Direct semantic equivalent. |
 | `Icon::ChevronLeft` | `chevron-left` | outline | Direct semantic equivalent. |
@@ -114,7 +127,6 @@ remain the caller's responsibility.
 | `Icon::Heart` | `heart` | outline | Direct semantic equivalent. |
 | `Icon::Rocket` | `rocket` | outline | Direct semantic equivalent. |
 | `Icon::Eyes` | `eye` | outline | GitHub eyes reaction: the official eye is the closest direct looking/watching metaphor; no two-eyes reaction glyph. |
-| `Icon::Planet` | `planet` | outline | Official ringed planet replaces the Neptune brand mark without modifying upstream paths. |
 | `Icon::GitHub` | `brand-github` | outline | Direct semantic equivalent. |
 | `Icon::ChevronUp` | `chevron-up` | outline | Direct semantic equivalent. |
 | `Icon::ArrowRight` | `arrow-right` | outline | Direct semantic equivalent. |
@@ -128,9 +140,6 @@ remain the caller's responsibility.
 | `Icon::CircleCheck` | `circle-check` | outline | Direct semantic equivalent. |
 | `Icon::Square` | `square` | outline | Direct semantic equivalent. |
 | `Icon::Checkbox` | `checkbox` | outline | Direct semantic equivalent. |
-| `Icon::Sparkles` | `sparkles` | outline | Claude provider fallback: no brand-claude or brand-anthropic glyph exists in pinned Tabler 3.49.0; retain Claude orange (#d97757). |
-| `Icon::BrandOpenAi` | `brand-openai` | outline | Official OpenAI brand identifies Codex; drawn in caller ink. |
-| `Icon::MathPi` | `math-pi` | outline | Official pi symbol identifies Pi; drawn in caller ink. |
 
 ## Reproducible generation
 
