@@ -374,30 +374,18 @@ pub fn window_controls(ui: &mut Ui, left_center: Pos2, p: Palette, actions: &mut
             painter.circle_stroke(center, 8.5, Stroke::new(1.5, theme::tint(p.accent, 0.8)));
         }
         if reveal > 0.0 {
-            let ink = Stroke::new(
-                1.2,
+            let (icon, side) = match index {
+                // Keep the ink inside the existing six-point lights.
+                0 => (Icon::Close, 10.3),
+                1 => (Icon::Minus, 10.8),
+                _ => (Icon::Plus, 10.8),
+            };
+            icons::paint(
+                painter,
+                Rect::from_center_size(center, Vec2::splat(side)),
+                icon,
                 theme::tint(theme::mix(color, Color32::BLACK, 0.62), reveal),
             );
-            match index {
-                0 => {
-                    for flip in [1.0, -1.0] {
-                        painter.line_segment(
-                            [
-                                center + vec2(-2.4, -2.4 * flip),
-                                center + vec2(2.4, 2.4 * flip),
-                            ],
-                            ink,
-                        );
-                    }
-                }
-                1 => {
-                    painter.line_segment([center - vec2(3.0, 0.0), center + vec2(3.0, 0.0)], ink);
-                }
-                _ => {
-                    painter.line_segment([center - vec2(3.0, 0.0), center + vec2(3.0, 0.0)], ink);
-                    painter.line_segment([center - vec2(0.0, 3.0), center + vec2(0.0, 3.0)], ink);
-                }
-            }
         }
         if response.clicked() {
             match index {
@@ -802,7 +790,12 @@ fn notification_bell(ui: &mut Ui, p: Palette, unread: bool, open: bool) -> bool 
         let painter = ui.painter();
         painter.circle_filled(centre, 5.0 * dot, p.chrome);
         painter.circle_filled(centre, 5.0 * dot, beneath);
-        painter.circle_filled(centre, 3.5 * dot, p.attention);
+        icons::paint(
+            painter,
+            Rect::from_center_size(centre, Vec2::splat(8.4 * dot)),
+            Icon::CircleFilled,
+            p.attention,
+        );
     }
     response.clicked()
 }
@@ -1015,7 +1008,15 @@ fn workspace_row(
     let name_left = if workspace.running {
         text_left
     } else {
-        painter.circle_filled(Pos2::new(text_left + 3.0, row.center().y - 7.5), 3.0, p.red);
+        icons::paint(
+            &painter,
+            Rect::from_center_size(
+                Pos2::new(text_left + 3.0, row.center().y - 7.5),
+                Vec2::splat(7.2),
+            ),
+            Icon::CircleFilled,
+            p.red,
+        );
         text_left + 11.0
     };
     let hint = Binding::workspace(position.0)
@@ -1134,7 +1135,15 @@ fn workspace_row(
             let named = galley_at(&painter, Pos2::new(left + 14.0, detail.y), name);
             // Work that is not committed yet marks the branch.
             if dirty {
-                painter.circle_filled(Pos2::new(named.right() + 6.0, detail.y), 2.5, p.yellow);
+                icons::paint(
+                    &painter,
+                    Rect::from_center_size(
+                        Pos2::new(named.right() + 6.0, detail.y),
+                        Vec2::splat(6.0),
+                    ),
+                    Icon::CircleFilled,
+                    p.yellow,
+                );
             }
         }
     }
@@ -1475,15 +1484,13 @@ fn group_row(
         );
     }
     let center = Pos2::new(row.left() + 12.0, row.center().y);
-    let rotation = egui::emath::Rot2::from_angle(openness * std::f32::consts::FRAC_PI_2);
-    painter.add(egui::Shape::line(
-        vec![
-            center + rotation * vec2(-2.0, -4.0),
-            center + rotation * vec2(2.0, 0.0),
-            center + rotation * vec2(-2.0, 4.0),
-        ],
-        Stroke::new(1.5, p.muted),
-    ));
+    icons::paint_rotated(
+        painter,
+        Rect::from_center_size(center, Vec2::splat(16.0)),
+        Icon::ChevronRight,
+        p.muted,
+        openness * std::f32::consts::FRAC_PI_2,
+    );
     icons::paint(
         painter,
         Rect::from_center_size(

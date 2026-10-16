@@ -299,9 +299,11 @@ function PlatformCard({
       <div className="px-3.5 pt-3.5 pb-3 text-[12.5px] leading-[1.5]">
         <p className="flex items-baseline gap-2 text-secondary">
           <span
-            className="size-[7px] shrink-0 translate-y-[-1px] rounded-full"
-            style={{ background: color }}
-          />
+            className="size-[7px] shrink-0 translate-y-[-1px]"
+            style={{ color }}
+          >
+            <Icon name="circleFilled" size={7} />
+          </span>
           {status}
         </p>
         <p className="mt-1.5 text-muted">{NOTES[system]}</p>

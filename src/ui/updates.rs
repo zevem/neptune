@@ -228,10 +228,7 @@ fn status_card(ui: &mut Ui, p: Palette, updates: &Updates) {
                             icons::paint(ui.painter(), icon, Icon::Check, p.green);
                         }
                         _ if updates.busy() => {
-                            egui::Spinner::new()
-                                .size(14.0)
-                                .color(p.secondary)
-                                .paint_at(ui, icon.shrink(1.0));
+                            super::helpers::spinner(ui, icon.shrink(1.0), p.secondary);
                         }
                         _ => icons::paint(ui.painter(), icon, Icon::Refresh, p.secondary),
                     }

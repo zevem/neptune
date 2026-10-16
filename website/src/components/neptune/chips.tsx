@@ -30,7 +30,7 @@ function PullChip({ pull }: { pull: Pull }) {
       {!merged && pull.checks === "passing" && <Icon name="check" size={10} className="text-ok" />}
       {!merged && pull.checks === "failing" && <Icon name="close" size={10} className="text-danger" />}
       {!merged && pull.checks === "pending" && (
-        <span className="mx-px size-[7.5px] rounded-full border-[1.5px] border-warn" />
+        <Icon name="circle" size={7.5} className="mx-px text-warn" />
       )}
       {!merged && pull.comments > 0 && (
         <span className="ml-0.5 flex items-center gap-[3px] text-attention">

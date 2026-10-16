@@ -194,7 +194,7 @@ export function execute(env: ShellEnv, pane: Pane) {
       });
       print(
         out(""),
-        row({ t: kind === "claude" ? "✻ " : ">_ ", c: kind === "claude" ? 3 : "muted" }, { t: AGENT_NAMES[kind], b: true }),
+        row({ icon: kind === "claude" ? "sparkles" : "brandOpenai", t: " ", c: kind === "claude" ? 3 : "muted" }, { t: AGENT_NAMES[kind], b: true }),
         out(""),
         out(`In Neptune, ${AGENT_NAMES[kind]} runs here: its tab carries its mark, its pull`),
         out("requests and files, and the Agents tab says when it waits for you."),

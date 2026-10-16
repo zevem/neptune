@@ -1,5 +1,6 @@
 "use client";
 
+import { Icon } from "../icons";
 import { Preferences } from "../neptune/preferences";
 import { usePrefs } from "../prefs";
 
@@ -33,18 +34,7 @@ function ConfigPane() {
     </div>
   );
   const chevron = (
-    <svg
-      viewBox="0 0 10 16"
-      className="inline-block h-[0.95em] w-[0.6em] align-[-0.1em]"
-      fill="none"
-      stroke="var(--ansi-2)"
-      strokeWidth="2.2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M2.5 3.5L7.5 8l-5 4.5" />
-    </svg>
+    <Icon name="chevronRight" size={14} className="inline-block size-[0.95em] align-[-0.1em] text-[var(--ansi-2)]" />
   );
   return (
     <div className="rounded-window bg-chrome p-1.5 shadow-window">

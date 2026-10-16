@@ -1796,11 +1796,12 @@ fn render_blocks(
                     Pos2::new(marker.left() + 6.0, marker.center().y),
                     vec2(11.0, 11.0),
                 );
-                ui.painter().rect_stroke(
-                    tick,
-                    3,
-                    Stroke::new(1.0, p.muted),
-                    egui::StrokeKind::Inside,
+                // The official square's outer ink covers 20 of its 24 cells.
+                icons::paint(
+                    ui.painter(),
+                    Rect::from_center_size(tick.center(), vec2(13.2, 13.2)),
+                    Icon::Square,
+                    p.muted,
                 );
                 if *done {
                     icons::paint(ui.painter(), tick.shrink(1.5), Icon::Check, p.secondary);
@@ -2987,7 +2988,7 @@ mod tests {
 
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
-        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        crate::theme::fonts(&ctx);
         theme::apply(&ctx, &crate::config::Config::default());
         ctx
     }
@@ -3037,6 +3038,36 @@ mod tests {
             collect(&clipped.shape, &mut found);
         }
         found
+    }
+
+    #[test]
+    fn task_markers_keep_their_two_tints_and_leave_list_content_alone() {
+        let ctx = context();
+        let text = "- [ ] open\n- [x] done\n- bullet\n1. numbered";
+        frame(&ctx, text, 300.0, Vec::new());
+        let (_, output) = frame(&ctx, text, 300.0, Vec::new());
+        let p = Palette::for_config(&crate::config::Config::default());
+        let icons: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text)
+                    if text.galley.job.sections[0].format.font_id.family
+                        == egui::FontFamily::Name("Tabler Outline".into()) =>
+                {
+                    Some(text.fallback_color)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(icons, [p.muted, p.muted, p.secondary]);
+        let written = drawn(&output);
+        for content in ["open", "done", "bullet", "1.", "numbered"] {
+            assert!(written.iter().any(|(text, ..)| text == content));
+        }
+        assert!(output.shapes.iter().any(|clipped| {
+            matches!(&clipped.shape, egui::Shape::Circle(circle) if circle.radius == 1.75)
+        }));
     }
 
     #[test]

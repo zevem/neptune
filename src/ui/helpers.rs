@@ -2,6 +2,27 @@
 pub use super::controls::*;
 use crate::runtime::pull_requests::{Checks, Lookup, Preview, State, unresolved_label};
 use eframe::egui::{self, Rect, Sense, Vec2};
+
+/// A Tabler loading mark with the same ink bounds and rotation speed as the
+/// previous egui spinner. Off-screen marks do not keep the window repainting.
+pub fn spinner(ui: &egui::Ui, rect: Rect, color: egui::Color32) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.request_repaint();
+    let angle = (ui.input(|input| input.time) * std::f64::consts::TAU) as f32;
+    // egui's old radius was side / 2 - 2 with a three-point stroke; Tabler's
+    // 24-point canvas has a 20-point ink diameter. Keep the visible diameter.
+    let side = (rect.width().min(rect.height()) - 1.0).max(0.0) * 24.0 / 20.0;
+    crate::icons::paint_rotated(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(side)),
+        crate::icons::Icon::Loader2,
+        color,
+        angle,
+    );
+}
+
 pub fn compact_path(path: &std::path::Path) -> String {
     let text = path.display().to_string();
     if let Some(home) = directories::BaseDirs::new()
@@ -396,9 +417,12 @@ impl<'a> PullRequestChips<'a> {
                 Checks::None => {}
                 Checks::Passing => icons::paint(painter, mark, Icon::Check, p.green),
                 Checks::Failing => icons::paint(painter, mark, Icon::Close, p.red),
-                Checks::Pending => {
-                    painter.circle_stroke(mark.center(), 3.25, egui::Stroke::new(1.5, p.yellow));
-                }
+                Checks::Pending => icons::paint(
+                    painter,
+                    Rect::from_center_size(mark.center(), Vec2::splat(8.0 * 24.0 / 20.0)),
+                    Icon::Circle,
+                    p.yellow,
+                ),
             }
             if chip.checks != Checks::None {
                 x += 14.0;
@@ -684,6 +708,57 @@ impl<'a> SpawnedChip<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_marks_keep_the_previous_ink_bounds_and_angular_speed() {
+        let ctx = egui::Context::default();
+        crate::theme::fonts(&ctx);
+        let ink = egui::Color32::LIGHT_GRAY;
+        let centre = egui::pos2(64.0, 64.0);
+        for time in [0.0, 0.25, 0.5] {
+            let angle = (time * std::f64::consts::TAU) as f32;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| {
+                    // The previous 11-point spinner had ten points of ink.
+                    spinner(ui, Rect::from_center_size(centre, Vec2::splat(11.0)), ink);
+                    crate::icons::paint_rotated(
+                        ui.painter(),
+                        Rect::from_center_size(centre, Vec2::splat(12.0)),
+                        crate::icons::Icon::Loader2,
+                        ink,
+                        angle,
+                    );
+                    spinner(
+                        ui,
+                        Rect::from_center_size(egui::pos2(-64.0, -64.0), Vec2::splat(11.0)),
+                        ink,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            let glyphs: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(glyphs.len(), 2, "an off-screen mark paints nothing");
+            assert_eq!(glyphs[0].galley.text(), glyphs[1].galley.text());
+            assert_eq!(glyphs[0].fallback_color, ink);
+            assert!((glyphs[0].angle - angle).abs() < 0.001);
+            assert_eq!(
+                glyphs[0].visual_bounding_rect(),
+                glyphs[1].visual_bounding_rect(),
+            );
+        }
+    }
+
     #[test]
     fn unicode_labels_truncate_safely() {
         assert_eq!(ellipsize("日本語の端末", 4), "日本語…");
@@ -695,7 +770,7 @@ mod tests {
     fn pull_request_chips_give_up_their_marks_before_their_numbers() {
         use crate::runtime::pull_requests::Status;
         let ctx = egui::Context::default();
-        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        crate::theme::fonts(&ctx);
         let p = crate::theme::Palette::new(crate::config::Theme::Graphite);
         let linked = |number: u64, state, checks, unresolved| LinkedPullRequest {
             link: neptune_model::PullRequest::parse(&format!(
@@ -775,7 +850,7 @@ mod tests {
     fn a_pressed_number_opens_its_tab_and_the_browser_when_pressed_as_a_link_is() {
         use eframe::egui::{Event, Modifiers, PointerButton, RawInput, pos2};
         let ctx = egui::Context::default();
-        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        crate::theme::fonts(&ctx);
         let p = crate::theme::Palette::new(crate::config::Theme::Graphite);
         let links = [LinkedPullRequest {
             link: neptune_model::PullRequest::parse("https://github.com/zevem/neptune/pull/83")

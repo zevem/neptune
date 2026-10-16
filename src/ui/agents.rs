@@ -4,12 +4,11 @@ use super::Action;
 use super::helpers::{elided, galley_at, menu_item, menu_layout};
 use crate::{
     agent_activity::{Activity, Attention},
-    icons::Icon,
+    icons::{self, Icon},
     theme::{self, Palette},
 };
 use eframe::egui::{
-    self, Align2, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, WidgetInfo, WidgetType,
-    vec2,
+    self, Align2, CursorIcon, Pos2, Rect, Sense, Ui, UiBuilder, WidgetInfo, WidgetType, vec2,
 };
 use neptune_model::{AgentKind, PaneId};
 use std::time::Duration;
@@ -146,14 +145,29 @@ fn group(activity: Activity) -> (u8, &'static str) {
 fn mark(painter: &egui::Painter, centre: Pos2, p: Palette, activity: Activity) {
     match activity {
         Activity::NeedsInput(_) => {
-            painter.circle_filled(centre, 4.0, p.attention);
+            icons::paint(
+                painter,
+                Rect::from_center_size(centre, vec2(9.6, 9.6)),
+                Icon::CircleFilled,
+                p.attention,
+            );
         }
         Activity::Working => {
             painter.circle_filled(centre, 4.0, theme::tint(p.green, 0.28));
-            painter.circle_filled(centre, 2.2, p.green);
+            icons::paint(
+                painter,
+                Rect::from_center_size(centre, vec2(5.28, 5.28)),
+                Icon::CircleFilled,
+                p.green,
+            );
         }
         Activity::Idle => {
-            painter.circle_stroke(centre, 3.5, Stroke::new(1.5, p.muted));
+            icons::paint(
+                painter,
+                Rect::from_center_size(centre, vec2(10.2, 10.2)),
+                Icon::Circle,
+                p.muted,
+            );
         }
     }
 }
@@ -322,6 +336,66 @@ pub fn show(ui: &mut Ui, rect: Rect, p: Palette, view: &View, actions: &mut Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_marks_use_tabler_glyphs_without_replacing_the_working_halo() {
+        let ctx = egui::Context::default();
+        crate::theme::fonts(&ctx);
+        let p = Palette::new(crate::config::Theme::Graphite);
+        let centre = Pos2::new(64.0, 64.0);
+        for (activity, icon, side, ink) in [
+            (
+                Activity::NeedsInput(Attention::Input),
+                Icon::CircleFilled,
+                9.6,
+                p.attention,
+            ),
+            (Activity::Working, Icon::CircleFilled, 5.28, p.green),
+            (Activity::Idle, Icon::Circle, 10.2, p.muted),
+        ] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                mark(ui.painter(), centre, p, activity);
+                icons::paint(
+                    ui.painter(),
+                    Rect::from_center_size(centre, vec2(side, side)),
+                    icon,
+                    ink,
+                );
+            });
+            output.textures_delta.clear();
+            let glyphs: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(glyphs.len(), 2);
+            assert_eq!(glyphs[0].galley.text(), glyphs[1].galley.text());
+            assert_eq!(glyphs[0].fallback_color, ink);
+            assert_eq!(
+                glyphs[0].visual_bounding_rect(),
+                glyphs[1].visual_bounding_rect(),
+            );
+            let halos: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Circle(circle) => Some(circle),
+                    _ => None,
+                })
+                .collect();
+            if activity == Activity::Working {
+                assert_eq!(halos.len(), 1);
+                assert_eq!(halos[0].center, centre);
+                assert_eq!(halos[0].radius, 4.0);
+                assert_eq!(halos[0].fill, theme::tint(p.green, 0.28));
+            } else {
+                assert!(halos.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn ages_are_short_and_never_tick_in_seconds() {

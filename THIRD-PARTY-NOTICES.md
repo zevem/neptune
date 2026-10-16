@@ -36,12 +36,19 @@ The iTerm2-Color-Schemes collection supplies Neptune's offline terminal palettes
 [MIT license](assets/themes/LICENSE), and complete [author credits](assets/themes/CREDITS.md)
 are retained in `assets/themes/` and copied into release archives.
 
-## Agent marks
+## Tabler icons
 
-The marks of Claude Code, Codex, OpenCode and pi shown on terminal tabs are
-trademarks of their respective owners, used only to identify the agent a
-terminal runs. [Their sources](assets/icons/providers/README.md) are recorded
-with the artwork. Neptune's license does not extend to them.
+Desktop controls, provider indicators, application icons and website icons use
+[Tabler Icons 3.49.0](https://github.com/tabler/tabler-icons), copyright Paweł
+Kuna, under the [MIT license](assets/icons/tabler/LICENSE.txt). The pinned
+[asset manifest and regeneration notes](assets/icons/tabler/README.md) retain
+source URLs, hashes and mappings. Native release archives include the MIT
+notice in `icons/Tabler-LICENSE.txt`. The website uses the same pinned version
+of `@tabler/icons-react`.
+
+The OpenAI and GitHub brand glyphs identify their respective services; those
+brands remain trademarks of their owners. Other agent indicators are generic
+Tabler glyphs rather than provider artwork.
 
 ## Bundled fonts and dependencies
 

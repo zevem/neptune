@@ -165,31 +165,31 @@ const LOG_LATER: Line[] = [
 
 
 // What the agents print, in the manner of their own interfaces.
-const said = (text: string): Line => row({ t: "● ", c: "fg" }, text);
-const tool = (name: string, args: string): Line => row({ t: "● ", c: 2 }, { t: name, b: true }, `(${args})`);
-const done = (text: string): Line => row({ t: "  ⎿ ", c: "muted" }, { t: text, c: "muted" });
+const said = (text: string): Line => row({ icon: "circleFilled", t: " ", c: "fg" }, text);
+const tool = (name: string, args: string): Line => row({ icon: "circleFilled", t: " ", c: 2 }, { t: name, b: true }, `(${args})`);
+const done = (text: string): Line => row("  ", { icon: "cornerDownRight", t: " ", c: "muted" }, { t: text, c: "muted" });
 
 const CLAUDE_BANNER: Line[] = [
   out(""),
-  row({ t: "✻ ", c: 3 }, { t: "Claude Code", b: true }),
+  row({ icon: "sparkles", t: " ", c: 3 }, { t: "Claude Code", b: true }),
   row({ t: "  ~/code/neptune", c: "muted" }),
   out(""),
 ];
 const ASK = "Add a --json flag to neptune-inspect. Ask Codex for the tests.";
 
 const CODEX_TASK: Line[] = [
-  row({ t: ">_ ", c: "muted" }, { t: "OpenAI Codex", b: true }),
+  row({ icon: "brandOpenai", t: " ", c: "muted" }, { t: "OpenAI Codex", b: true }),
   row({ t: "   ~/code/neptune", c: "muted" }),
   out(""),
-  row({ t: "› ", c: "muted" }, "Write tests for neptune-inspect --json"),
+  row({ icon: "chevronRight", t: " ", c: "muted" }, "Write tests for neptune-inspect --json"),
   out(""),
-  row({ t: "• ", c: 6 }, "Added tests/inspect_json.rs with 3 cases"),
+  row({ icon: "circleFilled", t: " ", c: 6 }, "Added tests/inspect_json.rs with 3 cases"),
 ];
 const CODEX_ASKS: Line[] = [
   out(""),
   row({ t: "Allow command?", b: true }),
   row({ t: "  $ cargo test -p neptune-terminal --test inspect_json", c: 6 }),
-  row({ t: "  › 1. Yes, run it   2. No", c: "muted" }),
+  row("  ", { icon: "chevronRight", t: " 1. Yes, run it   2. No", c: "muted" }),
 ];
 const CODEX_TESTS: Line[] = [
   out(""),
@@ -197,7 +197,7 @@ const CODEX_TESTS: Line[] = [
   out("..."),
   row("test result: ", { t: "ok", c: 2 }, ". 3 passed; 0 failed"),
   out(""),
-  row({ t: "• ", c: 6 }, "All three pass. Handing back to Claude Code."),
+  row({ icon: "circleFilled", t: " ", c: 6 }, "All three pass. Handing back to Claude Code."),
 ];
 
 const GOAL = "Refresh the website's hero demo with the new panel and check its copy.";
@@ -439,7 +439,7 @@ export const CHAPTERS: Chapter[] = [
       // Its row opens its terminal as a tab.
       s.d({ type: "openAgent", pane: tests });
       await s.wait(1300);
-      s.d({ type: "amend", pane: tests, line: row({ t: "  ✔ Yes, run it", c: 2 }) });
+      s.d({ type: "amend", pane: tests, line: row("  ", { icon: "check", t: " Yes, run it", c: 2 }) });
       s.d({ type: "agent", pane: tests, patch: { activity: "working" } });
       await s.wait(500);
       s.d({ type: "print", pane: tests, lines: CODEX_TESTS });

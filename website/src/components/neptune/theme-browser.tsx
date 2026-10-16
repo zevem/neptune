@@ -32,9 +32,11 @@ export function ThemePreview({ look, className = "" }: { look: Look; className?:
       {[0, 1, 2].map((index) => (
         <span
           key={index}
-          className="absolute top-[6.5px] size-1 rounded-full"
-          style={{ left: 8 + index * 7, background: hex(mix(look.chrome, look.fg, 0.26)) }}
-        />
+          className="absolute top-[6.5px] size-1"
+          style={{ left: 8 + index * 7, color: hex(mix(look.chrome, look.fg, 0.26)) }}
+        >
+          <Icon name="circleFilled" size={4} />
+        </span>
       ))}
       <span
         className="absolute top-[17px] right-1 bottom-1 left-1 overflow-hidden rounded-[5px] pt-1.5 pl-[9px] font-mono text-[9.5px] leading-[14px] whitespace-pre"

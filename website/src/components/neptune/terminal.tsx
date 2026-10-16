@@ -1,6 +1,7 @@
 "use client";
 
 import { memo, useEffect, useLayoutEffect, useRef } from "react";
+import { Icon } from "../icons";
 import type { Line, Pane, Span, Tone } from "./model";
 
 const useIsomorphicLayoutEffect =
@@ -28,30 +29,20 @@ function Spans({ spans, search }: { spans: Span[]; search: string }) {
       key={index}
       style={{ color: tone(span.c), fontWeight: span.b ? 700 : undefined }}
     >
+      {span.icon && <Icon name={span.icon} size={14} className="inline-block align-[-0.15em]" />}
       {highlighted(span.t, search)}
     </span>
   ));
 }
 
-/** The prompt mark, drawn so it sits on the cell grid in any font. */
+/** The official prompt glyph sits in one terminal cell. */
 function Chevron({ ok }: { ok: boolean }) {
   return (
     <span
       className="inline-block w-[1ch] text-center"
       style={{ color: `var(--ansi-${ok ? 2 : 1})` }}
     >
-      <svg
-        viewBox="0 0 10 16"
-        className="inline-block h-[0.95em] w-[0.6em] align-[-0.1em]"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        aria-hidden="true"
-      >
-        <path d="M2.5 3.5L7.5 8l-5 4.5" />
-      </svg>
+      <Icon name="chevronRight" size={14} className="inline-block size-[0.95em] align-[-0.1em]" />
       <span className="sr-only">$</span>
     </span>
   );

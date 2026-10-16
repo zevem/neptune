@@ -3,6 +3,8 @@
 // workspace owns a binary layout whose places each hold terminals as tabs, and
 // every change is one action.
 
+import type { IconName } from "../icons";
+
 export type Axis = "vertical" | "horizontal";
 
 export type Layout =
@@ -19,7 +21,7 @@ export type Layout =
 
 /** Terminal colours: a palette token or an ANSI index. */
 export type Tone = "fg" | "secondary" | "muted" | number;
-export type Span = { t: string; c?: Tone; b?: boolean };
+export type Span = { t: string; c?: Tone; b?: boolean; icon?: IconName };
 
 export type Line =
   /** The prompt's context line: where the shell is. */

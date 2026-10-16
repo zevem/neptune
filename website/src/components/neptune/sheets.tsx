@@ -402,7 +402,7 @@ export function Notifications({ state, dispatch }: { state: State; dispatch: Dis
                   {initial(workspace?.name ?? "")}
                   {alert.unread && (
                     // The bell's dot, on the workspace that rang it.
-                    <span className="absolute -top-[2.5px] -right-[2.5px] size-[7px] rounded-full bg-attention ring-[1.5px] ring-elevated" />
+                    <Icon name="circleFilled" size={7} className="absolute -top-[2.5px] -right-[2.5px] rounded-full text-attention ring-[1.5px] ring-elevated" />
                   )}
                 </span>
                 {/* Dismissing takes the time's place while the row is pointed at. */}
