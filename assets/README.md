@@ -16,6 +16,9 @@ The supplied originals have distinct uses:
   without adding padding.
 - [`icons/providers/`](icons/providers/README.md) contains the marks of the CLI
   agents a terminal tab can show.
+- [`icons/tabler/`](icons/tabler/README.md) contains the pinned Tabler 3.49.0
+  native UI font subsets, official SVGs, mapping and MIT notice. Provider marks
+  and supplied Neptune branding are not part of that migration.
 - [`fonts/`](fonts/README.md) contains the bundled typefaces and their licenses.
 
 Regenerate the icons and website copies from the repository root:

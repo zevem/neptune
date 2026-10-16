@@ -31,7 +31,16 @@ so it follows the app's own sources:
 
 - `src/app/globals.css` carries the palette, radii and motion of
   [`src/theme.rs`](../src/theme.rs) and [`docs/design.md`](../docs/design.md).
-- `src/components/icons.tsx` is the icon set of [`src/icons.rs`](../src/icons.rs).
+- `src/components/icons.tsx` maps the shared icon names to official
+  `@tabler/icons-react` **3.49.0** components, matching the native Tabler subset
+  in [`src/icons.rs`](../src/icons.rs). Explicit imports keep the bundle limited
+  to used glyphs; icons retain the upstream 24-point grid, 2-point rounded
+  strokes, `currentColor`, caller sizes and theme/hover classes. Playback uses
+  the official filled variants; GitHub uses `brand-github`. AI provider marks
+  retain their original filled Claude and Codex artwork, not Tabler substitutes,
+  and inherit the caller's color. Their CLI banners retain the original `✻`
+  and `>_` terminal text and colors. These provider trademarks belong to their
+  owners and are not covered by Neptune's license.
 - `src/components/neptune/` mirrors the chrome, panes, palette and sheets under
   [`src/ui/`](../src/ui), and a small model of
   [`crates/neptune-model`](../crates/neptune-model).

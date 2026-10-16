@@ -621,9 +621,12 @@ fn outcome_mark(painter: &egui::Painter, centre: Pos2, p: Palette, outcome: Outc
         Outcome::Cancelled => icons::paint(painter, glyph, Icon::Close, p.muted),
         Outcome::Skipped => icons::paint(painter, glyph, Icon::Minus, p.muted),
         Outcome::Awaiting => icons::paint(painter, glyph, Icon::Warning, p.attention),
-        Outcome::Running => {
-            painter.circle_stroke(centre, 3.5, Stroke::new(1.5, p.yellow));
-        }
+        Outcome::Running => icons::paint(
+            painter,
+            Rect::from_center_size(centre, Vec2::splat(8.5 * 24.0 / 20.0)),
+            Icon::Circle,
+            p.yellow,
+        ),
     }
 }
 
@@ -722,33 +725,68 @@ fn button_with(
 
 /// Words that are pressed, such as the order of the comments.
 fn text_button(ui: &mut Ui, p: Palette, right_center: Pos2, label: &str, name: &str) -> Response {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), theme::regular(11.5), p.secondary);
+    text_control(ui, p, right_center, label, name, None)
+}
+
+/// A word button, optionally exposing a checked state without changing its name.
+fn text_control(
+    ui: &mut Ui,
+    p: Palette,
+    right_center: Pos2,
+    label: &str,
+    name: &str,
+    selected: Option<bool>,
+) -> Response {
+    let painter = ui.painter();
+    let font = theme::regular(11.5);
+    let galley = painter.layout_no_wrap(label.to_owned(), font.clone(), p.secondary);
+    let marked = selected == Some(true);
+    // Measure, but never paint, the former suffix so host text fallbacks do
+    // not change the existing hit target when its check becomes an icon.
+    let width = if marked {
+        painter
+            .layout_no_wrap(format!("{label} ✓"), font, p.secondary)
+            .size()
+            .x
+    } else {
+        galley.size().x
+    };
+    let mark_width = width - galley.size().x;
     let rect = Rect::from_min_max(
-        Pos2::new(
-            right_center.x - galley.size().x - 12.0,
-            right_center.y - 10.0,
-        ),
+        Pos2::new(right_center.x - width - 12.0, right_center.y - 10.0),
         Pos2::new(right_center.x, right_center.y + 10.0),
     );
     let response = ui
         .interact(rect, Id::new(("pull-request-words", name)), Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, name));
+    response.widget_info(|| match selected {
+        Some(selected) => WidgetInfo::selected(WidgetType::Checkbox, true, selected, name),
+        None => WidgetInfo::labeled(WidgetType::Button, true, name),
+    });
     if response.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 6, p.pressed);
+        painter.rect_filled(rect, 6, p.pressed);
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, 6, p.hover);
+        painter.rect_filled(rect, 6, p.hover);
     }
     if response.has_focus() {
-        focus_ring(ui.painter(), rect, 6, p);
+        focus_ring(painter, rect, 6, p);
     }
-    galley_at(
-        ui.painter(),
+    let named = galley_at(
+        painter,
         Pos2::new(rect.left() + 6.0, rect.center().y),
         galley,
     );
+    if marked {
+        icons::paint(
+            painter,
+            Rect::from_center_size(
+                Pos2::new(named.right() + mark_width * 0.5, rect.center().y),
+                Vec2::splat(11.5),
+            ),
+            Icon::Check,
+            p.secondary,
+        );
+    }
     response
 }
 
@@ -1589,12 +1627,13 @@ fn standing_card(
         Tone::Merged => icons::paint(painter, glyph, Icon::Merged, ink),
         Tone::Good => icons::paint(painter, glyph, Icon::Check, ink),
         Tone::Bad => icons::paint(painter, glyph, Icon::Warning, ink),
-        Tone::Running => {
-            painter.circle_stroke(mark, 3.5, Stroke::new(1.5, ink));
-        }
-        Tone::Quiet => {
-            painter.circle_stroke(mark, 3.5, Stroke::new(1.5, p.muted));
-        }
+        Tone::Running | Tone::Quiet => icons::paint(
+            painter,
+            // Tabler's 20/24 ink span keeps the former 8.5-point ring.
+            Rect::from_center_size(mark, Vec2::splat(8.5 * 24.0 / 20.0)),
+            Icon::Circle,
+            if tone == Tone::Quiet { p.muted } else { ink },
+        ),
     }
     let line = elided(
         painter,
@@ -1702,7 +1741,11 @@ fn branches(ui: &mut Ui, p: Palette, detail: &Detail, events: &mut Vec<Event>) {
     }
     let left = rect.left() + 6.0;
     let room = (right - 4.0 - left).max(0.0);
-    let arrow = painter.layout_no_wrap(" ← ".into(), font.clone(), p.muted);
+    // Keep the three measured monospace cells, including the old spacing.
+    let arrow_width = painter
+        .layout_no_wrap("   ".into(), font.clone(), p.muted)
+        .size()
+        .x;
     let base = elided(
         &painter,
         &detail.base,
@@ -1717,10 +1760,14 @@ fn branches(ui: &mut Ui, p: Palette, detail: &Detail, events: &mut Vec<Event>) {
         if said { "Copied" } else { &detail.head },
         font,
         p.fg,
-        (room - base.size().x - arrow.size().x - 12.0).max(0.0),
+        (room - base.size().x - arrow_width - 12.0).max(0.0),
     );
     let based = galley_at(&painter, Pos2::new(left, middle), base);
-    let arrowed = galley_at(&painter, Pos2::new(based.right(), middle), arrow);
+    let arrowed = Rect::from_center_size(
+        Pos2::new(based.right() + arrow_width * 0.5, middle),
+        vec2(arrow_width, 11.0),
+    );
+    icons::paint(&painter, arrowed, Icon::ArrowLeft, p.muted);
     let chip = Rect::from_min_size(
         Pos2::new(arrowed.right(), middle - 10.0),
         vec2(head.size().x + 12.0, 20.0),
@@ -1862,9 +1909,12 @@ fn chips(
                 Verdict::ChangesRequested => icons::paint(&painter, glyph, Icon::Close, p.red),
                 Verdict::Commented => icons::paint(&painter, glyph, Icon::Comment, p.secondary),
                 Verdict::Dismissed => icons::paint(&painter, glyph, Icon::Minus, p.muted),
-                Verdict::Awaited => {
-                    painter.circle_stroke(centre, 3.0, Stroke::new(1.5, p.muted));
-                }
+                Verdict::Awaited => icons::paint(
+                    &painter,
+                    Rect::from_center_size(centre, Vec2::splat(7.5 * 24.0 / 20.0)),
+                    Icon::Circle,
+                    p.muted,
+                ),
             }
         }
         let response = ui.interact(
@@ -3317,13 +3367,13 @@ fn code(
     // The file whose diff is shown is marked as viewed from here.
     if let Some((file, _)) = diff.filter(|_| scoped.is_none() && detail.in_review()) {
         let viewed = detail.viewed.contains(&file.path);
-        let label = if viewed { "Viewed ✓" } else { "Viewed" };
-        let response = text_button(
+        let response = text_control(
             ui,
             p,
             Pos2::new(right, line.center().y),
-            label,
+            "Viewed",
             "Mark this file as viewed",
+            Some(viewed),
         );
         right = response.rect.left() - 4.0;
         if response
@@ -4283,6 +4333,86 @@ mod tests {
             outcome,
             seconds: None,
             url: String::new(),
+        }
+    }
+
+    #[test]
+    fn viewed_keeps_its_target_identity_and_exposes_a_checked_state() {
+        let ctx = egui::Context::default();
+        crate::theme::fonts(&ctx);
+        let run = |viewed, events| {
+            let mut response = None;
+            let mut expected_width = 0.0;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 100.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let p = Palette::for_config(&crate::config::Config::default());
+                    expected_width = ui
+                        .painter()
+                        .layout_no_wrap(
+                            if viewed { "Viewed ✓" } else { "Viewed" }.into(),
+                            theme::regular(11.5),
+                            p.secondary,
+                        )
+                        .size()
+                        .x
+                        + 12.0;
+                    response = Some(text_control(
+                        ui,
+                        p,
+                        Pos2::new(200.0, 30.0),
+                        "Viewed",
+                        "Mark this file as viewed",
+                        Some(viewed),
+                    ));
+                },
+            );
+            let response = response.unwrap();
+            assert!((response.rect.width() - expected_width).abs() < 0.001);
+            assert_eq!(response.rect.height(), 20.0);
+            assert_eq!(
+                response.id,
+                Id::new(("pull-request-words", "Mark this file as viewed"))
+            );
+            output.textures_delta.clear();
+            (response, output)
+        };
+        run(false, Vec::new());
+        for viewed in [false, true] {
+            let (response, output) = run(viewed, Vec::new());
+            let mut icons = 0;
+            for clipped in &output.shapes {
+                if let egui::Shape::Text(text) = &clipped.shape {
+                    let family = &text.galley.job.sections[0].format.font_id.family;
+                    if *family == egui::FontFamily::Name("Tabler Outline".into()) {
+                        icons += 1;
+                    } else {
+                        assert_eq!(text.galley.text(), "Viewed");
+                    }
+                }
+            }
+            assert_eq!(icons, usize::from(viewed));
+            let pos = response.rect.center();
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            run(viewed, vec![egui::Event::PointerMoved(pos)]);
+            run(viewed, vec![press(true)]);
+            let (response, output) = run(viewed, vec![press(false)]);
+            assert!(response.clicked());
+            assert!(output.platform_output.events.iter().any(|event| {
+                matches!(event, egui::output::OutputEvent::Clicked(info)
+                    if info.typ == WidgetType::Checkbox
+                        && info.label.as_deref() == Some("Mark this file as viewed")
+                        && info.selected == Some(viewed))
+            }));
         }
     }
 

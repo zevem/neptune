@@ -96,9 +96,11 @@ export function Install({ intro }: { intro?: React.ReactNode }) {
           {PLATFORMS.map(([name, status, color]) => (
             <li key={name} className="flex items-baseline gap-3 text-[13.5px]">
               <span
-                className="size-[7px] shrink-0 translate-y-[-1px] rounded-full"
-                style={{ background: color }}
-              />
+                className="size-[7px] shrink-0 translate-y-[-1px]"
+                style={{ color }}
+              >
+                <Icon name="circleFilled" size={7} />
+              </span>
               <span className="w-[68px] shrink-0 font-medium text-fg">{name}</span>
               <span className="text-secondary">{status}</span>
             </li>

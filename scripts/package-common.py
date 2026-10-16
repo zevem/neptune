@@ -62,12 +62,18 @@ def notices(destination):
     fonts.mkdir()
     for path in (ROOT / "assets/fonts").glob("*LICENSE*"):
         shutil.copy2(path, fonts / path.name)
+    icons = destination / "icons"
+    icons.mkdir()
+    shutil.copy2(ROOT / "assets/icons/tabler/LICENSE.txt", icons / "Tabler-LICENSE.txt")
     themes = destination / "themes"
     themes.mkdir()
     for filename in ("LICENSE", "CREDITS.md", "README.md", "source.json"):
         shutil.copy2(ROOT / "assets/themes" / filename, themes / filename)
     metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1"], cwd=ROOT))
-    output = ["Bundled iTerm2-Color-Schemes: see themes/ for license, authors and provenance.\n"]
+    output = [
+        "Bundled Tabler Icons 3.49.0: see icons/Tabler-LICENSE.txt for the MIT notice.\n",
+        "Bundled iTerm2-Color-Schemes: see themes/ for license, authors and provenance.\n",
+    ]
     for package in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"])):
         output.append(f"{package['name']} {package['version']}\nLicense: {package.get('license') or 'see license file'}\n")
         root = Path(package["manifest_path"]).parent

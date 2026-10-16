@@ -39,16 +39,14 @@ const age = (minutes: number) =>
 /** Filled while an agent wants a person, a ring while it works, faint at rest. */
 function Mark({ activity }: { activity: Activity }) {
   if (activity === "permission" || activity === "question") {
-    return <span className="size-2 shrink-0 rounded-full bg-attention" />;
+    return <Icon name="circleFilled" size={8} className="text-attention" />;
   }
   if (activity === "working") {
     return (
-      <span className="grid size-2 shrink-0 place-items-center rounded-full bg-[color-mix(in_srgb,var(--green)_28%,transparent)]">
-        <span className="size-[4.4px] rounded-full bg-ok" />
-      </span>
+      <Icon name="circleDot" size={8} className="rounded-full bg-[color-mix(in_srgb,var(--green)_28%,transparent)] text-ok" />
     );
   }
-  return <span className="size-[7px] shrink-0 rounded-full border-[1.5px] border-muted" />;
+  return <Icon name="circle" size={7} className="text-muted" />;
 }
 
 function Note({ children }: { children: React.ReactNode }) {

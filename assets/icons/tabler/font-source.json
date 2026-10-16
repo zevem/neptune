@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "package": "@tabler/icons-webfont",
+  "version": "3.49.0",
+  "revision": "a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d",
+  "archive": {
+    "url": "https://registry.npmjs.org/@tabler/icons-webfont/-/icons-webfont-3.49.0.tgz",
+    "sha256": "48c69c65a5f9013d482a17cab8899a09dcaec50750d1ac7324eb63a061fffb82"
+  },
+  "generator": {
+    "file": "generate.py",
+    "fonttools_version": "4.60.1"
+  },
+  "viewbox": [
+    0,
+    0,
+    24,
+    24
+  ],
+  "bearing_policy": "Recalculate bounds and set left side bearings to contour xMin; preserve upstream coordinates and 1000-unit advance.",
+  "fonts": {
+    "outline": {
+      "source_file": "dist/fonts/tabler-icons.ttf",
+      "source_sha256": "d291676dc4c28b386552753bf16cf2bef0e93e5543f8e0b5c5d72c0da41ae1bc",
+      "source_bytes": 1827912,
+      "file": "outline.ttf",
+      "sha256": "a2cdfb7ac499ed249caeb44b5d87beca390743b77645f63a75c85c6ab09efda6",
+      "bytes": 19900,
+      "glyph_count": 75,
+      "units_per_em": 1000,
+      "ascent": 900,
+      "descent": -100,
+      "line_gap": 0
+    },
+    "filled": {
+      "source_file": "dist/fonts/tabler-icons-filled.ttf",
+      "source_sha256": "08304212f3f43271ee700156044a298a081ad2a24b30e28b4f3346dd2fe7ecf9",
+      "source_bytes": 234172,
+      "file": "filled.ttf",
+      "sha256": "c74fe8bb278092db962ba427ae9db5193cb15c2c919fd04a96151063ed2d0e24",
+      "bytes": 1360,
+      "glyph_count": 4,
+      "units_per_em": 1000,
+      "ascent": 900,
+      "descent": -100,
+      "line_gap": 0
+    }
+  }
+}

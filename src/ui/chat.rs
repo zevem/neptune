@@ -1433,12 +1433,27 @@ pub fn send_button_named(
 /// The dot that leads a row of the roster.
 pub fn mark(painter: &egui::Painter, centre: Pos2, p: Palette, waits: bool, works: bool) {
     if waits {
-        painter.circle_filled(centre, 4.0, p.attention);
+        icons::paint(
+            painter,
+            Rect::from_center_size(centre, Vec2::splat(9.6)),
+            Icon::CircleFilled,
+            p.attention,
+        );
     } else if works {
         painter.circle_filled(centre, 4.0, theme::tint(p.green, 0.28));
-        painter.circle_filled(centre, 2.2, p.green);
+        icons::paint(
+            painter,
+            Rect::from_center_size(centre, Vec2::splat(5.28)),
+            Icon::CircleFilled,
+            p.green,
+        );
     } else {
-        painter.circle_stroke(centre, 3.5, Stroke::new(1.5, p.muted));
+        icons::paint(
+            painter,
+            Rect::from_center_size(centre, Vec2::splat(10.2)),
+            Icon::Circle,
+            p.muted,
+        );
     }
 }
 
@@ -1452,7 +1467,7 @@ mod tests {
 
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
-        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        crate::theme::fonts(&ctx);
         theme::apply(&ctx, &crate::config::Config::default());
         ctx
     }

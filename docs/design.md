@@ -621,11 +621,16 @@ end of a range where the value stays. It appears at once, takes no input, holds
 for 1.2 s and fades over 160 ms; the window sleeps through the hold. Labels
 use sentence case.
 
-Icons are drawn natively on a 24-point grid with a 1.5-point stroke and rounded
-ends, matching regular-weight text. Recolour an icon for state; do not swap
-assets. An agent's mark is the exception to native drawing: it is the agent's
-own artwork, bundled as a mask and tinted like an icon, except Claude Code's,
-which keeps its orange. Every icon-only control has a tooltip and an accessible name that match.
+Icons use official Tabler Icons 3.49.0 shapes on their 24-point grid, with
+rounded outline strokes and filled transport controls. Small dedicated font
+subsets are embedded for native rendering; they never join terminal or text
+font fallbacks. Recolour a glyph for state; do not swap assets. An agent
+mark is the exception: it keeps its original provider artwork, bundled as a
+mask and tinted like an icon, except Claude Code, which keeps its orange.
+Neptune app/site logos retain the supplied brand artwork, not a UI glyph.
+Widgets keep their original icon bounds, hover/focus surfaces, tooltips and
+accessible names. The [icon manifest](../assets/icons/tabler/README.md) records
+sources and regeneration; the website uses the same pinned Tabler version.
 
 ## Bundled fonts and notices
 

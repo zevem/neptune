@@ -209,9 +209,13 @@ fn status_capsule(
         return false;
     }
     capsule(&painter, rect, p);
-    painter.circle_filled(
-        Pos2::new(rect.left() + 17.0, rect.center().y),
-        3.5,
+    icons::paint(
+        &painter,
+        Rect::from_center_size(
+            Pos2::new(rect.left() + 17.0, rect.center().y),
+            Vec2::splat(8.4),
+        ),
+        Icon::CircleFilled,
         if problem { p.red } else { p.muted },
     );
     let text_rect = galley_at(
@@ -582,7 +586,12 @@ fn tab(
     }
     let mut left = rect.left() + if browser_tab { 10.0 } else { 9.0 };
     if !shown && presentation.unread > 0 {
-        painter.circle_filled(Pos2::new(left + 3.0, rect.center().y), 3.0, p.attention);
+        icons::paint(
+            &painter,
+            Rect::from_center_size(Pos2::new(left + 3.0, rect.center().y), Vec2::splat(7.2)),
+            Icon::CircleFilled,
+            p.attention,
+        );
         left += 11.0;
     }
     let close_alpha = if hovered {
@@ -1199,9 +1208,10 @@ fn draw_pane(
 
     if presentation.starting {
         let center = card.center();
-        egui::Spinner::new().size(14.0).color(p.muted).paint_at(
+        helpers::spinner(
             ui,
             Rect::from_center_size(center - vec2(52.0, 0.0), Vec2::splat(14.0)),
+            p.muted,
         );
         painter.text(
             center - vec2(38.0, 0.0),
@@ -1638,9 +1648,10 @@ pub fn empty_state(
     );
     let center = rect.center();
     if restoring {
-        egui::Spinner::new().size(16.0).color(p.muted).paint_at(
+        helpers::spinner(
             ui,
             Rect::from_center_size(center - vec2(0.0, 16.0), Vec2::splat(16.0)),
+            p.muted,
         );
         ui.painter().text(
             center + vec2(0.0, 12.0),

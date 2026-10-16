@@ -69,18 +69,19 @@ fn cursor(kind: u32) -> egui::CursorIcon {
     }
 }
 
-/// The mark of a page on its way: an arc that turns while it loads.
+/// The mark of a page on its way: a loader that turns while it loads.
 pub(super) fn turning(painter: &egui::Painter, rect: Rect, color: egui::Color32) {
     let ctx = painter.ctx();
-    let start = ctx.input(|i| i.time) as f32 * std::f32::consts::TAU * 0.9;
-    let radius = rect.width().min(rect.height()) * 0.5 - 1.5;
-    let points = (0..=20)
-        .map(|step| {
-            let angle = start + step as f32 / 20.0 * std::f32::consts::TAU * 0.7;
-            rect.center() + radius * egui::vec2(angle.cos(), angle.sin())
-        })
-        .collect();
-    painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
+    let angle = ctx.input(|i| i.time) as f32 * std::f32::consts::TAU * 0.9;
+    // The former arc's outer diameter was the available side less 1.5 points.
+    let side = (rect.width().min(rect.height()) - 1.5).max(0.0) * 1.2;
+    icons::paint_rotated(
+        painter,
+        Rect::from_center_size(rect.center(), Vec2::splat(side)),
+        Icon::Loader2,
+        color,
+        angle,
+    );
     ctx.request_repaint();
 }
 
@@ -589,12 +590,13 @@ pub(crate) fn show(
         // A page on its way shows it at the field's trailing edge.
         let loading = view.state.loading && address.width() >= 160.0;
         if loading {
-            egui::Spinner::new().size(12.0).color(p.muted).paint_at(
+            helpers::spinner(
                 ui,
                 Rect::from_center_size(
                     Pos2::new(address.right() - 15.0, address.center().y),
                     Vec2::splat(12.0),
                 ),
+                p.muted,
             );
         }
         let editor = Rect::from_min_max(
@@ -743,8 +745,12 @@ pub(crate) fn show(
             actions.push(tool(Tool::Record));
         }
         if recording {
-            ui.painter()
-                .circle_filled(bounds.right_top() + vec2(-7.0, 7.0), 3.0, p.red);
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(bounds.right_top() + vec2(-7.0, 7.0), Vec2::splat(7.2)),
+                Icon::CircleFilled,
+                p.red,
+            );
         }
     }
     if toolbar.width() >= CONTROL * 4.0 + 12.0 {
@@ -758,8 +764,12 @@ pub(crate) fn show(
             pane,
         );
         if recording && !wide {
-            ui.painter()
-                .circle_filled(more.rect.right_top() + vec2(-7.0, 7.0), 3.0, p.red);
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(more.rect.right_top() + vec2(-7.0, 7.0), Vec2::splat(7.2)),
+                Icon::CircleFilled,
+                p.red,
+            );
         }
         egui::Popup::menu(&more).show(|ui| {
             menu_layout(ui, 248.0);
@@ -968,9 +978,10 @@ pub(crate) fn show(
         } else {
             // As a terminal says it while its shell starts.
             let center = content.center();
-            egui::Spinner::new().size(14.0).color(p.muted).paint_at(
+            helpers::spinner(
                 ui,
                 Rect::from_center_size(center - vec2(58.0, 0.0), Vec2::splat(14.0)),
+                p.muted,
             );
             let said = painter.text(
                 center - vec2(44.0, 0.0),
@@ -995,5 +1006,50 @@ pub(crate) fn show(
     if selected {
         output.active_body = Some(content);
         output.active_terminal = Some(response.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_mark_is_a_native_glyph_at_its_original_center_and_speed() {
+        for pixels_per_point in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            theme::fonts(&ctx);
+            ctx.set_pixels_per_point(pixels_per_point);
+            let rect = Rect::from_center_size(Pos2::new(48.0, 48.0), Vec2::splat(14.0));
+            for time in [0.0, 0.25] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ui| turning(ui.painter(), rect, Color32::WHITE),
+                );
+                output.textures_delta.clear();
+                let glyphs: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|clipped| match &clipped.shape {
+                        egui::Shape::Text(shape) => Some(shape),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(glyphs.len(), 1);
+                let glyph = glyphs[0];
+                let expected_angle = time as f32 * std::f32::consts::TAU * 0.9;
+                assert!((glyph.angle - expected_angle).abs() < 0.001);
+                let center = glyph.pos
+                    + egui::emath::Rot2::from_angle(glyph.angle)
+                        * glyph.galley.rect.center().to_vec2();
+                assert!(center.distance(rect.center()) < 0.001);
+                let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
+                assert!(meshes.iter().any(|mesh| {
+                    matches!(&mesh.primitive, egui::epaint::Primitive::Mesh(mesh) if !mesh.is_empty())
+                }));
+            }
+        }
     }
 }

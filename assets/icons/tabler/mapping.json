@@ -1,0 +1,814 @@
+{
+  "schema_version": 1,
+  "library": "Tabler Icons",
+  "repository": "https://github.com/tabler/tabler-icons",
+  "version": "3.49.0",
+  "revision": "a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d",
+  "license": {
+    "spdx": "MIT",
+    "file": "LICENSE.txt",
+    "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/LICENSE",
+    "sha256": "b740a1d46122672da62833e97f7e7c8a13fa85cbc7445b584b297cc00dde93db"
+  },
+  "icons": [
+    {
+      "icon": "Bell",
+      "style": "outline",
+      "name": "bell",
+      "file": "outline/bell.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/bell.svg",
+      "unicode": "ea35",
+      "sha256": "7ef4f0c56a58fc7ea27ded1c2ee5bc753d63f8851ce85b33da48ddeefe53faf8",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Terminal",
+      "style": "outline",
+      "name": "terminal-2",
+      "file": "outline/terminal-2.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/terminal-2.svg",
+      "unicode": "ebef",
+      "sha256": "ea232ff7461f39a6c65c5919c0f9b28de29d2586730a9eeef2b2428526ceb069",
+      "upstream_icon_version": "1.7",
+      "meaning": "Terminal shell."
+    },
+    {
+      "icon": "Plus",
+      "style": "outline",
+      "name": "plus",
+      "file": "outline/plus.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/plus.svg",
+      "unicode": "eb0b",
+      "sha256": "9cc497d4cc1eb38cf9daae18f41ffdc1a5e2a8431d70247b0854978f303f28d6",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Close",
+      "style": "outline",
+      "name": "x",
+      "file": "outline/x.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/x.svg",
+      "unicode": "eb55",
+      "sha256": "9350785360414c39450c3505f17d1745e55a7534edace8548e30cf49e3727d43",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ChevronLeft",
+      "style": "outline",
+      "name": "chevron-left",
+      "file": "outline/chevron-left.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/chevron-left.svg",
+      "unicode": "ea60",
+      "sha256": "889174801ca4213379fe4e6a574546793a72ab22be35bc2f177e3d8d24576dbd",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ChevronRight",
+      "style": "outline",
+      "name": "chevron-right",
+      "file": "outline/chevron-right.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/chevron-right.svg",
+      "unicode": "ea61",
+      "sha256": "83733bb6e03e1d20fd2674d06a493642c8ea6eef76c44ebb2239b9ef17dedff7",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ChevronDown",
+      "style": "outline",
+      "name": "chevron-down",
+      "file": "outline/chevron-down.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/chevron-down.svg",
+      "unicode": "ea5f",
+      "sha256": "5a2e5c2a155ce06264a3f7299073ed636142dfd0b324b747387d9cfbf9fb5e3e",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Settings",
+      "style": "outline",
+      "name": "settings",
+      "file": "outline/settings.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/settings.svg",
+      "unicode": "eb20",
+      "sha256": "ef9cf42d822c00b4fad5bc5eeceddd4e1ec3774bb7ddd09891d0fba274bc3e95",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Search",
+      "style": "outline",
+      "name": "search",
+      "file": "outline/search.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/search.svg",
+      "unicode": "eb1c",
+      "sha256": "3dd53b9606283dfa0adcb0b10a7d9a4432369d4bebcfacf67f80fbe358381c34",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Sidebar",
+      "style": "outline",
+      "name": "layout-sidebar",
+      "file": "outline/layout-sidebar.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/layout-sidebar.svg",
+      "unicode": "eada",
+      "sha256": "52ada36bb39b40e45be8f14750af4b4881df326fa9ff796b622dd494de412074",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "PanelRight",
+      "style": "outline",
+      "name": "layout-sidebar-right",
+      "file": "outline/layout-sidebar-right.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/layout-sidebar-right.svg",
+      "unicode": "ead9",
+      "sha256": "fd2aa6ae63ca7d64f37d69053cbb9e2b39b2735d005767d6ece5a749b4167fdb",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "SplitVertical",
+      "style": "outline",
+      "name": "layout-columns",
+      "file": "outline/layout-columns.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/layout-columns.svg",
+      "unicode": "ead4",
+      "sha256": "9faef89c597b34d62faaa604d557e44cecace461e9e64322a381939889162e8b",
+      "upstream_icon_version": "1.0",
+      "meaning": "A vertical divider creates left/right columns."
+    },
+    {
+      "icon": "SplitHorizontal",
+      "style": "outline",
+      "name": "layout-rows",
+      "file": "outline/layout-rows.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/layout-rows.svg",
+      "unicode": "ead8",
+      "sha256": "6443a82f21fff4e73b3792a72c486478ab9a1d366cb46b738e0d4bbb0ac6a932",
+      "upstream_icon_version": "1.0",
+      "meaning": "A horizontal divider creates upper/lower rows."
+    },
+    {
+      "icon": "Folder",
+      "style": "outline",
+      "name": "folder",
+      "file": "outline/folder.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/folder.svg",
+      "unicode": "eaad",
+      "sha256": "acdf398775addb8104673e5a8ef29d01d40184c6a5b3c62a93f10309cf9ef253",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Grid",
+      "style": "outline",
+      "name": "layout-grid",
+      "file": "outline/layout-grid.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/layout-grid.svg",
+      "unicode": "edba",
+      "sha256": "91f923bcca6e9201ccedd2a10bb5d5a7eb3dbb5fa5a26af394d362f35c935237",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Keyboard",
+      "style": "outline",
+      "name": "keyboard",
+      "file": "outline/keyboard.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/keyboard.svg",
+      "unicode": "ebd6",
+      "sha256": "9e290c3ff26878fad5fcf338eb5c8dc203651a20cc1806fd6d6f40625668c90b",
+      "upstream_icon_version": "1.6"
+    },
+    {
+      "icon": "Check",
+      "style": "outline",
+      "name": "check",
+      "file": "outline/check.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/check.svg",
+      "unicode": "ea5e",
+      "sha256": "e206067a7d570997b5b3a7d30ab287c0b15a492787649a8b96dff8fad2862fbe",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ArrowUpRight",
+      "style": "outline",
+      "name": "arrow-up-right",
+      "file": "outline/arrow-up-right.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrow-up-right.svg",
+      "unicode": "ea24",
+      "sha256": "b7d952b0b6fbd089b110d85639ffffc001bb41fe53040e5e7f3e3f65ddc22595",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ArrowUp",
+      "style": "outline",
+      "name": "arrow-up",
+      "file": "outline/arrow-up.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrow-up.svg",
+      "unicode": "ea25",
+      "sha256": "c0a58436629c59996826b7980b0cbdfff51bfa289eefb2cceee494a964c5105e",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ArrowDown",
+      "style": "outline",
+      "name": "arrow-down",
+      "file": "outline/arrow-down.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrow-down.svg",
+      "unicode": "ea16",
+      "sha256": "34efc2d5737ffa3f29f8056e6d861ea8218d8f40858539a959a9482811f6bd05",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Minus",
+      "style": "outline",
+      "name": "minus",
+      "file": "outline/minus.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/minus.svg",
+      "unicode": "eaf2",
+      "sha256": "a6556d9c556316b946c28af277be016b4d56ad8618dc2a731ce455100438c0ea",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Maximize",
+      "style": "outline",
+      "name": "arrows-maximize",
+      "file": "outline/arrows-maximize.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrows-maximize.svg",
+      "unicode": "ea28",
+      "sha256": "106923855401d2164938e7db50f20c6a47c90d8f4aa4e299b94792ea87dd75e5",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Command",
+      "style": "outline",
+      "name": "command",
+      "file": "outline/command.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/command.svg",
+      "unicode": "ea78",
+      "sha256": "e2c48826702bf66925f59380f78e10404f23562b90563a95112cb004acb80e45",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Sun",
+      "style": "outline",
+      "name": "sun",
+      "file": "outline/sun.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/sun.svg",
+      "unicode": "eb30",
+      "sha256": "6677490605af8987d55d6e4185b1f6c241eced65b63ccfece68cadb7ce90fbb5",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Moon",
+      "style": "outline",
+      "name": "moon",
+      "file": "outline/moon.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/moon.svg",
+      "unicode": "eaf8",
+      "sha256": "7cabaae40eea65310da478d3cad30b23cf1d7e99adad56378f82824338079668",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Copy",
+      "style": "outline",
+      "name": "copy",
+      "file": "outline/copy.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/copy.svg",
+      "unicode": "ea7a",
+      "sha256": "3a455a299db4ec939fd0473d15c81c1d3f30f65dec81a7de816317c989b06073",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Code",
+      "style": "outline",
+      "name": "code",
+      "file": "outline/code.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/code.svg",
+      "unicode": "ea77",
+      "sha256": "ff3d40c83c1a908bc3aa173671232e5015dba2f7f3538edc23fa2218a3d329e2",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Wrap",
+      "style": "outline",
+      "name": "text-wrap",
+      "file": "outline/text-wrap.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/text-wrap.svg",
+      "unicode": "ebdd",
+      "sha256": "754eb01b8dae67c5f1d184f21c8ae61444b4fe76643482aa1e52f964c24bbc51",
+      "upstream_icon_version": "1.6"
+    },
+    {
+      "icon": "Ellipsis",
+      "style": "outline",
+      "name": "dots",
+      "file": "outline/dots.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/dots.svg",
+      "unicode": "ea95",
+      "sha256": "798ff2bd35fdb045535872ed5d5e93e39a289c6fd0faaf01639ae84180e54dae",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Refresh",
+      "style": "outline",
+      "name": "refresh",
+      "file": "outline/refresh.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/refresh.svg",
+      "unicode": "eb13",
+      "sha256": "9dd8ab8cac268489501cbb0a106d93cc3f367add493d20c47ec1e1d9804c760a",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Pencil",
+      "style": "outline",
+      "name": "pencil",
+      "file": "outline/pencil.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/pencil.svg",
+      "unicode": "eb04",
+      "sha256": "422796681dab2177b958836952b0a581025013a78d8a8c9df9c1af43f62d0e97",
+      "upstream_icon_version": "1.1"
+    },
+    {
+      "icon": "Clipboard",
+      "style": "outline",
+      "name": "clipboard-text",
+      "file": "outline/clipboard-text.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/clipboard-text.svg",
+      "unicode": "f089",
+      "sha256": "1d1b34197245aacb2e503ae55d67e1dc082b17a1bb2204f115c7acd98253d542",
+      "upstream_icon_version": "1.60"
+    },
+    {
+      "icon": "Warning",
+      "style": "outline",
+      "name": "alert-triangle",
+      "file": "outline/alert-triangle.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/alert-triangle.svg",
+      "unicode": "ea06",
+      "sha256": "25b1f0c39f34647017df84a0cdc9e691c697737094a5956c360ab448a7fd5bef",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Minimize",
+      "style": "outline",
+      "name": "arrows-minimize",
+      "file": "outline/arrows-minimize.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrows-minimize.svg",
+      "unicode": "ea29",
+      "sha256": "7a566eea9231dfb1eff4cf17e9f5aedf1a453f7b3fced3c849f1ba131595f678",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Eraser",
+      "style": "outline",
+      "name": "eraser",
+      "file": "outline/eraser.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/eraser.svg",
+      "unicode": "eb8b",
+      "sha256": "8bc50a8fa57161602f922f08ba7e24833155c3e531fcda56836df646b23d76ee",
+      "upstream_icon_version": "1.3"
+    },
+    {
+      "icon": "TextSize",
+      "style": "outline",
+      "name": "text-size",
+      "file": "outline/text-size.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/text-size.svg",
+      "unicode": "f2b1",
+      "sha256": "ff4620010b0760e029b7f2d1ce4c7e4a0492830c4318c351113d79efca296d68",
+      "upstream_icon_version": "1.80"
+    },
+    {
+      "icon": "Swap",
+      "style": "outline",
+      "name": "arrows-exchange",
+      "file": "outline/arrows-exchange.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrows-exchange.svg",
+      "unicode": "f1f4",
+      "sha256": "67be2e2afc04e53c70a4b81f58b18c232edd5b6124eff81a285fcd513f857016",
+      "upstream_icon_version": "1.70"
+    },
+    {
+      "icon": "Globe",
+      "style": "outline",
+      "name": "world",
+      "file": "outline/world.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/world.svg",
+      "unicode": "eb54",
+      "sha256": "d0dfc538f966d03b72a9fe872fbb567d5e84db9d24b95af032305404ef71f587",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Star",
+      "style": "outline",
+      "name": "star",
+      "file": "outline/star.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/star.svg",
+      "unicode": "eb2e",
+      "sha256": "c0b4afc60d311585f7c79c2ffd68d58eb5c1e3a3cd6d626cdc7792c5d3bbb49b",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Image",
+      "style": "outline",
+      "name": "photo",
+      "file": "outline/photo.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/photo.svg",
+      "unicode": "eb0a",
+      "sha256": "67d9b3ec02867e98ad17739380919a2d82287d15d3463161f450e17047ed319b",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "PullRequest",
+      "style": "outline",
+      "name": "git-pull-request",
+      "file": "outline/git-pull-request.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/git-pull-request.svg",
+      "unicode": "eab6",
+      "sha256": "0288b91bc889b45e0f04e4bfea34927ec270f9f8d6e79fea17968beacf034fc0",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Merged",
+      "style": "outline",
+      "name": "git-merge",
+      "file": "outline/git-merge.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/git-merge.svg",
+      "unicode": "eab5",
+      "sha256": "e6d8c06c5430d314df1295046760d8515dc553c420680bc1b8e1f2fd57a8756c",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Comment",
+      "style": "outline",
+      "name": "message",
+      "file": "outline/message.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/message.svg",
+      "unicode": "eaef",
+      "sha256": "0797af3ec861f73e60d4b98ac974ac2cbcfbe7240c97c5ec639a52815f075de3",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Branch",
+      "style": "outline",
+      "name": "git-branch",
+      "file": "outline/git-branch.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/git-branch.svg",
+      "unicode": "eab2",
+      "sha256": "7c45a13d2b0e6a6915730471345ebf7fbe0374bcd61d19679d59c5ffa38a234b",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Agents",
+      "style": "outline",
+      "name": "hierarchy",
+      "file": "outline/hierarchy.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/hierarchy.svg",
+      "unicode": "ee9e",
+      "sha256": "9c3f9872dc78a7047ead7152ede00eeb25b0be09e85c2d644e8a3f788b12b254",
+      "upstream_icon_version": "1.39",
+      "meaning": "Delegated agents form a hierarchy: one parent and its children; no exact multi-agent glyph."
+    },
+    {
+      "icon": "File",
+      "style": "outline",
+      "name": "file",
+      "file": "outline/file.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/file.svg",
+      "unicode": "eaa4",
+      "sha256": "c3995cdcfc6b74ff439efd5a8817c14ac4f821ae4435c0d2e6c021e3f39a6808",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Files",
+      "style": "outline",
+      "name": "files",
+      "file": "outline/files.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/files.svg",
+      "unicode": "edef",
+      "sha256": "ef444c8a7c4945e0be33c9f93cb6118fd2fcaaee0100f017339e57e6a620747e",
+      "upstream_icon_version": "1.38"
+    },
+    {
+      "icon": "FilePlus",
+      "style": "outline",
+      "name": "file-plus",
+      "file": "outline/file-plus.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/file-plus.svg",
+      "unicode": "eaa0",
+      "sha256": "fb1afebc6cdfe0679ed76018d2d2dbb96d927dddb093857e0c6a992d06cf38df",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "FolderPlus",
+      "style": "outline",
+      "name": "folder-plus",
+      "file": "outline/folder-plus.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/folder-plus.svg",
+      "unicode": "eaab",
+      "sha256": "29cca183967b0384a48ada6638c72bc0258086b76e3ae497f12d402b2c7b36d5",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Trash",
+      "style": "outline",
+      "name": "trash",
+      "file": "outline/trash.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/trash.svg",
+      "unicode": "eb41",
+      "sha256": "4b90fa07a6d980736951d9e83b91432972b2bcecf81be4578608a0983f2ebc9d",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Paperclip",
+      "style": "outline",
+      "name": "paperclip",
+      "file": "outline/paperclip.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/paperclip.svg",
+      "unicode": "eb02",
+      "sha256": "f1ede65f6ee259b7d754d8d77d67cb1029bb7d96d7d92f8b469847a641d394ed",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Pause",
+      "style": "filled",
+      "name": "player-pause",
+      "file": "filled/player-pause.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/filled/player-pause.svg",
+      "unicode": "f690",
+      "sha256": "42845a326ef1a16c99edaab761f82df388b22aa4b447a81e96cd452859eca64c",
+      "upstream_icon_version": "2.0"
+    },
+    {
+      "icon": "Play",
+      "style": "filled",
+      "name": "player-play",
+      "file": "filled/player-play.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/filled/player-play.svg",
+      "unicode": "f691",
+      "sha256": "f9a3ef8e8925e405ae74a8bf855757942cb18adfff8321e3c8b6d96337657ee1",
+      "upstream_icon_version": "2.0"
+    },
+    {
+      "icon": "Stop",
+      "style": "filled",
+      "name": "player-stop",
+      "file": "filled/player-stop.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/filled/player-stop.svg",
+      "unicode": "f695",
+      "sha256": "9fdd02782b295185b89cfc1514fb149eb1f633c8d1bcd9bb4035c3dd559cdbac",
+      "upstream_icon_version": "2.0"
+    },
+    {
+      "icon": "Lock",
+      "style": "outline",
+      "name": "lock",
+      "file": "outline/lock.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/lock.svg",
+      "unicode": "eae2",
+      "sha256": "407856048124fdd63239f75a3640ca8f20a9acbc1f49cac9de0bcdb1cb42ec5f",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Pointer",
+      "style": "outline",
+      "name": "pointer",
+      "file": "outline/pointer.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/pointer.svg",
+      "unicode": "f265",
+      "sha256": "811735d187eaf6c8a7b7f06053140b8284cf4b1b2ea7ba1c8f340f1fbafbac24",
+      "upstream_icon_version": "1.76"
+    },
+    {
+      "icon": "Record",
+      "style": "outline",
+      "name": "circle-dot",
+      "file": "outline/circle-dot.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/circle-dot.svg",
+      "unicode": "efb1",
+      "sha256": "816a38cb2e9c577133653cb4a7e133d77ee03cfabe2a9543aac012176c838069",
+      "upstream_icon_version": "1.49",
+      "meaning": "Concentric circle-dot represents recording without a bespoke record path."
+    },
+    {
+      "icon": "Person",
+      "style": "outline",
+      "name": "user",
+      "file": "outline/user.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/user.svg",
+      "unicode": "eb4d",
+      "sha256": "63554429f551522ea578a9bf72d1d350bd0ffdb8ede3af92a05e92d71cab6b9c",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ThumbUp",
+      "style": "outline",
+      "name": "thumb-up",
+      "file": "outline/thumb-up.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/thumb-up.svg",
+      "unicode": "eb3c",
+      "sha256": "109b328b89e50528fb1c8ae883192c51caa621701b133241030b165d1dcdfbdb",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ThumbDown",
+      "style": "outline",
+      "name": "thumb-down",
+      "file": "outline/thumb-down.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/thumb-down.svg",
+      "unicode": "eb3b",
+      "sha256": "5839b34f74fe771bf7e15cfcfc10a2e47bc2ed4e6268ee85a3557a0805552991",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Smile",
+      "style": "outline",
+      "name": "mood-smile",
+      "file": "outline/mood-smile.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/mood-smile.svg",
+      "unicode": "eaf7",
+      "sha256": "9a695309e620af65351ab5f311b0c7e15378faf9c1b80e088d0ebb5f9f9e53d5",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Party",
+      "style": "outline",
+      "name": "confetti",
+      "file": "outline/confetti.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/confetti.svg",
+      "unicode": "ee46",
+      "sha256": "a721d09917d5161b513291b121e93b4f793a6c37112bf45714f44484a15452a0",
+      "upstream_icon_version": "1.39"
+    },
+    {
+      "icon": "Unsure",
+      "style": "outline",
+      "name": "mood-confused",
+      "file": "outline/mood-confused.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/mood-confused.svg",
+      "unicode": "eaf3",
+      "sha256": "1462a7cfff6c19884eea437b56c72f833c4011f4df063cab7e58a52b9ce385e2",
+      "upstream_icon_version": "1.0",
+      "meaning": "The official confused face preserves the unsure reaction."
+    },
+    {
+      "icon": "Heart",
+      "style": "outline",
+      "name": "heart",
+      "file": "outline/heart.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/heart.svg",
+      "unicode": "eabe",
+      "sha256": "332be1c5c3a67df766c69da053a0eb29a11aa74a262f4422b82bceaaf098b1e8",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Rocket",
+      "style": "outline",
+      "name": "rocket",
+      "file": "outline/rocket.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/rocket.svg",
+      "unicode": "ec45",
+      "sha256": "ea5f8a0922691d4c36d56c61c6e5c1dab1ae11ff5856a1036430f26d0eb23214",
+      "upstream_icon_version": "1.11"
+    },
+    {
+      "icon": "Eyes",
+      "style": "outline",
+      "name": "eye",
+      "file": "outline/eye.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/eye.svg",
+      "unicode": "ea9a",
+      "sha256": "45bdbd35bb18e9997a86dad8db6eb90931d1d53884484baf2c65e34d6f6e4f93",
+      "upstream_icon_version": "1.0",
+      "meaning": "GitHub eyes reaction: the official eye is the closest direct looking/watching metaphor; no two-eyes reaction glyph."
+    },
+    {
+      "icon": "GitHub",
+      "style": "outline",
+      "name": "brand-github",
+      "file": "outline/brand-github.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/brand-github.svg",
+      "unicode": "ec1c",
+      "sha256": "1ba4d43069f269d4aedc71bd5887632ae08b17435d64f47f331b18c316ffeb37",
+      "upstream_icon_version": "1.18"
+    },
+    {
+      "icon": "ChevronUp",
+      "style": "outline",
+      "name": "chevron-up",
+      "file": "outline/chevron-up.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/chevron-up.svg",
+      "unicode": "ea62",
+      "sha256": "b9a66bccd34ae897a255a38af9e66a1149adf6549f60108907ea3066e5d0e740",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ArrowRight",
+      "style": "outline",
+      "name": "arrow-right",
+      "file": "outline/arrow-right.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrow-right.svg",
+      "unicode": "ea1f",
+      "sha256": "7e602a26d53e78ceb788f38cb89ec1d1091130c56d7829ca294b7ed0642277c6",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ExternalLink",
+      "style": "outline",
+      "name": "external-link",
+      "file": "outline/external-link.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/external-link.svg",
+      "unicode": "ea99",
+      "sha256": "95de8d4e3e77d34b39a94e157ff26b5a860015c6ce3056794f63dd3a55805bbc",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "ArrowLeft",
+      "style": "outline",
+      "name": "arrow-left",
+      "file": "outline/arrow-left.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/arrow-left.svg",
+      "unicode": "ea19",
+      "sha256": "12af90f1bb49b7ae62792ecf38d2fa8b39daa4753e39ebc3520d07482a90704f",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Circle",
+      "style": "outline",
+      "name": "circle",
+      "file": "outline/circle.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/circle.svg",
+      "unicode": "ea6b",
+      "sha256": "d7e7e7ec68e225eabf75483881ce12a290a746d0e4ebb56b874c05e068438d0b",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "CircleFilled",
+      "style": "filled",
+      "name": "circle",
+      "file": "filled/circle.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/filled/circle.svg",
+      "unicode": "f671",
+      "sha256": "c802ae8a2aa74414fd86d3f85ab70991a0ac56f6aff66ece2db9b90233ce78cb",
+      "upstream_icon_version": "2.0",
+      "meaning": "Solid status dot uses the official filled circle rather than custom geometry."
+    },
+    {
+      "icon": "Loader2",
+      "style": "outline",
+      "name": "loader-2",
+      "file": "outline/loader-2.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/loader-2.svg",
+      "unicode": "f226",
+      "sha256": "82639ca5a04efc951caef3d274c9e302f1c09dcdaa9a1b8e094c16890bfd1d41",
+      "upstream_icon_version": "1.72",
+      "meaning": "Official open circular loader; animation rotates this unmodified glyph around its design-cell center."
+    },
+    {
+      "icon": "CircleDashed",
+      "style": "outline",
+      "name": "circle-dashed",
+      "file": "outline/circle-dashed.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/circle-dashed.svg",
+      "unicode": "ed27",
+      "sha256": "7df7f2cf05d1283c7443382168b4dfa5c1d91cab1d709d48117df4d567e7ed54",
+      "upstream_icon_version": "1.26"
+    },
+    {
+      "icon": "CircleX",
+      "style": "outline",
+      "name": "circle-x",
+      "file": "outline/circle-x.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/circle-x.svg",
+      "unicode": "ea6a",
+      "sha256": "aaa9501a0ad80eb2620a1c6a01203425f3f0021b68e4788199b906ccfe82471d",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "CircleCheck",
+      "style": "outline",
+      "name": "circle-check",
+      "file": "outline/circle-check.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/circle-check.svg",
+      "unicode": "ea67",
+      "sha256": "c4cb2e026be5f4c217c3ff9b0ccefb9a26b7a135bc82eef28a8bead0cc02a958",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Square",
+      "style": "outline",
+      "name": "square",
+      "file": "outline/square.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/square.svg",
+      "unicode": "eb2c",
+      "sha256": "03f16281a365e8e68f5d084342c9f7b0c04b02f0ddf79668adb3247f83f662d4",
+      "upstream_icon_version": "1.0"
+    },
+    {
+      "icon": "Checkbox",
+      "style": "outline",
+      "name": "checkbox",
+      "file": "outline/checkbox.svg",
+      "source": "https://raw.githubusercontent.com/tabler/tabler-icons/a4ce1404bc6d24d3c365afe7b258d6bf6f48d62d/icons/outline/checkbox.svg",
+      "unicode": "eba6",
+      "sha256": "0914f31c851cbffa1a105241e8e94107abb147b2ee2b2326e3d6d25c1ff0451e",
+      "upstream_icon_version": "1.4"
+    }
+  ]
+}

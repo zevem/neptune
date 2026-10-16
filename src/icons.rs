@@ -1,8 +1,13 @@
-//! Small, consistent vector icons. Coordinates use a 24-point design grid.
+//! Official Tabler Icons 3.49.0, embedded as dedicated native font subsets.
+//!
+//! Source SVGs, exhaustive mappings, regeneration and MIT notices live in
+//! assets/icons/tabler. Provider marks retain their own bundled PNG masks,
+//! decoded and cached once for each physical-pixel size.
 
 use eframe::egui::{
-    Color32, ColorImage, CursorIcon, Id, Painter, Pos2, Rect, Response, Sense, Shape, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Ui, WidgetInfo, WidgetType, pos2, vec2,
+    Align2, Color32, ColorImage, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id,
+    Painter, Pos2, Rect, Response, Sense, Shape, StrokeKind, TextureHandle, TextureOptions, Ui,
+    WidgetInfo, WidgetType, emath::TSTransform, epaint::TextShape, pos2, vec2,
 };
 use neptune_model::AgentKind;
 
@@ -76,594 +81,112 @@ pub enum Icon {
     Heart,
     Rocket,
     Eyes,
+    GitHub,
+    ChevronUp,
+    ArrowRight,
+    ExternalLink,
+    ArrowLeft,
+    Circle,
+    CircleFilled,
+    Loader2,
+    CircleDashed,
+    CircleX,
+    CircleCheck,
+    Square,
+    Checkbox,
 }
 
-/// Paint an icon into its visual bounds. The caller controls the hit area.
-pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
-    let side = rect.width().min(rect.height());
-    let origin = rect.center() - vec2(side, side) * 0.5;
-    let scale = side / 24.0;
-    let point = |x: f32, y: f32| origin + vec2(x, y) * scale;
-    let stroke = Stroke::new(1.5, color);
-    let line = |points: &[[f32; 2]]| {
-        let points: Vec<Pos2> = points.iter().map(|p| point(p[0], p[1])).collect();
-        let first = points.first().copied();
-        let last = points.last().copied();
-        painter.add(Shape::line(points, stroke));
-        // egui's line primitives have square caps. These tiny circles give the
-        // outline set the same quiet, rounded ends as the desktop reference.
-        if let Some(first) = first {
-            painter.circle_filled(first, stroke.width * 0.5, color);
-        }
-        if let Some(last) = last {
-            painter.circle_filled(last, stroke.width * 0.5, color);
-        }
-    };
-    let rectangle = |x: f32, y: f32, width: f32, height: f32, radius: f32| {
-        painter.rect_stroke(
-            Rect::from_min_max(point(x, y), point(x + width, y + height)),
-            (radius * scale).round() as u8,
-            stroke,
-            StrokeKind::Middle,
-        );
-    };
-    let circle = |x: f32, y: f32, radius: f32| {
-        painter.circle_stroke(point(x, y), radius * scale, stroke);
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    Outline,
+    Filled,
+}
 
-    match icon {
-        Icon::Bell => {
-            // A dome that flares into the rim, closed along the base.
-            let bezier = |from: [f32; 2], a: [f32; 2], b: [f32; 2], to: [f32; 2]| {
-                (1..=8).map(move |step| {
-                    let t = step as f32 / 8.0;
-                    let u = 1.0 - t;
-                    let at = |i: usize| {
-                        u * u * u * from[i]
-                            + 3.0 * u * u * t * a[i]
-                            + 3.0 * u * t * t * b[i]
-                            + t * t * t * to[i]
-                    };
-                    [at(0), at(1)]
-                })
-            };
-            let mut outline = Vec::with_capacity(30);
-            for step in 0..=12 {
-                let angle = std::f32::consts::PI * (1.0 + step as f32 / 12.0);
-                outline.push([12.0 + 6.0 * angle.cos(), 8.5 + 6.0 * angle.sin()]);
-            }
-            outline.extend(bezier(
-                [18.0, 8.5],
-                [18.0, 14.5],
-                [19.5, 16.0],
-                [20.5, 17.5],
-            ));
-            outline.push([3.5, 17.5]);
-            outline.extend(bezier([3.5, 17.5], [4.5, 16.0], [6.0, 14.5], [6.0, 8.5]));
-            line(&outline);
-            line(&[[10.0, 20.5], [11.0, 21.5], [13.0, 21.5], [14.0, 20.5]]);
-        }
-        Icon::Terminal => {
-            rectangle(3.0, 5.0, 18.0, 14.0, 3.0);
-            line(&[[7.0, 9.0], [10.0, 12.0], [7.0, 15.0]]);
-            line(&[[13.0, 15.0], [17.0, 15.0]]);
-        }
-        Icon::Plus => {
-            line(&[[12.0, 5.0], [12.0, 19.0]]);
-            line(&[[5.0, 12.0], [19.0, 12.0]]);
-        }
-        Icon::Close => {
-            line(&[[6.0, 6.0], [18.0, 18.0]]);
-            line(&[[18.0, 6.0], [6.0, 18.0]]);
-        }
-        Icon::ChevronLeft => line(&[[15.0, 5.0], [8.0, 12.0], [15.0, 19.0]]),
-        Icon::ChevronRight => line(&[[9.0, 5.0], [16.0, 12.0], [9.0, 19.0]]),
-        Icon::ChevronDown => line(&[[5.0, 9.0], [12.0, 16.0], [19.0, 9.0]]),
-        Icon::Settings => {
-            let mut outline = Vec::with_capacity(33);
-            for tooth in 0..8 {
-                for (offset, radius) in [(0.0, 7.5), (0.2, 9.5), (0.55, 9.5), (0.75, 7.5)] {
-                    let angle = (tooth as f32 + offset) * std::f32::consts::TAU / 8.0;
-                    outline.push([12.0 + radius * angle.cos(), 12.0 + radius * angle.sin()]);
-                }
-            }
-            outline.push(outline[0]);
-            line(&outline);
-            circle(12.0, 12.0, 3.0);
-        }
-        Icon::Search => {
-            circle(10.5, 10.5, 6.5);
-            line(&[[15.3, 15.3], [20.0, 20.0]]);
-        }
-        Icon::Sidebar => {
-            rectangle(3.0, 4.0, 18.0, 16.0, 3.0);
-            line(&[[8.5, 4.5], [8.5, 19.5]]);
-        }
-        Icon::PanelRight => {
-            rectangle(3.0, 4.0, 18.0, 16.0, 3.0);
-            line(&[[15.5, 4.5], [15.5, 19.5]]);
-        }
-        Icon::SplitVertical => {
-            rectangle(3.0, 4.0, 18.0, 16.0, 3.0);
-            line(&[[12.0, 4.5], [12.0, 19.5]]);
-        }
-        Icon::SplitHorizontal => {
-            rectangle(3.0, 4.0, 18.0, 16.0, 3.0);
-            line(&[[3.5, 12.0], [20.5, 12.0]]);
-        }
-        Icon::Folder => {
-            line(&[
-                [3.0, 7.0],
-                [3.0, 18.0],
-                [4.0, 19.0],
-                [20.0, 19.0],
-                [21.0, 18.0],
-                [21.0, 9.0],
-                [20.0, 8.0],
-                [12.0, 8.0],
-                [10.0, 5.0],
-                [4.0, 5.0],
-                [3.0, 6.0],
-                [3.0, 7.0],
-            ]);
-        }
-        Icon::Grid => {
-            for y in [4.0, 14.0] {
-                for x in [4.0, 14.0] {
-                    rectangle(x, y, 6.0, 6.0, 1.5);
-                }
-            }
-        }
-        Icon::Keyboard => {
-            rectangle(2.0, 6.0, 20.0, 13.0, 3.0);
-            for y in [10.0, 13.0] {
-                for x in [6.0, 10.0, 14.0, 18.0] {
-                    painter.circle_filled(point(x, y), 0.8 * scale, color);
-                }
-            }
-            line(&[[8.0, 16.0], [16.0, 16.0]]);
-        }
-        Icon::Check => line(&[[5.0, 12.0], [10.0, 17.0], [20.0, 7.0]]),
-        Icon::ArrowUpRight => {
-            line(&[[6.0, 18.0], [18.0, 6.0]]);
-            line(&[[7.0, 6.0], [18.0, 6.0], [18.0, 17.0]]);
-        }
-        Icon::ArrowUp => {
-            line(&[[12.0, 19.0], [12.0, 5.0]]);
-            line(&[[6.0, 11.0], [12.0, 5.0], [18.0, 11.0]]);
-        }
-        Icon::ArrowDown => {
-            line(&[[12.0, 5.0], [12.0, 19.0]]);
-            line(&[[6.0, 13.0], [12.0, 19.0], [18.0, 13.0]]);
-        }
-        Icon::Minus => line(&[[5.0, 12.0], [19.0, 12.0]]),
-        Icon::Pause => {
-            line(&[[9.0, 6.0], [9.0, 18.0]]);
-            line(&[[15.0, 6.0], [15.0, 18.0]]);
-        }
-        Icon::Play => {
-            line(&[[8.0, 5.5], [18.5, 12.0], [8.0, 18.5], [8.0, 5.5]]);
-        }
-        Icon::Stop => rectangle(7.0, 7.0, 10.0, 10.0, 2.0),
-        Icon::Maximize => {
-            line(&[[4.0, 9.0], [4.0, 4.0], [9.0, 4.0]]);
-            line(&[[15.0, 4.0], [20.0, 4.0], [20.0, 9.0]]);
-            line(&[[20.0, 15.0], [20.0, 20.0], [15.0, 20.0]]);
-            line(&[[9.0, 20.0], [4.0, 20.0], [4.0, 15.0]]);
-        }
-        Icon::Command => {
-            rectangle(8.0, 8.0, 8.0, 8.0, 0.0);
-            for (x, y) in [(3.0, 3.0), (16.0, 3.0), (3.0, 16.0), (16.0, 16.0)] {
-                rectangle(x, y, 5.0, 5.0, 2.5);
-            }
-        }
-        Icon::Sun => {
-            circle(12.0, 12.0, 4.0);
-            for index in 0..8 {
-                let angle = index as f32 * std::f32::consts::TAU / 8.0;
-                let direction = [angle.cos(), angle.sin()];
-                line(&[
-                    [12.0 + direction[0] * 7.0, 12.0 + direction[1] * 7.0],
-                    [12.0 + direction[0] * 9.5, 12.0 + direction[1] * 9.5],
-                ]);
-            }
-        }
-        Icon::Moon => {
-            // A continuous crescent keeps the background visible, including
-            // when the icon is drawn on a selected control.
-            let mut crescent = Vec::with_capacity(33);
-            for step in 0..=20 {
-                let angle = (-93.0 - step as f32 * 13.2).to_radians();
-                crescent.push([12.0 + 9.0 * angle.cos(), 12.0 + 9.0 * angle.sin()]);
-            }
-            for step in 0..=12 {
-                let angle = (65.2 + step as f32 * (139.6 / 12.0)).to_radians();
-                crescent.push([18.0 + 7.125 * angle.cos(), 6.0 + 7.125 * angle.sin()]);
-            }
-            crescent.push(crescent[0]);
-            line(&crescent);
-        }
-        Icon::Code => {
-            line(&[[8.0, 7.0], [3.0, 12.0], [8.0, 17.0]]);
-            line(&[[16.0, 7.0], [21.0, 12.0], [16.0, 17.0]]);
-            line(&[[14.0, 4.0], [10.0, 20.0]]);
-        }
-        Icon::Wrap => {
-            line(&[[4.0, 6.0], [20.0, 6.0]]);
-            line(&[
-                [4.0, 11.0],
-                [17.0, 11.0],
-                [20.0, 14.0],
-                [17.0, 17.0],
-                [12.0, 17.0],
-            ]);
-            line(&[[15.0, 14.0], [12.0, 17.0], [15.0, 20.0]]);
-            line(&[[4.0, 17.0], [8.0, 17.0]]);
-        }
-        Icon::Copy => {
-            rectangle(8.0, 8.0, 12.0, 13.0, 2.5);
-            line(&[
-                [15.0, 5.0],
-                [15.0, 3.0],
-                [4.0, 3.0],
-                [3.0, 4.0],
-                [3.0, 15.0],
-                [5.0, 15.0],
-            ]);
-        }
-        Icon::Ellipsis => {
-            for x in [5.5, 12.0, 18.5] {
-                painter.circle_filled(point(x, 12.0), 1.6 * scale, color);
-            }
-        }
-        Icon::Refresh => {
-            // An open ring with an arrowhead at its leading end.
-            let mut ring = Vec::with_capacity(25);
-            for step in 0..=24 {
-                let angle = (-60.0 + step as f32 * 12.5).to_radians();
-                ring.push([12.0 + 8.0 * angle.cos(), 12.0 + 8.0 * angle.sin()]);
-            }
-            line(&ring);
-            line(&[[16.0, 2.5], [16.2, 5.6], [19.4, 5.2]]);
-        }
-        Icon::Pencil => {
-            line(&[
-                [4.0, 20.0],
-                [5.0, 15.5],
-                [16.0, 4.5],
-                [19.5, 8.0],
-                [8.5, 19.0],
-                [4.0, 20.0],
-            ]);
-            line(&[[13.5, 7.0], [17.0, 10.5]]);
-        }
-        Icon::Clipboard => {
-            rectangle(5.0, 5.0, 14.0, 16.0, 2.5);
-            rectangle(9.0, 3.0, 6.0, 4.0, 1.5);
-            line(&[[9.0, 12.0], [15.0, 12.0]]);
-            line(&[[9.0, 16.0], [13.0, 16.0]]);
-        }
-        Icon::Warning => {
-            line(&[[12.0, 4.0], [21.0, 19.5], [3.0, 19.5], [12.0, 4.0]]);
-            line(&[[12.0, 10.0], [12.0, 14.0]]);
-            painter.circle_filled(point(12.0, 16.8), 1.0 * scale, color);
-        }
-        Icon::Minimize => {
-            line(&[[4.0, 9.0], [9.0, 9.0], [9.0, 4.0]]);
-            line(&[[15.0, 4.0], [15.0, 9.0], [20.0, 9.0]]);
-            line(&[[20.0, 15.0], [15.0, 15.0], [15.0, 20.0]]);
-            line(&[[9.0, 20.0], [9.0, 15.0], [4.0, 15.0]]);
-        }
-        Icon::Eraser => {
-            line(&[
-                [8.0, 19.0],
-                [3.5, 14.5],
-                [13.5, 4.5],
-                [20.0, 11.0],
-                [12.0, 19.0],
-                [8.0, 19.0],
-            ]);
-            line(&[[8.5, 9.5], [15.0, 16.0]]);
-            line(&[[12.0, 19.0], [20.0, 19.0]]);
-        }
-        Icon::TextSize => {
-            line(&[[3.0, 19.0], [8.0, 7.0], [13.0, 19.0]]);
-            line(&[[4.8, 15.0], [11.2, 15.0]]);
-            line(&[[15.0, 19.0], [18.0, 12.0], [21.0, 19.0]]);
-            line(&[[16.2, 16.5], [19.8, 16.5]]);
-        }
-        Icon::Swap => {
-            line(&[[4.0, 8.0], [20.0, 8.0]]);
-            line(&[[16.0, 4.0], [20.0, 8.0], [16.0, 12.0]]);
-            line(&[[20.0, 16.0], [4.0, 16.0]]);
-            line(&[[8.0, 12.0], [4.0, 16.0], [8.0, 20.0]]);
-        }
-        Icon::Globe => {
-            circle(12.0, 12.0, 9.0);
-            line(&[[3.0, 12.0], [21.0, 12.0]]);
-            // The central meridian, seen slightly from the side.
-            let mut meridian = Vec::with_capacity(25);
-            for step in 0..=24 {
-                let angle = step as f32 * std::f32::consts::TAU / 24.0;
-                meridian.push([12.0 + 4.0 * angle.cos(), 12.0 + 9.0 * angle.sin()]);
-            }
-            line(&meridian);
-        }
-        Icon::Image => {
-            rectangle(3.0, 4.0, 18.0, 16.0, 3.0);
-            circle(8.5, 9.5, 1.7);
-            line(&[[4.5, 18.0], [10.0, 12.5], [13.5, 16.0]]);
-            line(&[[13.5, 16.0], [16.0, 13.5], [20.0, 17.5]]);
-        }
-        Icon::PullRequest => {
-            // The base branch, and the change that turns into it.
-            circle(6.0, 6.0, 3.0);
-            line(&[[6.0, 9.0], [6.0, 21.0]]);
-            circle(18.0, 18.0, 3.0);
-            line(&[[13.0, 6.0], [16.0, 6.0], [18.0, 8.0], [18.0, 15.0]]);
-        }
-        Icon::Merged => {
-            // The change, joined to the branch it came from.
-            circle(6.0, 6.0, 3.0);
-            line(&[[6.0, 9.0], [6.0, 21.0]]);
-            circle(18.0, 18.0, 3.0);
-            let mut joined = Vec::with_capacity(9);
-            for step in 0..=8 {
-                let angle = std::f32::consts::PI * (1.0 - step as f32 / 16.0);
-                joined.push([15.0 + 9.0 * angle.cos(), 9.0 + 9.0 * angle.sin()]);
-            }
-            line(&joined);
-        }
-        Icon::Comment => line(&[
-            [7.0, 17.0],
-            [3.0, 21.0],
-            [3.0, 5.0],
-            [5.0, 3.0],
-            [19.0, 3.0],
-            [21.0, 5.0],
-            [21.0, 15.0],
-            [19.0, 17.0],
-            [7.0, 17.0],
-        ]),
-        Icon::Branch => {
-            // A trunk, and the branch that left it.
-            circle(6.0, 5.5, 2.5);
-            line(&[[6.0, 8.0], [6.0, 16.0]]);
-            circle(6.0, 18.5, 2.5);
-            circle(18.0, 7.5, 2.5);
-            line(&[[18.0, 10.0], [18.0, 11.0], [15.0, 14.0], [6.0, 14.0]]);
-        }
-        Icon::Paperclip => {
-            // One wire: down the long side, round the foot, up over the
-            // head and back down into the loop it holds.
-            let arc = |x: f32, y: f32, radius: f32, from: f32, to: f32| {
-                (0..=8).map(move |step| {
-                    let angle = (from + (to - from) * step as f32 / 8.0).to_radians();
-                    [x + radius * angle.cos(), y + radius * angle.sin()]
-                })
-            };
-            let mut wire = vec![[18.0, 8.0]];
-            wire.extend(arc(12.0, 15.0, 6.0, 0.0, 180.0));
-            wire.extend(arc(10.25, 7.25, 4.25, 180.0, 360.0));
-            wire.extend(arc(12.25, 14.5, 2.25, 0.0, 180.0));
-            wire.push([10.0, 9.0]);
-            line(&wire);
-        }
-        Icon::Agents => {
-            // One agent, and the two it started.
-            circle(12.0, 5.5, 2.5);
-            line(&[[12.0, 8.0], [12.0, 12.0]]);
-            line(&[
-                [6.0, 15.5],
-                [6.0, 13.5],
-                [7.5, 12.0],
-                [16.5, 12.0],
-                [18.0, 13.5],
-                [18.0, 15.5],
-            ]);
-            circle(6.0, 18.0, 2.5);
-            circle(18.0, 18.0, 2.5);
-        }
-        Icon::File | Icon::FilePlus => {
-            // A sheet with its top trailing corner folded down.
-            line(&[
-                [13.5, 3.0],
-                [6.5, 3.0],
-                [5.0, 4.5],
-                [5.0, 19.5],
-                [6.5, 21.0],
-                [17.5, 21.0],
-                [19.0, 19.5],
-                [19.0, 8.5],
-                [13.5, 3.0],
-                [13.5, 8.5],
-                [19.0, 8.5],
-            ]);
-            if icon == Icon::FilePlus {
-                line(&[[12.0, 12.0], [12.0, 18.0]]);
-                line(&[[9.0, 15.0], [15.0, 15.0]]);
-            }
-        }
-        Icon::Files => {
-            // A sheet in front of another: the files of a folder.
-            line(&[
-                [14.5, 6.0],
-                [9.5, 6.0],
-                [8.0, 7.5],
-                [8.0, 19.5],
-                [9.5, 21.0],
-                [18.5, 21.0],
-                [20.0, 19.5],
-                [20.0, 11.5],
-                [14.5, 6.0],
-                [14.5, 11.5],
-                [20.0, 11.5],
-            ]);
-            line(&[
-                [11.0, 3.0],
-                [5.5, 3.0],
-                [4.0, 4.5],
-                [4.0, 16.5],
-                [5.0, 17.5],
-            ]);
-        }
-        Icon::FolderPlus => {
-            line(&[
-                [3.0, 7.0],
-                [3.0, 18.0],
-                [4.0, 19.0],
-                [20.0, 19.0],
-                [21.0, 18.0],
-                [21.0, 9.0],
-                [20.0, 8.0],
-                [12.0, 8.0],
-                [10.0, 5.0],
-                [4.0, 5.0],
-                [3.0, 6.0],
-                [3.0, 7.0],
-            ]);
-            line(&[[12.0, 10.5], [12.0, 16.5]]);
-            line(&[[9.0, 13.5], [15.0, 13.5]]);
-        }
-        Icon::Trash => {
-            line(&[[4.0, 6.5], [20.0, 6.5]]);
-            line(&[[9.0, 6.5], [9.5, 3.5], [14.5, 3.5], [15.0, 6.5]]);
-            line(&[
-                [6.0, 6.5],
-                [7.0, 19.5],
-                [8.5, 21.0],
-                [15.5, 21.0],
-                [17.0, 19.5],
-                [18.0, 6.5],
-            ]);
-            line(&[[10.0, 10.5], [10.3, 17.0]]);
-            line(&[[14.0, 10.5], [13.7, 17.0]]);
-        }
-        Icon::Pointer => {
-            line(&[
-                [6.0, 3.5],
-                [6.0, 18.5],
-                [9.8, 15.0],
-                [12.6, 20.5],
-                [14.8, 19.4],
-                [12.0, 14.0],
-                [17.5, 14.0],
-                [6.0, 3.5],
-            ]);
-        }
-        Icon::Record => {
-            circle(12.0, 12.0, 8.0);
-            circle(12.0, 12.0, 2.5);
-        }
-        Icon::Person => {
-            circle(12.0, 8.5, 3.5);
-            let mut shoulders = Vec::new();
-            for step in 0..=8 {
-                let angle = std::f32::consts::PI * (1.0 + step as f32 / 8.0);
-                shoulders.push([12.0 + 6.5 * angle.cos(), 19.5 + 5.0 * angle.sin()]);
-            }
-            line(&shoulders);
-        }
-        Icon::Lock => {
-            // A shackle over the body: a page reached over a secure connection.
-            let mut shackle = vec![[8.5, 10.5]];
-            for step in 0..=8 {
-                let angle = std::f32::consts::PI * (1.0 + step as f32 / 8.0);
-                shackle.push([12.0 + 3.5 * angle.cos(), 7.5 + 3.5 * angle.sin()]);
-            }
-            shackle.push([15.5, 10.5]);
-            line(&shackle);
-            rectangle(5.5, 10.5, 13.0, 9.5, 2.5);
-        }
-        Icon::ThumbUp | Icon::ThumbDown => {
-            // A cuff and the hand that leaves it, thumb up; turned over for
-            // the other one.
-            let turned = |y: f32| if icon == Icon::ThumbDown { 24.0 - y } else { y };
-            let hand = [
-                [7.5, 11.0],
-                [11.0, 4.0],
-                [13.0, 4.5],
-                [13.5, 6.5],
-                [12.5, 10.0],
-                [19.0, 10.0],
-                [20.5, 11.5],
-                [19.0, 19.0],
-                [17.5, 20.0],
-                [7.5, 20.0],
-            ]
-            .map(|[x, y]| [x, turned(y)]);
-            line(&hand);
-            line(&[[3.5, turned(11.0)], [3.5, turned(20.0)]]);
-        }
-        Icon::Smile | Icon::Unsure => {
-            circle(12.0, 12.0, 9.0);
-            painter.circle_filled(point(9.0, 10.0), 1.2 * scale, color);
-            painter.circle_filled(point(15.0, 10.0), 1.2 * scale, color);
-            if icon == Icon::Smile {
-                let mouth: Vec<[f32; 2]> = (0..=8)
-                    .map(|step| {
-                        let angle = (25.0 + step as f32 * 130.0 / 8.0).to_radians();
-                        [12.0 + 5.0 * angle.cos(), 11.5 + 5.0 * angle.sin()]
-                    })
-                    .collect();
-                line(&mouth);
-            } else {
-                line(&[[8.5, 16.5], [11.0, 15.0], [13.0, 16.5], [15.5, 15.0]]);
-            }
-        }
-        Icon::Party => {
-            // A cone on its side, and what flies out of it.
-            line(&[[4.0, 20.0], [9.0, 8.0], [16.0, 15.0], [4.0, 20.0]]);
-            line(&[[14.0, 4.0], [14.0, 7.0]]);
-            line(&[[19.0, 6.0], [17.0, 8.0]]);
-            line(&[[20.5, 12.0], [17.5, 12.0]]);
-        }
-        Icon::Heart => {
-            let points = (0..32)
-                .map(|step| {
-                    let t = step as f32 * std::f32::consts::TAU / 32.0;
-                    let x = 16.0 * t.sin().powi(3);
-                    let y = 13.0 * t.cos()
-                        - 5.0 * (2.0 * t).cos()
-                        - 2.0 * (3.0 * t).cos()
-                        - (4.0 * t).cos();
-                    point(12.0 + x * 0.54, 11.5 - y * 0.54)
-                })
-                .collect();
-            painter.add(Shape::closed_line(points, stroke));
-        }
-        Icon::Rocket => {
-            line(&[
-                [12.0, 3.0],
-                [16.0, 8.5],
-                [16.0, 16.0],
-                [8.0, 16.0],
-                [8.0, 8.5],
-                [12.0, 3.0],
-            ]);
-            circle(12.0, 10.0, 1.7);
-            line(&[[8.0, 12.5], [5.0, 16.5], [8.0, 16.0]]);
-            line(&[[16.0, 12.5], [19.0, 16.5], [16.0, 16.0]]);
-            line(&[[10.5, 18.5], [12.0, 21.5], [13.5, 18.5]]);
-        }
-        Icon::Eyes => {
-            for x in [7.5, 16.5] {
-                circle(x, 12.0, 3.9);
-                painter.circle_filled(point(x + 1.0, 12.6), 1.4 * scale, color);
-            }
-        }
-        Icon::Star => {
-            // Closed, so all five points are mitred alike.
-            let points = (0..10)
-                .map(|step| {
-                    let angle = (step as f32 * 36.0 - 90.0).to_radians();
-                    let radius = if step % 2 == 0 { 9.5 } else { 4.4 };
-                    point(12.0 + radius * angle.cos(), 12.9 + radius * angle.sin())
-                })
-                .collect();
-            painter.add(Shape::closed_line(points, stroke));
+impl Variant {
+    fn family(self) -> &'static str {
+        match self {
+            Self::Outline => "Tabler Outline",
+            Self::Filled => "Tabler Filled",
         }
     }
+
+    fn font(self, size: f32) -> FontId {
+        FontId::new(size, FontFamily::Name(self.family().into()))
+    }
+}
+
+mod tabler {
+    use super::{Icon, Variant};
+    include!("../assets/icons/tabler/glyphs.rs");
+}
+
+/// Add dedicated icon families without changing the text families' fallbacks.
+pub fn register_fonts(definitions: &mut FontDefinitions) {
+    for (variant, bytes) in [
+        (
+            Variant::Outline,
+            include_bytes!("../assets/icons/tabler/outline.ttf").as_slice(),
+        ),
+        (
+            Variant::Filled,
+            include_bytes!("../assets/icons/tabler/filled.ttf").as_slice(),
+        ),
+    ] {
+        let family = variant.family();
+        definitions
+            .font_data
+            .insert(family.into(), FontData::from_static(bytes).into());
+        definitions
+            .families
+            .insert(FontFamily::Name(family.into()), vec![family.into()]);
+    }
+}
+
+/// Paint an icon inside its square design grid. The caller owns the hit area.
+pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
+    paint_rotated(painter, rect, icon, color, 0.0);
+}
+
+/// Paint a glyph rotated clockwise around the design-cell center, in radians.
+/// Rotation does not change the caller's layout bounds or hit target.
+pub fn paint_rotated(painter: &Painter, rect: Rect, icon: Icon, color: Color32, angle: f32) {
+    let side = rect.width().min(rect.height());
+    if !side.is_finite()
+        || side <= 0.0
+        || !angle.is_finite()
+        || color.a() == 0
+        || !painter.clip_rect().intersects(rect)
+    {
+        return;
+    }
+    let (variant, glyph) = tabler::mapping(icon);
+    // Fractional/animated bounds reuse whole physical-pixel rasters. Mesh
+    // scaling keeps movement smooth without growing the font atlas per frame.
+    let pixels_per_point = painter.pixels_per_point();
+    let raster_size = (side * pixels_per_point).round().max(1.0) / pixels_per_point;
+    let galley = painter.layout_no_wrap(
+        glyph.to_string(),
+        variant.font(raster_size),
+        Color32::PLACEHOLDER,
+    );
+    let scale = side / raster_size;
+    // Preserve Tabler's full 24-point cell and optical offsets, not tight ink
+    // centering. Rotate around that same cell for spinners and disclosure.
+    let translation = rect.center().to_vec2() - scale * galley.rect.center().to_vec2();
+    let shape = if scale == 1.0 {
+        Shape::Text(
+            TextShape::new(translation.to_pos2(), galley, color)
+                .with_angle_and_anchor(angle, Align2::CENTER_CENTER),
+        )
+    } else {
+        let mut shape = Shape::Text(
+            TextShape::new(Pos2::ZERO, galley, color)
+                .with_angle_and_anchor(angle, Align2::CENTER_CENTER),
+        );
+        shape.transform(TSTransform::new(translation, scale));
+        shape
+    };
+    painter.add(shape);
 }
 
 /// Paint a CLI agent's own mark into its visual bounds, in `ink` unless the
@@ -784,8 +307,97 @@ mod tests {
     use eframe::egui::{self, Align, Event, Layout, Modifiers, PointerButton, UiBuilder};
 
     #[test]
+    fn every_tabler_icon_is_present_in_its_dedicated_font() {
+        let ctx = egui::Context::default();
+        crate::platform::fonts::install(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for icon in tabler::ALL {
+                let (variant, glyph) = tabler::mapping(icon);
+                assert!(
+                    ui.ctx()
+                        .fonts_mut(|fonts| fonts.has_glyph(&variant.font(16.0), glyph)),
+                    "{icon:?} is missing from {variant:?}"
+                );
+            }
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn all_icons_draw_at_small_large_and_fractional_sizes_on_both_display_scales() {
+        for pixels_per_point in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            crate::platform::fonts::install(&ctx);
+            ctx.set_pixels_per_point(pixels_per_point);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                for icon in tabler::ALL {
+                    for side in [8.0, 14.0, 16.0, 16.25, 24.0, 40.0] {
+                        let rect = Rect::from_center_size(Pos2::new(64.0, 64.0), vec2(side, side));
+                        paint(&painter, rect, icon, Color32::WHITE);
+                    }
+                }
+            });
+            output.textures_delta.clear();
+            assert_eq!(
+                output
+                    .shapes
+                    .iter()
+                    .filter(|shape| matches!(shape.shape, Shape::Text(_)))
+                    .count(),
+                tabler::ALL.len() * 6,
+            );
+            let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
+            assert!(meshes.iter().any(|mesh| {
+                matches!(&mesh.primitive, egui::epaint::Primitive::Mesh(mesh) if !mesh.is_empty())
+            }));
+        }
+    }
+
+    #[test]
+    fn rotating_glyphs_preserves_the_design_cell_center() {
+        for pixels_per_point in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            crate::platform::fonts::install(&ctx);
+            ctx.set_pixels_per_point(pixels_per_point);
+            let center = Pos2::new(64.0, 64.0);
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                for side in [14.0, 16.25] {
+                    for angle in [
+                        0.0,
+                        std::f32::consts::FRAC_PI_2,
+                        std::f32::consts::TAU / 3.0,
+                    ] {
+                        paint_rotated(
+                            &painter,
+                            Rect::from_center_size(center, vec2(side, side)),
+                            Icon::Loader2,
+                            Color32::WHITE,
+                            angle,
+                        );
+                    }
+                }
+            });
+            output.textures_delta.clear();
+            let mut checked = 0;
+            for clipped in output.shapes {
+                if let Shape::Text(shape) = clipped.shape {
+                    let rotated_center = shape.pos
+                        + eframe::egui::emath::Rot2::from_angle(shape.angle)
+                            * shape.galley.rect.center().to_vec2();
+                    assert!(rotated_center.distance(center) < 0.001);
+                    checked += 1;
+                }
+            }
+            assert_eq!(checked, 6);
+        }
+    }
+
+    #[test]
     fn agents_with_a_mark_paint_it_and_the_rest_leave_the_tab_as_it_was() {
         let ctx = egui::Context::default();
+        crate::platform::fonts::install(&ctx);
         let mut painted = Vec::new();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let rect = Rect::from_min_size(Pos2::ZERO, vec2(13.0, 13.0));
@@ -804,6 +416,97 @@ mod tests {
                 AgentKind::Pi
             ]
         );
+    }
+
+    #[test]
+    fn provider_marks_keep_original_tints_bounds_and_physical_pixel_cache() {
+        for pixels_per_point in [1.0, 2.0] {
+            // Provider marks do not depend on the Tabler font families.
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
+            let rect = Rect::from_center_size(Pos2::new(64.0, 64.0), vec2(21.0, 13.25));
+            let square = Rect::from_center_size(rect.center(), vec2(13.25, 13.25));
+            let pixels = (13.25_f32 * pixels_per_point).round() as usize;
+            let mut expected = Vec::new();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                for (kind, name) in [
+                    (AgentKind::Claude, "claude"),
+                    (AgentKind::Codex, "codex"),
+                    (AgentKind::Opencode, "opencode"),
+                    (AgentKind::Pi, "pi"),
+                ] {
+                    let key = Id::new(("provider-mark", name, pixels as u32));
+                    assert!(paint_provider(&painter, rect, kind, Color32::WHITE));
+                    let texture = ctx
+                        .data(|data| data.get_temp::<TextureHandle>(key))
+                        .unwrap();
+                    assert_eq!(texture.size(), [pixels; 2]);
+                    assert!(paint_provider(&painter, rect, kind, Color32::LIGHT_GREEN));
+                    let cached = ctx
+                        .data(|data| data.get_temp::<TextureHandle>(key))
+                        .unwrap();
+                    assert_eq!(texture.id(), cached.id());
+                    expected.push((kind, texture.id()));
+                }
+            });
+            for (kind, texture_id) in expected {
+                let uploads = output
+                    .textures_delta
+                    .set
+                    .iter()
+                    .filter(|(id, _)| **id == texture_id)
+                    .count();
+                assert_eq!(uploads, 1, "{kind:?} uploaded its mask more than once");
+                let meshes: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        Shape::Mesh(mesh) if mesh.texture_id == texture_id => Some(mesh),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(meshes.len(), 2);
+                for (mesh, ink) in meshes.iter().zip([Color32::WHITE, Color32::LIGHT_GREEN]) {
+                    assert_eq!(mesh.calc_bounds(), square);
+                    let tint = if kind == AgentKind::Claude {
+                        Color32::from_rgb(0xd9, 0x77, 0x57)
+                    } else {
+                        ink
+                    };
+                    assert!(mesh.vertices.iter().all(|vertex| vertex.color == tint));
+                    assert_eq!(mesh.vertices[0].uv, pos2(0.0, 0.0));
+                    assert_eq!(mesh.vertices[3].uv, pos2(1.0, 1.0));
+                }
+            }
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn unsupported_providers_paint_nothing_and_allocate_no_mask_textures() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
+            let rect = Rect::from_center_size(Pos2::new(64.0, 64.0), vec2(13.0, 13.0));
+            for kind in [AgentKind::Gemini, AgentKind::Omp] {
+                assert!(!paint_provider(&painter, rect, kind, Color32::WHITE));
+            }
+        });
+        assert!(
+            output
+                .shapes
+                .iter()
+                .all(|shape| !matches!(shape.shape, Shape::Mesh(_) | Shape::Text(_)))
+        );
+        assert!(
+            output
+                .textures_delta
+                .set
+                .iter()
+                .all(|(id, _)| matches!(id, egui::TextureId::Managed(0)))
+        );
+        output.textures_delta.clear();
     }
 
     fn title_controls_frame(ctx: &egui::Context, events: Vec<Event>) -> Response {
@@ -853,6 +556,7 @@ mod tests {
     #[test]
     fn rtl_titlebar_icon_retains_identity_and_clicks_on_release() {
         let ctx = egui::Context::default();
+        crate::platform::fonts::install(&ctx);
         crate::theme::apply(&ctx, &crate::config::Config::default());
         let initial = title_controls_frame(&ctx, vec![]);
         let pos = initial.rect.center();
@@ -926,6 +630,7 @@ mod tests {
     #[test]
     fn hiding_neighboring_controls_preserves_focus_and_keyboard_activation() {
         let ctx = egui::Context::default();
+        crate::platform::fonts::install(&ctx);
         let (initial_find, initial_close) = action_controls_frame(&ctx, true, true, vec![]);
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(initial_find.id));
 

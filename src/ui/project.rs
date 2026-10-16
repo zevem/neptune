@@ -907,9 +907,13 @@ fn pinned_row(
             }
             let indent = if mark { 16.0 } else { 0.0 };
             if mark {
-                ui.painter().circle_filled(
-                    Pos2::new(line.left() + 4.0, line.center().y),
-                    4.0,
+                icons::paint(
+                    ui.painter(),
+                    Rect::from_center_size(
+                        Pos2::new(line.left() + 4.0, line.center().y),
+                        vec2(9.6, 9.6),
+                    ),
+                    Icon::CircleFilled,
                     p.attention,
                 );
             }
@@ -992,7 +996,12 @@ fn agent_words(member: &Member) -> String {
 fn agent_mark(painter: &egui::Painter, centre: Pos2, p: Palette, member: &Member) {
     if member.ready {
         // Something to look at, which is not a wait.
-        painter.circle_filled(centre, 4.0, p.accent);
+        icons::paint(
+            painter,
+            Rect::from_center_size(centre, vec2(9.6, 9.6)),
+            Icon::CircleFilled,
+            p.accent,
+        );
     } else {
         chat::mark(painter, centre, p, member.waits, member.works);
     }

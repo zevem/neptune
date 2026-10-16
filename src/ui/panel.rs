@@ -110,7 +110,12 @@ fn attention_dot(ui: &Ui, p: Palette, response: &egui::Response, on: bool, press
     let painter = ui.painter();
     painter.circle_filled(centre, 5.0 * dot, p.chrome);
     painter.circle_filled(centre, 5.0 * dot, beneath);
-    painter.circle_filled(centre, 3.5 * dot, p.attention);
+    icons::paint(
+        painter,
+        Rect::from_center_size(centre, vec2(8.4, 8.4) * dot),
+        Icon::CircleFilled,
+        p.attention,
+    );
 }
 
 /// The toolbar's control for the panel. It stays pressed while the panel is
@@ -458,7 +463,7 @@ mod tests {
 
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
-        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        crate::theme::fonts(&ctx);
         theme::apply(&ctx, &crate::config::Config::default());
         ctx
     }

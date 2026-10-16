@@ -72,27 +72,22 @@ function WindowControls() {
     <div className="group/lights absolute top-4 left-4 z-30 flex gap-2">
       {(
         [
-          ["Close window", "#ff5f57", "M-2.4 -2.4L2.4 2.4M2.4 -2.4L-2.4 2.4"],
-          ["Minimize", "#febc2e", "M-3 0H3"],
-          ["Maximize", "#28c840", "M-3 0H3M0 -3V3"],
+          ["Close window", "#ff5f57", "close"],
+          ["Minimize", "#febc2e", "minus"],
+          ["Maximize", "#28c840", "plus"],
         ] as const
       ).map(([label, color, glyph]) => (
         <span
           key={label}
           title={label}
           className="grid size-3 place-items-center rounded-full shadow-[inset_0_0_0_0.5px_rgb(0_0_0/0.19)]"
-          style={{ background: color }}
+          style={{ background: color, color: `color-mix(in srgb, black 62%, ${color})` }}
         >
-          <svg
-            viewBox="-6 -6 12 12"
-            className="size-3 opacity-0 transition-opacity duration-100 group-hover/lights:opacity-100"
-            stroke={`color-mix(in srgb, black 62%, ${color})`}
-            strokeWidth="1.2"
-            strokeLinecap="round"
-            aria-hidden="true"
-          >
-            <path d={glyph} />
-          </svg>
+          <Icon
+            name={glyph}
+            size={12}
+            className="opacity-0 transition-opacity duration-100 group-hover/lights:opacity-100"
+          />
         </span>
       ))}
     </div>
@@ -208,7 +203,7 @@ function WorkspaceRow({
         <span className="flex min-w-0 items-center">
           {!running && (
             // Every terminal here has stopped: a red dot leads the name.
-            <span className="mr-[5px] size-1.5 shrink-0 rounded-full bg-danger" />
+            <Icon name="circleFilled" size={6} className="mr-[5px] text-danger" />
           )}
           <span
             className={`block truncate text-[13px] leading-4 font-medium ${
@@ -242,7 +237,7 @@ function WorkspaceRow({
                 <span className="ml-1 flex min-w-0 items-center gap-[3px]">
                   <Icon name="branch" size={11} />
                   <span className="truncate">{workspace.branch.name}</span>
-                  {workspace.branch.dirty && <span className="ml-0.5 size-[5px] shrink-0 rounded-full bg-warn" />}
+                  {workspace.branch.dirty && <Icon name="circleFilled" size={5} className="ml-0.5 text-warn" />}
                 </span>
               )}
             </>
@@ -335,20 +330,13 @@ function GroupRow({
         }
         className="absolute inset-0 flex cursor-pointer items-center rounded-control pr-[34px] pl-[7px] text-left"
       >
-        <svg
-          viewBox="-5 -5 10 10"
-          className={`size-2.5 shrink-0 text-muted transition-transform duration-[120ms] ease-out ${
+        <Icon
+          name="chevronRight"
+          size={10}
+          className={`text-muted transition-transform duration-[120ms] ease-out ${
             group.collapsed ? "" : "rotate-90"
           }`}
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
-          <path d="M-2 -4L2 0L-2 4" />
-        </svg>
+        />
         <Icon
           name="folder"
           size={16}
@@ -721,8 +709,10 @@ function Toolbar({
                 })
               }
             />
-            <span
-              className={`pointer-events-none absolute top-[5.5px] right-[5.5px] size-[7px] rounded-full bg-attention ring-[1.5px] ring-chrome transition-transform duration-[160ms] ease-out ${
+            <Icon
+              name="circleFilled"
+              size={7}
+              className={`pointer-events-none absolute top-[5.5px] right-[5.5px] rounded-full text-attention ring-[1.5px] ring-chrome transition-transform duration-[160ms] ease-out ${
                 unread ? "scale-100" : "scale-0"
               }`}
             />
@@ -736,8 +726,10 @@ function Toolbar({
               className={state.panel.open ? "[&>span]:bg-pressed" : ""}
               onClick={() => dispatch({ type: "panel" })}
             />
-            <span
-              className={`pointer-events-none absolute top-[5.5px] right-[5.5px] size-[7px] rounded-full bg-attention ring-[1.5px] ring-chrome transition-transform duration-[160ms] ease-out ${
+            <Icon
+              name="circleFilled"
+              size={7}
+              className={`pointer-events-none absolute top-[5.5px] right-[5.5px] rounded-full text-attention ring-[1.5px] ring-chrome transition-transform duration-[160ms] ease-out ${
                 waiting ? "scale-100" : "scale-0"
               }`}
             />
@@ -760,7 +752,7 @@ function Toolbar({
 function StatusCapsule({ pane, dispatch }: { pane: Pane; dispatch: Dispatch }) {
   return (
     <div className="absolute bottom-[17px] left-1/2 flex h-[34px] max-w-[calc(100%-16px)] -translate-x-1/2 animate-fade-in items-center rounded-full border border-edge bg-elevated pr-[5px] pl-[13px] shadow-popup">
-      <span className="size-[7px] shrink-0 rounded-full bg-muted" />
+      <Icon name="circleFilled" size={7} className="text-muted" />
       <span className="mr-3 ml-[9px] truncate text-[12px] font-medium text-fg">
         Process exited
       </span>
@@ -847,7 +839,7 @@ function Tab({
         alone ? "" : shown ? "bg-fg/8" : "hover:bg-fg/[0.045]"
       }`}
     >
-      {!shown && unread && <span className="mr-[5px] size-1.5 shrink-0 rounded-full bg-attention" />}
+      {!shown && unread && <Icon name="circleFilled" size={6} className="mr-[5px] text-attention" />}
       {/* The agent's own mark leads the tab while the terminal runs one. */}
       {pane.agent && <TabMark kind={pane.agent.kind} />}
       <span className={`truncate text-[12px] font-medium ${focused ? "text-fg" : "text-secondary"}`}>
@@ -1011,9 +1003,7 @@ function PlaceView({
       />
       {pane.status === "starting" && (
         <p className="absolute inset-0 flex items-center justify-center gap-2 text-[12.5px] text-muted">
-          <svg viewBox="0 0 16 16" className="spinner size-3.5" fill="none" aria-hidden="true">
-            <path d="M8 1.5a6.5 6.5 0 106.5 6.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-          </svg>
+          <Icon name="loader" size={14} className="spinner" />
           {pane.remote ? "Connecting…" : "Starting shell…"}
         </p>
       )}

@@ -41,7 +41,7 @@ const WINDOW: Rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(900.0, 860.0));
 
 fn context() -> egui::Context {
     let ctx = egui::Context::default();
-    ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+    crate::theme::fonts(&ctx);
     theme::apply(&ctx, &crate::config::Config::default());
     ctx
 }

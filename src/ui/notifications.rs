@@ -390,7 +390,12 @@ fn row(
         if highlighted {
             painter.circle_filled(dot, 5.0, p.hover);
         }
-        painter.circle_filled(dot, 3.5, p.attention);
+        icons::paint(
+            &painter,
+            Rect::from_center_size(dot, Vec2::splat(8.4)),
+            Icon::CircleFilled,
+            p.attention,
+        );
     }
 
     let mut y = rect.top() + 10.0;
@@ -512,7 +517,7 @@ mod tests {
 
     fn context() -> (egui::Context, Palette) {
         let ctx = egui::Context::default();
-        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        crate::theme::fonts(&ctx);
         let config = crate::config::Config::default();
         theme::apply(&ctx, &config);
         (ctx, Palette::for_config(&config))

@@ -98,9 +98,13 @@ pub(super) fn show(
         if response.has_focus() {
             focus_ring(ui.painter(), line.shrink(2.0), 7, p);
         }
-        ui.painter().circle_filled(
-            Pos2::new(line.left() + 13.0, line.center().y),
-            4.0,
+        icons::paint(
+            ui.painter(),
+            Rect::from_center_size(
+                Pos2::new(line.left() + 13.0, line.center().y),
+                vec2(9.6, 9.6),
+            ),
+            Icon::CircleFilled,
             p.attention,
         );
         ui.painter().text(
@@ -505,9 +509,13 @@ fn watch(
         ui.add_space(4.0);
         ui.horizontal_top(|ui| {
             let (_, mark) = ui.allocate_space(vec2(20.0, 18.0));
-            ui.painter().circle_filled(
-                Pos2::new(mark.left() + 8.0, mark.center().y),
-                4.0,
+            icons::paint(
+                ui.painter(),
+                Rect::from_center_size(
+                    Pos2::new(mark.left() + 8.0, mark.center().y),
+                    vec2(9.6, 9.6),
+                ),
+                Icon::CircleFilled,
                 p.attention,
             );
             ui.vertical(|ui| {

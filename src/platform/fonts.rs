@@ -398,6 +398,7 @@ fn font_definitions_with(
     read: &mut impl FnMut(&Path) -> io::Result<Vec<u8>>,
 ) -> egui::FontDefinitions {
     let mut definitions = egui::FontDefinitions::default();
+    crate::icons::register_fonts(&mut definitions);
     for (name, bytes) in [
         (
             "Geist",
@@ -962,6 +963,24 @@ mod tests {
         }
         assert!(!definitions.font_data.contains_key("SystemNerd"));
         assert!(!definitions.font_data.contains_key("SystemCjk"));
+    }
+
+    #[test]
+    fn tabler_families_survive_font_selection_without_entering_text_fallbacks() {
+        let base = bundled_definitions();
+        for selected in [DEFAULT_FAMILY, "Unavailable family"] {
+            let (definitions, _) = definitions_for(&base, &[], selected);
+            for name in ["Tabler Outline", "Tabler Filled"] {
+                let icon_family = FontFamily::Name(name.into());
+                assert!(definitions.font_data.contains_key(name));
+                assert_eq!(definitions.families[&icon_family], [name]);
+                for (family, fallbacks) in &definitions.families {
+                    if *family != icon_family {
+                        assert!(!fallbacks.iter().any(|fallback| fallback == name));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
