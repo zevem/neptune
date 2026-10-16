@@ -310,16 +310,18 @@ fn repaint_notifications_coalesce_bursts_and_force_the_final_frame() {
     assert_eq!(callbacks.load(Ordering::Relaxed), 2);
 
     // A pending notification must not hide natural exit or its final glyphs.
+    // Exit and the last worker's teardown each force a repaint. Wait for both:
+    // the intermediate count of three can pass between two observer polls.
     session.write(b"finish\n").unwrap();
     wait_for(|| {
         matches!(
             session.metadata().status,
             SessionStatus::Exited { code: 7, .. }
-        ) && callbacks.load(Ordering::Relaxed) == 3
+        ) && session.metrics().active_workers == 0
+            && callbacks.load(Ordering::Relaxed) == 4
     });
     assert!(screen(&session).contains("FINAL-FRAME"));
     assert_eq!(session.metrics().bytes_parsed, 10 + 5000 * 3 + 9 + 11);
-    wait_for(|| session.metrics().active_workers == 0);
 }
 
 #[test]

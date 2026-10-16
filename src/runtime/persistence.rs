@@ -367,6 +367,28 @@ mod tests {
         StateSnapshot::from_model(controller.model())
     }
 
+    fn drain_file_writes(mut writer: PersistenceWriter) {
+        // File-content tests must not assert a wall-clock bound on fsync. Drop
+        // requests draining; join keeps the temporary destinations alive until
+        // completion. Test shutdown deadlines separately with injected storage.
+        let shared = Arc::clone(&writer.shared);
+        let worker = writer.worker.take().unwrap();
+        drop(writer);
+        worker.join().unwrap();
+        let queue = shared.queue.lock().unwrap();
+        assert!(queue.exited);
+        assert!(queue.pending.iter().all(Option::is_none));
+        for (target, completed) in queue.latest.iter().zip(&queue.completed) {
+            if let Some(target) = target {
+                let event = completed.as_ref().expect("accepted snapshot completed");
+                assert_eq!(event.generation, *target);
+                // A directory-sync failure can follow a successful replacement,
+                // so correct file contents alone do not prove a successful save.
+                assert_eq!(event.result, Ok(()));
+            }
+        }
+    }
+
     #[test]
     fn single_writer_coalesces_blocked_storage_and_rejects_old_snapshots() {
         let started = Arc::new(Barrier::new(2));
@@ -407,9 +429,10 @@ mod tests {
             1
         );
         release.wait();
-        writer.shutdown(Duration::from_secs(2)).unwrap();
+        writer.flush().unwrap();
         assert_eq!(*saved.lock().unwrap(), vec![1, 100]);
         assert_eq!(writer.drain_events()[0].generation, 100);
+        writer.shutdown(Duration::from_secs(2)).unwrap();
     }
 
     #[test]
@@ -429,12 +452,12 @@ mod tests {
     }
 
     #[test]
-    fn destination_generations_are_independent_and_flush_latest_files() {
+    fn destination_generations_are_independent_and_drain_latest_files() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("workspaces.json");
         let config_path = directory.path().join("config.toml");
         let window_path = directory.path().join("window.json");
-        let mut writer = PersistenceWriter::new(
+        let writer = PersistenceWriter::new(
             state_path.clone(),
             config_path.clone(),
             window_path.clone(),
@@ -459,7 +482,7 @@ mod tests {
         };
         writer.submit_window(2, window).unwrap();
         writer.submit_window(1, WindowState::default()).unwrap();
-        writer.shutdown(Duration::from_secs(2)).unwrap();
+        drain_file_writes(writer);
         let saved: StateSnapshot =
             serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
         assert_eq!(saved.workspaces[0].name, "latest state");
@@ -490,6 +513,65 @@ mod tests {
         writer.submit_state(2, snapshot("second")).unwrap();
         release.store(true, Ordering::Release);
         writer.shutdown(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_timeout_keeps_draining_pending_snapshots() {
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let op_started = Arc::clone(&started);
+        let op_release = Arc::clone(&release);
+        let mut writer = PersistenceWriter::with_operation(
+            true,
+            Arc::new(|| {}),
+            Arc::new(move |job| {
+                if job.kind == SaveKind::State {
+                    op_started.wait();
+                    op_release.wait();
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        writer.submit_state(90, snapshot("blocked state")).unwrap();
+        started.wait();
+        writer.submit_config(1, Config::default()).unwrap();
+        writer.submit_window(2, WindowState::default()).unwrap();
+        writer.submit_window(1, WindowState::default()).unwrap();
+
+        // Hold storage beyond the entire shutdown budget without timing a sleep.
+        // The shared deadline reports this as a shutdown timeout even though the
+        // worker is still writing, not stuck in its exit handshake.
+        assert_eq!(
+            writer.shutdown(Duration::ZERO).unwrap_err(),
+            "Timed out waiting for persistence shutdown"
+        );
+        {
+            let queue = writer.shared.queue.lock().unwrap();
+            assert!(queue.stopping);
+            assert!(!queue.exited);
+            assert!(queue.completed.iter().all(Option::is_none));
+        }
+        assert_eq!(
+            writer.submit_state(91, snapshot("too late")).unwrap_err(),
+            "Persistence writer has shut down"
+        );
+        release.wait();
+        writer.shutdown(Duration::from_secs(2)).unwrap();
+        assert!(writer.worker.is_none());
+        assert_eq!(
+            writer.drain_events(),
+            [
+                (SaveKind::State, 90),
+                (SaveKind::Config, 1),
+                (SaveKind::Window, 2),
+            ]
+            .map(|(kind, generation)| SaveEvent {
+                kind,
+                generation,
+                result: Ok(()),
+            })
+        );
     }
 
     #[test]
@@ -526,7 +608,7 @@ mod tests {
             &state_path,
             neptune_model::Limits::default(),
         );
-        let mut writer = PersistenceWriter::new(
+        let writer = PersistenceWriter::new(
             state_path.clone(),
             config_path.clone(),
             directory.path().join("window.json"),
@@ -546,7 +628,7 @@ mod tests {
                 },
             )
             .unwrap();
-        writer.shutdown(Duration::from_secs(2)).unwrap();
+        drain_file_writes(writer);
         assert_eq!(std::fs::read(state_path).unwrap(), original);
         assert_eq!(Config::load(&config_path).unwrap().font_size, 22.0);
     }
