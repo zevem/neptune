@@ -18,23 +18,15 @@ Commands in this guide run from the repository root.
 ## Development builds
 
 The repository defaults to two Cargo build jobs per invocation so agents working
-in parallel leave capacity for the desktop. For a shared compiler cache, install
-[sccache](https://github.com/mozilla/sccache#installation) using a prebuilt release
-or package manager and merge these settings into your user Cargo configuration
-(`~/.cargo/config.toml`, or `$CARGO_HOME/config.toml` when set):
+in parallel leave capacity for the desktop. To cover existing worktrees before
+they receive the repository configuration, set the same limit in your user Cargo
+configuration (`~/.cargo/config.toml`, or `$CARGO_HOME/config.toml` when set),
+keeping existing configuration entries:
 
 ```toml
 [build]
 jobs = 2
-rustc-wrapper = "sccache"
 ```
-
-The user-level job limit covers existing worktrees before they receive the
-repository configuration. Keep existing configuration entries when merging.
-The wrapper is optional and configured per user so other contributors and CI
-can build without installing sccache. Worktrees share its local disk cache while
-keeping separate Cargo target directories; use `sccache --show-stats` to inspect
-reuse. [Incremental Rust compilations and binary crates are not cached](https://github.com/mozilla/sccache/blob/v0.17.0/docs/Rust.md).
 
 ## Verification
 

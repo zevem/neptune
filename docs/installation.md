@@ -85,7 +85,7 @@ need their bundled helper layout. See [browser development and platform setup](b
 The terminal starts normally when that optional development payload is absent;
 opening a browser then shows a recoverable error.
 
-For optional compiler caching and build job limits, see
+For build job limits, see
 [development builds](development.md#development-builds).
 
 ## Desktop integration

@@ -110,8 +110,7 @@ these repository constraints also apply when following a skill.
   `.cargo/config.toml`'s job limit. Avoid expensive compilation concurrently with
   other agents; coordinate one validation owner or wait for existing builds.
   Increase parallelism through `--jobs`, `CARGO_BUILD_JOBS` or `--config` only
-  when explicitly requested. For shared compiler-cache setup, read
-  [development builds](README.md#development-builds).
+  when explicitly requested.
 - Use the pinned `rust-toolchain.toml` and `--locked`; do not upgrade the
   toolchain or lockfile merely to get a check running. Local commands belong in
   the owning guide. Report actual checks, host/features and any unverified

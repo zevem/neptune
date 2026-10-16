@@ -61,7 +61,7 @@ Windows prerequisites, executable locations, and desktop integration.
 
 ### Development builds
 
-Build job limits, optional compiler caching, and scoped verification are in the
+Build job limits and scoped verification are in the
 [development guide](docs/development.md#development-builds).
 
 ## Documentation
