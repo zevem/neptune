@@ -345,10 +345,21 @@ mod tests {
                 .any(|item| item.port == port)
         );
         let mut other = Command::new("/bin/sh")
-            .args(["-c", "read line"])
+            .args(["-c", "echo started; read line"])
             .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        // A vfork-based spawn can return while the child is still inside
+        // exec, before close-on-exec descriptors (this listener) are closed.
+        // Once the shell speaks, it no longer holds them.
+        let mut started = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(other.stdout.as_mut().unwrap()),
+            &mut started,
+        )
+        .unwrap();
+        assert_eq!(started, "started\n");
         assert!(
             !discover(other.id())
                 .unwrap()
@@ -371,7 +382,8 @@ mod tests {
     fn discovery_follows_nested_shell_children_and_unix_probe_agrees() {
         let root = tempfile::tempdir().unwrap();
         let ready = root.path().join("ready");
-        let code = "import socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); open(sys.argv[1],'w').write(str(s.getsockname()[1])); time.sleep(15)";
+        // Publish the port by rename, so the file never appears empty.
+        let code = "import os,socket,sys,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); p=sys.argv[1]; open(p+'.tmp','w').write(str(s.getsockname()[1])); os.replace(p+'.tmp',p); time.sleep(15)";
         use std::os::unix::process::CommandExt;
         let mut child = Command::new("/bin/sh")
             .args([
