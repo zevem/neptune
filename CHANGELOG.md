@@ -11,8 +11,64 @@ their preparation records remain in Git history.
 
 ### What's New
 
+## [0.1.0-rc.7] - 2026-10-16
+
+### What's New
+
+- Find text inside workspace files from **Files → Text**. Matching lines show
+  highlighted snippets and open the source preview at that line. Search includes
+  hidden files and collapsed folders, respects your exclusions, and reports
+  skipped files or reached limits.
+- Drag workspaces between windows on Wayland compositors that support
+  `xdg-toplevel-drag`, including GNOME. A detached window stays above the others
+  while held, and dragging into another window's sidebar joins it there. Other
+  compositors can use **Move to window** in the workspace menu.
+- Each window's sidebar now shows only the folders that contain its workspaces;
+  empty folders stay in the main window. Closing the main window on Wayland no
+  longer leaves an empty window on the taskbar.
 - On macOS, opening a browser tab no longer adds a second, bouncing Neptune
   icon to the Dock.
+- Controls across Neptune and its website now use a consistent Tabler icon set.
+
+### Acceptance notes and known limitations
+
+- Full native acceptance on every platform remains pending; this is a release
+  candidate for acceptance testing, not a production-stable release.
+- Saved workspaces now use schema version 15 to retain window organization.
+  Earlier workspace files still load, but RC5 and earlier cannot restore or
+  save over layouts written by this version. Back up workspace state before
+  testing if you need to return to an earlier candidate. Restoration starts
+  fresh shells and SSH connections; running commands and process memory are
+  not restored. Browser tabs reopen their last page in their selected profile;
+  private tabs restore blank.
+- Browser previews include a separate Chromium runtime, increasing installer
+  size. On Linux hosts that block the AppImage's Chromium sandbox, previews run
+  without it and the blank tab displays a warning; see the
+  [installation guide](https://github.com/zevem/neptune/blob/v0.1.0-rc.7/docs/installation.md#browser-previews-and-chromiums-sandbox)
+  for enabling it. The DEB includes the sandbox helper. A browser startup
+  failure leaves terminals usable. Browser sandbox, clipboard, IME, DPI and
+  installer behavior still need native acceptance on macOS and Windows.
+- Projects require Claude Code or Codex installed and signed in, and a local
+  workspace; they are not available on Windows yet. Pull request actions require
+  the GitHub CLI (`gh`) signed in with the necessary repository permissions.
+- Windows installers remain unsigned and may show an unverified-publisher or
+  SmartScreen warning. Both macOS installers require signing and notarization;
+  all installers are covered by signed update metadata and build attestations.
+- Linux x64 packages require glibc 2.35 or newer and working host graphics
+  drivers. Browser-downloaded AppImages need execute permission before launch;
+  enable it in file Properties or run `chmod u+x` on the downloaded file.
+- The macOS browser Dock fix and in-place updates still need native acceptance
+  on macOS. The reported intermittent native Wayland freeze still needs a
+  capture of the blocking state; XWayland checks
+  do not establish native Wayland acceptance. File-manager drops on native
+  Wayland currently work only in the original window.
+- SSH requires an installed OpenSSH client and a POSIX remote shell. Remote
+  directory tracking is integrated for zsh; other shells need OSC 7 integration.
+- Kitty graphics and comprehensive complex-script shaping remain unsupported.
+  Keypad identity and some keyboard-layout information depend on the window
+  toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
+- Automatic updates never downgrade. After this candidate is published, select
+  Beta in Preferences → Updates to receive it; private drafts are not offered.
 
 ## [0.1.0-rc.6] - 2026-10-13
 
