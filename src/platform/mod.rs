@@ -14,6 +14,8 @@ pub mod links;
 pub(crate) mod ports;
 pub mod shells;
 pub mod updates;
+#[cfg(target_os = "linux")]
+pub(crate) mod wayland_seat;
 pub mod window;
 pub(crate) mod workspace_drag;
 

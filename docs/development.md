@@ -52,6 +52,21 @@ Wayland child-window file drops require additional toolkit support and are
 currently unavailable. Workspace tear-off keeps the pressed native surface with
 the moving workspace so its compositor move can use the original pointer press.
 
+On native Wayland, `platform/wayland_seat.rs` holds one data device on the
+root window's connection for both file drops and workspace drags. Compositors
+give drag-and-drop only to a client's newest data device, and the toolkit's
+clipboard creates one for every window, so the seat renews its device after
+each new native window. A workspace held out of a sidebar is carried as an
+`xdg_toplevel_drag_v1` transfer that moves its new window under the pointer;
+`app/windows/carry.rs` docks and tears it off as the compositor reports the
+pointer over Neptune's windows. This needs each child window's toplevel and
+surface, which the [patched eframe](../vendor/eframe/NEPTUNE-PATCH.md) exposes
+through `eframe::viewport_window`. Wayland windows cannot be hidden, so when the
+root window's own workspaces close, it shows another window's workspaces
+instead and that window's native window closes. `native-workspace-windows.py`
+covers X11 only; Wayland tear-off and rejoin were checked by hand with real
+input on GNOME (Mutter 50).
+
 Workspace tear-off has a focused Linux/X11 workflow using actual pointer and
 keyboard input, a fresh data root, and native windows matched to the exact owned
 process PID. It measures the bootstrap window's display scale before converting
