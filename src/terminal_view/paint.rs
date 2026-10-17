@@ -266,25 +266,36 @@ impl Cache {
             if self.mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift) {
                 return None;
             }
-            let point = super::geometry::point_at(
-                rect,
-                self.cell,
-                self.columns,
-                self.lines,
-                self.display_offset,
-                pos,
-            );
+            let point_at = |pos| {
+                super::geometry::point_at(
+                    rect,
+                    self.cell,
+                    self.columns,
+                    self.lines,
+                    self.display_offset,
+                    pos,
+                )
+            };
+            let point = point_at(pos);
             if response.double_clicked() {
                 Some(SelectionInteraction::Start {
                     point,
                     kind: SelectionType::Semantic,
                 })
-            } else if response.drag_started() {
+            } else if response.is_pointer_button_down_on()
+                && ui.input(|input| input.pointer.primary_pressed())
+            {
+                // Capture the anchor before click-and-drag's movement threshold.
                 Some(SelectionInteraction::Start {
-                    point,
+                    point: point_at(
+                        ui.input(|input| input.pointer.press_origin())
+                            .unwrap_or(pos),
+                    ),
                     kind: SelectionType::Simple,
                 })
-            } else if response.dragged() {
+            } else if response.dragged_by(egui::PointerButton::Primary)
+                || response.drag_stopped_by(egui::PointerButton::Primary)
+            {
                 Some(SelectionInteraction::Update(point))
             } else if response.clicked() {
                 Some(SelectionInteraction::Clear)
@@ -298,5 +309,157 @@ impl Cache {
             open_link,
             image_paths,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Gesture {
+        context: egui::Context,
+        cache: Cache,
+        time: f64,
+    }
+
+    impl Gesture {
+        fn new() -> Self {
+            let mut cache = Cache::default();
+            cache.columns = 20;
+            cache.lines = 3;
+            cache.cell = egui::vec2(8.0, 16.0);
+            let mut gesture = Self {
+                context: egui::Context::default(),
+                cache,
+                time: 0.0,
+            };
+            gesture.frame(Vec::new());
+            gesture
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Option<SelectionInteraction> {
+            self.time += 0.1;
+            let mut interaction = None;
+            let mut output = self.context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 80.0))),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    interaction = self
+                        .cache
+                        .paint(
+                            ui,
+                            Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(160.0, 48.0)),
+                            &Config::default(),
+                            Palette::new(crate::config::Theme::Graphite),
+                            true,
+                            "",
+                            "",
+                        )
+                        .interaction;
+                },
+            );
+            output.textures_delta.clear();
+            interaction
+        }
+
+        fn button(x: f32, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos: egui::pos2(x, 18.0),
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+    }
+
+    #[test]
+    fn selection_drag_keeps_the_original_press_cell() {
+        let mut gesture = Gesture::new();
+        let interaction = gesture.frame(vec![Gesture::button(11.0, true)]);
+        assert!(
+            matches!(
+                interaction,
+                Some(SelectionInteraction::Start {
+                    point: Point { line: 0, column: 0 },
+                    kind: SelectionType::Simple,
+                    ..
+                })
+            ),
+            "drag must retain the pressed cell: {interaction:?}"
+        );
+        assert_eq!(
+            gesture.frame(vec![egui::Event::PointerMoved(egui::pos2(35.0, 18.0))]),
+            Some(SelectionInteraction::Update(Point::new(0, 3))),
+        );
+    }
+
+    #[test]
+    fn selection_drag_applies_the_release_position_at_the_left_edge() {
+        let mut gesture = Gesture::new();
+        gesture.frame(vec![Gesture::button(75.0, true)]);
+        gesture.frame(vec![egui::Event::PointerMoved(egui::pos2(55.0, 18.0))]);
+        gesture.frame(vec![egui::Event::PointerMoved(egui::pos2(35.0, 18.0))]);
+        assert_eq!(
+            gesture.frame(vec![Gesture::button(5.0, false)]),
+            Some(SelectionInteraction::Update(Point::new(0, 0))),
+        );
+    }
+
+    #[test]
+    fn selection_anchor_survives_press_and_motion_in_one_frame() {
+        let mut gesture = Gesture::new();
+        assert_eq!(
+            gesture.frame(vec![
+                Gesture::button(11.0, true),
+                egui::Event::PointerMoved(egui::pos2(35.0, 18.0)),
+            ]),
+            Some(SelectionInteraction::Start {
+                point: Point::new(0, 0),
+                kind: SelectionType::Simple,
+            }),
+        );
+    }
+
+    #[test]
+    fn selection_press_respects_the_tui_mouse_and_shift_override() {
+        let mut gesture = Gesture::new();
+        gesture.cache.mode = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(gesture.frame(vec![Gesture::button(11.0, true)]), None);
+        assert_eq!(gesture.frame(vec![Gesture::button(11.0, false)]), None);
+        let interaction = gesture.frame(vec![
+            egui::Event::ModifiersChanged(egui::Modifiers::SHIFT),
+            egui::Event::PointerButton {
+                pos: egui::pos2(11.0, 18.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+        ]);
+        assert!(matches!(
+            interaction,
+            Some(SelectionInteraction::Start {
+                kind: SelectionType::Simple,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn double_click_still_selects_a_word() {
+        let mut gesture = Gesture::new();
+        gesture.frame(vec![Gesture::button(27.0, true)]);
+        gesture.frame(vec![Gesture::button(27.0, false)]);
+        gesture.frame(vec![Gesture::button(27.0, true)]);
+        assert_eq!(
+            gesture.frame(vec![Gesture::button(27.0, false)]),
+            Some(SelectionInteraction::Start {
+                point: Point::new(0, 2),
+                kind: SelectionType::Semantic,
+            }),
+        );
     }
 }
