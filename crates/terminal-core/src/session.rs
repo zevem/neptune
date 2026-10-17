@@ -520,6 +520,7 @@ impl TerminalSession {
         let point = viewport_point(&terminal, row, col);
         if let Some(selection) = &mut terminal.selection {
             selection.update(point, Side::Right);
+            selection.include_all();
         }
         self.shared.changed();
         drop(terminal);

@@ -546,6 +546,74 @@ fn owned_snapshots_preserve_osc8_targets_across_wrap_resize_and_replacement() {
 }
 
 #[test]
+fn dragging_selection_left_to_column_zero_includes_the_leading_character() {
+    let session = fixture(12, 4, 0);
+    feed(&session, b"/a");
+    session.start_selection_at(crate::Point::new(0, 2), crate::SelectionType::Simple);
+    session.update_selection_at(crate::Point::new(0, 0));
+    assert_eq!(session.selected_text().as_deref(), Some("/a"));
+}
+
+#[test]
+fn drag_selection_includes_endpoint_cells_when_direction_changes() {
+    for viewport_coordinates in [false, true] {
+        for kind in [crate::SelectionType::Simple, crate::SelectionType::Block] {
+            let session = fixture(12, 4, 0);
+            feed(&session, b"/abcdef");
+            if viewport_coordinates {
+                session.start_selection(0, 3, kind);
+            } else {
+                session.start_selection_at(crate::Point::new(0, 3), kind);
+            }
+            for (column, expected) in [(5, "cde"), (0, "/abc"), (3, "c"), (1, "abc"), (6, "cdef")] {
+                if viewport_coordinates {
+                    session.update_selection(0, column);
+                } else {
+                    session.update_selection_at(crate::Point::new(0, column));
+                }
+                assert_eq!(
+                    session.selected_text().as_deref(),
+                    Some(expected),
+                    "viewport_coordinates={viewport_coordinates}, kind={kind:?}, column={column}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn reverse_selection_preserves_newlines_and_unicode_in_scrollback() {
+    for viewport_coordinates in [false, true] {
+        let session = fixture(12, 2, 16);
+        feed(&session, "/abc\r\n/界e\u{301}\r\nlast".as_bytes());
+        session.scroll(1);
+        if viewport_coordinates {
+            session.start_selection(1, 4, crate::SelectionType::Simple);
+            session.update_selection(0, 0);
+        } else {
+            session.start_selection_at(crate::Point::new(0, 4), crate::SelectionType::Simple);
+            session.update_selection_at(crate::Point::new(-1, 0));
+        }
+        assert_eq!(
+            session.selected_text().as_deref(),
+            Some("/abc\n/界e\u{301}")
+        );
+        let selection = session.viewport().selection.unwrap();
+        assert_eq!(selection.start, crate::Point::new(-1, 0));
+        assert_eq!(selection.end, crate::Point::new(0, 4));
+    }
+}
+
+#[test]
+fn reverse_selection_preserves_soft_wrapped_text() {
+    let session = fixture(4, 3, 0);
+    feed(&session, b"/abcdef");
+    session.start_selection_at(crate::Point::new(1, 3), crate::SelectionType::Simple);
+    session.update_selection_at(crate::Point::new(0, 0));
+    assert_eq!(session.selected_text().as_deref(), Some("/abcdef"));
+}
+
+#[test]
 fn viewport_scroll_and_selection_use_history_coordinates() {
     let session = fixture(12, 4, 16);
     feed(&session, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");

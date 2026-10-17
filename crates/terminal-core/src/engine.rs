@@ -343,6 +343,8 @@ impl TerminalSession {
         );
         if let Some(selection) = &mut terminal.selection {
             selection.update(point, Side::Right);
+            // These coordinates name whole cells, even when the drag reverses.
+            selection.include_all();
         }
         self.shared.changed();
     }

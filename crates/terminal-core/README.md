@@ -10,6 +10,10 @@ revision counters, bounded clipboard/notification events, selection, and budgete
 selection coordinates; its revision is captured under the grid mutex. No backend
 re-export or mutable lock is public. The adapter copies damaged rows and shares
 unchanged rows with `Arc`, while the renderer owns shaping and painting caches.
+Cell-based selection includes both endpoint cells in either drag direction.
+`start_selection`/`update_selection` use viewport coordinates;
+`start_selection_at`/`update_selection_at` use grid coordinates, including negative
+history lines.
 Scroll/reflow/geometry/color changes fully invalidate the required rows. Cache
 rows until `revision()` changes; avoid capturing complete history on frames.
 Call `acknowledge_repaint()` once at the beginning of each UI frame for visible

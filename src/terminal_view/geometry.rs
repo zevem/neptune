@@ -57,6 +57,17 @@ mod tests {
     }
 
     #[test]
+    fn pointer_at_or_before_the_left_edge_reaches_column_zero() {
+        let rect = Rect::from_min_size(Pos2::new(29.0, 19.0), Vec2::new(80.0, 48.0));
+        for x in [-100.0, 28.9, 29.0, 29.1, 36.9] {
+            assert_eq!(
+                point_at(rect, Vec2::new(8.0, 16.0), 10, 3, 7, Pos2::new(x, 27.0)),
+                Point::new(-7, 0),
+            );
+        }
+    }
+
+    #[test]
     fn pointer_selection_is_clamped_and_translates_scrollback() {
         assert_eq!(
             point_at(
