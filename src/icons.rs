@@ -5,9 +5,12 @@
 //! decoded and cached once for each physical-pixel size.
 
 use eframe::egui::{
-    Align2, Color32, ColorImage, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id,
-    Painter, Pos2, Rect, Response, Sense, Shape, StrokeKind, TextureHandle, TextureOptions, Ui,
-    WidgetInfo, WidgetType, emath::TSTransform, epaint::TextShape, pos2, vec2,
+    Color32, ColorImage, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id, Painter,
+    Pos2, Rect, Response, Sense, Shape, StrokeKind, TextureHandle, TextureOptions, Ui, WidgetInfo,
+    WidgetType,
+    emath::{Rot2, TSTransform},
+    epaint::{Galley, TextShape},
+    pos2, vec2,
 };
 use neptune_model::AgentKind;
 
@@ -172,22 +175,42 @@ pub fn paint_rotated(painter: &Painter, rect: Rect, icon: Icon, color: Color32, 
     let scale = side / raster_size;
     // Preserve Tabler's full 24-point cell and optical offsets, not tight ink
     // centering. Rotate around that same cell for spinners and disclosure.
-    let translation = rect.center().to_vec2() - scale * galley.rect.center().to_vec2();
+    let cell = cell_center(&galley, raster_size);
+    let rotated = Rot2::from_angle(angle) * cell.to_vec2();
     let shape = if scale == 1.0 {
-        Shape::Text(
-            TextShape::new(translation.to_pos2(), galley, color)
-                .with_angle_and_anchor(angle, Align2::CENTER_CENTER),
-        )
+        Shape::Text(TextShape::new(rect.center() - rotated, galley, color).with_angle(angle))
     } else {
-        let mut shape = Shape::Text(
-            TextShape::new(Pos2::ZERO, galley, color)
-                .with_angle_and_anchor(angle, Align2::CENTER_CENTER),
-        );
-        shape.transform(TSTransform::new(translation, scale));
+        let mut shape =
+            Shape::Text(TextShape::new(Pos2::ZERO - rotated, galley, color).with_angle(angle));
+        shape.transform(TSTransform::new(rect.center().to_vec2(), scale));
         shape
     };
     painter.add(shape);
 }
+
+/// The centre of a laid-out glyph's design cell, relative to its galley.
+///
+/// Tabler's em square is the 24-point cell: 0.9 em above the baseline and
+/// 0.1 em below it. The font also declares a typographic line gap, which egui
+/// adds to the row, so the galley's bounds are taller than the cell and
+/// centring them would lift every glyph.
+pub(crate) fn cell_center(galley: &Galley, size: f32) -> Pos2 {
+    let Some((row, glyph)) = galley
+        .rows
+        .first()
+        .and_then(|row| Some((row, row.glyphs.first()?)))
+    else {
+        return galley.rect.center();
+    };
+    let baseline = row.pos + glyph.pos.to_vec2();
+    pos2(
+        baseline.x + glyph.advance_width * 0.5,
+        baseline.y - size * (CELL_ASCENT - 0.5),
+    )
+}
+
+/// The share of Tabler's em square above the baseline (900 of 1,000 units).
+const CELL_ASCENT: f32 = 0.9;
 
 /// Paint a CLI agent's own mark into its visual bounds, in `ink` unless the
 /// mark has a colour of its own. Reports `false`, painting nothing, for an
@@ -354,43 +377,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rotating_glyphs_preserves_the_design_cell_center() {
-        for pixels_per_point in [1.0, 2.0] {
-            let ctx = egui::Context::default();
-            crate::platform::fonts::install(&ctx);
-            ctx.set_pixels_per_point(pixels_per_point);
-            let center = Pos2::new(64.0, 64.0);
+    /// The coverage-weighted centre of a painted glyph's ink, in points.
+    fn ink_center(pixels_per_point: f32, rect: Rect, icon: Icon, angle: f32) -> Pos2 {
+        let ctx = egui::Context::default();
+        crate::platform::fonts::install(&ctx);
+        ctx.set_pixels_per_point(pixels_per_point);
+        let mut center = Pos2::ZERO;
+        // The second frame paints with the glyph already in the font atlas.
+        for _ in 0..2 {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let painter = ui.ctx().layer_painter(egui::LayerId::background());
-                for side in [14.0, 16.25] {
+                paint_rotated(ui.painter(), rect, icon, Color32::WHITE, angle);
+            });
+            output.textures_delta.clear();
+            let atlas = ctx.fonts(|fonts| fonts.image());
+            let [width, height] = atlas.size.map(|size| size as f32);
+            let (mut sum, mut weight) = (vec2(0.0, 0.0), 0.0);
+            for primitive in ctx.tessellate(output.shapes, pixels_per_point) {
+                let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
+                    continue;
+                };
+                // Each glyph is a quad: top-left, top-right, bottom-left,
+                // bottom-right, possibly rotated.
+                for quad in mesh.vertices.chunks_exact(4) {
+                    let (u0, v0) = (quad[0].uv.x * width, quad[0].uv.y * height);
+                    let (u1, v1) = (quad[3].uv.x * width, quad[3].uv.y * height);
+                    let across = quad[1].pos - quad[0].pos;
+                    let down = quad[2].pos - quad[0].pos;
+                    for v in v0.round() as usize..v1.round() as usize {
+                        for u in u0.round() as usize..u1.round() as usize {
+                            let alpha = f32::from(atlas[(u, v)].a()) / 255.0;
+                            let s = (u as f32 + 0.5 - u0) / (u1 - u0);
+                            let t = (v as f32 + 0.5 - v0) / (v1 - v0);
+                            sum += (quad[0].pos + across * s + down * t).to_vec2() * alpha;
+                            weight += alpha;
+                        }
+                    }
+                }
+            }
+            center = (sum / weight).to_pos2();
+        }
+        center
+    }
+
+    #[test]
+    fn glyphs_stay_centered_in_their_design_cell_at_every_scale_and_angle() {
+        // Tabler's plus is symmetric about its cell centre, so its ink centre
+        // is the cell centre at any rotation. Text lands on whole physical
+        // pixels, leaving under one pixel of error; centring the galley's
+        // line box instead lifted glyphs by 1.6 pixels at 150 %.
+        for pixels_per_point in [1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            for origin in [pos2(10.0, 10.0), pos2(10.5, 11.25)] {
+                for side in [16.0, 15.5, 14.0, 16.25] {
                     for angle in [
                         0.0,
                         std::f32::consts::FRAC_PI_2,
                         std::f32::consts::TAU / 3.0,
                     ] {
-                        paint_rotated(
-                            &painter,
-                            Rect::from_center_size(center, vec2(side, side)),
-                            Icon::Loader2,
-                            Color32::WHITE,
-                            angle,
+                        let rect = Rect::from_min_size(origin, vec2(side, side));
+                        let offset =
+                            ink_center(pixels_per_point, rect, Icon::Plus, angle) - rect.center();
+                        let limit = 0.75 / pixels_per_point;
+                        assert!(
+                            offset.x.abs() <= limit && offset.y.abs() <= limit,
+                            "glyph off centre by {offset:?} at {pixels_per_point}x, \
+                             {angle} rad in {rect:?}"
                         );
                     }
                 }
-            });
-            output.textures_delta.clear();
-            let mut checked = 0;
-            for clipped in output.shapes {
-                if let Shape::Text(shape) = clipped.shape {
-                    let rotated_center = shape.pos
-                        + eframe::egui::emath::Rot2::from_angle(shape.angle)
-                            * shape.galley.rect.center().to_vec2();
-                    assert!(rotated_center.distance(center) < 0.001);
-                    checked += 1;
-                }
             }
-            assert_eq!(checked, 6);
         }
     }
 
