@@ -23,10 +23,12 @@ The font subsets preserve upstream contour coordinates and the full 24×24
 cell. The generator recalculates bounds and corrects left side bearings to the
 contour minimum; source fonts contain zero bounding-box minima that otherwise
 shift glyphs after subsetting. Every retained glyph keeps its 1000-unit advance,
-900/-100 ascent/descent and zero line gap.
+900/-100 ascent/descent and zero `hhea` line gap. The OS/2 table keeps a
+90-unit typographic line gap, which egui adds below the cell.
 
 `paint` centers the full design cell rather than tight ink bounds, preserving
-upstream optical offsets. Physical-pixel raster sizes are rounded and fractional
+upstream optical offsets. It locates the cell from the glyph's baseline, not
+the laid-out row, so that line gap cannot lift the glyph. Physical-pixel raster sizes are rounded and fractional
 bounds scale the cached mesh, avoiding new font rasters for every animation
 fraction. `paint_rotated` rotates that cell clockwise about its center, without
 changing layout or hit targets. Both circle styles have a 20/24 ink diameter;
