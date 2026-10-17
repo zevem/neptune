@@ -194,7 +194,7 @@ pub fn paint_rotated(painter: &Painter, rect: Rect, icon: Icon, color: Color32, 
 /// 0.1 em below it. The font also declares a typographic line gap, which egui
 /// adds to the row, so the galley's bounds are taller than the cell and
 /// centring them would lift every glyph.
-fn cell_center(galley: &Galley, size: f32) -> Pos2 {
+pub(crate) fn cell_center(galley: &Galley, size: f32) -> Pos2 {
     let Some((row, glyph)) = galley
         .rows
         .first()

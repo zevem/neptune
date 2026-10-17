@@ -1041,9 +1041,11 @@ mod tests {
                 let glyph = glyphs[0];
                 let expected_angle = time as f32 * std::f32::consts::TAU * 0.9;
                 assert!((glyph.angle - expected_angle).abs() < 0.001);
+                // The glyph turns about its design cell, not its line box.
+                let size = glyph.galley.job.sections[0].format.font_id.size;
                 let center = glyph.pos
                     + egui::emath::Rot2::from_angle(glyph.angle)
-                        * glyph.galley.rect.center().to_vec2();
+                        * icons::cell_center(&glyph.galley, size).to_vec2();
                 assert!(center.distance(rect.center()) < 0.001);
                 let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
                 assert!(meshes.iter().any(|mesh| {
