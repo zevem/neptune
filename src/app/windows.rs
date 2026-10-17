@@ -3,6 +3,8 @@
 use super::*;
 use neptune_model::{WindowId, WorkspaceId};
 
+mod carry;
+
 pub(super) struct ProjectEdits {
     project: neptune_model::ProjectId,
     draft: Option<String>,
@@ -24,6 +26,8 @@ pub(super) struct Windows {
     focus_targets: BTreeMap<WindowId, Option<PaneId>>,
     pointer: crate::platform::workspace_drag::Monitor,
     drag: Option<WorkspaceDrag>,
+    /// A held workspace the compositor carries between windows instead.
+    carried: Option<carry::Carry>,
     drop_zones: BTreeMap<WindowId, DropZones>,
     released: std::collections::BTreeSet<egui::ViewportId>,
     raise_after_mapping: Option<egui::ViewportId>,
@@ -341,6 +345,86 @@ mod tests {
     }
 
     #[test]
+    fn a_torn_off_window_lists_only_its_own_workspaces_and_their_folders() {
+        use neptune_model::SidebarItem;
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        let ctx = egui::Context::default();
+        for name in ["Servers", "Empty"] {
+            app.controller
+                .dispatch(Command::AddWorkspaceGroup { name: name.into() })
+                .unwrap();
+        }
+        let servers = app.controller.model().groups()[0].id();
+        let empty = app.controller.model().groups()[1].id();
+        app.controller
+            .dispatch(Command::SetWorkspaceGroup {
+                workspace: workspaces[0],
+                group: Some(servers),
+            })
+            .unwrap();
+        let child = detach(&mut app, &ctx, workspaces[2], false);
+        let child_order = app.window_sidebar_order(child);
+        assert_eq!(child_order, [SidebarItem::Workspace(workspaces[2])]);
+        let root_order = app.window_sidebar_order(WindowId::ROOT);
+        assert!(root_order.contains(&SidebarItem::Group(servers)));
+        assert!(root_order.contains(&SidebarItem::Group(empty)));
+        assert!(!root_order.contains(&SidebarItem::Workspace(workspaces[2])));
+
+        // A folder follows its workspaces into another window.
+        app.move_workspace_to_window(&ctx, workspaces[0], child);
+        assert!(
+            app.window_sidebar_order(child)
+                .contains(&SidebarItem::Group(servers))
+        );
+        assert!(
+            !app.window_sidebar_order(WindowId::ROOT)
+                .contains(&SidebarItem::Group(servers))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn where_windows_cannot_hide_closing_the_roots_window_moves_a_sibling_into_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        app.windows.pointer = crate::platform::workspace_drag::Monitor::wayland_without_seat();
+        let ctx = egui::Context::default();
+        let child = detach(&mut app, &ctx, workspaces[2], false);
+        app.close_window(&ctx, WindowId::ROOT);
+        app.rehost_empty_root(&ctx);
+        assert_eq!(app.host_window(), child);
+        assert_eq!(app.viewport_of(child), egui::ViewportId::ROOT);
+        assert!(!app.windows.root_hidden);
+        // No child viewport is left to keep a second native window open.
+        assert!(
+            app.controller
+                .model()
+                .windows()
+                .iter()
+                .all(|window| window.active_workspace().is_none()
+                    || app.viewport_of(window.id()) == egui::ViewportId::ROOT)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn where_windows_cannot_hide_an_emptied_root_shows_the_remaining_window() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        app.windows.pointer = crate::platform::workspace_drag::Monitor::wayland_without_seat();
+        let ctx = egui::Context::default();
+        let child = detach(&mut app, &ctx, workspaces[2], false);
+        for workspace in &workspaces[..2] {
+            app.move_workspace_to_window(&ctx, *workspace, child);
+        }
+        app.rehost_empty_root(&ctx);
+        assert_eq!(app.host_window(), child);
+        assert_eq!(app.viewport_of(child), egui::ViewportId::ROOT);
+        assert_ne!(app.viewport_of(WindowId::ROOT), egui::ViewportId::ROOT);
+    }
+
+    #[test]
     fn visible_browser_panes_and_focus_are_aggregated_across_native_windows() {
         let root = tempfile::tempdir().unwrap();
         let (mut app, workspaces) = fixture(root.path());
@@ -472,6 +556,7 @@ impl Default for Windows {
             focus_targets: BTreeMap::new(),
             pointer: Default::default(),
             drag: None,
+            carried: None,
             drop_zones: BTreeMap::new(),
             released: Default::default(),
             raise_after_mapping: None,
@@ -537,8 +622,19 @@ pub(super) fn viewport(window: WindowId) -> egui::ViewportId {
 }
 
 impl App {
-    pub(super) fn attach_workspace_pointer(&mut self, frame: &eframe::Frame) {
-        self.windows.pointer.attach(frame);
+    pub(super) fn attach_workspace_pointer(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
+        self.windows.pointer.attach(frame, ctx);
+        // The seat the pointer connected to receives the root's files too.
+        let files = self.windows.pointer.take_file_signals();
+        self.file_drag.attach(frame, files);
+        let viewports: Vec<_> = self
+            .controller
+            .model()
+            .windows()
+            .iter()
+            .map(|window| self.viewport_of(window.id()))
+            .collect();
+        self.windows.pointer.notice_windows(viewports);
     }
 
     pub(super) fn finish_workspace_raise(&mut self, ctx: &egui::Context) {
@@ -556,7 +652,7 @@ impl App {
     }
 
     pub(super) fn workspace_drag_active(&self) -> bool {
-        self.windows.drag.is_some()
+        self.windows.drag.is_some() || self.carrying_workspace()
     }
 
     pub(super) fn take_workspace_drag_release(&mut self, ctx: &egui::Context) -> bool {
@@ -574,6 +670,7 @@ impl App {
         if let Some(drag) = self.windows.drag.take() {
             self.end_workspace_drag(ctx, &drag, false);
         }
+        self.cancel_carried_workspace(ctx);
     }
 
     fn end_workspace_drag(&mut self, ctx: &egui::Context, drag: &WorkspaceDrag, released: bool) {
@@ -1154,24 +1251,52 @@ impl App {
             self.dispatch(ctx, Command::MoveSidebarItem { item, index });
             return;
         };
-        let visible: Vec<_> = model
+        let visible = self.window_sidebar_order(owner);
+        let Some(target) = visible.get(index.min(visible.len().saturating_sub(1))) else {
+            return;
+        };
+        let model = self.controller.model();
+        let Some(index) = model.sidebar_order().iter().position(|item| item == target) else {
+            return;
+        };
+        self.dispatch(ctx, Command::MoveSidebarItem { item, index });
+    }
+
+    /// The sidebar entries one window lists: its own workspaces and the
+    /// folders that hold one of them. A folder belongs to the windows of its
+    /// workspaces; an empty folder stays in the first window.
+    pub(super) fn window_sidebar_order(&self, window: WindowId) -> Vec<neptune_model::SidebarItem> {
+        let model = self.controller.model();
+        let first = if model
+            .window(WindowId::ROOT)
+            .is_some_and(|root| root.active_workspace().is_some())
+        {
+            WindowId::ROOT
+        } else {
+            self.host_window()
+        };
+        model
             .sidebar_order()
             .iter()
             .copied()
             .filter(|item| match item {
                 neptune_model::SidebarItem::Workspace(id) => {
-                    model.workspace(*id).is_some_and(|w| w.window() == owner)
+                    model.workspace(*id).is_some_and(|w| w.window() == window)
                 }
-                neptune_model::SidebarItem::Group(_) => true,
+                neptune_model::SidebarItem::Group(group) => {
+                    let mut members = model
+                        .workspaces()
+                        .iter()
+                        .filter(|w| w.group() == Some(*group))
+                        .peekable();
+                    if members.peek().is_none() {
+                        window == first
+                    } else {
+                        members.any(|w| w.window() == window)
+                    }
+                }
             })
-            .collect();
-        let Some(target) = visible.get(index.min(visible.len().saturating_sub(1))) else {
-            return;
-        };
-        let Some(index) = model.sidebar_order().iter().position(|item| item == target) else {
-            return;
-        };
-        self.dispatch(ctx, Command::MoveSidebarItem { item, index });
+            .collect()
     }
 
     pub(super) fn reconcile_window_selection(&mut self) {
@@ -1466,28 +1591,20 @@ impl App {
             self.move_workspace_to_window(ctx, workspace, target);
             return;
         }
+        if drag
+            && watch.is_none()
+            && self.carry_workspace_out(
+                ctx,
+                workspace,
+                source,
+                grip.unwrap_or(Vec2::new(80.0, 20.0)),
+            )
+        {
+            return;
+        }
         self.cancel_workspace_drag(ctx);
         self.ui.cancel_sidebar_drag(ctx);
-        let edits = self.take_workspace_project_edits(workspace);
-        let effects = match self
-            .controller
-            .dispatch(Command::DetachWorkspace(workspace))
-        {
-            Ok(effects) => effects,
-            Err(error) => {
-                self.restore_workspace_project_edits(edits);
-                self.ui.error = Some(error.to_string());
-                return;
-            }
-        };
-        self.restore_workspace_project_edits(edits);
-        let Some(window) = self
-            .controller
-            .model()
-            .workspace(workspace)
-            .map(|w| w.window())
-            .filter(|id| *id != source)
-        else {
+        let Some((window, effects)) = self.detach_to_new_window(workspace, source) else {
             return;
         };
         if drag {
@@ -1578,6 +1695,35 @@ impl App {
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
+    /// Give `workspace` a window of its own, keeping its project edits.
+    /// Returns the new window and the effects still to execute.
+    fn detach_to_new_window(
+        &mut self,
+        workspace: WorkspaceId,
+        source: WindowId,
+    ) -> Option<(WindowId, Vec<neptune_model::Effect>)> {
+        let edits = self.take_workspace_project_edits(workspace);
+        let effects = match self
+            .controller
+            .dispatch(Command::DetachWorkspace(workspace))
+        {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.restore_workspace_project_edits(edits);
+                self.ui.error = Some(error.to_string());
+                return None;
+            }
+        };
+        self.restore_workspace_project_edits(edits);
+        let window = self
+            .controller
+            .model()
+            .workspace(workspace)
+            .map(|w| w.window())
+            .filter(|id| *id != source)?;
+        Some((window, effects))
+    }
+
     pub(super) fn move_workspace_to_window(
         &mut self,
         ctx: &egui::Context,
@@ -1607,6 +1753,7 @@ impl App {
             .drag
             .as_ref()
             .is_some_and(|drag| drag.window == window)
+            || self.carries_in(window)
         {
             self.cancel_workspace_drag(ctx);
         }
@@ -1636,6 +1783,7 @@ impl App {
 
     pub(super) fn show_windows(&mut self, ctx: &egui::Context) {
         self.reconcile_empty_host(ctx);
+        self.rehost_empty_root(ctx);
         let children: Vec<_> = self
             .controller
             .model()
@@ -1736,6 +1884,7 @@ impl App {
                 self.poll_directory(&child_ctx);
                 self.poll(&child_ctx);
                 self.window_ui(ui);
+                self.attach_carried_window(&child_ctx, window);
             });
             if !rendered {
                 self.recover_window(ctx, window, fallback);

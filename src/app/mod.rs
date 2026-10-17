@@ -1028,13 +1028,13 @@ impl eframe::App for App {
         self.frame_started = Instant::now();
         self.reconcile_empty_host(ctx);
         self.enter_window(self.host_window());
-        self.file_drag.attach(frame, ctx);
-        self.attach_workspace_pointer(frame);
+        self.attach_workspace_pointer(frame, ctx);
         self.finish_workspace_raise(ctx);
         // Resolve held window transfers before enumerating child viewports.
         // Changing their owners inside a child callback can omit the pressed
         // native surface from this frame and let eframe destroy it.
         self.poll_workspace_drag(ctx);
+        self.poll_carried_workspace(ctx);
         if self.host_exists() {
             self.poll_directory(ctx);
         }
@@ -1149,19 +1149,7 @@ impl App {
         ui.painter().rect_filled(bounds, radius, p.chrome);
         let mut actions = Vec::new();
         let views = self.views();
-        let sidebar_order: Vec<_> = self
-            .controller
-            .model()
-            .sidebar_order()
-            .iter()
-            .copied()
-            .filter(|item| match item {
-                neptune_model::SidebarItem::Workspace(id) => {
-                    views.iter().any(|workspace| workspace.id == *id)
-                }
-                neptune_model::SidebarItem::Group(_) => true,
-            })
-            .collect();
+        let sidebar_order = self.window_sidebar_order(self.controller.model().current_window());
         let window_destinations: Vec<_> = self
             .controller
             .model()

@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/terminal-core", "crates/neptune-model", "crates/browser-host"]
+exclude = ["vendor"]
 resolver = "3"
 
 [package]
@@ -82,6 +83,10 @@ zbus = "5.13.2"
 x11rb = "0.13"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
+# Already part of the window backend. A held workspace window follows the
+# pointer between windows as an xdg-toplevel-drag transfer.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 
 [target."cfg(windows)".dependencies]
 winreg = "0.10.1"
@@ -108,3 +113,7 @@ incremental = false
 
 [profile.ci.package."*"]
 opt-level = 0
+
+# eframe with each viewport's native window exposed; see vendor/eframe/NEPTUNE-PATCH.md.
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }
