@@ -25,6 +25,9 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct View {
     pub state: State,
+    /// Where the tab is, or the address it was last sent to while that page
+    /// is on its way.
+    pub address: String,
     pub texture: Option<egui::TextureId>,
     pub popup: Option<(egui::TextureId, egui::Rect)>,
     /// The page's own icon, for its tab.
@@ -155,7 +158,10 @@ struct Entry {
     focused: Option<bool>,
     geometry: Option<(u32, u32, f32)>,
     frame_rate: Option<u32>,
+    /// The address last asked for, until the page reports another one.
     navigation: Option<String>,
+    /// The host has been told to load `navigation`.
+    sent: bool,
     profile: Option<String>,
     /// The file a recording under way is saved to.
     recording: Option<PathBuf>,
@@ -354,6 +360,7 @@ impl Browsers {
                 geometry: None,
                 frame_rate: None,
                 navigation: restored.map(|tab| tab.url),
+                sent: false,
                 profile,
                 recording: None,
                 buttons: 0,
@@ -398,6 +405,11 @@ impl Browsers {
             .filter(|e| e.generation == generation)?;
         Some(View {
             state: entry.state.clone(),
+            address: entry
+                .navigation
+                .as_ref()
+                .unwrap_or(&entry.state.url)
+                .clone(),
             texture: entry.texture.as_ref().map(egui::TextureHandle::id),
             popup: entry
                 .popup
@@ -425,8 +437,8 @@ impl Browsers {
                 .clone(),
         )
     }
-    pub fn send(&self, command: Command) -> Result<(), &'static str> {
-        match &command {
+    pub fn send(&mut self, command: Command) -> Result<(), &'static str> {
+        let abandoned = match &command {
             Command::Text { text, .. }
             | Command::Paste { text, .. }
             | Command::Ime { text, .. }
@@ -435,13 +447,25 @@ impl Browsers {
             {
                 return Err("Browser text input is limited to 64 KiB per operation.");
             }
-            _ => {}
-        }
+            // These leave an address on its way for the page's history.
+            Command::Stop { target } | Command::Back { target } | Command::Forward { target } => {
+                Some(*target)
+            }
+            _ => None,
+        };
         if self
             .bridge
             .as_ref()
             .is_some_and(|bridge| bridge.send(command))
         {
+            if let Some(target) = abandoned
+                && let Some(entry) = self
+                    .entries
+                    .get_mut(&PaneId::new(target.pane))
+                    .filter(|e| e.generation == target.generation && e.sent)
+            {
+                entry.navigation = None;
+            }
             Ok(())
         } else {
             Err("The browser is busy or has stopped. Try again in a moment.")
@@ -479,6 +503,7 @@ impl Browsers {
             .filter(|e| e.generation == generation)
             .ok_or("This browser pane has closed.")?;
         entry.navigation = Some(url);
+        entry.sent = false;
         Ok(())
     }
     pub fn geometry(&mut self, pane: PaneId, generation: u64, size: egui::Vec2, scale: f32) {
@@ -606,6 +631,10 @@ impl Browsers {
                     .get_mut(&PaneId::new(target.pane))
                     .filter(|e| e.generation == target.generation)
                 {
+                    // The page is no longer where it was asked to go from.
+                    if entry.sent && state.url != entry.state.url {
+                        entry.navigation = None;
+                    }
                     entry.state = state;
                     // Only this window's saved profiles are remembered: a
                     // private tab leaves no trace of where it went.
@@ -763,13 +792,13 @@ impl Browsers {
                 entry.frame_rate = Some(frame_rate);
             }
             if entry.completed
-                && let Some(url) = entry.navigation.take()
-                && !bridge.send(Command::Navigate {
+                && !entry.sent
+                && let Some(url) = &entry.navigation
+            {
+                entry.sent = bridge.send(Command::Navigate {
                     target,
                     url: url.clone(),
-                })
-            {
-                entry.navigation = Some(url);
+                });
             }
             let visible = shown.contains(pane);
             if entry.visible != Some(visible) && bridge.send(Command::Visible { target, visible }) {
@@ -1714,6 +1743,59 @@ mod tests {
             receiver.try_iter().any(
                 |c| matches!(c, Command::Navigate { url, .. } if url == "http://localhost:3000")
             )
+        );
+    }
+    #[test]
+    fn browser_address_shows_where_the_tab_is_going_until_the_page_moves() {
+        let (mut browsers, receiver, ctx, pane) = fixture();
+        let target = Target {
+            pane: 3,
+            generation: 1,
+        };
+        let at = |url: &str, loading| State {
+            ready: true,
+            loading,
+            url: url.into(),
+            ..Default::default()
+        };
+        browsers.poll(&ctx, &[pane], None);
+        update(&browsers, target, at("about:blank", false));
+        browsers.poll(&ctx, &[pane], None);
+        browsers.navigate(pane, 1, "neptune.rs").unwrap();
+        assert_eq!(
+            browsers.view(pane, 1).unwrap().address,
+            "https://neptune.rs"
+        );
+        browsers.poll(&ctx, &[pane], None);
+        assert!(
+            receiver
+                .try_iter()
+                .any(|c| matches!(c, Command::Navigate { .. }))
+        );
+        // The old page loading or failing toward it does not lose the address.
+        update(&browsers, target, at("about:blank", true));
+        browsers.poll(&ctx, &[pane], None);
+        assert_eq!(
+            browsers.view(pane, 1).unwrap().address,
+            "https://neptune.rs"
+        );
+        assert_eq!(
+            browsers.address(pane, 1).as_deref(),
+            Some("https://neptune.rs")
+        );
+        update(&browsers, target, at("https://neptune.rs/", true));
+        browsers.poll(&ctx, &[pane], None);
+        assert_eq!(
+            browsers.view(pane, 1).unwrap().address,
+            "https://neptune.rs/"
+        );
+        // Stopping a page on its way shows the page that stayed.
+        browsers.navigate(pane, 1, "example.com").unwrap();
+        browsers.poll(&ctx, &[pane], None);
+        browsers.send(Command::Stop { target }).unwrap();
+        assert_eq!(
+            browsers.view(pane, 1).unwrap().address,
+            "https://neptune.rs/"
         );
     }
     #[test]

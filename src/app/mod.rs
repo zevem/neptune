@@ -715,6 +715,7 @@ impl App {
                                 },
                                 ..Default::default()
                             },
+                            address: String::new(),
                             unsandboxed: false,
                             profile: None,
                             saved: false,
