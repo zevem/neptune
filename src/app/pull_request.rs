@@ -1832,6 +1832,7 @@ mod tests {
     /// What a capture shows in place of GitHub: a pull request in review with
     /// a description, reviewers, checks in every outcome, a conversation and
     /// changed files.
+    #[cfg(target_os = "linux")]
     fn pictured(state: &str) -> Detail {
         use source::{Check, Commit, Decision, Entry, Kind, Outcome, Reply, Reviewer};
         let now = std::time::SystemTime::now()

@@ -1004,6 +1004,7 @@ pub(crate) mod tests {
     }
 
     /// A verified download as the sheet sees it, installable in place or not.
+    #[cfg(target_os = "linux")]
     pub(crate) fn prepare(updates: &mut Updates, in_place: bool) {
         updates.target = in_place.then(|| "/opt/Neptune.AppImage".into());
         updates.prepared = Some(PreparedUpdate {
