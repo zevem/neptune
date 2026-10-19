@@ -16,6 +16,9 @@ pub struct Cache {
     pub(super) sources: Vec<Arc<[terminal_core::Cell]>>,
     colors: Option<Colors>,
     palette_colors: Option<[Color32; 19]>,
+    /// The font atlas's options when rows were laid out. egui rebuilds the
+    /// atlas when they change, e.g. between light and dark visuals.
+    text_options: Option<egui::epaint::text::TextOptions>,
     revision: u64,
     key: Option<CacheKey>,
     pub columns: u16,
@@ -250,6 +253,16 @@ impl Cache {
         } else {
             None
         };
+        // Galleys point into the atlas they were laid out against.
+        let text_options = ui.ctx().fonts(|fonts| *fonts.options());
+        if self
+            .text_options
+            .replace(text_options)
+            .is_some_and(|previous| previous != text_options)
+        {
+            self.rows.clear();
+            self.sources.clear();
+        }
         let mut palette_colors = [p.bg; 19];
         palette_colors[..16].copy_from_slice(&p.ansi);
         palette_colors[16] = p.bg;
@@ -749,6 +762,32 @@ mod synthetic_tests {
         fixture.cache.invalidate();
         fixture.frame("");
         assert_eq!(fixture.cache.rows[0].text, "Z");
+    }
+
+    #[test]
+    fn rows_are_laid_out_again_against_a_rebuilt_font_atlas() {
+        let mut fixture = Fixture::new();
+        crate::theme::apply(&fixture.context, &fixture.config);
+        fixture.frame("");
+        // A theme applied mid-frame recolors rows against the old atlas.
+        // Light and dark visuals render text differently, so egui rebuilds
+        // the atlas when the next frame begins.
+        fixture.config.theme = crate::config::Theme::Light;
+        let _ = fixture.context.run_ui(egui::RawInput::default(), |ui| {
+            crate::theme::apply(ui.ctx(), &fixture.config);
+            fixture.cache.prepare(
+                ui,
+                &fixture.snapshot,
+                &fixture.config,
+                Palette::for_config(&fixture.config),
+            );
+        });
+        let stale = fixture.cache.rows[0].runs[0].galley.clone();
+        fixture.frame("");
+        let rebuilt = fixture.cache.rows[0].runs[0].galley.clone();
+        assert!(!Arc::ptr_eq(&stale, &rebuilt));
+        fixture.frame("");
+        assert!(Arc::ptr_eq(&rebuilt, &fixture.cache.rows[0].runs[0].galley));
     }
 
     #[test]
