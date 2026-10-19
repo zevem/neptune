@@ -112,7 +112,7 @@ impl Watch {
         }
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn test_samples() -> (mpsc::SyncSender<Result<Pointer, ()>>, Self) {
         let (sender, samples) = mpsc::sync_channel(1);
         (
