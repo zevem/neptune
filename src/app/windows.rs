@@ -1,6 +1,7 @@
 //! Native windows share model identities, processes and the single state writer.
 //! Only presentation and input state move in and out of the current frame.
 use super::*;
+use crate::platform::workspace_drag::desktop_scale;
 use neptune_model::{WindowId, WorkspaceId};
 
 mod carry;
@@ -42,7 +43,7 @@ struct WorkspaceDrag {
     watch: crate::platform::workspace_drag::Watch,
     /// Original press relative to the row, in egui points.
     grip: Vec2,
-    /// Last desktop pointer sample, in physical pixels.
+    /// Last pointer sample in the platform's shared desktop coordinates.
     pointer: Pos2,
     mode: WorkspaceDragMode,
 }
@@ -162,6 +163,137 @@ mod tests {
         assert!(!app.windows.launches[&WindowId::ROOT].defer_creation);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_held_tear_off_keeps_the_gesture_that_can_rejoin_another_sidebar() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let point = Pos2::new(300.0, 90.0);
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
+            events: vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let info = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        info.native_pixels_per_point = Some(2.0);
+        info.inner_rect = Some(Rect::from_min_size(
+            Pos2::new(100.0, 80.0),
+            Vec2::new(1000.0, 700.0),
+        ));
+        info.outer_rect = info.inner_rect;
+        ctx.run_ui(input, |ui| {
+            app.detach_workspace(ui.ctx(), workspaces[2], Some(point), None);
+        })
+        .textures_delta
+        .clear();
+        assert!(
+            app.windows.drag.is_some(),
+            "the macOS tear-off lost its held gesture, so moving over another sidebar cannot rejoin"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_rejoin_uses_desktop_points_at_each_display_scale_and_app_zoom() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        let ctx = egui::Context::default();
+        let child = detach(&mut app, &ctx, workspaces[2], false);
+        for zoom in [1.0, 1.5, 2.0] {
+            ctx.set_zoom_factor(zoom);
+            for native_scale in [1.0, 2.0] {
+                let mut input = egui::RawInput::default();
+                let info = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+                info.native_pixels_per_point = Some(native_scale);
+                info.inner_rect = Some(Rect::from_min_size(
+                    Pos2::new(-800.0, 40.0) / zoom,
+                    Vec2::new(1000.0, 700.0) / zoom,
+                ));
+                app.windows.drop_zones.insert(
+                    WindowId::ROOT,
+                    DropZones {
+                        sidebar: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(240.0, 700.0) / zoom,
+                        )),
+                        toolbar: Rect::NOTHING,
+                        last_focused: 1.0,
+                    },
+                );
+                ctx.run_ui(input, |ui| {
+                    assert_eq!(
+                        app.workspace_drop_destination(ui.ctx(), child, Pos2::new(-750.0, 100.0)),
+                        Some(WindowId::ROOT),
+                        "macOS screen points must hit the receiving sidebar at scale {native_scale}, zoom {zoom}"
+                    );
+                }).textures_delta.clear();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_closed_root_is_reused_at_the_surviving_windows_position() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        let ctx = egui::Context::default();
+        let child = detach(&mut app, &ctx, workspaces[2], false);
+        let before = app
+            .controller
+            .model()
+            .workspace(workspaces[2])
+            .unwrap()
+            .clone();
+        let child_viewport = app.viewport_of(child);
+        app.close_window(&ctx, WindowId::ROOT);
+        let position = Pos2::new(-700.0, 120.0);
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            child_viewport,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(2.0),
+                inner_rect: Some(Rect::from_min_size(position, Vec2::new(700.0, 500.0))),
+                outer_rect: Some(Rect::from_min_size(position, Vec2::new(700.0, 500.0))),
+                minimized: Some(true),
+                ..Default::default()
+            },
+        );
+        let output = ctx.run_ui(input, |ui| app.rehost_empty_root(ui.ctx()));
+        assert_eq!(
+            app.viewport_of(child),
+            egui::ViewportId::ROOT,
+            "closing on macOS must reuse the root, not retain an empty native window"
+        );
+        assert!(!app.windows.root_hidden);
+        assert!(!app.exit_approved);
+        assert_eq!(
+            app.controller
+                .model()
+                .workspace(workspaces[2])
+                .unwrap()
+                .panes(),
+            before.panes()
+        );
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|command|
+            matches!(command, egui::ViewportCommand::OuterPosition(at) if *at == position)));
+        assert!(matches!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .last(),
+            Some(egui::ViewportCommand::Minimized(true))
+        ));
+    }
+
     #[test]
     fn moving_to_a_minimized_destination_reveals_it_before_requesting_focus() {
         let root = tempfile::tempdir().unwrap();
@@ -205,6 +337,161 @@ mod tests {
                 .window(),
             child
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_press_can_tear_off_dock_tear_off_again_and_release_without_replacing_panes() {
+        use crate::platform::workspace_drag::{Pointer, Watch};
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let before = app
+            .controller
+            .model()
+            .workspace(workspaces[2])
+            .unwrap()
+            .clone();
+        let info = |position, scale| egui::ViewportInfo {
+            native_pixels_per_point: Some(scale),
+            inner_rect: Some(Rect::from_min_size(position, Vec2::new(1000.0, 700.0))),
+            outer_rect: Some(Rect::from_min_size(position, Vec2::new(1000.0, 700.0))),
+            ..Default::default()
+        };
+        let mut initial = egui::RawInput::default();
+        initial
+            .viewports
+            .insert(egui::ViewportId::ROOT, info(Pos2::new(100.0, 80.0), 2.0));
+        let (sender, watch) = Watch::test_samples();
+        let mut watch = Some(watch);
+        let mut output = ctx.run_ui(initial, |ui| {
+            if let Some(watch) = watch.take() {
+                app.detach_workspace_with_watch(
+                    ui.ctx(),
+                    workspaces[2],
+                    Some(Pos2::new(300.0, 90.0)),
+                    Some(Vec2::new(40.0, 15.0)),
+                    Some(watch),
+                );
+            }
+        });
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)
+                ))
+        );
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::StartDrag))
+        );
+        let replacement = app.viewport_of(WindowId::ROOT);
+        app.windows.drop_zones.insert(
+            WindowId::ROOT,
+            DropZones {
+                sidebar: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(240.0, 700.0))),
+                toolbar: Rect::NOTHING,
+                last_focused: 1.0,
+            },
+        );
+        let input = || {
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .insert(egui::ViewportId::ROOT, info(Pos2::new(100.0, 80.0), 2.0));
+            input
+                .viewports
+                .insert(replacement, info(Pos2::new(100.0, 80.0), 1.0));
+            input
+        };
+        assert!(
+            sender
+                .send(Ok(Pointer {
+                    position: Pos2::new(150.0, 180.0),
+                    primary_down: true
+                }))
+                .is_ok()
+        );
+        ctx.run_ui(input(), |ui| app.poll_workspace_drag(ui.ctx()))
+            .textures_delta
+            .clear();
+        assert_eq!(
+            app.controller
+                .model()
+                .workspace(workspaces[2])
+                .unwrap()
+                .window(),
+            WindowId::ROOT
+        );
+        assert!(matches!(
+            app.windows.drag.as_ref().unwrap().mode,
+            WorkspaceDragMode::Docked
+        ));
+        assert_eq!(app.viewport_of(WindowId::ROOT), egui::ViewportId::ROOT);
+        // Different display densities must not change the receiving window's logical size.
+        assert_eq!(
+            app.windows.launches[&WindowId::ROOT].size,
+            Vec2::new(1000.0, 700.0)
+        );
+        assert!(
+            sender
+                .send(Ok(Pointer {
+                    position: Pos2::new(700.0, 300.0),
+                    primary_down: true
+                }))
+                .is_ok()
+        );
+        ctx.run_ui(input(), |ui| app.poll_workspace_drag(ui.ctx()))
+            .textures_delta
+            .clear();
+        let floating = app
+            .controller
+            .model()
+            .workspace(workspaces[2])
+            .unwrap()
+            .window();
+        assert_ne!(floating, WindowId::ROOT);
+        assert_eq!(app.viewport_of(floating), egui::ViewportId::ROOT);
+        assert!(matches!(
+            app.windows.drag.as_ref().unwrap().mode,
+            WorkspaceDragMode::Floating { .. }
+        ));
+        assert!(
+            sender
+                .send(Ok(Pointer {
+                    position: Pos2::new(720.0, 320.0),
+                    primary_down: false
+                }))
+                .is_ok()
+        );
+        ctx.run_ui(input(), |ui| app.poll_workspace_drag(ui.ctx()))
+            .textures_delta
+            .clear();
+        assert!(app.windows.drag.is_none());
+        assert_eq!(
+            app.controller
+                .model()
+                .workspace(workspaces[2])
+                .unwrap()
+                .panes(),
+            before.panes()
+        );
+        assert_eq!(
+            app.controller
+                .model()
+                .workspace(workspaces[2])
+                .unwrap()
+                .layout(),
+            before.layout()
+        );
+        assert!(app.windows.released.contains(&egui::ViewportId::ROOT));
     }
 
     #[test]
@@ -737,7 +1024,7 @@ impl App {
         let zoom = ctx.zoom_factor();
         ctx.input(|input| {
             let info = input.raw.viewports.get(&viewport)?;
-            let scale = info.native_pixels_per_point? * zoom;
+            let scale = desktop_scale(info.native_pixels_per_point?, zoom);
             Some(pointer / scale - info.inner_rect?.min.to_vec2())
         })
     }
@@ -782,7 +1069,7 @@ impl App {
         let zoom = ctx.zoom_factor();
         let position = ctx.input(|input| {
             let info = input.raw.viewports.get(&drag.viewport)?;
-            let scale = info.native_pixels_per_point? * zoom;
+            let scale = desktop_scale(info.native_pixels_per_point?, zoom);
             let frame = info.outer_rect?.min - info.inner_rect?.min;
             Some(drag.pointer / scale - anchor + frame)
         });
@@ -858,8 +1145,8 @@ impl App {
                         return None;
                     }
                     // Each viewport reports screen positions in its own egui
-                    // points. Convert both its origin and zones to desktop pixels.
-                    let scale = info.native_pixels_per_point? * zoom;
+                    // points. Convert its origin and zones to the pointer's desktop space.
+                    let scale = desktop_scale(info.native_pixels_per_point?, zoom);
                     let origin = info.inner_rect?.min * scale;
                     let contains =
                         |rect: Rect| (rect * scale).translate(origin.to_vec2()).contains(pointer);
@@ -892,7 +1179,7 @@ impl App {
         let Some((carried_scale, target_scale)) = carried_info
             .native_pixels_per_point
             .zip(target_info.native_pixels_per_point)
-            .map(|(carried, target)| (carried * zoom, target * zoom))
+            .map(|(carried, target)| (desktop_scale(carried, zoom), desktop_scale(target, zoom)))
         else {
             return;
         };
@@ -1565,7 +1852,15 @@ impl App {
         let scale = info
             .as_ref()
             .and_then(|info| info.native_pixels_per_point)
-            .map_or(ctx.pixels_per_point(), |scale| scale * ctx.zoom_factor());
+            .map_or_else(
+                || {
+                    desktop_scale(
+                        ctx.native_pixels_per_point().unwrap_or(1.0),
+                        ctx.zoom_factor(),
+                    )
+                },
+                |scale| desktop_scale(scale, ctx.zoom_factor()),
+            );
         let desktop_pointer = origin
             .zip(pointer)
             .map(|(origin, pointer)| (origin + pointer.to_vec2()) * scale);
@@ -1771,7 +2066,9 @@ impl App {
             return;
         }
         self.dispatch(ctx, Command::CloseWindow(window));
-        if self.viewport_of(window) == egui::ViewportId::ROOT {
+        if self.viewport_of(window) == egui::ViewportId::ROOT
+            && self.windows.pointer.keeps_hidden_root()
+        {
             self.windows.root_hidden = true;
             ctx.send_viewport_cmd_to(
                 egui::ViewportId::ROOT,

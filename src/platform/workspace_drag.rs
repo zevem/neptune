@@ -8,6 +8,7 @@
 //! tells each of Neptune's windows where the workspace is held over it.
 
 use eframe::egui::{self, Pos2};
+#[cfg(any(not(target_os = "macos"), test))]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -16,9 +17,20 @@ use std::sync::{
 
 #[derive(Clone, Copy)]
 pub(crate) struct Pointer {
-    /// Desktop coordinates in physical pixels.
+    /// Top-left desktop coordinates: screen points on macOS, physical pixels
+    /// on X11. A macOS display scales its window coordinates independently;
+    /// multiplying them by Retina scale would break a shared desktop space.
     pub position: Pos2,
     pub primary_down: bool,
+}
+
+/// Convert a viewport's egui points into the pointer's desktop coordinates.
+pub(crate) fn desktop_scale(native_pixels_per_point: f32, zoom: f32) -> f32 {
+    if cfg!(target_os = "macos") {
+        zoom
+    } else {
+        native_pixels_per_point * zoom
+    }
 }
 
 #[derive(Default)]
@@ -55,24 +67,57 @@ fn surface(viewport: egui::ViewportId) -> Option<wayland_backend::client::Object
     crate::platform::wayland_seat::surface_of(&handle.as_raw())
 }
 
-pub(crate) struct Watch {
-    samples: mpsc::Receiver<Result<Pointer, ()>>,
-    cancelled: Arc<AtomicBool>,
+pub(crate) struct Watch(Observation);
+
+enum Observation {
+    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        expect(dead_code, reason = "This backend has no desktop pointer observer")
+    )]
+    Samples {
+        samples: mpsc::Receiver<Result<Pointer, ()>>,
+        cancelled: Arc<AtomicBool>,
+    },
+    #[cfg(target_os = "macos")]
+    Desktop,
 }
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        match &self.0 {
+            #[cfg(any(not(target_os = "macos"), test))]
+            Observation::Samples { cancelled, .. } => cancelled.store(true, Ordering::Relaxed),
+            #[cfg(target_os = "macos")]
+            Observation::Desktop => {}
+        }
     }
 }
 
 impl Watch {
     pub fn poll(&self) -> Result<Option<Pointer>, ()> {
-        match self.samples.try_recv() {
-            Ok(sample) => sample.map(Some),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(()),
+        match &self.0 {
+            #[cfg(any(not(target_os = "macos"), test))]
+            Observation::Samples { samples, .. } => match samples.try_recv() {
+                Ok(sample) => sample.map(Some),
+                Err(mpsc::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::TryRecvError::Disconnected) => Err(()),
+            },
+            #[cfg(target_os = "macos")]
+            Observation::Desktop => macos::pointer().map(Some),
         }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn test_samples() -> (mpsc::SyncSender<Result<Pointer, ()>>, Self) {
+        let (sender, samples) = mpsc::sync_channel(1);
+        (
+            sender,
+            Self(Observation::Samples {
+                samples,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+        )
     }
 }
 
@@ -234,15 +279,22 @@ impl Monitor {
         }
     }
 
-    /// Whether `ViewportCommand::Visible(false)` hides a window. Wayland
-    /// windows stay mapped, and listed by the shell, until they close.
-    pub fn hides_windows(&self) -> bool {
+    /// Whether an empty native root may stay hidden beside occupied windows.
+    /// Wayland cannot hide it; on macOS ordering it out retains an empty
+    /// NSWindow. Reuse the root and destroy the spare viewport on both.
+    pub fn keeps_hidden_root(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
             !self.wayland
         }
-        #[cfg(not(target_os = "linux"))]
-        true
+        #[cfg(target_os = "macos")]
+        {
+            false
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            true
+        }
     }
 
     pub fn watch(&self, ctx: &egui::Context) -> Option<Watch> {
@@ -263,13 +315,71 @@ impl Monitor {
                     }
                 })
                 .ok()?;
-            Some(Watch { samples, cancelled })
+            Some(Watch(Observation::Samples { samples, cancelled }))
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // The gesture's existing 16 ms repaint deadline drives polling.
+            // No global event tap, worker or idle pointer observation is needed.
+            let _ = ctx;
+            Some(Watch(Observation::Desktop))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = ctx;
             None
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const c_void) -> *const c_void;
+        fn CGEventGetLocation(event: *const c_void) -> Point;
+        fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(value: *const c_void);
+    }
+
+    pub(super) fn pointer() -> Result<Pointer, ()> {
+        // SAFETY: A null source requests the current session's default event.
+        // Check the owned Create result, read it, and release it exactly once.
+        // These read-only queries neither install an event tap nor post input.
+        let (position, primary_down) = unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            if event.is_null() {
+                return Err(());
+            }
+            let position = CGEventGetLocation(event);
+            // kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft.
+            let primary_down = CGEventSourceButtonState(0, 0);
+            CFRelease(event);
+            (
+                Pos2::new(position.x as f32, position.y as f32),
+                primary_down,
+            )
+        };
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return Err(());
+        }
+        Ok(Pointer {
+            position,
+            primary_down,
+        })
     }
 }
 
@@ -319,5 +429,22 @@ mod linux {
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_macos_workspace_drag_can_observe_the_press_after_leaving_its_window() {
+        let ctx = egui::Context::default();
+        let watch = Monitor::default().watch(&ctx);
+        assert!(
+            watch.is_some(),
+            "macOS must observe the desktop press to move a held workspace back into another window"
+        );
+        let pointer = watch.unwrap().poll().unwrap().unwrap();
+        assert!(pointer.position.x.is_finite() && pointer.position.y.is_finite());
     }
 }
