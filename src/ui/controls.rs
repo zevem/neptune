@@ -452,9 +452,13 @@ pub fn stepper(
 /// editor `id` holds the keyboard. A field whose text cannot be used is
 /// outlined in the problem colour instead.
 pub fn field_frame(ui: &Ui, p: Palette, rect: Rect, id: Id, valid: bool) {
+    field_surface(ui, p, rect, id, (valid, metrics::CONTROL_RADIUS));
+}
+/// The same surface with another corner, for a field that holds controls
+/// of its own and so is rounded concentrically around them.
+pub fn field_surface(ui: &Ui, p: Palette, rect: Rect, id: Id, (valid, radius): (bool, u8)) {
     let id = viewport_id(ui.ctx(), id);
     let focused = ui.memory(|memory| memory.has_focus(id));
-    let radius = metrics::CONTROL_RADIUS;
     let painter = ui.painter();
     painter.rect_filled(rect, radius, p.control);
     let ink = if valid { p.accent } else { p.red };

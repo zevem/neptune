@@ -52,17 +52,19 @@ A workspace has at most one project, and Neptune at most eight across its window
    here** or **Show project** from the command palette, or bind
    [`show-project`](usage.md#custom-keybindings).
 2. Type what you want done in the field under "New project". The folder
-   named over the field is the one the terminal in front is in, as its shell
+   named under the field is the one the terminal in front is in, as its shell
    last reported it, and it follows that terminal while you `cd`; it is the
    folder the panel's Changes and Files tabs show. A terminal whose shell
    reports no directory leaves the workspace's own.
-3. Press Enter, or the arrow in the field.
+3. Press Enter, or the round arrow in the field.
 
-The line under the field names the lead, such as "Claude Code ›". That is
-all most projects need. Pressing it unfolds the lead's options: which CLI
-leads, where both are installed, and its **Model** and **Effort**. Left at
-"Default", the CLI's own settings apply; both can be changed later in the
-project's [settings](#settings), the CLI cannot.
+The row at the foot of the field names the lead, such as "Claude Code", and
+its effort. That is all most projects need. Pressing the lead's name lists
+which CLI leads, where both are installed, and its **Model**, including
+**Custom…** for a model id no list names; pressing **Effort** lists its
+efforts. Left at "Default", the CLI's own settings apply; both can be changed
+later in the chat's field or the project's [settings](#settings), the CLI
+cannot.
 
 Neptune names the project after the workspace, makes its folder, and sends
 what you typed as the first message. **The project's directory is settled
@@ -98,9 +100,9 @@ A project is a conversation, and the tab shows little else:
 - **What needs you**, only while something does; see [Needs you](#needs-you).
 - **A strip of its agents**, once it has any: one row with a pill for each,
   pressed like a tab; see [Agents](#agents).
-- **The chat** and the field you write in.
-- **Who leads**: the lead's CLI with its model and effort under the field,
-  which opens the settings when pressed.
+- **The chat** and the field you write in, whose row names the lead's model
+  and effort: pressing either changes it for the lead's next turn, and
+  **Lead settings…** at the end of the model's list opens the settings.
 
 **Project details** replaces the chat with three parts, **Context**,
 **Watches** and **Settings**, and opens on the one you last looked at. The
@@ -208,7 +210,7 @@ lead's process is let go and started again in the same conversation with the
 new model and effort (Claude Code with `--resume`, Codex by resuming its
 thread, which is also told the model and effort with every turn), so that
 turn takes a few seconds longer to begin; until then the card reads
-"Changed. The lead takes this up with its next turn." The line under the
+"Changed. The lead takes this up with its next turn." The row of the
 chat's field names the model you chose, or where you chose none the model
 the lead's CLI reported the last time it started.
 

@@ -192,12 +192,14 @@ fn menu_button(width: f32) -> Pos2 {
 fn details_button(width: f32) -> Pos2 {
     menu_button(width) - vec2(28.0, 0.0)
 }
-/// The control inside the goal's field, over the line that reads `line`.
+/// The control that starts a project, at the trailing end of the row of
+/// the goal's field that holds a text beginning with `line`.
 fn start_control(texts: &[(String, Rect)], line: &str, width: f32) -> Pos2 {
-    Pos2::new(
-        panel(width).right() - 8.0 - 4.0 - 17.0,
-        nth(texts, line, 0).y - 31.0,
-    )
+    let (_, words) = texts
+        .iter()
+        .find(|(text, _)| text.starts_with(line))
+        .unwrap_or_else(|| panic!("{line} in {texts:?}"));
+    Pos2::new(panel(width).right() - 8.0 - 4.0 - 22.0, words.center().y)
 }
 /// The fill painted last under `pos`.
 fn fill_at(output: &egui::FullOutput, pos: Pos2) -> egui::Color32 {
@@ -273,8 +275,7 @@ fn the_lead_is_named_under_the_goal_and_picked_among_the_clis_installed_here() {
     // is started: a project whose lead cannot run helps nobody. What was
     // typed stays in the field.
     let mut state = State::default();
-    let looking = "Looking for Claude Code and Codex…";
-    let (started, texts) = asked(None, &mut state, 300.0, looking);
+    let (started, texts) = asked(None, &mut state, 300.0, "Looking for");
     assert!(started.is_empty() && has(&texts, "A lead plans the work"));
     assert_eq!(state.goal, "Split checkout");
     let (started, texts) = asked(Some(&[]), &mut State::default(), 300.0, "No lead installed");
@@ -290,30 +291,37 @@ fn the_lead_is_named_under_the_goal_and_picked_among_the_clis_installed_here() {
     );
     assert_eq!(started, [AgentKind::Codex; 2]);
     assert!(!has(&texts, "Claude Code"), "{texts:?}");
-    // Both: the first is named, and the other is behind that line, at
-    // the narrowest the panel gets as well.
+    // Both: the first is named, and the other is in the list its control
+    // opens, over the models of the one picked, at the narrowest the panel
+    // gets as well.
     for width in [300.0, 220.0] {
         let mut state = State::default();
         let (started, texts) = asked(Some(BOTH), &mut state, width, "Claude Code");
         assert_eq!(started, [AgentKind::Claude; 2]);
         assert_eq!(count(&texts, "Codex"), 0, "folded until asked for");
+        inside(&texts, panel(width));
         let ctx = context();
         let both = || empty(Some(BOTH), false, None);
         for events in click(at(&texts, "Claude Code")) {
             frame(&ctx, both(), &mut state, width, events);
         }
-        assert!(state.lead_options);
         let (_, texts) = frame(&ctx, both(), &mut state, width, Vec::new());
-        inside(&texts, panel(width));
-        for wanted in ["Lead", "Model", "Effort", "Codex"] {
+        for wanted in ["Lead", "Codex", "Model", "Default", "Opus", "Sonnet"] {
             assert!(count(&texts, wanted) == 1, "{wanted} in {texts:?}");
         }
+        assert_eq!(count(&texts, "Claude Code"), 2, "the control and its row");
+        assert!(at(&texts, "Codex").y < at(&texts, "Opus").y);
         for events in click(at(&texts, "Codex")) {
             frame(&ctx, both(), &mut state, width, events);
         }
         assert_eq!(state.lead, Some(AgentKind::Codex));
+        // The list stays open on what the CLI picked runs on.
+        let (_, texts) = frame(&ctx, both(), &mut state, width, Vec::new());
+        assert!(
+            has(&texts, "gpt-6-sol") && !has(&texts, "Opus"),
+            "{texts:?}"
+        );
         state.goal.clear();
-        state.lead_options = false;
         let (started, _) = asked(Some(BOTH), &mut state, width, "Codex");
         assert_eq!(started, [AgentKind::Codex; 2]);
         // A pick whose CLI is gone does not stand.
@@ -339,21 +347,23 @@ fn a_workspace_without_a_project_starts_one_from_a_goal_typed_into_one_field() {
             .1
             .top()
     };
-    // The field comes before anything is explained.
+    // The field comes before anything is explained, its row names who
+    // leads, and the tray under it where the project works.
     let order = [
         "New project",
-        "~/code/shop",
         "What do you want to get done?",
         "Claude Code",
+        "~/code/shop",
         "A lead plans the work",
         "The chat and notes stay on this computer.",
     ];
     for pair in order.windows(2) {
         assert!(position(pair[0]) <= position(pair[1]), "{pair:?}");
     }
-    assert!(has(&texts, "Enter starts"));
+    assert!((at(&texts, "Claude Code").y - at(&texts, "Effort").y).abs() < 1.0);
+    assert!(at(&texts, "Claude Code").x < at(&texts, "Effort").x);
     // Without a goal there is nothing to start.
-    let start = start_control(&texts, "Enter starts", 300.0);
+    let start = start_control(&texts, "Effort", 300.0);
     for events in click(start) {
         assert!(
             frame(&ctx, form(false), &mut state, 300.0, events)
@@ -397,7 +407,7 @@ fn a_workspace_without_a_project_starts_one_from_a_goal_typed_into_one_field() {
     ));
     // While its folder is made it cannot be started twice.
     let (_, texts) = frame(&ctx, form(true), &mut state, 300.0, Vec::new());
-    assert!(has(&texts, "Starting…") && !has(&texts, "Enter starts"));
+    assert!(has(&texts, "Starting…"));
     let mut pressed = Vec::new();
     for events in click(start).into_iter().chain([key(Key::Enter)]) {
         pressed.extend(frame(&ctx, form(true), &mut state, 300.0, events).0);
@@ -950,15 +960,39 @@ fn the_line_under_the_composer_names_the_lead_and_says_what_its_turn_is_doing() 
         300.0,
         Vec::new(),
     );
-    assert!(has(&texts, "Claude Code · Opus · High"));
-    let reported = led(Some("claude-opus-5-5"), settings());
-    let (_, texts) = frame(&ctx, reported, &mut state, 300.0, Vec::new());
-    let chip = at(&texts, "Claude Code · claude-opus-5-5");
-    // A press on it shows what the lead runs with.
-    for input in click(chip) {
-        let body = led(Some("claude-opus-5-5"), settings());
-        assert!(frame(&ctx, body, &mut state, 300.0, input).0.is_empty());
-    }
+    // The composer's row names them, under what is written.
+    let (model, effort) = (at(&texts, "Opus"), at(&texts, "High"));
+    assert!(model.y > at(&texts, "Message the lead…").y);
+    assert!((model.y - effort.y).abs() < 1.0 && model.x < effort.x);
+    let (_, texts) = frame(&ctx, led(None, settings()), &mut state, 300.0, Vec::new());
+    assert!(has(&texts, "Claude Code") && has(&texts, "Effort"));
+    let reported = || led(Some("claude-opus-5-5"), settings());
+    let (_, texts) = frame(&ctx, reported(), &mut state, 300.0, Vec::new());
+    let chip = at(&texts, "claude-opus-5-5");
+    // Its model is chosen in place, in a list over the row, and the lead
+    // takes it with its next turn.
+    let press = |state: &mut State, pos: Pos2| {
+        let mut all = Vec::new();
+        for input in click(pos) {
+            all.extend(events(frame(&ctx, reported(), state, 300.0, input).0));
+        }
+        all
+    };
+    assert!(press(&mut state, chip).is_empty());
+    let (_, open) = frame(&ctx, reported(), &mut state, 300.0, Vec::new());
+    assert!(at(&open, "Sonnet").y < chip.y, "{open:?}");
+    assert_eq!(
+        press(&mut state, at(&open, "Sonnet")),
+        [Event::SetLead {
+            project: ID,
+            model: Some("sonnet".into()),
+            effort: None,
+        }]
+    );
+    // The rest of what it runs with is at the end of that list.
+    press(&mut state, chip);
+    let (_, open) = frame(&ctx, reported(), &mut state, 300.0, Vec::new());
+    assert!(press(&mut state, at(&open, "Lead settings…")).is_empty());
     assert_eq!(
         (state.segment, state.details),
         (Segment::Settings, Segment::Settings)
@@ -1301,11 +1335,15 @@ fn the_strip_is_one_row_however_many_agents_and_their_list_lies_over_the_chat() 
             frame(Vec::new());
         }
         let output = frame(Vec::new());
+        // The strip's own: the composer's row draws its CLI's mark as well.
+        let strip = (rect.top() + HEADER)..=(rect.top() + HEADER + ROW);
         let mut edges: Vec<f32> = output
             .shapes
             .iter()
             .filter_map(|clipped| match &clipped.shape {
-                egui::Shape::Mesh(mesh) => Some(mesh.calc_bounds().left()),
+                egui::Shape::Mesh(mesh) if strip.contains(&mesh.calc_bounds().center().y) => {
+                    Some(mesh.calc_bounds().left())
+                }
                 _ => None,
             })
             .collect();
@@ -1472,7 +1510,7 @@ fn an_action_that_cannot_be_taken_is_not_shown_in_the_accent() {
     };
     // The control that starts a project, without a goal and with one.
     let form = || empty(Some(&[AgentKind::Claude]), false, None);
-    let start = |texts: &[(String, Rect)]| start_control(texts, "Enter starts", 300.0);
+    let start = |texts: &[(String, Rect)]| start_control(texts, "Effort", 300.0);
     let mut state = State::default();
     check(&start, &mut state, &form, false, "Start");
     state.goal = "Split checkout".into();
@@ -1539,8 +1577,8 @@ fn a_message_is_written_sent_with_enter_and_a_running_turn_can_be_stopped() {
     assert!(has(&texts, "Queued · 2"));
     let bounds = panel(300.0);
     let control = Pos2::new(
-        bounds.right() - 8.0 - 17.0,
-        bounds.bottom() - 8.0 - HINT - 16.0,
+        bounds.right() - 8.0 - 22.0,
+        bounds.bottom() - 8.0 - HINT - 22.0,
     );
     let mut actions = Vec::new();
     for events in click(control) {
@@ -2609,28 +2647,30 @@ fn a_new_projects_lead_can_be_given_a_model_and_an_effort_before_it_starts() {
         }
         all
     };
-    // Folded until asked for: the form is the goal and who leads.
+    // Left to the CLI, the row names the CLI and effort is not said; the
+    // lists are away until asked for.
     let (_, texts) = show(&mut state, Vec::new());
-    assert!(!has(&texts, "Model") && !has(&texts, "Default"));
+    assert!(has(&texts, "Claude Code") && has(&texts, "Effort"));
+    assert!(!has(&texts, "Default") && !has(&texts, "Opus"));
     assert!(press(&mut state, at(&texts, "Claude Code")).is_empty());
-    let (_, texts) = show(&mut state, Vec::new());
-    assert_eq!(count(&texts, "Default"), 2);
-    press(&mut state, nth(&texts, "Default", 0));
     let (_, open) = show(&mut state, Vec::new());
     assert!(has(&open, "Opus") && has(&open, "Sonnet") && !has(&open, "gpt-6-sol"));
+    assert!(
+        at(&open, "Opus").y > at(&texts, "Claude Code").y,
+        "under the row"
+    );
     assert!(press(&mut state, at(&open, "Sonnet")).is_empty());
     assert_eq!(state.lead_settings.model.as_deref(), Some("sonnet"));
     let (_, texts) = show(&mut state, Vec::new());
-    press(&mut state, at(&texts, "Default"));
+    press(&mut state, at(&texts, "Effort"));
     let (_, open) = show(&mut state, Vec::new());
     press(&mut state, at(&open, "Low"));
-    // The line under the field says what was picked,
+    // The row says what was picked,
     let (_, texts) = show(&mut state, Vec::new());
-    let line = "Claude Code · Sonnet · Low";
-    assert!(has(&texts, line));
+    assert!(has(&texts, "Sonnet") && has(&texts, "Low") && !has(&texts, "Effort"));
     // and the project starts with it.
     assert_eq!(
-        press(&mut state, start_control(&texts, line, 300.0)),
+        press(&mut state, start_control(&texts, "Low", 300.0)),
         [Event::Create {
             workspace,
             goal: "Split checkout".into(),
@@ -2639,7 +2679,7 @@ fn a_new_projects_lead_can_be_given_a_model_and_an_effort_before_it_starts() {
             effort: Some("low".into()),
         }]
     );
-    // A model no list names is typed here as it is in the settings.
+    // A model no list names is typed in the row as it is in the settings.
     press(&mut state, at(&texts, "Sonnet"));
     let (_, open) = show(&mut state, Vec::new());
     press(&mut state, at(&open, "Custom…"));
@@ -2654,13 +2694,16 @@ fn a_new_projects_lead_can_be_given_a_model_and_an_effort_before_it_starts() {
     // Another CLI takes other models: what was picked does not carry
     // over to it.
     let (_, texts) = show(&mut state, Vec::new());
-    press(&mut state, at(&texts, "Codex"));
+    press(&mut state, at(&texts, "claude-opus-5-5"));
+    let (_, open) = show(&mut state, Vec::new());
+    press(&mut state, at(&open, "Codex"));
     assert_eq!(state.lead, Some(AgentKind::Codex));
     assert_eq!(state.lead_settings, LeadSettings::default());
+    show(&mut state, key(Key::Escape));
     let (_, texts) = show(&mut state, Vec::new());
-    assert_eq!(count(&texts, "Default"), 2);
+    assert!(has(&texts, "Codex") && has(&texts, "Effort"), "{texts:?}");
     assert_eq!(
-        press(&mut state, start_control(&texts, "Codex", 300.0)),
+        press(&mut state, start_control(&texts, "Effort", 300.0)),
         [Event::Create {
             workspace,
             goal: "Split checkout".into(),
@@ -2670,9 +2713,9 @@ fn a_new_projects_lead_can_be_given_a_model_and_an_effort_before_it_starts() {
         }]
     );
 
-    // A panel too short for the form with its options open scrolls it:
-    // the field that starts the project stays in view at the top, and the
-    // rest is a turn of the wheel away.
+    // A panel too short for the whole form scrolls it: the field that
+    // starts the project stays in view at the top, and the rest is a turn
+    // of the wheel away.
     let short = Rect::from_min_size(Pos2::new(600.0, 78.0), vec2(300.0, 150.0));
     let draw = |state: &mut State, input: Vec<Input>| {
         let (_, output) = frame_in(&ctx, form(), state, short, input);
@@ -2682,7 +2725,8 @@ fn a_new_projects_lead_can_be_given_a_model_and_an_effort_before_it_starts() {
         draw(&mut state, Vec::new());
     }
     let texts = draw(&mut state, Vec::new());
-    assert!(has(&texts, "Split checkout") && !has(&texts, "Effort"));
+    let explained = "The chat and notes stay on this computer.";
+    assert!(has(&texts, "Split checkout") && !has(&texts, explained));
     for (text, rect) in &texts {
         assert!(short.contains(rect.center()), "{text} at {rect:?}");
     }
@@ -2699,7 +2743,7 @@ fn a_new_projects_lead_can_be_given_a_model_and_an_effort_before_it_starts() {
     for _ in 0..30 {
         draw(&mut state, Vec::new());
     }
-    assert!(has(&draw(&mut state, Vec::new()), "Effort"));
+    assert!(has(&draw(&mut state, Vec::new()), explained));
 }
 
 #[test]

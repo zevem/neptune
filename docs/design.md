@@ -322,14 +322,30 @@ icon buttons keep a 28-point target around a 16-point glyph.
   again every 30 seconds for its ages, and otherwise only when what was
   read changed.
 - **Project.** The Project tab holds the project of the workspace in view,
-  and is a conversation with its lead. A workspace without one shows the
-  creation form: "New project", a muted line naming the directory, and one
-  multi-line field with the send control inside it, which Enter also
-  presses. The line under the field names the lead ("Claude Code ›") and
-  unfolds its options: the CLI (a two-part segmented control when both are
-  installed), its model and its effort, each a select whose first choice is
-  "Default". A muted paragraph says what a lead is; a project that worked in
-  the directory before is offered in a card instead. The form scrolls where
+  and is a conversation with its lead. Both the creation form and a
+  project are written in the composer: one surface with the field's fill,
+  hairline and focus ring at radius 12, a multi-line field over a row of
+  controls at its foot. A press on the surface outside its controls writes
+  in the field. The row leads with the lead's CLI mark beside its model,
+  then a hairline and its effort: 26-point controls of radius 6 in the
+  medium weight at 12, in the secondary ink at rest and with the hover fill,
+  each with a chevron. The model control names the chosen model, the one
+  the CLI named when it last started, or else the CLI itself; the effort
+  control says "Effort" until one is chosen. Each opens a list headed
+  "Model" or "Effort" whose first choice is "Default"; the model's list
+  ends with "Custom…", which turns the row into a field for a model id
+  until Enter uses it or the field is left. Where the row is narrow the
+  hairline goes first, then both controls narrow alike. The row ends with
+  round 28-point controls: the one that sends, in the accent once there is
+  something to send, which Enter also presses. A workspace without a
+  project shows the creation form: "New project" over the composer, whose
+  model list begins with the CLIs that can lead, by mark and name, when
+  more than one is installed, and stays open on the models of the one
+  picked. Under the surface a tray in a fainter fill names the directory
+  with a folder, and says "Starting…" while the project's folder is made,
+  when a spinner takes the send control's place. A muted paragraph says
+  what a lead is; a project that worked in the directory before is offered
+  in a card instead. The form scrolls where
   the panel is short. A workspace over SSH, no workspace and an unsupported
   system each say so in muted text. A project shows, from the top: a title
   row with its name, its directory in muted text, a "Project details" control
@@ -405,16 +421,17 @@ icon buttons keep a 28-point target around a 16-point glyph.
   report that two lines do not hold has the chevron of the rows above it
   before its headline, which unfolds all of it in place, drawn as a reply
   is, and folds it again. What the person is asked to allow is always
-  shown whole. The composer is fixed at the bottom with one control that sends,
-  or stops the lead while it works and the field is empty, and a paperclip
-  beside it that attaches files. Attached files are outlined chips of an
+  shown whole. The composer is fixed at the bottom; its lists open over it.
+  Its row changes the lead's model and effort for its next turn, the model's
+  list ending with "Lead settings…", and ends with a paperclip that attaches
+  files and the control that sends, or stops the lead while it works and
+  the field is empty. Attached files are outlined chips of an
   icon and a name cut to fit: over the field, each with a control that
   takes it off, at most three rows before they scroll, and under the
   person's message in the chat. Files held over the chat tint it in the
   accent with "Drop to attach for the lead", as a terminal does. The line under
-  it names the lead's CLI, model and effort and opens the settings; at its
-  trailing edge it says how long the lead has worked and how many messages
-  wait. No field takes the keyboard unasked, and Escape returns it to the
+  it says at its trailing edge how long the lead has worked and how many
+  messages wait. No field takes the keyboard unasked, and Escape returns it to the
   terminal with the draft kept. "Project details" replaces the chat with a
   row of a back chevron and a segmented control "Context", "Watches",
   "Settings", and stays pressed meanwhile; where something needs the person
