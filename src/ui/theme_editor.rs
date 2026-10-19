@@ -8,7 +8,7 @@ use super::helpers::{
 };
 use super::theme_browser::{GUTTER, footer_note, preview, tile_outline};
 use crate::{
-    config::{Config, Theme},
+    config::{Appearance, Config, Theme},
     terminal_theme::{CustomTheme, HexColor, MAX_CUSTOM_THEMES, MAX_NAME_CHARS, ThemeColors},
     theme::{self, Palette, metrics},
 };
@@ -119,16 +119,17 @@ impl Draft {
             .or_else(|| self.error.clone())
     }
 
-    /// Saves the draft as the theme in use. The configuration's own rules
-    /// decide; nothing is applied when they reject it.
-    fn save(&mut self, config: &mut Config) -> bool {
+    /// Saves the draft as the theme chosen for `target`: a mode's, or the
+    /// single theme for none. The configuration's own rules decide; nothing is
+    /// applied when they reject it.
+    fn save(&mut self, config: &mut Config, target: Option<Appearance>) -> bool {
         let candidate = CustomTheme {
             id: self.id.clone(),
             name: self.name.trim().to_owned(),
             colors: self.colors,
         };
         let mut updated = config.clone();
-        updated.theme = Theme::Palette(candidate.id.clone());
+        *updated.theme_for_mut(target) = Theme::Palette(candidate.id.clone());
         match updated
             .custom_themes
             .iter_mut()
@@ -207,6 +208,7 @@ pub(super) fn show(
     p: Palette,
     config: &mut Config,
     draft: &mut Draft,
+    target: Option<Appearance>,
     body_height: f32,
 ) -> (Outcome, bool) {
     let title = if draft.saved {
@@ -322,7 +324,7 @@ pub(super) fn show(
         },
     );
 
-    let outcome = if save && draft.save(config) {
+    let outcome = if save && draft.save(config, target) {
         Outcome::Saved
     } else if discard || ((cancel || back) && !draft.is_changed()) {
         Outcome::Left
@@ -701,21 +703,35 @@ mod tests {
         let mut config = Config::default();
         let colors = crate::terminal_theme::bundled("Dracula").unwrap().colors;
         let mut draft = Draft::copy(&config, "Night", colors);
-        assert!(draft.save(&mut config));
+        assert!(draft.save(&mut config, None));
         assert_eq!(config.theme, Theme::Palette("custom:1".into()));
         assert_eq!(config.custom_themes, [custom(1, "Night")]);
 
         // Editing replaces the saved theme instead of adding another.
         let mut draft = Draft::edit(&config.custom_themes[0]);
         draft.name = "Dusk night".into();
-        assert!(draft.save(&mut config));
+        assert!(draft.save(&mut config, None));
         assert_eq!(config.custom_themes, [custom(1, "Dusk night")]);
 
         let before = config.clone();
         let mut draft = Draft::copy(&config, "Other", colors);
         draft.name = "bad\u{7}name".into();
-        assert!(!draft.save(&mut config));
+        assert!(!draft.save(&mut config, None));
         assert_eq!(config, before);
         assert!(draft.problem(&config).is_some());
+    }
+
+    #[test]
+    fn a_theme_saved_for_a_mode_is_chosen_for_that_mode_alone() {
+        let mut config = Config::default();
+        config.set_match_system_appearance(true);
+        config.system_appearance = Some(Appearance::Light);
+        let colors = crate::terminal_theme::bundled("3024 Day").unwrap().colors;
+        let mut draft = Draft::copy(&config, "Paper", colors);
+        assert!(draft.save(&mut config, Some(Appearance::Light)));
+        assert_eq!(config.light_theme, Theme::Palette("custom:1".into()));
+        assert_eq!(config.active_theme(), &config.light_theme);
+        assert_eq!(config.dark_theme, Theme::Graphite);
+        assert_eq!(config.theme, Theme::Graphite);
     }
 }

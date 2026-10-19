@@ -56,6 +56,9 @@ surfaces carry a soft shadow and a one-pixel `border`; regions that share a
 material are divided by a `separator` hairline or by space alone.
 
 One theme determines the palette for the entire window and every terminal.
+When themes match the system appearance, that theme is the one chosen for the
+system's current light or dark mode, and the window and terminals follow a
+change of mode as it happens.
 Graphite, Dusk and Light retain their original materials. The 712 imported
 palettes and saved custom themes supply exact terminal colors; window materials
 are derived from their background, with interface text contrast of at least
@@ -571,8 +574,13 @@ icon buttons keep a 28-point target around a 16-point glyph.
   "caret" the cursor); a misspelling is accepted only when nothing matches as
   typed. Enter opens the pane of the first result, choosing a pane leaves the
   search, and Escape clears the search before it closes the sheet.
-  Appearance leads with the theme in use: a miniature drawn in its own colours,
-  its name and where it comes from. The whole row opens the theme catalog.
+  Appearance leads with the "Match system appearance" switch, then the theme
+  in use: a miniature drawn in its own colours, its name and where it comes
+  from. The whole row opens the theme catalog. With the switch on, a Light
+  mode and a Dark mode row take its place, the one in use says so, and each
+  opens the catalog to choose that mode's theme; the switch leads so the rows
+  it adds never move it. When the system reports no mode, the note beneath
+  names the mode used instead.
   Below it is a window zoom percentage stepper. Text has an installed monospace
   font family selector with a pinned "Custom…" choice that opens a focused name
   field. Enter applies the name; partial names leave the terminal font in place.
@@ -589,11 +597,13 @@ icon buttons keep a 28-point target around a 16-point glyph.
   window with sample text in the theme's colours, never terminal contents. Only
   the rows in view are laid out. The catalog opens at the theme in use, which
   carries the accent ring and a check; choosing a card applies it to the window
-  and every terminal at once. On hover or focus a card shows a "more" control
-  with the same menu as a secondary click: "Use theme", "Add to favorites" or
-  "Remove from favorites" and "Duplicate…", and for a custom theme "Edit…" and
-  "Delete…". Deleting asks in the action bar, in place of "New theme" and
-  "Done", so nothing reflows.
+  and every terminal at once. Opened for a mode, it is titled "Light mode
+  theme" or "Dark mode theme", rings that mode's theme, and a card, or a
+  theme saved from the editor, is chosen for that mode alone. On hover or
+  focus a card shows a "more" control with the same menu as a secondary
+  click: "Use theme", "Add to favorites" or "Remove from favorites" and
+  "Duplicate…", and for a custom theme "Edit…" and "Delete…". Deleting asks
+  in the action bar, in place of "New theme" and "Done", so nothing reflows.
   A star at the end of a card's name keeps the theme as a favorite without
   applying it. A favorite's star is always shown, in the accent; any other
   card shows a quiet one on hover or focus. Favorites lead the catalog in the

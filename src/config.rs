@@ -6,7 +6,20 @@ use std::path::{Path, PathBuf};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub keybindings: crate::keybindings::Keybindings,
+    /// The theme in use unless themes match the system appearance.
     pub theme: Theme,
+    /// Use `light_theme` or `dark_theme` as the system switches between light
+    /// and dark mode. These three are omitted while they are the defaults, so
+    /// settings that never matched the system still load in older versions.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub match_system_appearance: bool,
+    #[serde(skip_serializing_if = "Theme::is_light")]
+    pub light_theme: Theme,
+    #[serde(skip_serializing_if = "Theme::is_graphite")]
+    pub dark_theme: Theme,
+    /// What the system last reported, while running; never saved.
+    #[serde(skip)]
+    pub system_appearance: Option<Appearance>,
     pub custom_themes: Vec<crate::terminal_theme::CustomTheme>,
     /// Themes starred in the catalog, in the order they were starred.
     pub favorite_themes: Vec<Theme>,
@@ -94,6 +107,35 @@ impl Theme {
             Self::Palette(id) => id,
         }
     }
+    fn is_light(&self) -> bool {
+        self == &Self::Light
+    }
+    fn is_graphite(&self) -> bool {
+        self == &Self::Graphite
+    }
+}
+
+/// The light or dark mode an operating system asks applications to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Appearance {
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Light => "Light mode",
+            Self::Dark => "Dark mode",
+        }
+    }
+    /// The theme a mode starts with, and returns to when its own is deleted.
+    pub fn default_theme(self) -> Theme {
+        match self {
+            Self::Light => Theme::Light,
+            Self::Dark => Theme::Graphite,
+        }
+    }
 }
 impl TryFrom<String> for Theme {
     type Error = &'static str;
@@ -157,6 +199,10 @@ impl Default for Config {
         Self {
             keybindings: Default::default(),
             theme: Theme::Graphite,
+            match_system_appearance: false,
+            light_theme: Appearance::Light.default_theme(),
+            dark_theme: Appearance::Dark.default_theme(),
+            system_appearance: None,
             custom_themes: Vec::new(),
             favorite_themes: Vec::new(),
             accent: Accent::Blue,
@@ -242,11 +288,9 @@ impl Config {
                 "Custom theme names must be unique"
             );
         }
-        anyhow::ensure!(
-            self.has_theme(&self.theme),
-            "Unknown theme: {}",
-            self.theme.id()
-        );
+        for theme in [&self.theme, &self.light_theme, &self.dark_theme] {
+            anyhow::ensure!(self.has_theme(theme), "Unknown theme: {}", theme.id());
+        }
         // Favorites follow the themes that exist: one whose theme is gone is
         // dropped rather than refused, and none is listed twice.
         let mut seen = std::collections::HashSet::new();
@@ -329,8 +373,65 @@ impl Config {
             || self.custom_themes.iter().any(|custom| &custom.id == id)
     }
 
-    pub fn theme_colors(&self) -> Option<crate::terminal_theme::ThemeColors> {
-        let Theme::Palette(id) = &self.theme else {
+    /// The mode whose theme is in use, when themes match the system. Until
+    /// the system reports one, or where it never does, the mode of the single
+    /// theme stands in: turning matching on then changes nothing until the
+    /// system says otherwise.
+    pub fn appearance(&self) -> Option<Appearance> {
+        self.match_system_appearance
+            .then(|| self.system_appearance.unwrap_or(self.mode_of(&self.theme)))
+    }
+
+    /// The theme chosen for `appearance`, or the single theme for none.
+    pub fn theme_for(&self, appearance: Option<Appearance>) -> &Theme {
+        match appearance {
+            None => &self.theme,
+            Some(Appearance::Light) => &self.light_theme,
+            Some(Appearance::Dark) => &self.dark_theme,
+        }
+    }
+
+    pub fn theme_for_mut(&mut self, appearance: Option<Appearance>) -> &mut Theme {
+        match appearance {
+            None => &mut self.theme,
+            Some(Appearance::Light) => &mut self.light_theme,
+            Some(Appearance::Dark) => &mut self.dark_theme,
+        }
+    }
+
+    /// The theme that colors the window and every terminal now.
+    pub fn active_theme(&self) -> &Theme {
+        self.theme_for(self.appearance())
+    }
+
+    /// Starts or stops matching the system. The single theme becomes the
+    /// choice for its own mode, so nothing changes until the system differs.
+    pub fn set_match_system_appearance(&mut self, on: bool) {
+        if on && !self.match_system_appearance {
+            let mode = self.mode_of(&self.theme);
+            *self.theme_for_mut(Some(mode)) = self.theme.clone();
+        }
+        self.match_system_appearance = on;
+    }
+
+    /// Whether `theme` has a dark background.
+    pub fn is_dark(&self, theme: &Theme) -> bool {
+        self.colors_of(theme)
+            .map_or(theme != &Theme::Light, |colors| colors.is_dark())
+    }
+
+    /// The mode `theme` suits, by its background.
+    fn mode_of(&self, theme: &Theme) -> Appearance {
+        if self.is_dark(theme) {
+            Appearance::Dark
+        } else {
+            Appearance::Light
+        }
+    }
+
+    /// The exact palette of a bundled or custom theme; none for Neptune's own.
+    pub fn colors_of(&self, theme: &Theme) -> Option<crate::terminal_theme::ThemeColors> {
+        let Theme::Palette(id) = theme else {
             return None;
         };
         if let Some(name) = id.strip_prefix("iterm:") {
@@ -343,8 +444,12 @@ impl Config {
         }
     }
 
-    pub fn theme_name(&self) -> &str {
-        match &self.theme {
+    pub fn theme_colors(&self) -> Option<crate::terminal_theme::ThemeColors> {
+        self.colors_of(self.active_theme())
+    }
+
+    pub fn name_of<'a>(&'a self, theme: &'a Theme) -> &'a str {
+        match theme {
             Theme::Graphite => "Graphite",
             Theme::Dusk => "Dusk",
             Theme::Light => "Light",
@@ -355,6 +460,10 @@ impl Config {
                     .map_or("Unknown theme", |theme| theme.name.as_str())
             }),
         }
+    }
+
+    pub fn theme_name(&self) -> &str {
+        self.name_of(self.active_theme())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -652,6 +761,85 @@ mod tests {
         ];
         legacy.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn the_system_appearance_chooses_between_the_light_and_dark_themes() {
+        let mut config = Config {
+            theme: Theme::Dusk,
+            ..Config::default()
+        };
+        // Not matching: the system's mode is beside the point.
+        config.system_appearance = Some(Appearance::Light);
+        assert_eq!(config.appearance(), None);
+        assert_eq!(config.active_theme(), &Theme::Dusk);
+
+        // Turning matching on makes the single theme its own mode's choice,
+        // so nothing changes until the system differs.
+        config.system_appearance = None;
+        config.set_match_system_appearance(true);
+        assert_eq!(config.dark_theme, Theme::Dusk);
+        assert_eq!(config.light_theme, Theme::Light);
+        assert_eq!(config.appearance(), Some(Appearance::Dark));
+        assert_eq!(config.active_theme(), &Theme::Dusk);
+        config.system_appearance = Some(Appearance::Light);
+        assert_eq!(config.active_theme(), &Theme::Light);
+        assert_eq!(config.theme_name(), "Light");
+        config.system_appearance = Some(Appearance::Dark);
+        assert_eq!(config.active_theme(), &Theme::Dusk);
+
+        // A light palette is seeded as the light choice; turning matching on
+        // again keeps the choices already made.
+        config.set_match_system_appearance(false);
+        config.theme = Theme::Palette("iterm:3024 Day".into());
+        config.dark_theme = Theme::Palette("iterm:Dracula".into());
+        config.set_match_system_appearance(true);
+        assert_eq!(config.light_theme, config.theme);
+        assert_eq!(config.dark_theme, Theme::Palette("iterm:Dracula".into()));
+        config.system_appearance = None;
+        assert_eq!(config.appearance(), Some(Appearance::Light));
+        assert_eq!(
+            config.theme_colors(),
+            crate::terminal_theme::bundled("3024 Day").map(|t| t.colors)
+        );
+        config.set_match_system_appearance(true);
+        assert_eq!(config.dark_theme, Theme::Palette("iterm:Dracula".into()));
+    }
+
+    #[test]
+    fn system_theme_choices_round_trip_and_stay_out_of_settings_that_never_matched() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        // What the system reports is never saved.
+        let unmatched = Config {
+            system_appearance: Some(Appearance::Dark),
+            ..Config::default()
+        };
+        unmatched.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        for key in ["match_system_appearance", "light_theme", "dark_theme"] {
+            assert!(!saved.contains(key), "{key} is left to older versions");
+        }
+        assert_eq!(Config::load(&path).unwrap().system_appearance, None);
+
+        let matched = Config {
+            match_system_appearance: true,
+            light_theme: Theme::Palette("iterm:3024 Day".into()),
+            dark_theme: Theme::Dusk,
+            ..Config::default()
+        };
+        matched.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), matched);
+
+        // Each choice must be a theme that exists.
+        for (light, dark) in [("custom:9", "dusk"), ("light", "iterm:missing")] {
+            std::fs::write(
+                &path,
+                format!("match_system_appearance = true\nlight_theme = \"{light}\"\ndark_theme = \"{dark}\"\n"),
+            )
+            .unwrap();
+            assert!(Config::load(&path).is_err());
+        }
     }
 
     #[test]

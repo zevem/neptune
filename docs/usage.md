@@ -379,7 +379,7 @@ neptune --help
 
 ## Preferences and themes
 
-[config.example.toml](../config.example.toml) documents the supported settings: 715 themes shared by the window and terminal, custom themes, window zoom, terminal font family, font size and line height, scrollback limit, shell executable and arguments, [custom keybindings](#custom-keybindings), cursor style/blink, sidebar width, workspace restoration, and the two independent close warnings. Window zoom is available in Preferences under Appearance; changes there or through zoom shortcuts are saved and restored on the next launch, including with workspace restoration disabled. Settings are validated; unknown keys are rejected. Workspace restoration restores directories, split positions, and focused panes, and launches fresh shell processes; a remote workspace opens new SSH connections to its host. Recognized coding agents can resume their provider-owned conversations through saved session references; arbitrary commands and process memory are never serialized.
+[config.example.toml](../config.example.toml) documents the supported settings: 715 themes shared by the window and terminal, custom themes, light and dark mode themes that follow the system, window zoom, terminal font family, font size and line height, scrollback limit, shell executable and arguments, [custom keybindings](#custom-keybindings), cursor style/blink, sidebar width, workspace restoration, and the two independent close warnings. Window zoom is available in Preferences under Appearance; changes there or through zoom shortcuts are saved and restored on the next launch, including with workspace restoration disabled. Settings are validated; unknown keys are rejected. Workspace restoration restores directories, split positions, and focused panes, and launches fresh shell processes; a remote workspace opens new SSH connections to its host. Recognized coding agents can resume their provider-owned conversations through saved session references; arbitrary commands and process memory are never serialized.
 
 Preferences → Shell lists the shells found on this computer, as Windows Terminal lists profiles. On Windows it offers Command Prompt, Windows PowerShell, PowerShell 7, WSL distributions, Git Bash, Visual Studio developer prompts and Windows Terminal profiles that have their own command line (such as the Anaconda prompts). On macOS and Linux it offers the shells in `/etc/shells` and common shells on `PATH` or in Homebrew. **System default** keeps the platform's own startup, including a login shell on macOS and Linux; **Custom…** takes any program. A new choice applies to new terminals.
 
@@ -392,6 +392,19 @@ Graphite, Dusk and Light themes sit alongside all 712 palettes from the
 Dark, Light, Custom and Favorites; each card previews the window and terminal,
 and the catalog opens at the theme in use. Choosing a card updates existing and
 new terminals, the sidebar, toolbar and dialogs at once.
+Turn on **Match system appearance** in the same card to use one theme while
+your system is in light mode and another while it is in dark mode. The card
+then shows a **Light mode** and a **Dark mode** row, marks the one in use, and
+each opens the catalog to choose that mode's theme; the window and every
+terminal switch as soon as the system does. Turning it on makes the current
+theme the choice for its own mode, so nothing changes until the system
+differs. macOS and Windows report the mode directly; on Linux, GNOME, KDE and
+other desktops report it through the XDG desktop portal. If the system reports
+neither, the card says so and the mode of your single theme is used. While it
+is on, **Use … theme** in the command palette chooses for that theme's own
+mode, and **Stop matching system appearance** turns it off. The choices are
+saved as `match_system_appearance`, `light_theme` and `dark_theme`; your single
+`theme` is kept for when matching is off.
 Star a theme (the star beside its name, or **Add to favorites** in its menu) to
 keep it: favorites lead the catalog in the order you starred them, and the
 **Favorites** filter shows them alone. Starring does not change the theme in
@@ -407,7 +420,8 @@ text, bold text, cursor, selection and 16 ANSI colors; the preview updates as
 you edit. **Save theme** saves and applies it. Leaving the editor with unsaved
 changes asks before discarding them. A custom theme's menu also offers
 **Edit…** and **Delete…**; deletion asks for confirmation, and deleting the
-theme in use returns to Graphite. Up to 128 custom themes are saved in
+theme in use returns to Graphite (or, for a mode's theme, to Light or
+Graphite). Up to 128 custom themes are saved in
 `config.toml`, with names up to 64 characters. Reset to defaults retains your
 saved custom themes and favorites; deleting a custom theme removes its star.
 Terminal programs can still override terminal colors through escape sequences.

@@ -116,7 +116,7 @@ impl App {
             Tool::DefaultProfile(profile) => {
                 let mut config = self.config.clone();
                 config.browser_profile = profile.unwrap_or_else(|| BrowserProfile::PRIVATE.into());
-                self.action(ctx, Action::Preferences(config));
+                self.action(ctx, Action::Preferences(Box::new(config)));
                 Ok(())
             }
             Tool::NewProfile => {
@@ -129,7 +129,7 @@ impl App {
                         name: unused_name(&config, "Profile"),
                         id: id.clone(),
                     });
-                    self.action(ctx, Action::Preferences(config));
+                    self.action(ctx, Action::Preferences(Box::new(config)));
                     if self.config.browser_profiles.iter().any(|p| p.id == id) {
                         self.restart_in(ctx, pane, Some(id));
                     }
@@ -145,7 +145,7 @@ impl App {
                 if config.browser_profiles.len() == self.config.browser_profiles.len() {
                     return;
                 }
-                self.action(ctx, Action::Preferences(config));
+                self.action(ctx, Action::Preferences(Box::new(config)));
                 if self.config.browser_profiles.iter().all(|p| p.id != id) {
                     self.browsers.remove_profile(&id);
                     // Every tab that was in it goes on in the default one.

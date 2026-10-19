@@ -1,14 +1,15 @@
 //! The theme catalog: a screen of Preferences, and the way into the editor.
 //!
-//! One theme styles the window and every terminal. Choosing a card applies it
-//! at once; custom themes are edited as drafts in `theme_editor`.
+//! One theme styles the window and every terminal, or one for each of the
+//! system's light and dark modes. Choosing a card applies it at once; custom
+//! themes are edited as drafts in `theme_editor`.
 use super::helpers::{
     ButtonKind, Group, bare_text_edit, button, elided, field_frame, focus_ring, galley_at,
     menu_item, menu_layout, menu_separator, place, segmented, sheet_back_header, sheet_footer,
 };
 use super::theme_editor::{self, Draft, Outcome};
 use crate::{
-    config::{Accent, Config, Theme},
+    config::{Accent, Appearance, Config, Theme},
     icons::{self, Icon},
     terminal_theme::{
         BUNDLED, BundledTheme, CustomTheme, HexColor, MAX_CUSTOM_THEMES, ThemeColors, bundled,
@@ -16,8 +17,8 @@ use crate::{
     theme::{self, Palette, metrics},
 };
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Layout, Painter, Pos2,
-    Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType,
+    self, Align, Align2, Color32, CursorIcon, FontId, Id, Layout, Painter, Pos2, Rect, Response,
+    Sense, Stroke, StrokeKind, Ui, Vec2, WidgetInfo, WidgetType,
     text::{LayoutJob, TextFormat},
     vec2,
 };
@@ -36,6 +37,8 @@ const CUSTOM_LIMIT: &str = "Custom theme limit reached (128). Delete a theme to 
 pub struct State {
     /// The catalog replaces the general settings.
     pub open: bool,
+    /// The mode whose theme the catalog chooses, or the single theme.
+    target: Option<Appearance>,
     query: String,
     filter: Filter,
     draft: Option<Draft>,
@@ -58,9 +61,11 @@ enum Filter {
 }
 
 impl State {
-    /// Shows the catalog, ready to search, at the theme in use.
-    pub fn browse(&mut self) {
+    /// Shows the catalog, ready to search, at the theme chosen for `target`:
+    /// a mode's, or the single theme for none.
+    pub fn browse(&mut self, target: Option<Appearance>) {
         self.open = true;
+        self.target = target;
         self.focus_search = true;
         self.reveal = true;
     }
@@ -421,22 +426,35 @@ pub(super) fn tile_outline(painter: &Painter, tile: Rect, p: Palette, emphasized
     );
 }
 
-/// Where the theme in use came from, for the general settings.
-fn kind(config: &Config) -> &'static str {
-    match &config.theme {
+/// Where a theme came from, for the general settings.
+fn kind(theme: &Theme) -> &'static str {
+    match theme {
         Theme::Palette(id) if id.starts_with("custom:") => "Custom theme",
         Theme::Palette(_) => "iTerm2 collection",
         _ => "Neptune theme",
     }
 }
 
-/// The theme in use, drawn in its own colours. The whole row opens the catalog.
-pub fn summary(ui: &mut Ui, p: Palette, config: &Config, rows: &mut Group) -> bool {
+/// The theme chosen for `target`, drawn in its own colours: a mode's, or the
+/// single theme for none. The whole row opens the catalog to choose it.
+pub fn summary(
+    ui: &mut Ui,
+    p: Palette,
+    config: &Config,
+    rows: &mut Group,
+    target: Option<Appearance>,
+) -> bool {
     let inner = rows.row_with_height(ui, "", 112.0, |ui| ui.max_rect());
     // The row's controls are inset; the row itself spans the group.
     let row = inner.expand2(vec2(12.0, 0.0));
-    let response = ui.interact(row, ui.id().with("theme-summary"), Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Browse themes…"));
+    let response = ui.interact(row, ui.id().with(("theme-summary", target)), Sense::click());
+    let label = match target {
+        None => "Browse themes…".to_owned(),
+        Some(mode) => format!("Choose the {} theme…", mode.name().to_lowercase()),
+    };
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
+    let chosen = config.theme_for(target);
+    let look = Palette::for_theme(config, chosen);
     let painter = ui.painter();
     let fill = if response.is_pointer_button_down_on() {
         Some(p.pressed)
@@ -446,14 +464,8 @@ pub fn summary(ui: &mut Ui, p: Palette, config: &Config, rows: &mut Group) -> bo
         None
     };
     if let Some(fill) = fill {
-        // The first row of its group: only the top corners are rounded.
-        let radius = CornerRadius {
-            nw: 10,
-            ne: 10,
-            sw: 0,
-            se: 0,
-        };
-        painter.rect_filled(row, radius, fill);
+        // The switch above takes the group's rounded corners.
+        painter.rect_filled(row, 0, fill);
     }
     if response.has_focus() {
         focus_ring(painter, row.shrink(3.0), 7, p);
@@ -462,7 +474,7 @@ pub fn summary(ui: &mut Ui, p: Palette, config: &Config, rows: &mut Group) -> bo
         Pos2::new(row.left() + 12.0 + 66.0, row.center().y),
         vec2(132.0, 88.0),
     );
-    preview(painter, tile, &p, false);
+    preview(painter, tile, &look, false);
     tile_outline(painter, tile, p, false);
     let ink = if response.hovered() {
         p.fg
@@ -493,17 +505,20 @@ pub fn summary(ui: &mut Ui, p: Palette, config: &Config, rows: &mut Group) -> bo
         Pos2::new(left, row.center().y - 9.0),
         elided(
             painter,
-            config.theme_name(),
+            config.name_of(chosen),
             theme::medium(13.0),
             p.fg,
             width,
         ),
     );
-    let origin = format!(
-        "{} · {}",
-        kind(config),
-        if p.dark { "Dark" } else { "Light" }
-    );
+    let tone = if look.dark { "Dark" } else { "Light" };
+    let origin = match target {
+        None => format!("{} · {tone}", kind(chosen)),
+        Some(mode) if config.appearance() == Some(mode) => {
+            format!("{} · In use · {}", mode.name(), kind(chosen))
+        }
+        Some(mode) => format!("{} · {}", mode.name(), kind(chosen)),
+    };
     galley_at(
         painter,
         Pos2::new(left, row.center().y + 10.0),
@@ -522,16 +537,17 @@ pub fn show(
     state: &mut State,
     body_height: f32,
 ) -> bool {
+    let target = state.target;
     let Some(draft) = &mut state.draft else {
         return catalog(ui, p, config, state, body_height);
     };
-    let (outcome, close) = theme_editor::show(ui, p, config, draft, body_height);
+    let (outcome, close) = theme_editor::show(ui, p, config, draft, target, body_height);
     match outcome {
         Outcome::Editing => {}
         Outcome::Saved => {
             // Back in the catalog at the saved theme, whatever was filtered.
             *state = State::default();
-            state.browse();
+            state.browse(target);
         }
         Outcome::Left => {
             // The catalog is as it was left, ready to search again.
@@ -642,8 +658,13 @@ fn catalog(
     state: &mut State,
     body_height: f32,
 ) -> bool {
+    let title = match state.target {
+        None => "Themes".to_owned(),
+        Some(mode) => format!("{} theme", mode.name()),
+    };
     let (back, mut close) =
-        sheet_back_header(ui, p, "Themes", "Back to preferences", "Close preferences");
+        sheet_back_header(ui, p, &title, "Back to preferences", "Close preferences");
+    let chosen = config.theme_for(state.target).clone();
     let width = ui.available_width();
     let inner = width - GUTTER * 2.0;
     let (changed, toolbar_height) = toolbar(ui, p, state);
@@ -675,7 +696,7 @@ fn catalog(
         if changed {
             scroll = scroll.vertical_scroll_offset(0.0);
         } else if state.reveal
-            && let Some(top) = list.row_of(&config.theme)
+            && let Some(top) = list.row_of(&chosen)
         {
             // Centre the row of the theme in use; near the top, keep its heading.
             let offset = top - ((list_height - CARD_HEIGHT) * 0.5).max(4.0);
@@ -708,7 +729,7 @@ fn catalog(
                                 origin + vec2(column as f32 * (card_width + CARD_GAP), *top),
                                 vec2(card_width, CARD_HEIGHT),
                             );
-                            card(ui, p, rect, entry, config, &mut command);
+                            card(ui, p, rect, entry, config, &chosen, &mut command);
                         }
                     }
                 }
@@ -726,7 +747,7 @@ fn catalog(
     close |= footer(ui, p, config, state);
     match command {
         Some(Command::Use(theme)) => {
-            config.theme = theme;
+            *config.theme_for_mut(state.target) = theme;
             state.deleting = None;
         }
         Some(Command::Star(theme, pinned)) => {
@@ -983,9 +1004,10 @@ fn footer(ui: &mut Ui, p: Palette, config: &mut Config, state: &mut State) -> bo
                         CUSTOM_LIMIT
                     });
                 if new.clicked() {
+                    let chosen = config.theme_for(state.target);
                     let colors = config
-                        .theme_colors()
-                        .unwrap_or_else(|| colors_of(&Palette::for_config(config)));
+                        .colors_of(chosen)
+                        .unwrap_or_else(|| colors_of(&Palette::for_theme(config, chosen)));
                     state.draft = Some(Draft::copy(config, "My theme", colors));
                 }
             },
@@ -998,7 +1020,7 @@ fn footer(ui: &mut Ui, p: Palette, config: &mut Config, state: &mut State) -> bo
             |ui| button(ui, p, "Done", ButtonKind::Primary).clicked(),
         );
     };
-    let in_use = config.theme.id() == id;
+    let consequence = deletion_consequence(config, &id);
     let (mut delete, mut cancel) = (false, false);
     place(
         ui,
@@ -1009,23 +1031,53 @@ fn footer(ui: &mut Ui, p: Palette, config: &mut Config, state: &mut State) -> bo
             ui.spacing_mut().item_spacing.x = 8.0;
             delete = button(ui, p, "Delete theme", ButtonKind::Destructive).clicked();
             cancel = button(ui, p, "Cancel", ButtonKind::Secondary).clicked();
-            let consequence = if in_use {
-                "Neptune switches to Graphite."
-            } else {
-                "This cannot be undone."
-            };
             footer_note(ui, &format!("Delete “{name}”? {consequence}"), p.fg);
         },
     );
     if delete {
-        if in_use {
-            config.theme = Theme::Graphite;
-        }
-        config.custom_themes.retain(|t| t.id != id);
+        delete_custom(config, &id);
     } else if !cancel {
         state.deleting = Some(id);
     }
     false
+}
+
+/// Removes the custom theme `id`. Whatever chose it returns to its default,
+/// shown or not.
+fn delete_custom(config: &mut Config, id: &str) {
+    for target in [None, Some(Appearance::Light), Some(Appearance::Dark)] {
+        let theme = config.theme_for_mut(target);
+        if theme.id() == id {
+            *theme = target.map_or(Theme::Graphite, Appearance::default_theme);
+        }
+    }
+    config.custom_themes.retain(|t| t.id != id);
+}
+
+/// What deleting the custom theme `id` changes, among the choices shown.
+fn deletion_consequence(config: &Config, id: &str) -> String {
+    let targets: &[Option<Appearance>] = if config.match_system_appearance {
+        &[Some(Appearance::Light), Some(Appearance::Dark)]
+    } else {
+        &[None]
+    };
+    let changes: Vec<String> = targets
+        .iter()
+        .filter(|&&target| config.theme_for(target).id() == id)
+        .map(|&target| match target {
+            None => "Neptune switches to Graphite.".to_owned(),
+            Some(mode) => format!(
+                "{} switches to {}.",
+                mode.name(),
+                config.name_of(&mode.default_theme())
+            ),
+        })
+        .collect();
+    if changes.is_empty() {
+        "This cannot be undone.".to_owned()
+    } else {
+        changes.join(" ")
+    }
 }
 
 /// A theme of the catalog: its preview, its name and, for a favorite, its
@@ -1037,10 +1089,11 @@ fn card(
     rect: Rect,
     entry: &Entry,
     config: &Config,
+    chosen: &Theme,
     command: &mut Option<Command>,
 ) {
     let id = entry.id();
-    let selected = entry.is(&config.theme);
+    let selected = entry.is(chosen);
     let response = ui.interact(rect, id, Sense::click());
     response.widget_info(|| {
         WidgetInfo::selected(
@@ -1163,8 +1216,8 @@ fn card(
             );
         }
     }
-    egui::Popup::menu(&more).show(|ui| card_menu(ui, p, entry, config, command));
-    response.context_menu(|ui| card_menu(ui, p, entry, config, command));
+    egui::Popup::menu(&more).show(|ui| card_menu(ui, p, entry, config, chosen, command));
+    response.context_menu(|ui| card_menu(ui, p, entry, config, chosen, command));
     if response.gained_focus() || more.gained_focus() || star.gained_focus() {
         response.scroll_to_me(None);
     }
@@ -1200,6 +1253,7 @@ fn card_menu(
     p: Palette,
     entry: &Entry,
     config: &Config,
+    chosen: &Theme,
     command: &mut Option<Command>,
 ) {
     menu_layout(ui, 190.0);
@@ -1208,7 +1262,7 @@ fn card_menu(
         Source::Custom(custom) => Some(*custom),
         _ => None,
     };
-    if !entry.is(&config.theme) && menu_item(ui, p, Icon::Check, "Use theme", "", false) {
+    if !entry.is(chosen) && menu_item(ui, p, Icon::Check, "Use theme", "", false) {
         *command = Some(Command::Use(entry.theme()));
         ui.close();
     }
@@ -1310,7 +1364,7 @@ mod tests {
         let ctx = context();
         let mut config = Config::default();
         let mut state = State::default();
-        state.browse();
+        state.browse(None);
         frame(&ctx, vec![], &mut config, &mut state);
         let dusk = Entry::neptune((Theme::Dusk, "Dusk")).id();
         let target = ctx.read_response(dusk).expect("Dusk is in view").rect;
@@ -1341,7 +1395,7 @@ mod tests {
         let ctx = context();
         let mut config = Config::default();
         let mut state = State::default();
-        state.browse();
+        state.browse(None);
         frame(&ctx, vec![], &mut config, &mut state);
         let dusk = Entry::neptune((Theme::Dusk, "Dusk")).id();
         let pinned = Entry::favorite(&config, &Theme::Dusk).unwrap().id();
@@ -1431,7 +1485,7 @@ mod tests {
             ..Config::default()
         };
         let mut state = State::default();
-        state.browse();
+        state.browse(None);
         frame(&ctx, vec![], &mut config, &mut state);
         frame(&ctx, vec![], &mut config, &mut state);
         assert!(ctx.read_response(bundled_card("Zenburn")).is_some());
@@ -1439,10 +1493,71 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_catalog_chooses_the_theme_for_that_mode_alone() {
+        let ctx = context();
+        let mut config = Config {
+            match_system_appearance: true,
+            system_appearance: Some(Appearance::Light),
+            ..Config::default()
+        };
+        let mut state = State::default();
+        state.browse(Some(Appearance::Dark));
+        frame(&ctx, vec![], &mut config, &mut state);
+        let dusk = Entry::neptune((Theme::Dusk, "Dusk")).id();
+        let target = ctx.read_response(dusk).expect("Dusk is in view").rect;
+        click(&ctx, target.center(), &mut config, &mut state);
+        assert_eq!(config.dark_theme, Theme::Dusk);
+        assert_eq!(config.light_theme, Theme::Light);
+        assert_eq!(config.theme, Theme::Graphite, "the single theme is kept");
+        assert_eq!(config.active_theme(), &Theme::Light, "the system is light");
+    }
+
+    #[test]
+    fn deleting_a_custom_theme_returns_each_choice_of_it_to_its_default() {
+        let custom = CustomTheme {
+            id: "custom:1".into(),
+            name: "Paper".into(),
+            colors: bundled("3024 Day").unwrap().colors,
+        };
+        let chosen = Theme::Palette(custom.id.clone());
+        let mut config = Config {
+            theme: chosen.clone(),
+            light_theme: chosen.clone(),
+            dark_theme: Theme::Dusk,
+            custom_themes: vec![custom],
+            ..Config::default()
+        };
+        assert_eq!(
+            deletion_consequence(&config, "custom:1"),
+            "Neptune switches to Graphite."
+        );
+        config.match_system_appearance = true;
+        assert_eq!(
+            deletion_consequence(&config, "custom:1"),
+            "Light mode switches to Light."
+        );
+        config.dark_theme = chosen;
+        assert_eq!(
+            deletion_consequence(&config, "custom:1"),
+            "Light mode switches to Light. Dark mode switches to Graphite."
+        );
+        assert_eq!(
+            deletion_consequence(&config, "custom:2"),
+            "This cannot be undone."
+        );
+        delete_custom(&mut config, "custom:1");
+        assert_eq!(
+            (&config.theme, &config.light_theme, &config.dark_theme),
+            (&Theme::Graphite, &Theme::Light, &Theme::Graphite)
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn escape_asks_before_discarding_a_changed_draft() {
         let config = Config::default();
         let mut state = State::default();
-        state.browse();
+        state.browse(None);
         state.draft = Some(Draft::copy(
             &config,
             "My theme",

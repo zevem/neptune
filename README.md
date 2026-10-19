@@ -17,7 +17,8 @@ browser tabs preview websites alongside terminals.
 - Scrollback, terminal search, selection/clipboard, and a command palette.
 - [Custom keybindings](docs/usage.md#custom-keybindings) configured in TOML.
 - [Browser tabs](docs/usage.md#browser-tabs) that split and move with terminals.
-- 715 built-in themes and custom themes shared by the window and terminal.
+- 715 built-in themes and custom themes shared by the window and terminal,
+  optionally one for light mode and one for dark mode that follow the system.
 - Terminal notifications with optional native desktop banners.
 - Saved workspace layouts and directories, plus optional Claude Code, Codex,
   OpenCode, pi and Oh My Pi session resumption on local Unix terminals, where
