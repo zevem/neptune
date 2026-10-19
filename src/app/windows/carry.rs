@@ -125,6 +125,7 @@ impl App {
                 defer_creation: false,
                 first_frame: true,
                 fallback: Some(source),
+                keep_frame: false,
             },
         );
         self.execute(ctx, effects);

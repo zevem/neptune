@@ -860,6 +860,12 @@ struct LaunchWindow {
     defer_creation: bool,
     first_frame: bool,
     fallback: Option<WindowId>,
+    /// A replacement left behind by a tear-off keeps its source's frame.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "Only AppKit moves a newly created window")
+    )]
+    keep_frame: bool,
 }
 
 // Keep frame-local fields together here, rather than sharing overlays, input
@@ -1192,6 +1198,7 @@ impl App {
                 defer_creation: false,
                 first_frame: false,
                 fallback: None,
+                keep_frame: false,
             })
         };
         let Some((target_launch, source_launch)) = placement(
@@ -1922,6 +1929,7 @@ impl App {
                     defer_creation: false,
                     first_frame: false,
                     fallback: None,
+                    keep_frame: false,
                 },
             );
             self.windows.launches.insert(
@@ -1938,6 +1946,7 @@ impl App {
                         .is_some_and(|window| window.active_workspace().is_some()),
                     first_frame: false,
                     fallback: Some(window),
+                    keep_frame: true,
                 },
             );
             if fullscreen {
@@ -1983,6 +1992,7 @@ impl App {
                     defer_creation: false,
                     first_frame: true,
                     fallback: Some(source),
+                    keep_frame: false,
                 },
             );
         }
@@ -2110,6 +2120,9 @@ impl App {
             if self.controller.model().window(window).is_none() {
                 continue;
             }
+            #[cfg(target_os = "macos")]
+            let created =
+                !ctx.input(|input| input.raw.viewports.contains_key(&self.viewport_of(window)));
             let default_fallback = self.host_window();
             let launch = self.windows.launches.entry(window).or_insert(LaunchWindow {
                 position: None,
@@ -2119,6 +2132,7 @@ impl App {
                 defer_creation: false,
                 first_frame: true,
                 fallback: Some(default_fallback),
+                keep_frame: false,
             });
             // Position or start the move on the carried surface before mapping
             // its replacement. Some compositors focus a newly mapped window even
@@ -2151,6 +2165,15 @@ impl App {
             if let Some(position) = launch.position {
                 builder = builder.with_position(position);
             }
+            // AppKit pushes a new window's top edge down near the menu bar and
+            // clips it to the visible frame; moving an existing window is not
+            // constrained. A tear-off's replacement restores its source's frame
+            // once, as it is created.
+            #[cfg(target_os = "macos")]
+            let placement = launch
+                .position
+                .filter(|_| created && launch.keep_frame && !launch.maximized && !launch.fullscreen)
+                .map(|position| Rect::from_min_size(position, launch.size));
             let first = std::mem::replace(&mut launch.first_frame, false);
             let fallback = launch.fallback;
             let mut rendered = false;
@@ -2171,6 +2194,19 @@ impl App {
                 });
                 if first {
                     child_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(placement) = placement
+                    && child_ctx
+                        .input(|input| input.viewport().outer_rect)
+                        .is_some_and(|shown| {
+                            (shown.min - placement.min).length() > 0.5
+                                || (shown.size() - placement.size()).length() > 0.5
+                        })
+                {
+                    child_ctx
+                        .send_viewport_cmd(egui::ViewportCommand::OuterPosition(placement.min));
+                    child_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(placement.size()));
                 }
                 if child_ctx.input(|input| input.viewport().close_requested())
                     && !self.exit_approved
