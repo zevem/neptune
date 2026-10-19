@@ -117,6 +117,28 @@ pub struct State {
     pub focus_address: bool,
 }
 
+impl State {
+    /// The field shows where the tab is going. Words the user is still
+    /// editing stay theirs; a field that only showed the last address, or
+    /// one they have left, follows the page.
+    fn follow(&mut self, address: &str, focused: bool) {
+        if self.observed == address {
+            return;
+        }
+        let shown = |address: &str| {
+            if address == "about:blank" {
+                String::new()
+            } else {
+                address.to_owned()
+            }
+        };
+        if !focused || self.address == shown(&self.observed) {
+            self.address = shown(address);
+        }
+        self.observed = address.to_owned();
+    }
+}
+
 /// Browser tabs and navigation share this band without retuning app materials.
 pub(super) fn bar(p: Palette) -> Color32 {
     theme::mix(p.bg, p.chrome, if p.dark { 0.72 } else { 0.55 })
@@ -549,14 +571,7 @@ pub(crate) fn show(
     );
     let field_id = Id::new(("browser-address", pane));
     let focused = ui.memory(|m| m.focused() == Some(field_id));
-    if state.observed != view.state.url && !focused {
-        state.observed.clone_from(&view.state.url);
-        state.address = if view.state.url == "about:blank" {
-            String::new()
-        } else {
-            view.state.url.clone()
-        };
-    }
+    state.follow(&view.address, focused);
     let blank = view.state.url.is_empty() || view.state.url == "about:blank";
     if address.width() > 8.0 {
         address_surface(ui.painter(), address, p, focused);
@@ -577,7 +592,7 @@ pub(crate) fn show(
                     Pos2::new(address.left() + 16.0, address.center().y),
                     Vec2::splat(12.0),
                 ),
-                if focused || blank {
+                if focused || view.address.is_empty() || view.address == "about:blank" {
                     Icon::Search
                 } else if secure {
                     Icon::Lock
@@ -1013,6 +1028,33 @@ pub(crate) fn show(
 mod tests {
     use super::*;
 
+    #[test]
+    fn address_field_keeps_what_the_user_typed_and_follows_the_page() {
+        let mut state = State::default();
+        // A new tab focuses its field before the page is ready.
+        state.follow("", true);
+        state.follow("about:blank", true);
+        state.address = "neptune.rs".into();
+        // Submission releases focus while the page is still blank.
+        state.follow("about:blank", false);
+        assert_eq!(state.address, "neptune.rs");
+        state.follow("https://neptune.rs", false);
+        assert_eq!(state.address, "https://neptune.rs");
+        state.follow("https://neptune.rs/", false);
+        assert_eq!(state.address, "https://neptune.rs/");
+        // A redirect reaches a field that is focused but unedited...
+        state.follow("https://neptune.rs/docs", true);
+        assert_eq!(state.address, "https://neptune.rs/docs");
+        // ...but not words the user is typing.
+        state.address = "localhost:3000".into();
+        state.follow("https://neptune.rs/docs/", true);
+        assert_eq!(state.address, "localhost:3000");
+        state.follow("https://neptune.rs/docs/", false);
+        assert_eq!(state.address, "localhost:3000");
+        // A page that moves after the user left the field shows itself.
+        state.follow("https://neptune.rs/", false);
+        assert_eq!(state.address, "https://neptune.rs/");
+    }
     #[test]
     fn loading_mark_is_a_native_glyph_at_its_original_center_and_speed() {
         for pixels_per_point in [1.0, 2.0] {
