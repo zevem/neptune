@@ -49,6 +49,10 @@ pub(crate) struct Monitor {
 /// Where the compositor reports a carried workspace, in the viewport's
 /// local logical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "Only the Wayland seat carries a held workspace")
+)]
 pub(crate) enum Carried {
     Over {
         viewport: Option<egui::ViewportId>,
@@ -178,6 +182,8 @@ impl Monitor {
         {
             self.seat.as_mut().and_then(|seat| seat.take_files())
         }
+        #[cfg(not(target_os = "linux"))]
+        None
     }
 
     /// Whether the compositor carries held windows between Neptune's

@@ -22,7 +22,7 @@ pub struct FileDrag {
 #[cfg(target_os = "linux")]
 pub type SeatFiles = Option<std::sync::mpsc::Receiver<super::wayland_seat::FileSignal>>;
 #[cfg(not(target_os = "linux"))]
-pub type SeatFiles = ();
+pub type SeatFiles = Option<std::convert::Infallible>;
 
 #[derive(Default)]
 pub struct FileDragSource {
