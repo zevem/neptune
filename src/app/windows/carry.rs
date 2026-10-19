@@ -102,15 +102,30 @@ impl App {
 
     fn carry_into_new_window(&mut self, ctx: &egui::Context, carry: &mut Carry) {
         let source = carry.window;
-        let size = ctx
-            .input(|input| {
-                input
-                    .raw
-                    .viewports
-                    .get(&self.viewport_of(source))
-                    .and_then(|info| info.inner_rect)
-            })
-            .map_or(ctx.content_rect().size(), |rect| rect.size());
+        let viewport = self.viewport_of(source);
+        let (filling, inner) = ctx.input(|input| {
+            input
+                .raw
+                .viewports
+                .get(&viewport)
+                .map_or((false, None), |info| {
+                    (
+                        info.maximized == Some(true) || info.fullscreen == Some(true),
+                        info.inner_rect,
+                    )
+                })
+        });
+        // A maximized or fullscreen source fills its screen; the new window is
+        // normal. The press may be polled in another window's frame, so read
+        // the size of the window it leaves.
+        let size = if filling {
+            self.normal_window_size(ctx)
+        } else {
+            inner.map_or_else(
+                || ctx.input_for(viewport, |input| input.content_rect().size()),
+                |rect| rect.size(),
+            )
+        };
         self.enter_window(source);
         let Some((window, effects)) = self.detach_to_new_window(carry.workspace, source) else {
             return;
@@ -507,5 +522,108 @@ impl App {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
         }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{detach, filling, fixture};
+    use super::*;
+
+    fn carry(workspace: WorkspaceId, window: WindowId) -> Carry {
+        Carry {
+            workspace,
+            window,
+            grip: Vec2::new(80.0, 20.0),
+            docked: true,
+            attach: None,
+            origin: egui::ViewportId::ROOT,
+            transfer: true,
+            origin_closing: false,
+            left: None,
+            closed: None,
+            ended: false,
+        }
+    }
+
+    /// Wayland reports no window positions, so viewport input has no rects.
+    fn unplaced(info: egui::ViewportInfo) -> egui::ViewportInfo {
+        egui::ViewportInfo {
+            inner_rect: None,
+            outer_rect: None,
+            ..info
+        }
+    }
+
+    #[test]
+    fn a_workspace_carried_out_of_a_maximized_or_fullscreen_window_gets_a_normal_window() {
+        for (maximized, fullscreen) in [(true, false), (false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut app, workspaces) = fixture(root.path());
+            let normal = Vec2::from(app.window_state.inner_size);
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 1408.0))),
+                ..Default::default()
+            };
+            input.viewports.insert(
+                egui::ViewportId::ROOT,
+                unplaced(filling(maximized, fullscreen)),
+            );
+            let mut carry = carry(workspaces[2], WindowId::ROOT);
+            ctx.run_ui(input, |ui| app.carry_into_new_window(ui.ctx(), &mut carry))
+                .textures_delta
+                .clear();
+            assert_ne!(carry.window, WindowId::ROOT);
+            assert_eq!(
+                app.windows.launches[&carry.window].size, normal,
+                "maximized {maximized}, fullscreen {fullscreen}: \
+                 a carried-out window must not take its source's screen size"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workspace_carried_out_of_a_child_window_gets_that_windows_size_not_the_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        let ctx = egui::Context::default();
+        let child = detach(&mut app, &ctx, workspaces[2], false);
+        app.controller
+            .dispatch(Command::MoveWorkspaceToWindow {
+                workspace: workspaces[1],
+                window: child,
+            })
+            .unwrap();
+        let child_viewport = app.viewport_of(child);
+        let size = Vec2::new(900.0, 600.0);
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(egui::ViewportId::ROOT, unplaced(filling(true, false)));
+        viewports.insert(child_viewport, unplaced(filling(false, false)));
+        // The child's own frame gives it its size; the press is then polled
+        // in the maximized root's frame.
+        ctx.run_ui(
+            egui::RawInput {
+                viewport_id: child_viewport,
+                viewports: viewports.clone(),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .textures_delta
+        .clear();
+        let input = egui::RawInput {
+            viewports,
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(2560.0, 1408.0))),
+            ..Default::default()
+        };
+        let mut carry = carry(workspaces[2], child);
+        ctx.run_ui(input, |ui| app.carry_into_new_window(ui.ctx(), &mut carry))
+            .textures_delta
+            .clear();
+        assert_ne!(carry.window, child);
+        assert_eq!(app.windows.launches[&carry.window].size, size);
     }
 }

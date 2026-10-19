@@ -64,7 +64,7 @@ struct DropZones {
 mod tests {
     use super::*;
 
-    fn fixture(root: &std::path::Path) -> (App, Vec<WorkspaceId>) {
+    pub(super) fn fixture(root: &std::path::Path) -> (App, Vec<WorkspaceId>) {
         let (mut app, _) = super::super::tests::fixture(root);
         app.startup = None;
         app.command = None;
@@ -83,7 +83,12 @@ mod tests {
         (app, workspaces)
     }
 
-    fn detach(app: &mut App, ctx: &egui::Context, workspace: WorkspaceId, held: bool) -> WindowId {
+    pub(super) fn detach(
+        app: &mut App,
+        ctx: &egui::Context,
+        workspace: WorkspaceId,
+        held: bool,
+    ) -> WindowId {
         ctx.set_embed_viewports(false);
         let mut input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
@@ -142,6 +147,134 @@ mod tests {
                 .unwrap()
                 .layout(),
             before.layout()
+        );
+    }
+
+    /// Viewport input of a window that fills a 1.5x display, as a maximized
+    /// or fullscreen window does.
+    pub(super) fn filling(maximized: bool, fullscreen: bool) -> egui::ViewportInfo {
+        let screen = Rect::from_min_size(Pos2::new(0.0, 32.0), Vec2::new(2560.0, 1408.0));
+        egui::ViewportInfo {
+            native_pixels_per_point: Some(1.5),
+            inner_rect: Some(screen),
+            outer_rect: Some(screen),
+            maximized: Some(maximized),
+            fullscreen: Some(fullscreen),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_workspace_torn_off_a_maximized_or_fullscreen_window_opens_at_the_normal_window_size() {
+        for (maximized, fullscreen) in [(true, false), (false, true)] {
+            for held in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let (mut app, workspaces) = fixture(root.path());
+                let normal = Vec2::from(app.window_state.inner_size);
+                let ctx = egui::Context::default();
+                ctx.set_embed_viewports(false);
+                let point = Pos2::new(300.0, 90.0);
+                let mut input = egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(point)],
+                    ..Default::default()
+                };
+                if held {
+                    input.events.push(egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    });
+                }
+                input
+                    .viewports
+                    .insert(egui::ViewportId::ROOT, filling(maximized, fullscreen));
+                ctx.run_ui(input, |ui| {
+                    app.detach_workspace(ui.ctx(), workspaces[2], held.then_some(point), None)
+                })
+                .textures_delta
+                .clear();
+                let torn_off = app
+                    .controller
+                    .model()
+                    .workspace(workspaces[2])
+                    .unwrap()
+                    .window();
+                assert_eq!(
+                    app.windows.launches[&torn_off].size, normal,
+                    "maximized {maximized}, fullscreen {fullscreen}, held {held}: \
+                     a torn-off window must not take its source's screen size"
+                );
+                if held {
+                    // The replacement keeps its source's state, and restores
+                    // to the normal size rather than the screen's.
+                    let replacement = &app.windows.launches[&WindowId::ROOT];
+                    assert_eq!(
+                        (replacement.maximized, replacement.fullscreen),
+                        (maximized, fullscreen)
+                    );
+                    assert_eq!(replacement.size, normal);
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_maximized_window_a_held_workspace_joins_restores_to_the_normal_window_size() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, workspaces) = fixture(root.path());
+        let normal = Vec2::from(app.window_state.inner_size);
+        let ctx = egui::Context::default();
+        let target = detach(&mut app, &ctx, workspaces[2], false);
+        let (_samples, watch) = crate::platform::workspace_drag::Watch::test_samples();
+        let mut drag = WorkspaceDrag {
+            workspace: workspaces[1],
+            window: WindowId::ROOT,
+            viewport: egui::ViewportId::ROOT,
+            watch,
+            grip: Vec2::new(80.0, 20.0),
+            pointer: Pos2::new(300.0, 300.0),
+            mode: WorkspaceDragMode::Floating { anchor: None },
+        };
+        let carried = Rect::from_min_size(Pos2::new(600.0, 300.0), Vec2::new(900.0, 600.0));
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(1.5),
+                inner_rect: Some(carried),
+                outer_rect: Some(carried),
+                maximized: Some(false),
+                fullscreen: Some(false),
+                ..Default::default()
+            },
+        );
+        input
+            .viewports
+            .insert(app.viewport_of(target), filling(true, false));
+        let output = ctx.run_ui(input, |ui| {
+            app.dock_workspace_drag(ui.ctx(), &mut drag, target);
+        });
+        // The carried surface now presents the window it joined.
+        let joined = &app.windows.launches[&target];
+        assert!(joined.maximized);
+        assert_eq!(
+            joined.size, normal,
+            "the joined window must restore to a normal size, not its screen's"
+        );
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        let resized = commands.iter().position(
+            |command| matches!(command, egui::ViewportCommand::InnerSize(size) if *size == normal),
+        );
+        let maximized = commands
+            .iter()
+            .position(|command| matches!(command, egui::ViewportCommand::Maximized(true)));
+        assert!(
+            resized
+                .zip(maximized)
+                .is_some_and(|(resized, maximized)| resized < maximized),
+            "{commands:?}"
         );
     }
 
@@ -1189,16 +1322,26 @@ impl App {
         else {
             return;
         };
+        let normal = self.normal_window_size(ctx);
         let placement = |info: &egui::ViewportInfo, scale: f32, new_scale: f32| {
-            info.inner_rect.map(|inner| LaunchWindow {
-                position: Some(info.outer_rect.unwrap_or(inner).min * scale / new_scale),
-                size: inner.size() * scale / new_scale,
-                maximized: info.maximized == Some(true),
-                fullscreen: info.fullscreen == Some(true),
-                defer_creation: false,
-                first_frame: false,
-                fallback: None,
-                keep_frame: false,
+            info.inner_rect.map(|inner| {
+                let maximized = info.maximized == Some(true);
+                let fullscreen = info.fullscreen == Some(true);
+                LaunchWindow {
+                    position: Some(info.outer_rect.unwrap_or(inner).min * scale / new_scale),
+                    // The size a maximized or fullscreen surface restores to.
+                    size: if maximized || fullscreen {
+                        normal
+                    } else {
+                        inner.size() * scale / new_scale
+                    },
+                    maximized,
+                    fullscreen,
+                    defer_creation: false,
+                    first_frame: false,
+                    fallback: None,
+                    keep_frame: false,
+                }
             })
         };
         let Some((target_launch, source_launch)) = placement(
@@ -1880,10 +2023,15 @@ impl App {
         let fullscreen = info
             .as_ref()
             .is_some_and(|info| info.fullscreen == Some(true));
-        let size = info
-            .as_ref()
-            .and_then(|info| info.inner_rect)
-            .map_or(ctx.content_rect().size(), |rect| rect.size());
+        // A maximized or fullscreen window fills its screen. The window torn
+        // off it, and the size its replacement restores to, are normal.
+        let size = if maximized || fullscreen {
+            self.normal_window_size(ctx)
+        } else {
+            info.as_ref()
+                .and_then(|info| info.inner_rect)
+                .map_or(ctx.content_rect().size(), |rect| rect.size())
+        };
         let drag = watch.is_some()
             || (pointer.is_some() && ctx.input(|input| input.pointer.primary_down()));
         if !drag
@@ -2088,6 +2236,12 @@ impl App {
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
+    /// A new window's size in points: the last normal (not maximized or
+    /// fullscreen) window size.
+    pub(super) fn normal_window_size(&self, ctx: &egui::Context) -> Vec2 {
+        Vec2::from(self.window_state.inner_size) / ctx.zoom_factor()
+    }
+
     pub(super) fn show_windows(&mut self, ctx: &egui::Context) {
         self.reconcile_empty_host(ctx);
         self.rehost_empty_root(ctx);
@@ -2124,9 +2278,10 @@ impl App {
             let created =
                 !ctx.input(|input| input.raw.viewports.contains_key(&self.viewport_of(window)));
             let default_fallback = self.host_window();
+            let size = self.normal_window_size(ctx);
             let launch = self.windows.launches.entry(window).or_insert(LaunchWindow {
                 position: None,
-                size: Vec2::from(self.window_state.inner_size) / ctx.zoom_factor(),
+                size,
                 maximized: false,
                 fullscreen: false,
                 defer_creation: false,
