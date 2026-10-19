@@ -164,6 +164,12 @@ icon buttons keep a 28-point target around a 16-point glyph.
   While a terminal is carried, every other workspace's row on the same machine
   is a drop destination and takes the accent under the pointer.
   The sidebar yields to terminal content below 820 points of window width.
+  There its toggle stays in the toolbar, and the button, the shortcut or the
+  command palette lays the same sidebar over the terminals, sliding in from
+  the leading edge over a dimmed window without resizing any shell or
+  changing the saved sidebar state. Folders, menus and row drags work as they
+  do in place. A click beside it, Escape, the toggle, choosing or creating a
+  workspace, or widening the window puts it away.
   Toggling it slides it in or out over 160 ms, from the button, the shortcut
   or the command palette alike. The window controls stay in place, the toggle
   travels between the sidebar's trailing edge and its place in the toolbar, and
@@ -179,8 +185,9 @@ icon buttons keep a 28-point target around a 16-point glyph.
   for input, or the project of the workspace in view needs the person, where
   the panel does not show it. When
   the sidebar is hidden the toolbar also carries the window controls, the
-  sidebar toggle and "New workspace". In narrow windows the command field
-  collapses to an icon and search takes the title's room.
+  sidebar toggle and "New workspace". In narrow windows the command field,
+  find, new tab, new browser tab and split controls fold into one "More
+  actions" menu that names each shortcut, and search takes the title's room.
 - **Subscription footer.** A 44-point strip below the content, sharing the
   window material. Its trailing control shows each available local AI
   subscription's most consumed allowance and a small track; it collapses

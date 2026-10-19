@@ -1882,6 +1882,32 @@ fn toggling_the_sidebar_starts_a_slide_from_where_it_is() {
 }
 
 #[test]
+fn toggling_the_sidebar_in_a_narrow_window_lays_it_over_the_terminals() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    app.startup = None;
+    app.ui.sidebar_narrow = true;
+    let saved = app.controller.model().sidebar();
+
+    app.action(&ctx, Action::ToggleSidebar);
+    assert_eq!(app.ui.overlay, OverlayState::Sidebar);
+    assert_eq!(app.controller.model().sidebar(), saved, "saved state stays");
+    assert_eq!(
+        app.ui.sidebar_slide, None,
+        "nothing beside the terminals moves"
+    );
+
+    app.action(&ctx, Action::ToggleSidebar);
+    assert_eq!(app.ui.overlay, OverlayState::None);
+
+    app.action(&ctx, Action::ToggleSidebar);
+    app.action(&ctx, Action::CloseOverlay);
+    assert_eq!(app.ui.overlay, OverlayState::None);
+    assert_eq!(app.controller.model().sidebar(), saved);
+}
+
+#[test]
 fn sidebar_width_is_clamped_and_saved_as_one_preference_change() {
     let root = tempfile::tempdir().unwrap();
     let (mut app, _sender) = fixture(root.path());

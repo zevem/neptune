@@ -190,8 +190,11 @@ fn workspace_detach(
     if !state.dragging_sidebar_row() {
         return;
     }
-    if state.overlay != super::OverlayState::None
-        || !view.sidebar_open
+    // The sidebar laid over the terminals is itself an overlay.
+    if !matches!(
+        state.overlay,
+        super::OverlayState::None | super::OverlayState::Sidebar
+    ) || !view.sidebar_open
         || view.sidebar < 1.0
         || !ui.input(|input| input.focused)
         || state
@@ -427,12 +430,7 @@ pub fn toolbar(
     let middle = rect.center().y;
     // The title starts clear of the leading controls wherever they overlap the
     // toolbar: always while the sidebar is hidden, and in passing as it slides.
-    let leading = if view.sidebar_available {
-        toggle_offset(view) + 24.0
-    } else {
-        78.0
-    };
-    let left = (rect.left() + 8.0).max(view.window.left() + leading);
+    let left = (rect.left() + 8.0).max(view.window.left() + toggle_offset(view) + 24.0);
 
     // The command field stays centred on the content; narrow windows fall back
     // to an icon so the title keeps its room. A sliding sidebar decides this
@@ -501,7 +499,9 @@ pub fn toolbar(
                 ) {
                     actions.push(Action::Notifications);
                 }
-                if let Some(pane) = view.pane {
+                if !show_field {
+                    actions_menu(ui, p, view, actions);
+                } else if let Some(pane) = view.pane {
                     if icons::button_with_hint(
                         ui,
                         Icon::SplitHorizontal,
@@ -552,17 +552,6 @@ pub fn toolbar(
                     {
                         actions.push(Action::Find);
                     }
-                }
-                if !show_field
-                    && icons::button_with_hint(
-                        ui,
-                        Icon::Command,
-                        "Command palette",
-                        &view.keybindings.hint(Binding::CommandPalette),
-                    )
-                    .clicked()
-                {
-                    actions.push(Action::Palette);
                 }
                 ui.min_rect().left()
             },
@@ -798,6 +787,78 @@ fn notification_bell(ui: &mut Ui, p: Palette, unread: bool, open: bool) -> bool 
         );
     }
     response.clicked()
+}
+
+/// In a narrow window the focused terminal's actions and the command palette
+/// share one menu, leaving the toolbar's room to the title and search. The
+/// button stays pressed while its menu is open.
+fn actions_menu(ui: &mut Ui, p: Palette, view: &ChromeView, actions: &mut Vec<Action>) {
+    let surface = ui.painter().add(egui::Shape::Noop);
+    let response = icons::button(ui, Icon::Ellipsis, "More actions");
+    if egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response)) {
+        ui.painter().set(
+            surface,
+            egui::Shape::rect_filled(response.rect.shrink(1.0), 7, p.pressed),
+        );
+    }
+    let hint = |binding| view.keybindings.hint(binding);
+    egui::Popup::menu(&response)
+        .align(egui::RectAlign::BOTTOM_END)
+        .show(|ui| {
+            menu_layout(ui, 230.0);
+            let mut item = |ui: &mut Ui, icon, label, binding, action| {
+                if menu_item(ui, p, icon, label, &hint(binding), false) {
+                    actions.push(action);
+                    ui.close();
+                }
+            };
+            item(
+                ui,
+                Icon::Command,
+                "Command palette",
+                Binding::CommandPalette,
+                Action::Palette,
+            );
+            let Some(pane) = view.pane else {
+                return;
+            };
+            item(
+                ui,
+                Icon::Search,
+                "Find in terminal",
+                Binding::Find,
+                Action::Find,
+            );
+            menu_separator(ui, p);
+            item(
+                ui,
+                Icon::Terminal,
+                "New tab",
+                Binding::NewTab,
+                Action::NewTab(pane),
+            );
+            item(
+                ui,
+                Icon::Globe,
+                "New browser tab",
+                Binding::NewBrowser,
+                Action::NewBrowser(pane, None, None),
+            );
+            item(
+                ui,
+                Icon::SplitVertical,
+                "Split right",
+                Binding::SplitRight,
+                Action::Split(pane, neptune_model::Axis::Vertical),
+            );
+            item(
+                ui,
+                Icon::SplitHorizontal,
+                "Split below",
+                Binding::SplitBelow,
+                Action::Split(pane, neptune_model::Axis::Horizontal),
+            );
+        });
 }
 
 fn workspace_menu(
@@ -2104,19 +2165,112 @@ pub fn leading_controls(ui: &mut Ui, p: Palette, view: &ChromeView, actions: &mu
     let origin = view.window.min;
     let middle = origin.y + metrics::TOOLBAR_HEIGHT * 0.5;
     window_controls(ui, Pos2::new(origin.x + 16.0, middle), p, actions);
-    if view.sidebar_available
-        && icon_at(
-            ui,
-            Pos2::new(origin.x + toggle_offset(view).round(), middle),
-            Icon::Sidebar,
-            "Toggle sidebar",
-            &view.keybindings.hint(Binding::ToggleSidebar),
-            "sidebar-toggle",
-        )
-        .clicked()
+    if icon_at(
+        ui,
+        Pos2::new(origin.x + toggle_offset(view).round(), middle),
+        Icon::Sidebar,
+        "Toggle sidebar",
+        &view.keybindings.hint(Binding::ToggleSidebar),
+        "sidebar-toggle",
+    )
+    .clicked()
     {
         actions.push(Action::ToggleSidebar);
     }
+}
+
+/// How the sidebar is laid over the terminals this frame.
+pub struct Drawer {
+    /// How much of it is shown: it slides in from the leading edge.
+    pub reveal: f32,
+    pub width: f32,
+    /// It is requested rather than sliding away, so it takes the pointer.
+    pub open: bool,
+    /// The window's corner radius, which its leading corners follow.
+    pub radius: u8,
+}
+
+/// In a window too narrow for the sidebar, toggling it lays the same sidebar
+/// over the terminals, which keep their size. A click beside it, Escape, the
+/// toggle or choosing a workspace puts it away; folders, menus and row drags
+/// work as they do in place.
+pub fn sidebar_drawer(
+    ctx: &egui::Context,
+    p: Palette,
+    view: &ChromeView,
+    state: &mut UiState,
+    drawer: Drawer,
+    actions: &mut Vec<Action>,
+) {
+    let bounds = view.window;
+    let edge =
+        bounds.left() + (drawer.reveal * drawer.width).round_to_pixels(ctx.pixels_per_point());
+    let rect = Rect::from_min_size(
+        Pos2::new(edge - drawer.width, bounds.top()),
+        vec2(drawer.width, bounds.height()),
+    );
+    let view = ChromeView {
+        sidebar: drawer.reveal,
+        sidebar_open: true,
+        sidebar_width: drawer.width,
+        sidebar_available: true,
+        ..*view
+    };
+    egui::Area::new(egui::Id::new("sidebar-drawer"))
+        .order(egui::Order::Foreground)
+        .movable(false)
+        // It slides rather than fades, coming and going alike.
+        .fade_in(false)
+        .fixed_pos(bounds.min)
+        .show(ctx, |ui| {
+            let mut emitted = Vec::new();
+            if drawer.open {
+                // Covers the window, so nothing beneath takes the pointer.
+                ui.set_min_size(bounds.size());
+                let backdrop = ui.interact(bounds, ui.id().with("backdrop"), Sense::click());
+                if backdrop.clicked() || backdrop.secondary_clicked() {
+                    actions.push(Action::CloseOverlay);
+                }
+            } else {
+                // Sliding away, it is only a picture of itself.
+                ui.set_min_size(vec2((edge - bounds.left()).max(0.0), bounds.height()));
+                ui.style_mut().visuals.disabled_alpha = 1.0;
+                ui.disable();
+            }
+            ui.response()
+                .widget_info(|| WidgetInfo::labeled(WidgetType::Window, true, "Sidebar"));
+            // Only the part inside the window is drawn, its leading corners
+            // following the window's.
+            let shown = Rect::from_min_max(
+                Pos2::new(rect.left().max(bounds.left()), rect.top()),
+                rect.max,
+            );
+            let corners = egui::CornerRadius {
+                nw: drawer.radius,
+                sw: drawer.radius,
+                ne: 0,
+                se: 0,
+            };
+            let painter = ui.painter();
+            painter.add(p.popup_shadow().as_shape(shown, corners));
+            painter.rect_filled(shown, corners, p.chrome);
+            painter.line_segment([shown.right_top(), shown.right_bottom()], p.hairline());
+            sidebar(ui, rect, p, &view, state, &mut emitted);
+            leading_controls(ui, p, &view, &mut emitted);
+            if !drawer.open {
+                return;
+            }
+            // Choosing where to go next is done with it.
+            if emitted.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::SelectWorkspace(_) | Action::New | Action::NewInGroup(_)
+                )
+            }) {
+                actions.push(Action::CloseOverlay);
+            }
+            actions.extend(emitted);
+        });
 }
 
 /// The sidebar spans the full window height, like a native source list.
@@ -2923,6 +3077,17 @@ mod tests {
                 .any(|action| matches!(action, Action::SelectWorkspace(_))),
             "a drag is not a click"
         );
+    }
+
+    #[test]
+    fn rows_still_move_while_the_sidebar_is_laid_over_the_terminals() {
+        let mut sidebar = Fixture::new(&[1, 2, 3]);
+        sidebar.state.overlay = super::super::OverlayState::Sidebar;
+        let to = row(2) + vec2(0.0, 6.0);
+        sidebar.carry(row(0), to);
+        assert!(sidebar.state.dragging_sidebar_row());
+        sidebar.frame(vec![button(to, false)]);
+        assert_eq!(sidebar.order, [2, 3, 1]);
     }
 
     #[test]

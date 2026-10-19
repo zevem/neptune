@@ -754,6 +754,15 @@ impl App {
                     self.ui.error = Some(error.into());
                 }
             }
+            // A window too narrow for the sidebar lays it over the terminals
+            // for a moment; the saved state stays for when there is room.
+            Action::ToggleSidebar if self.ui.sidebar_narrow => {
+                self.ui.overlay = if self.ui.overlay == OverlayState::Sidebar {
+                    OverlayState::None
+                } else {
+                    OverlayState::Sidebar
+                };
+            }
             Action::ToggleSidebar => {
                 let shown = self.controller.model().sidebar();
                 self.ui.sidebar_slide = Some(ui::chrome::SidebarSlide::toggled(

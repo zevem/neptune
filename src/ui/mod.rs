@@ -73,6 +73,9 @@ pub enum OverlayState {
     /// The project of the workspace in view, in a window too narrow for the
     /// panel that holds its tab.
     Project,
+    /// The sidebar laid over the terminals, in a window too narrow for it to
+    /// sit beside them.
+    Sidebar,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CloseStatus {
@@ -128,6 +131,13 @@ pub struct UiState {
     pub workspace_rows: Vec<(WorkspaceId, eframe::egui::Rect)>,
     /// A sidebar toggle still sliding into place.
     pub sidebar_slide: Option<chrome::SidebarSlide>,
+    /// The window was too narrow for the sidebar as of the last frame, so a
+    /// toggle lays it over the terminals instead of changing the saved state.
+    pub sidebar_narrow: bool,
+    /// The sidebar laid over the terminals as of the last frame, and its
+    /// slide while it comes or goes.
+    pub drawer_shown: bool,
+    pub drawer_slide: Option<chrome::SidebarSlide>,
     /// The terminal being carried by its header, as of the last frame.
     pub pane_drag: Option<PaneId>,
     /// The panel at the trailing edge, which holds the tabs below.

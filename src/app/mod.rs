@@ -1126,7 +1126,10 @@ impl App {
         // the notification popover move their own highlight.
         let sheet_open = !matches!(
             self.ui.overlay,
-            OverlayState::None | OverlayState::Palette | OverlayState::Notifications
+            OverlayState::None
+                | OverlayState::Palette
+                | OverlayState::Notifications
+                | OverlayState::Sidebar
         );
         if !sheet_open && !menu_open {
             ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
@@ -1135,7 +1138,8 @@ impl App {
         if self.ui.pane_drag.is_some() && self.ui.overlay != OverlayState::None {
             self.cancel_pane_drag(&ctx);
         }
-        if self.ui.overlay != OverlayState::None {
+        // The sidebar laid over the terminals keeps its own row drags.
+        if !matches!(self.ui.overlay, OverlayState::None | OverlayState::Sidebar) {
             self.ui.cancel_sidebar_drag(&ctx);
         }
         let p = Palette::for_config(&self.config);
@@ -1226,7 +1230,45 @@ impl App {
         } else {
             self.ui.sidebar_slide = None;
         }
-        if !sidebar_open {
+        // Too narrow to sit beside the terminals, the sidebar is laid over
+        // them on request; a window made wide enough puts it back in place.
+        self.ui.sidebar_narrow = !sidebar_available;
+        if sidebar_available && self.ui.overlay == OverlayState::Sidebar {
+            self.ui.overlay = OverlayState::None;
+        }
+        // Timed from the frame that sees the change, so a shortcut handled
+        // at the start of a frame after a pause still slides.
+        let drawer_open = self.ui.overlay == OverlayState::Sidebar;
+        let now = ctx.input(|input| input.time);
+        if drawer_open != self.ui.drawer_shown {
+            self.ui.drawer_slide = Some(ui::chrome::SidebarSlide::toggled(
+                self.ui.drawer_slide,
+                self.ui.drawer_shown,
+                now,
+            ));
+            self.ui.drawer_shown = drawer_open;
+        }
+        let drawer = self
+            .ui
+            .drawer_slide
+            .and_then(|slide| slide.reveal(drawer_open, now));
+        if drawer.is_some() {
+            ctx.request_repaint();
+        } else {
+            self.ui.drawer_slide = None;
+        }
+        let drawer = drawer.unwrap_or(if drawer_open { 1.0 } else { 0.0 });
+        // It slides away only when nothing takes its place.
+        let drawer = (!sidebar_available && (drawer_open || self.ui.overlay == OverlayState::None))
+            .then_some(drawer)
+            .filter(|reveal| *reveal > 0.0);
+        let drawer_width = self
+            .ui
+            .sidebar_drag
+            .unwrap_or(self.config.sidebar_width)
+            .min(bounds.width() - 48.0)
+            .max(0.0);
+        if !sidebar_open && !drawer_open {
             // Neither an edge drag nor a row drag can finish once the sidebar
             // is leaving.
             self.ui.sidebar_drag = None;
@@ -1301,7 +1343,7 @@ impl App {
         // Git is asked about what is in view: the sidebar's rows and the tab.
         self.sync_changes(
             &ctx,
-            edge > 0.0,
+            edge > 0.0 || drawer.is_some(),
             panel_reveal > 0.0 && panel_tab == ui::panel::Tab::Changes,
         );
         // A pull request is read only while its tab is the one in view.
@@ -1354,6 +1396,21 @@ impl App {
         );
         ui::chrome::toolbar(ui, toolbar, p, &chrome, &mut self.ui, &mut actions);
         ui::chrome::leading_controls(ui, p, &chrome, &mut actions);
+        if let Some(reveal) = drawer {
+            ui::chrome::sidebar_drawer(
+                &ctx,
+                p,
+                &chrome,
+                &mut self.ui,
+                ui::chrome::Drawer {
+                    reveal,
+                    width: drawer_width,
+                    open: drawer_open,
+                    radius,
+                },
+                &mut actions,
+            );
+        }
         self.workspace_drop_zones(
             &ctx,
             (sidebar_open && reveal >= 1.0).then(|| {
@@ -1618,11 +1675,16 @@ impl App {
             egui::Id::new("overlay-scrim"),
             !matches!(
                 self.ui.overlay,
-                OverlayState::None | OverlayState::Palette | OverlayState::Notifications
+                OverlayState::None
+                    | OverlayState::Palette
+                    | OverlayState::Notifications
+                    | OverlayState::Sidebar
             ) && !(matches!(self.ui.overlay, OverlayState::ConfirmClose(_))
                 && self.ui.close_status == ui::CloseStatus::Checking),
             0.16,
         );
+        // The sidebar laid over the terminals dims them as far as it is in.
+        let dim = dim.max(drawer.unwrap_or(0.0));
         let dim = if self.ui.overlay == OverlayState::Palette {
             // Opened from the keyboard many times a day: no transition.
             1.0
