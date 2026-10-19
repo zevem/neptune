@@ -65,6 +65,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         delegation: Default::default(),
         projects: projects::Projects::new(root.join("projects"), true),
         desktop_notifier: Default::default(),
+        system_appearance: Default::default(),
         updates: Default::default(),
         usage: Default::default(),
         relaunch: false,
@@ -558,7 +559,7 @@ fn protected_window_state_does_not_block_preferences_saves() {
         font_size: 20.0,
         ..app.config.clone()
     };
-    app.action(&ctx, Action::Preferences(config));
+    app.action(&ctx, Action::Preferences(Box::new(config)));
     eframe::App::on_exit(&mut app);
     assert_eq!(std::fs::read(&app.window_path).unwrap(), original);
     assert_eq!(Config::load(&app.config_path).unwrap().font_size, 20.0);
@@ -657,9 +658,9 @@ fn pending_preferences_coalesce_without_closing_settings() {
     app.ui.overlay = OverlayState::Settings;
     let mut config = app.config.clone();
     config.font_size = 18.0;
-    app.action(&ctx, Action::Preferences(config.clone()));
+    app.action(&ctx, Action::Preferences(Box::new(config.clone())));
     config.font_size = 20.0;
-    app.action(&ctx, Action::Preferences(config));
+    app.action(&ctx, Action::Preferences(Box::new(config)));
     assert_eq!(app.deferred_actions.len(), 1);
     assert_eq!(app.ui.overlay, OverlayState::Settings);
     app.complete_startup(&ctx, loaded(app.config.clone(), Model::default()));
@@ -1051,13 +1052,13 @@ fn window_zoom_preferences_and_reset_survive_shutdown_and_startup() {
     app.complete_startup(&ctx, loaded(app.config.clone(), Model::default()));
     app.action(
         &ctx,
-        Action::Preferences(Config {
+        Action::Preferences(Box::new(Config {
             window_zoom: 1.3,
             font_size: 19.0,
             font_family: "Installed Mono".into(),
             restore_workspaces: false,
             ..app.config.clone()
-        }),
+        })),
     );
     eframe::App::on_exit(&mut app);
 
@@ -1138,7 +1139,7 @@ fn zoom_actions_respect_limits_and_defaults_reset_the_saved_zoom() {
         assert_eq!(app.config.window_zoom, zoom);
         assert_eq!(app.preference_generation, 0);
     }
-    app.action(&ctx, Action::Preferences(Config::default()));
+    app.action(&ctx, Action::Preferences(Box::default()));
     ctx.run_ui(egui::RawInput::default(), |_| {})
         .textures_delta
         .clear();
@@ -1179,10 +1180,10 @@ fn stepping_font_size_or_zoom_names_the_new_value_until_it_fades() {
     app.ui.level = None;
     app.action(
         &ctx,
-        Action::Preferences(Config {
+        Action::Preferences(Box::new(Config {
             font_size: 20.0,
             ..Config::default()
-        }),
+        })),
     );
     assert_eq!(app.ui.level, None);
 
@@ -2942,7 +2943,7 @@ fn custom_theme_preferences_survive_writer_shutdown_and_reopen() {
         });
     configured.theme = config::Theme::Palette("custom:1".into());
     configured.favorite_themes = vec![configured.theme.clone(), config::Theme::Dusk];
-    app.action(&ctx, Action::Preferences(configured.clone()));
+    app.action(&ctx, Action::Preferences(Box::new(configured.clone())));
     eframe::App::on_exit(&mut app);
     let saved = Config::load(&app.config_path).unwrap();
     assert_eq!(saved, configured);
@@ -2956,13 +2957,66 @@ fn custom_theme_preferences_survive_writer_shutdown_and_reopen() {
     let mut removed = reopened.config.clone();
     removed.custom_themes.clear();
     removed.theme = config::Theme::Graphite;
-    reopened.action(&ctx, Action::Preferences(removed));
+    reopened.action(&ctx, Action::Preferences(Box::new(removed)));
     eframe::App::on_exit(&mut reopened);
     let saved = Config::load(&reopened.config_path).unwrap();
     assert!(saved.custom_themes.is_empty());
     assert_eq!(saved.theme, config::Theme::Graphite);
     // The deleted theme took its star with it.
     assert_eq!(saved.favorite_themes, [config::Theme::Dusk]);
+}
+
+#[test]
+fn the_window_follows_the_system_appearance_while_themes_match_it() {
+    use config::{Appearance, Theme};
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    app.system_appearance.reporting = Some(Some(Appearance::Light));
+    let mut configured = app.config.clone();
+    configured.set_match_system_appearance(true);
+    configured.dark_theme = Theme::Palette("iterm:Dracula".into());
+    app.complete_startup(&ctx, loaded(configured, Model::default()));
+    // The system's mode is taken in before the first themed frame.
+    assert_eq!(app.config.system_appearance, Some(Appearance::Light));
+    assert_eq!(ctx.theme(), egui::Theme::Light);
+    assert_eq!(
+        Palette::for_config(&app.config).bg,
+        Palette::new(Theme::Light).bg
+    );
+
+    // A change of mode recolors the window by the next frame.
+    app.system_appearance.reporting = Some(Some(Appearance::Dark));
+    app.poll(&ctx);
+    assert_eq!(app.config.system_appearance, Some(Appearance::Dark));
+    assert_eq!(ctx.theme(), egui::Theme::Dark);
+    assert_eq!(
+        Palette::for_config(&app.config).bg,
+        crate::theme::color(0x282a36)
+    );
+
+    // A view's stale copy of what the system reported cannot undo it.
+    let mut stale = app.config.clone();
+    stale.system_appearance = Some(Appearance::Light);
+    stale.font_size = 15.0;
+    app.action(&ctx, Action::Preferences(Box::new(stale)));
+    assert_eq!(app.config.font_size, 15.0);
+    assert_eq!(app.config.system_appearance, Some(Appearance::Dark));
+    assert_eq!(ctx.theme(), egui::Theme::Dark);
+
+    // Without matching, the single theme returns and the system is not asked.
+    let mut single = app.config.clone();
+    single.set_match_system_appearance(false);
+    app.action(&ctx, Action::Preferences(Box::new(single)));
+    assert_eq!(app.config.system_appearance, None);
+    assert_eq!(
+        Palette::for_config(&app.config).bg,
+        Palette::new(Theme::Graphite).bg
+    );
+    app.system_appearance.reporting = Some(Some(Appearance::Light));
+    app.poll(&ctx);
+    assert_eq!(app.config.system_appearance, None);
+    assert_eq!(ctx.theme(), egui::Theme::Dark);
 }
 
 #[test]
@@ -3171,7 +3225,7 @@ fn update_channel_preferences_are_saved_and_stale_buttons_cannot_download() {
         check_updates: false,
         ..app.config.clone()
     };
-    app.action(&ctx, Action::Preferences(config));
+    app.action(&ctx, Action::Preferences(Box::new(config)));
     app.action(&ctx, Action::DownloadUpdate("0.2.0".into()));
     assert!(!app.updates.busy());
     assert_eq!(
@@ -4527,10 +4581,10 @@ fn custom_keybindings_invalid_config_cannot_be_overwritten_by_preferences() {
     );
     app.action(
         &ctx,
-        Action::Preferences(Config {
+        Action::Preferences(Box::new(Config {
             font_size: 20.0,
             ..app.config.clone()
-        }),
+        })),
     );
     eframe::App::on_exit(&mut app);
     assert_eq!(std::fs::read_to_string(&app.config_path).unwrap(), source);

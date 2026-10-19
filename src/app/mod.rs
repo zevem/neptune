@@ -132,6 +132,8 @@ pub struct App {
     /// Each project's lead, chat and what waits for the lead.
     projects: projects::Projects,
     desktop_notifier: crate::platform::notifications::DesktopNotifier,
+    /// The system's light or dark mode, followed while themes match it.
+    system_appearance: crate::platform::appearance::SystemAppearance,
     updates: crate::runtime::updates::Updates,
     usage: crate::runtime::usage::Usage,
     /// Start the installed update once this approved exit completes.
@@ -285,6 +287,7 @@ impl App {
             delegation: Default::default(),
             projects: projects::Projects::new(data.join("projects"), ephemeral),
             desktop_notifier: Default::default(),
+            system_appearance: Default::default(),
             updates: Default::default(),
             usage: Default::default(),
             relaunch: false,
@@ -478,6 +481,15 @@ impl App {
         // Selection stores are unsupported by the portable desktop clipboard.
         self.notifications.retain_sessions(self.controller.model());
         self.desktop_notifier.poll();
+        if self.observe_appearance(ctx) {
+            self.apply_theme(ctx);
+        }
+        let dark = self.config.is_dark(self.config.active_theme());
+        self.system_appearance.leave_windows_to_system(
+            ctx,
+            self.config.match_system_appearance,
+            dark,
+        );
         for (pane, session) in self.sessions.iter() {
             let Some(item) = self.controller.model().pane(pane) else {
                 continue;
@@ -557,10 +569,31 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
     }
+    /// Takes in the system's light or dark mode while themes match it, and
+    /// returns whether it changed.
+    fn observe_appearance(&mut self, ctx: &egui::Context) -> bool {
+        let reported = if self.config.match_system_appearance {
+            self.system_appearance.current(ctx)
+        } else {
+            None
+        };
+        std::mem::replace(&mut self.config.system_appearance, reported) != reported
+    }
+
+    /// Colors the window and every terminal with the theme in use.
+    fn apply_theme(&self, ctx: &egui::Context) {
+        theme::apply(ctx, &self.config);
+        let p = Palette::for_config(&self.config);
+        for (_, session) in self.sessions.iter() {
+            set_session_palette(session, p);
+        }
+    }
+
     fn complete_startup(&mut self, ctx: &egui::Context, startup: Startup) {
         self.startup = None;
         self.config_writable = startup.error.is_none();
         self.config = startup.config;
+        self.observe_appearance(ctx);
         ctx.set_zoom_factor(self.config.window_zoom);
         theme::apply(ctx, &self.config);
         self.state_writable = startup.report.can_write;

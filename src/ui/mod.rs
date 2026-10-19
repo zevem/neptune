@@ -277,7 +277,8 @@ pub enum Action {
     Quit,
     Create(PathBuf, Option<String>),
     SetName(WorkspaceId, String),
-    Preferences(Config),
+    /// Boxed: settings are far larger than any other action.
+    Preferences(Box<Config>),
     CheckUpdates,
     Usage,
     RefreshUsage,

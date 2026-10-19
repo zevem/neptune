@@ -7,7 +7,7 @@ use super::helpers::{
 };
 use super::theme_browser::{self, search_field};
 use crate::{
-    config::{Config, Cursor},
+    config::{Appearance, Config, Cursor},
     icons::{self, Icon},
     platform::fonts::{DEFAULT_FAMILY, Fonts},
     platform::shells::{Detection, Shell},
@@ -217,7 +217,7 @@ const INDEX: [(Setting, Pane, &str, &str); 19] = [
         Setting::Theme,
         Pane::Appearance,
         "Theme",
-        "themes color colors colour colours scheme palette dark light mode night day skin background foreground browse custom favorites iterm graphite dusk",
+        "themes color colors colour colours scheme palette dark light mode night day skin background foreground browse custom favorites iterm graphite dusk system match sync follow automatic auto os appearance",
     ),
     (
         Setting::WindowZoom,
@@ -600,7 +600,7 @@ pub fn show(
         actions.push(Action::CloseOverlay);
     }
     if &config != current {
-        actions.push(Action::Preferences(config));
+        actions.push(Action::Preferences(Box::new(config)));
     }
 }
 
@@ -911,10 +911,36 @@ fn appearance(
         "Theme",
         &[Setting::Theme],
         |ui, rows| {
-            if theme_browser::summary(ui, p, config, rows) {
-                state.browse();
+            // The switch leads, so the rows it adds never move it.
+            rows.row(ui, "Match system appearance", |ui| {
+                let mut on = config.match_system_appearance;
+                if toggle(ui, p, &mut on, "Match system appearance").changed() {
+                    config.set_match_system_appearance(on);
+                }
+            });
+            let Some(mode) = config.appearance() else {
+                if theme_browser::summary(ui, p, config, rows, None) {
+                    state.browse(None);
+                }
+                rows.note(ui, "One theme colors the window and every terminal.");
+                return;
+            };
+            for target in [Appearance::Light, Appearance::Dark] {
+                if theme_browser::summary(ui, p, config, rows, Some(target)) {
+                    state.browse(Some(target));
+                }
             }
-            rows.note(ui, "One theme colors the window and every terminal.");
+            rows.note(
+                ui,
+                &if config.system_appearance.is_some() {
+                    "Your system's light or dark mode chooses which theme colors the window and every terminal.".to_owned()
+                } else {
+                    format!(
+                        "Your system has not reported light or dark mode, so Neptune uses the {} theme.",
+                        mode.name().to_lowercase()
+                    )
+                },
+            );
         },
     );
     card(

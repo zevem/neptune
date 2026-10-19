@@ -724,7 +724,7 @@ impl App {
             Action::Themes => {
                 if !self.ui.preferences.editing() {
                     self.ui.preferences = Default::default();
-                    self.ui.preferences.browse();
+                    self.ui.preferences.browse(self.config.appearance());
                 }
                 // Leaving the catalog returns to the pane that opens it.
                 self.ui.preference_view.pane = ui::preferences::Pane::Appearance;
@@ -784,7 +784,7 @@ impl App {
                     sidebar_width: width.clamp(170.0, 360.0),
                     ..self.config.clone()
                 };
-                self.action(ctx, Action::Preferences(config));
+                self.action(ctx, Action::Preferences(Box::new(config)));
             }
             Action::Zoom => self.ui.zoomed = !self.ui.zoomed,
             action @ (Action::IncreaseFontSize
@@ -797,10 +797,10 @@ impl App {
                 };
                 self.action(
                     ctx,
-                    Action::Preferences(Config {
+                    Action::Preferences(Box::new(Config {
                         font_size,
                         ..self.config.clone()
-                    }),
+                    })),
                 );
                 self.show_level(
                     ctx,
@@ -821,10 +821,10 @@ impl App {
                 if zoom != self.config.window_zoom {
                     self.action(
                         ctx,
-                        Action::Preferences(Config {
+                        Action::Preferences(Box::new(Config {
                             window_zoom: zoom,
                             ..self.config.clone()
-                        }),
+                        })),
                     );
                 }
                 self.show_level(
@@ -949,13 +949,13 @@ impl App {
                 if !config.desktop_notifications {
                     self.desktop_notifier.cancel_all();
                 }
-                self.config = config;
+                self.config = *config;
+                // What the system reports is the app's to know, whatever
+                // the view that asked for the change held.
+                self.observe_appearance(ctx);
                 self.updates.configure(self.config.release_channel);
                 ctx.set_zoom_factor(self.config.window_zoom);
-                theme::apply(ctx, &self.config);
-                for (_, session) in self.sessions.iter() {
-                    set_session_palette(session, Palette::for_config(&self.config));
-                }
+                self.apply_theme(ctx);
                 self.dispatch(ctx, Command::UpdatePreferences);
             }
             Action::Confirm(close) => self.confirm_close(ctx, close),

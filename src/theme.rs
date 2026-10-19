@@ -190,11 +190,17 @@ impl Palette {
         })
     }
 
+    /// The theme in use, which may follow the system's light or dark mode.
     pub fn for_config(config: &Config) -> Self {
+        Self::for_theme(config, config.active_theme())
+    }
+
+    /// Any theme of `config`, as it would draw the window.
+    pub fn for_theme(config: &Config, theme: &Theme) -> Self {
         config
-            .theme_colors()
+            .colors_of(theme)
             .map(Self::from_colors)
-            .unwrap_or_else(|| Self::with_accent(&config.theme, config.accent))
+            .unwrap_or_else(|| Self::with_accent(theme, config.accent))
     }
 
     /// Derive all window materials from the same palette used by the terminal.

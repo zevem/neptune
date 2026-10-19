@@ -15,6 +15,15 @@ theme = "graphite"
 # favorite_themes = ["iterm:Dracula", "dusk"]
 # Reset to defaults retains the custom theme library and the favorites.
 
+# Match the system's light or dark mode: use light_theme while the system is
+# light and dark_theme while it is dark. Each takes the same IDs as theme.
+# macOS and Windows report the mode directly; Linux desktops report it through
+# the XDG desktop portal. Where the system reports neither, the mode of `theme`
+# stands in. These keys are omitted while they hold the defaults below.
+# match_system_appearance = false
+# light_theme = "light"
+# dark_theme = "graphite"
+
 # Legacy accent setting for Graphite, Dusk and Light only. Imported/custom
 # themes derive their interface accent from the palette:
 # blue, indigo, purple, pink, red, orange, yellow, green, or graphite

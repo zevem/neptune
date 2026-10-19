@@ -3,7 +3,7 @@ use super::helpers::{SheetPlacement, bare_text_edit, elided, galley_at, keycaps,
 use super::{Action, UiState, WorkspaceView};
 use crate::keybindings::BindingAction as Binding;
 use crate::{
-    config::{Config, Theme},
+    config::{Appearance, Config, Theme},
     icons::{self, Icon},
     theme::{self, Palette},
 };
@@ -799,24 +799,43 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         view.config.keybindings.hint(Binding::BrowseThemes),
         [Action::Themes],
     ));
-    for (theme, name, icon) in [
-        (Theme::Graphite, "Graphite", Icon::Moon),
-        (Theme::Dusk, "Dusk", Icon::Moon),
-        (Theme::Light, "Light", Icon::Sun),
+    let matching = view.config.match_system_appearance;
+    for (theme, name, mode, icon) in [
+        (Theme::Graphite, "Graphite", Appearance::Dark, Icon::Moon),
+        (Theme::Dusk, "Dusk", Appearance::Dark, Icon::Moon),
+        (Theme::Light, "Light", Appearance::Light, Icon::Sun),
     ] {
-        if theme != view.config.theme {
+        // While themes match the system, each is chosen for its own mode.
+        let target = matching.then_some(mode);
+        if &theme != view.config.theme_for(target) {
+            let title = match target {
+                None => format!("Use {name} theme"),
+                Some(mode) => format!("Use {name} theme for {}", mode.name().to_lowercase()),
+            };
+            let mut config = view.config.clone();
+            *config.theme_for_mut(target) = theme;
             list.push(command(
                 "Appearance",
                 icon,
-                format!("Use {name} theme"),
+                title,
                 "",
-                [Action::Preferences(Config {
-                    theme,
-                    ..view.config.clone()
-                })],
+                [Action::Preferences(Box::new(config))],
             ));
         }
     }
+    let mut config = view.config.clone();
+    config.set_match_system_appearance(!matching);
+    list.push(command(
+        "Appearance",
+        Icon::Settings,
+        if matching {
+            "Stop matching system appearance"
+        } else {
+            "Match system appearance"
+        },
+        "",
+        [Action::Preferences(Box::new(config))],
+    ));
     list
 }
 
@@ -1100,6 +1119,43 @@ mod tests {
             })
             .collect();
         assert_eq!(targets, [1, 2]);
+    }
+
+    #[test]
+    fn theme_commands_choose_for_their_own_mode_while_matching_the_system() {
+        let chosen = |list: &[Command], title: &str| -> Config {
+            let command = list.iter().find(|command| command.title == title);
+            match command.map(|command| command.actions.as_slice()) {
+                Some([Action::Preferences(config)]) => (**config).clone(),
+                _ => panic!("no command {title}"),
+            }
+        };
+        let config = Config::default();
+        let list = commands(&view(&config, &[]));
+        assert_eq!(chosen(&list, "Use Dusk theme").theme, Theme::Dusk);
+        let matching = chosen(&list, "Match system appearance");
+        assert!(matching.match_system_appearance);
+        // The single theme becomes its own mode's choice.
+        assert_eq!(matching.dark_theme, Theme::Graphite);
+
+        let list = commands(&view(&matching, &[]));
+        let dusk = chosen(&list, "Use Dusk theme for dark mode");
+        assert_eq!(
+            (&dusk.theme, &dusk.light_theme, &dusk.dark_theme),
+            (&Theme::Graphite, &Theme::Light, &Theme::Dusk)
+        );
+        // Each mode's own choice is not offered again.
+        assert!(
+            !list
+                .iter()
+                .any(|command| command.title.starts_with("Use Light"))
+        );
+        assert!(
+            !list
+                .iter()
+                .any(|command| command.title.starts_with("Use Graphite"))
+        );
+        assert!(!chosen(&list, "Stop matching system appearance").match_system_appearance);
     }
 
     fn view<'a>(config: &'a Config, workspaces: &'a [WorkspaceView]) -> PaletteView<'a> {
@@ -1738,7 +1794,8 @@ mod tests {
                 "Reset terminal font size",
                 "Browse themes",
                 "Use Dusk theme",
-                "Use Light theme"
+                "Use Light theme",
+                "Match system appearance"
             ]
         );
         assert!(titles("zzz").is_empty());
