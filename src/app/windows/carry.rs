@@ -400,11 +400,11 @@ impl App {
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
-    /// Where windows cannot hide, the root's native window never stays
+    /// Where empty native windows must not linger, the root never stays
     /// empty beside other windows: it shows the most recently used of them,
     /// whose own native window then closes.
-    pub(super) fn rehost_empty_root(&mut self, ctx: &egui::Context) {
-        if self.windows.pointer.hides_windows()
+    pub(in crate::app) fn rehost_empty_root(&mut self, ctx: &egui::Context) {
+        if self.windows.pointer.keeps_hidden_root()
             || self.startup.is_some()
             || self.windows.drag.is_some()
             || self.windows.carried.is_some()
@@ -443,9 +443,11 @@ impl App {
         let shown = ctx.input(|input| {
             input.raw.viewports.get(&child).map(|info| {
                 (
+                    info.outer_rect.map(|rect| rect.min),
                     info.inner_rect.map(|rect| rect.size()),
                     info.maximized.unwrap_or(false),
                     info.fullscreen.unwrap_or(false),
+                    info.minimized.unwrap_or(false),
                 )
             })
         });
@@ -457,14 +459,23 @@ impl App {
         }
         self.windows.host = adopted;
         self.windows.root_hidden = false;
-        // The root's native window takes the adopted window's shape; only
-        // its place is the compositor's.
-        if let Some((size, maximized, fullscreen)) = shown {
+        // Reuse the surviving window's geometry. Wayland omits its position;
+        // macOS reports it in shared desktop points, independent of Retina scale.
+        if let Some((position, size, maximized, fullscreen, minimized)) = shown {
+            // Leave the old host's special states before applying the survivor's
+            // normal geometry, then restore the survivor's window states.
             for command in [
-                egui::ViewportCommand::Fullscreen(fullscreen),
-                egui::ViewportCommand::Maximized(maximized),
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Fullscreen(false),
+                egui::ViewportCommand::Maximized(false),
             ] {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, command);
+            }
+            if let Some(position) = position {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::OuterPosition(position),
+                );
             }
             if let Some(size) = size.filter(|_| !maximized && !fullscreen) {
                 ctx.send_viewport_cmd_to(
@@ -472,6 +483,27 @@ impl App {
                     egui::ViewportCommand::InnerSize(size),
                 );
             }
+            if maximized {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Maximized(true),
+                );
+            }
+            if fullscreen {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Fullscreen(true),
+                );
+            }
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+            if minimized {
+                ctx.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(true),
+                );
+            }
+        } else {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
         }
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }

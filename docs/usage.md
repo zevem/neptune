@@ -39,15 +39,15 @@ workspace's terminals, browser tabs, split layout and running processes stay
 with it. Dragging within the sidebar still reorders workspaces; Escape cancels
 before the workspace moves out.
 
-On Linux, under X11 or a Wayland compositor that supports moving a held
-window (`xdg-toplevel-drag`, as GNOME does), a workspace becomes a floating
+On macOS, and on Linux under X11 or a Wayland compositor that supports moving
+a held window (`xdg-toplevel-drag`, as GNOME does), a workspace becomes a floating
 window above the others as soon as the pointer leaves the sidebar, with the row
 held at the original grab position. Entering another Neptune window's sidebar
 joins it immediately, without releasing. Keep holding to reorder the row or
 pull it out again; release to leave it there. A window with its sidebar hidden
 receives the workspace in its top toolbar. Under other Wayland compositors,
-dragging a window's only workspace moves its window; other native backends
-currently use the menu or palette to combine windows.
+dragging a window's only workspace moves its window. On Windows, use the menu
+or palette to combine windows.
 
 The workspace menu offers **Move to new window**, and the command palette offers
 **Move workspace to new window** when the sidebar is hidden. To bring a workspace

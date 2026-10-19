@@ -1027,6 +1027,10 @@ impl eframe::App for App {
         use crate::platform::window::{self, WindowOperation};
         self.frame_started = Instant::now();
         self.reconcile_empty_host(ctx);
+        // A drag can briefly leave the native root hidden. Reuse it even
+        // when eframe runs logic without drawing that window.
+        #[cfg(target_os = "macos")]
+        self.rehost_empty_root(ctx);
         self.enter_window(self.host_window());
         self.attach_workspace_pointer(frame, ctx);
         self.finish_workspace_raise(ctx);

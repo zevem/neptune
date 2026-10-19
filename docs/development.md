@@ -67,6 +67,23 @@ instead and that window's native window closes. `native-workspace-windows.py`
 covers X11 only; Wayland tear-off and rejoin were checked by hand with real
 input on GNOME (Mutter 50).
 
+On macOS, `platform/workspace_drag.rs` queries the current Quartz pointer and
+primary button only during a workspace gesture. The existing drag repaint
+deadline drives those queries, so no event tap or background observer runs while
+idle. Pointer and window positions use the same top-left desktop screen points;
+Retina density is kept out of that conversion, while app zoom still applies.
+The pressed native surface stays with the workspace as it docks and tears off
+again. An emptied root adopts a surviving window's workspaces and geometry, so
+there is no spare hidden root window. The focused macOS regression filter is:
+
+```sh
+cargo test -p neptune-terminal --lib --features inspection --locked -- a_macos_
+```
+
+Those tests cover the desktop coordinator and read-only Quartz sampling, not
+real pointer delivery or visual acceptance. Native dragging, stacking and the
+Dock/window menu still require running-app review on macOS.
+
 Workspace tear-off has a focused Linux/X11 workflow using actual pointer and
 keyboard input, a fresh data root, and native windows matched to the exact owned
 process PID. It measures the bootstrap window's display scale before converting
