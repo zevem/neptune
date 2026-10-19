@@ -339,6 +339,9 @@ fn cmd_and_powershell_report_directory_changes() {
             Arc::new(|| {}),
         )
         .unwrap();
+        // Type at the first prompt, as a person would. PowerShell can echo
+        // input sent while it is still starting but lose its Enter.
+        wait_for(&session, || session.metadata().reported_cwd.is_some());
         session.write(cd.as_bytes()).unwrap();
         wait_for(&session, || {
             let metadata = session.metadata();
