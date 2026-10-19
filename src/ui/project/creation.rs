@@ -1,23 +1,22 @@
-//! The form that starts a project: one field for what the person wants
-//! done, which Enter or the control inside it starts. The line under it
-//! names the lead, and unfolds the choice of its CLI, model and effort for
-//! the few who want another. A project that worked here before is offered
-//! again under the form.
-use super::settings::{effort_control, model_control};
-use super::{Action, Catalog, Event, Setting, State, Tone, lead_words, quiet, row_action};
+//! The form that starts a project: the composer, for what the person wants
+//! done, which Enter or the control inside it starts. Its row names the
+//! lead's CLI and model and its effort, each a press away from the others;
+//! the tray under it names the folder the project works in. A project that
+//! worked here before is offered again under the form.
+use super::composer::{self, Bar, Who};
+use super::{Action, Catalog, Event, Setting, State, Tone, quiet, row_action};
 use crate::{
     icons::{self, Icon},
     projects::settings::LeadSettings,
     theme::{self, Palette},
     ui::{
-        agents::kind_name,
         chat::{self, Editor},
-        helpers::{elided, focus_ring, galley_at, place, section_label, segmented},
+        helpers::{elided, galley_at, place, section_label, spinner},
     },
 };
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, Frame, Id, Layout, Margin, Pos2, Rect, Sense, Ui,
-    UiBuilder, Vec2, WidgetInfo, WidgetType, vec2,
+    self, Align, Align2, CornerRadius, Frame, Id, Layout, Margin, Pos2, Rect, Sense, StrokeKind,
+    Ui, UiBuilder, Vec2, vec2,
 };
 use neptune_model::{AgentKind, WorkspaceId};
 
@@ -40,32 +39,10 @@ pub(super) struct Form<'a> {
 
 const EXPLAINER: &str = "A lead plans the work, starts agents in their own terminals and reports \
                          back here. The chat and notes stay on this computer.";
+/// The tray under the composer.
+const TRAY: f32 = 26.0;
 const NONE_INSTALLED: &str = "Neptune found neither Claude Code nor Codex. Install one and check \
                               that it runs in a terminal. Neptune looks again within a minute.";
-/// The names of the options: as wide as the longest of them.
-const LABELS: f32 = 56.0;
-
-/// One option of the lead: its name, then its control in the room beside.
-fn option<R>(ui: &mut Ui, p: Palette, label: &str, control: impl FnOnce(&mut Ui, f32) -> R) -> R {
-    let (_, row) = ui.allocate_space(vec2(ui.available_width(), theme::metrics::CONTROL_HEIGHT));
-    ui.painter().text(
-        Pos2::new(row.left() + 4.0, row.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        theme::regular(12.0),
-        p.secondary,
-    );
-    let room = Rect::from_min_max(Pos2::new(row.left() + LABELS + 4.0, row.top()), row.max);
-    let inner = place(
-        ui,
-        room,
-        Layout::left_to_right(Align::Center),
-        ("project-option", label),
-        |ui| control(ui, room.width()),
-    );
-    ui.add_space(6.0);
-    inner
-}
 
 pub(super) fn show(
     ui: &mut Ui,
@@ -128,234 +105,87 @@ pub(super) fn show(
                     theme::medium(13.0),
                     p.fg,
                 );
-                ui.add_space(2.0);
+                ui.add_space(10.0);
             }
-            // Where it would work: the focused terminal's directory, which
-            // it follows until the project is started.
-            let (_, line) = ui.allocate_space(vec2(width, 18.0));
-            icons::paint(
-                ui.painter(),
-                Rect::from_center_size(
-                    Pos2::new(line.left() + 10.0, line.center().y),
-                    Vec2::splat(12.0),
-                ),
-                Icon::Folder,
-                p.muted,
+            let height = composer::height(ui, &state.goal, width, (3, 8));
+            let (_, card) = ui.allocate_space(vec2(width, height));
+            let (_, mut start) = composer::surface(
+                ui,
+                p,
+                card,
+                !starting,
+                Editor {
+                    id: chat::goal_id(),
+                    text: &mut state.goal,
+                    hint: "What do you want to get done?",
+                    label: "Project goal",
+                    focus: &mut state.focus,
+                    composing,
+                    trailing: 0.0,
+                    newline: false,
+                },
             );
-            let folder = galley_at(
-                ui.painter(),
-                Pos2::new(line.left() + 22.0, line.center().y),
-                elided(
-                    ui.painter(),
-                    directory,
-                    theme::regular(11.5),
-                    p.muted,
-                    width - 26.0,
-                ),
-            );
-            ui.interact(folder, Id::new("project-create-folder"), Sense::hover())
-                .on_hover_text(
-                    "The project works in this folder. It follows the focused terminal until \
-                     you start.",
-                );
-            ui.add_space(10.0);
-
-            let height = chat::editor_height(ui, &state.goal, width - 28.0, (3, 8));
-            let (_, field) = ui.allocate_space(vec2(width, height));
-            let mut start = false;
-            ui.add_enabled_ui(!starting, |ui| {
-                let (_, entered) = chat::editor(
-                    ui,
-                    p,
-                    field,
-                    Editor {
-                        id: chat::goal_id(),
-                        text: &mut state.goal,
-                        hint: "What do you want to get done?",
-                        label: "Project goal",
-                        focus: &mut state.focus,
-                        composing,
-                        trailing: if starting { 0.0 } else { 28.0 },
-                        newline: false,
-                    },
-                );
-                start |= entered;
-            });
             let ready = !starting && lead.is_some() && !state.goal.trim().is_empty();
-            // While its folder is made there is nothing to press.
-            if !starting {
-                let control = Rect::from_min_size(
-                    Pos2::new(field.right() - 29.0, field.bottom() - 28.0),
-                    Vec2::splat(24.0),
-                );
+            let (send, _) = composer::controls(card);
+            if starting {
+                // While its folder is made there is nothing to press.
+                spinner(ui, send.shrink(7.0), p.secondary);
+            } else {
                 // The composer's control, so that the two fields are one habit.
                 start |= chat::send_button_named(
                     ui,
                     p,
-                    control,
+                    send,
                     (false, ready),
                     "Start project",
                     "Start · Enter. Shift+Enter starts a new line.",
                 )
                 .clicked();
             }
-
-            // The line that names the lead. A press unfolds what else can
-            // be chosen for it.
-            ui.add_space(4.0);
-            let (_, row) = ui.allocate_space(vec2(width, 22.0));
-            let mut right = row.right() - 4.0;
-            if starting || width >= 240.0 {
-                let said = ui.painter().text(
-                    Pos2::new(right, row.center().y),
-                    Align2::RIGHT_CENTER,
-                    if starting {
-                        "Starting…"
-                    } else {
-                        "Enter starts"
-                    },
-                    theme::regular(11.0),
-                    p.muted,
-                );
-                right = said.left() - 10.0;
-            }
-            let left = row.left() + 4.0;
-            let choices = lead.and_then(|lead| catalog.of(Setting::Lead, lead));
-            match (leads, lead) {
-                (_, Some(kind)) => {
-                    let words = lead_words(
-                        kind,
-                        state.lead_settings.model.as_deref(),
-                        state.lead_settings.effort.as_deref(),
-                        choices,
-                    );
-                    let font = theme::regular(11.5);
-                    let room = (right - left - 16.0).max(0.0);
-                    let chip = elided(ui.painter(), &words, font.clone(), p.secondary, room);
-                    let rect = Rect::from_min_size(
-                        Pos2::new(left, row.center().y - chip.size().y * 0.5),
-                        chip.size() + vec2(16.0, 0.0),
-                    );
-                    let response = ui.interact(
-                        rect.expand2(vec2(4.0, 3.0)),
-                        Id::new("project-lead-options"),
-                        if starting {
-                            Sense::hover()
-                        } else {
-                            Sense::click()
+            // Who leads and what it runs with, each a press away. The CLI
+            // is picked beside the models, where more than one can lead.
+            let who = match (leads, lead) {
+                (Some(leads), Some(kind)) => Who::Pick(kind, leads),
+                (None, _) => Who::Missing("Looking for Claude Code and Codex…"),
+                (Some(_), None) => Who::Missing("No lead installed"),
+            };
+            let told = ui
+                .add_enabled_ui(!starting, |ui| {
+                    composer::bar(
+                        ui,
+                        p,
+                        card,
+                        Bar {
+                            who,
+                            owner: None,
+                            choices: lead.and_then(|lead| catalog.of(Setting::Lead, lead)),
+                            model: state.lead_settings.model.as_deref(),
+                            effort: state.lead_settings.effort.as_deref(),
+                            reported: None,
+                            rounds: 1,
+                            above: false,
+                            composing,
                         },
-                    );
-                    if response.clicked() {
-                        state.lead_options = !state.lead_options;
-                    }
-                    let open = state.lead_options;
-                    response.widget_info(|| {
-                        WidgetInfo::labeled(WidgetType::CollapsingHeader, !starting, "Lead options")
-                    });
-                    ui.ctx().accesskit_node_builder(response.id, |node| {
-                        node.set_expanded(open);
-                    });
-                    if response.has_focus() {
-                        focus_ring(ui.painter(), rect.expand2(vec2(4.0, 2.0)), 5, p);
-                    }
-                    let lit = !starting && (response.hovered() || response.has_focus());
-                    let chip = if lit {
-                        elided(ui.painter(), &words, font, p.fg, room)
-                    } else {
-                        chip
-                    };
-                    icons::paint(
-                        ui.painter(),
-                        Rect::from_center_size(
-                            Pos2::new(rect.right() - 6.0, row.center().y + 0.5),
-                            Vec2::splat(10.0),
-                        ),
-                        if open {
-                            Icon::ChevronDown
-                        } else {
-                            Icon::ChevronRight
-                        },
-                        if lit { p.fg } else { p.muted },
-                    );
-                    ui.painter().galley(rect.min, chip, Color32::PLACEHOLDER);
-                    if !starting {
-                        response
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .on_hover_text("Choose the lead's CLI, model and effort");
-                    }
-                }
-                (found, None) => {
-                    galley_at(
-                        ui.painter(),
-                        Pos2::new(left, row.center().y),
-                        elided(
-                            ui.painter(),
-                            if found.is_none() {
-                                "Looking for Claude Code and Codex…"
-                            } else {
-                                "No lead installed"
-                            },
-                            theme::regular(11.5),
-                            p.secondary,
-                            right - left,
-                        ),
-                    );
-                }
+                        &mut state.custom,
+                    )
+                })
+                .inner;
+            if let Some(picked) = told.lead {
+                lead = Some(picked);
+                state.lead = Some(picked);
+                // What one CLI takes is not what the other does.
+                state.lead_settings = LeadSettings::default();
+                state.custom = None;
             }
-
-            if let (true, Some(picked)) = (state.lead_options, lead.as_mut()) {
-                ui.add_space(8.0);
-                ui.add_enabled_ui(!starting, |ui| {
-                    if let Some(leads) = leads.filter(|leads| leads.len() > 1) {
-                        let options: Vec<(AgentKind, &str)> =
-                            leads.iter().map(|kind| (*kind, kind_name(*kind))).collect();
-                        let changed = option(ui, p, "Lead", |ui, room| {
-                            segmented(ui, p, "project-lead", picked, &options, room)
-                        });
-                        if changed {
-                            state.lead = Some(*picked);
-                            // What one CLI takes is not what the other does.
-                            state.lead_settings = LeadSettings::default();
-                            state.custom = None;
-                        }
-                    }
-                    // What the lead runs with is its CLI's own choice
-                    // unless it is asked for here; the project's settings
-                    // change it later.
-                    if let Some(choices) = catalog.of(Setting::Lead, *picked) {
-                        let model = option(ui, p, "Model", |ui, room| {
-                            model_control(
-                                ui,
-                                p,
-                                room,
-                                (None, Setting::Lead),
-                                ("Lead model", "Default", "What your CLI is set to"),
-                                state.lead_settings.model.as_deref(),
-                                choices,
-                                composing,
-                                &mut state.custom,
-                            )
-                        });
-                        if let Some(model) = model {
-                            state.lead_settings.model = model;
-                        }
-                        let effort = option(ui, p, "Effort", |ui, room| {
-                            effort_control(
-                                ui,
-                                p,
-                                room,
-                                (None, Setting::Lead),
-                                ("Lead effort", "Default", "What your CLI is set to"),
-                                state.lead_settings.effort.as_deref(),
-                                choices,
-                            )
-                        });
-                        if let Some(effort) = effort {
-                            state.lead_settings.effort = effort;
-                        }
-                    }
-                });
+            // What the lead runs with is its CLI's own choice unless it is
+            // asked for here; the project's settings change it later.
+            if let Some(model) = told.model {
+                state.lead_settings.model = model;
             }
+            if let Some(effort) = told.effort {
+                state.lead_settings.effort = effort;
+            }
+            tray(ui, p, card, directory, starting);
 
             if leads.is_some_and(<[AgentKind]>::is_empty) {
                 ui.add_space(12.0);
@@ -425,6 +255,73 @@ pub(super) fn show(
             }
             ui.add_space(8.0);
         });
+}
+
+/// The tray under the surface in `card`: the folder the project would work
+/// in, which follows the focused terminal until it is started, and while
+/// that folder is made, that it is starting.
+fn tray(ui: &mut Ui, p: Palette, card: Rect, directory: &str, starting: bool) {
+    ui.allocate_space(vec2(card.width(), TRAY));
+    let tray = Rect::from_min_max(
+        Pos2::new(card.left() + 12.0, card.bottom()),
+        Pos2::new(card.right() - 12.0, card.bottom() + TRAY),
+    );
+    let radius = CornerRadius {
+        nw: 0,
+        ne: 0,
+        sw: 8,
+        se: 8,
+    };
+    let painter = ui.painter();
+    painter.rect_filled(tray, radius, p.control.gamma_multiply(0.5));
+    // Its sides and foot: the surface's edge is its top.
+    painter
+        .with_clip_rect(
+            tray.with_min_y(tray.top() + 0.5)
+                .intersect(painter.clip_rect()),
+        )
+        .rect_stroke(
+            tray.with_min_y(tray.top() - 8.0),
+            8,
+            p.hairline(),
+            StrokeKind::Inside,
+        );
+    let centre = tray.center().y;
+    let mut right = tray.right() - 10.0;
+    if starting {
+        let said = painter.text(
+            Pos2::new(right, centre),
+            Align2::RIGHT_CENTER,
+            "Starting…",
+            theme::regular(11.5),
+            p.secondary,
+        );
+        right = said.left() - 10.0;
+    }
+    // Under the mark of the lead, its words under the lead's name.
+    let mark = card.left() + composer::MARK_CENTRE;
+    icons::paint(
+        painter,
+        Rect::from_center_size(Pos2::new(mark, centre), Vec2::splat(12.0)),
+        Icon::Folder,
+        p.muted,
+    );
+    let words = mark + 13.0;
+    let folder = galley_at(
+        painter,
+        Pos2::new(words, centre),
+        elided(
+            painter,
+            directory,
+            theme::regular(11.5),
+            p.muted,
+            (right - words).max(0.0),
+        ),
+    );
+    ui.interact(folder, Id::new("project-create-folder"), Sense::hover())
+        .on_hover_text(
+            "The project works in this folder. It follows the focused terminal until you start.",
+        );
 }
 
 /// Words set in from the field's edge as the form's other lines are.

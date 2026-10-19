@@ -90,6 +90,16 @@ pub fn take_enter(ui: &Ui) -> bool {
 /// Draws the field in `rect`. Returns its response and whether Enter asked
 /// for its text to be used.
 pub fn editor(ui: &mut Ui, p: Palette, rect: Rect, editor: Editor) -> (Response, bool) {
+    field_frame(ui, p, rect, editor.id, true);
+    let inner = Rect::from_min_max(
+        rect.min + vec2(10.0, 7.0),
+        rect.max - vec2(10.0 + editor.trailing, 7.0),
+    );
+    editor_in(ui, inner, editor)
+}
+/// The same field without its surface, its words laid out in `inner`: for
+/// a surface that holds more than the field, as the composer's does.
+pub fn editor_in(ui: &mut Ui, inner: Rect, editor: Editor) -> (Response, bool) {
     let Editor {
         id,
         text,
@@ -97,7 +107,7 @@ pub fn editor(ui: &mut Ui, p: Palette, rect: Rect, editor: Editor) -> (Response,
         label,
         focus,
         composing,
-        trailing,
+        trailing: _,
         newline,
     } = editor;
     let field_id = viewport_id(ui.ctx(), id);
@@ -117,11 +127,6 @@ pub fn editor(ui: &mut Ui, p: Palette, rect: Rect, editor: Editor) -> (Response,
     } else {
         Modifiers::SHIFT
     };
-    field_frame(ui, p, rect, id, true);
-    let inner = Rect::from_min_max(
-        rect.min + vec2(10.0, 7.0),
-        rect.max - vec2(10.0 + trailing, 7.0),
-    );
     let response = place(
         ui,
         inner,
@@ -474,13 +479,14 @@ pub fn attach_button(ui: &mut Ui, p: Palette, rect: Rect) -> Response {
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Attach files"));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
+        let radius = (rect.height() * 0.5).round() as u8;
         if response.is_pointer_button_down_on() {
-            painter.rect_filled(rect, 7, p.pressed);
+            painter.rect_filled(rect, radius, p.pressed);
         } else if response.hovered() {
-            painter.rect_filled(rect, 7, p.hover);
+            painter.rect_filled(rect, radius, p.hover);
         }
         if response.has_focus() {
-            focus_ring(painter, rect, 7, p);
+            focus_ring(painter, rect, radius, p);
         }
         icons::paint(
             painter,
@@ -489,7 +495,7 @@ pub fn attach_button(ui: &mut Ui, p: Palette, rect: Rect) -> Response {
             if response.hovered() || response.has_focus() {
                 p.fg
             } else {
-                p.muted
+                p.secondary
             },
         );
     }
@@ -1384,6 +1390,8 @@ pub fn send_button_named(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let live = enabled || stop;
+        // Round, as the one control of the composer that acts.
+        let radius = (rect.height() * 0.5).round() as u8;
         let fill = if stop {
             p.control
         } else if enabled {
@@ -1391,14 +1399,14 @@ pub fn send_button_named(
         } else {
             p.control
         };
-        painter.rect_filled(rect, 7, fill);
+        painter.rect_filled(rect, radius, fill);
         if live && response.is_pointer_button_down_on() {
-            painter.rect_filled(rect, 7, p.pressed);
+            painter.rect_filled(rect, radius, p.pressed);
         } else if live && response.hovered() {
-            painter.rect_filled(rect, 7, p.hover);
+            painter.rect_filled(rect, radius, p.hover);
         }
         if response.has_focus() {
-            focus_ring(painter, rect, 7, p);
+            focus_ring(painter, rect, radius, p);
         }
         let ink = if stop {
             p.fg
@@ -1416,7 +1424,7 @@ pub fn send_button_named(
         if stop {
             painter.rect_stroke(
                 rect,
-                7,
+                radius,
                 Stroke::new(1.0, p.border),
                 egui::StrokeKind::Inside,
             );

@@ -96,28 +96,44 @@ pub(super) fn choice_select(
     let mut picked = None;
     egui::Popup::menu(&response).show(|ui| {
         menu_layout(ui, width.max(180.0));
-        let first = choice_row(ui, p, open, current.is_none());
-        if first.clicked() {
-            picked = Some(Pick::Value(None));
+        picked = choice_list(ui, p, (open, tip), current, choices, custom);
+    });
+    picked
+}
+
+/// The rows of a list of choices, under the words for leaving it open, as
+/// `choice_select` describes them. A row that is pressed closes the list.
+/// Returns what was picked where that changes what is in force.
+pub(super) fn choice_list(
+    ui: &mut Ui,
+    p: Palette,
+    (open, tip): (&str, &str),
+    current: Option<&str>,
+    choices: &[Choice],
+    custom: Option<bool>,
+) -> Option<Pick> {
+    let mut picked = None;
+    let first = choice_row(ui, p, open, current.is_none());
+    if first.clicked() {
+        picked = Some(Pick::Value(None));
+        ui.close();
+    }
+    if !tip.is_empty() {
+        first.on_hover_text(tip);
+    }
+    for choice in choices {
+        if choice_row(ui, p, &choice.label, current == Some(choice.value)).clicked() {
+            picked = Some(Pick::Value(Some(choice.value.to_owned())));
             ui.close();
         }
-        if !tip.is_empty() {
-            first.on_hover_text(tip);
+    }
+    if let Some(typed) = custom {
+        menu_separator(ui, p);
+        if choice_row(ui, p, "Custom…", typed).clicked() {
+            picked = Some(Pick::Custom);
+            ui.close();
         }
-        for choice in choices {
-            if choice_row(ui, p, &choice.label, current == Some(choice.value)).clicked() {
-                picked = Some(Pick::Value(Some(choice.value.to_owned())));
-                ui.close();
-            }
-        }
-        if let Some(typed) = custom {
-            menu_separator(ui, p);
-            if choice_row(ui, p, "Custom…", typed).clicked() {
-                picked = Some(Pick::Custom);
-                ui.close();
-            }
-        }
-    });
+    }
     // Choosing what is in force already changes nothing.
     picked.filter(|picked| match picked {
         Pick::Value(value) => value.as_deref() != current,

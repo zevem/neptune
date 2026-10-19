@@ -3348,7 +3348,6 @@ impl App {
         if let Some(ui) = self.window_ui_state_mut(creating.window) {
             ui.project.goal.clear();
             ui.project.lead_settings = LeadSettings::default();
-            ui.project.lead_options = false;
             ui.project.custom = None;
             ui.project.shown = ui::chat::PAGE;
             ui.project.focus = ui.panel.open && ui.panel.tab == ui::panel::Tab::Project;

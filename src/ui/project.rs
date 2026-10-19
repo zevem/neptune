@@ -7,6 +7,7 @@
 //! one press away on its details: what its agents share, what wakes its
 //! lead, and what the lead and its agents run with. Without a project the
 //! tab is the field that starts one.
+mod composer;
 mod creation;
 mod details;
 mod settings;
@@ -62,8 +63,6 @@ const ROSTER: f32 = 0.6;
 const SHEET: f32 = 560.0;
 /// The line under the composer.
 const HINT: f32 = 18.0;
-/// The room each of the two controls at the composer's trailing edge takes.
-const CONTROLS: f32 = 28.0;
 /// The row that leads the details back to the chat: the control that
 /// chooses among their parts, and the room under it.
 const BACK: f32 = 34.0;
@@ -235,8 +234,6 @@ pub struct State {
     pub removing: Option<(ProjectId, u64)>,
     /// The model and effort picked for the lead of the next project.
     pub lead_settings: LeadSettings,
-    /// The creation form shows them, and the choice of its lead.
-    pub lead_options: bool,
     /// The one model being typed, until it is applied or put away.
     pub custom: Option<Custom>,
 }
@@ -259,7 +256,6 @@ impl Default for State {
             watch: WatchForm::default(),
             removing: None,
             lead_settings: LeadSettings::default(),
-            lead_options: false,
             custom: None,
         }
     }
@@ -626,20 +622,6 @@ fn choice_label(choices: Option<&Choices>, value: &str, models: bool) -> String 
         .and_then(|list| list.iter().find(|choice| choice.value == value))
         .map_or_else(|| value.to_owned(), |choice| choice.label.clone())
 }
-/// "Claude Code · Opus · High": a lead's CLI, then what it runs with. A
-/// part that is left to the CLI is left out.
-fn lead_words(
-    kind: AgentKind,
-    model: Option<&str>,
-    effort: Option<&str>,
-    choices: Option<&Choices>,
-) -> String {
-    let mut parts = vec![super::agents::kind_name(kind).to_owned()];
-    parts.extend(model.map(|model| choice_label(choices, model, true)));
-    parts.extend(effort.map(|effort| choice_label(choices, effort, false)));
-    parts.join(" · ")
-}
-
 /// Where the tab is laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fit {
@@ -1550,18 +1532,19 @@ fn project(
     }
     state.deleting = None;
     state.removing = None;
+    // Only the model of this project's lead is typed in the composer.
     if state
         .custom
         .as_ref()
-        .is_some_and(|custom| custom.owner.is_some())
+        .is_some_and(|custom| custom.owner != Some(project.id) || custom.setting != Setting::Lead)
     {
         state.custom = None;
     }
 
     // The composer keeps its place at the bottom and grows upwards.
     let draft = state.drafts.entry(project.id).or_default();
-    let field_height = chat::editor_height(ui, draft, inner.width() - 2.0 * CONTROLS - 6.0, (1, 6))
-        .min((inner.height() * 0.4).max(31.0));
+    let field_height = composer::height(ui, draft, inner.width(), (1, 6))
+        .min((inner.height() * 0.4).max(composer::LEAST_HEIGHT));
     let hint = Rect::from_min_max(Pos2::new(inner.left(), inner.bottom() - HINT), inner.max);
     let field = Rect::from_min_max(
         Pos2::new(inner.left(), hint.top() - field_height),
@@ -1753,44 +1736,39 @@ fn project(
         && !composing
         && ui.memory(|memory| memory.has_focus(composer))
         && chat::take_enter(ui);
-    let mut entered = false;
-    ui.add_enabled_ui(!project.locked, |ui| {
-        entered = bare
-            | chat::editor(
-                ui,
-                p,
-                field,
-                Editor {
-                    id: chat::composer_id(),
-                    text: draft,
-                    hint: if project.locked {
-                        "This project is read-only"
-                    } else {
-                        "Message the lead…"
-                    },
-                    label: "Message the lead",
-                    focus: &mut state.focus,
-                    composing,
-                    trailing: 2.0 * CONTROLS,
-                    newline: false,
+    let entered = bare
+        | composer::surface(
+            ui,
+            p,
+            field,
+            !project.locked,
+            Editor {
+                id: chat::composer_id(),
+                text: draft,
+                hint: if project.locked {
+                    "This project is read-only"
+                } else {
+                    "Message the lead…"
                 },
-            )
-            .1;
-    });
+                label: "Message the lead",
+                focus: &mut state.focus,
+                composing,
+                trailing: 0.0,
+                newline: false,
+            },
+        )
+        .1;
     let ready = !project.locked && (!draft.trim().is_empty() || files > 0);
     // A project that takes nothing has no control to send with.
     if !project.locked {
-        let control = Rect::from_min_size(
-            Pos2::new(field.right() - 29.0, field.bottom() - 28.0),
-            Vec2::splat(24.0),
-        );
+        let (send, attach) = composer::controls(field);
         // While a turn runs the control stops it; a message typed
         // meanwhile is sent with Enter and waits its turn.
         let stop = project.busy && !ready;
-        if chat::attach_button(ui, p, control.translate(vec2(-CONTROLS, 0.0))).clicked() {
+        if chat::attach_button(ui, p, attach).clicked() {
             actions.push(Action::Project(Event::Attach(project.id)));
         }
-        let pressed = chat::send_button(ui, p, control, stop, ready).clicked();
+        let pressed = chat::send_button(ui, p, send, stop, ready).clicked();
         if pressed && stop {
             actions.push(Action::Project(Event::Stop(project.id)));
         } else if (pressed || entered) && ready {
@@ -1804,7 +1782,42 @@ fn project(
             state.focus |= pressed;
         }
     }
-    footer(ui, p, hint, project, state);
+    // What the lead runs on and with, changed from its next turn. The
+    // model its CLI named when it last started stands in where none was
+    // chosen.
+    let kept = &project.settings.lead;
+    let told = ui
+        .add_enabled_ui(!project.locked, |ui| {
+            composer::bar(
+                ui,
+                p,
+                field,
+                composer::Bar {
+                    who: composer::Who::Kept(project.lead),
+                    owner: Some(project.id),
+                    choices: project.catalog.of(Setting::Lead, project.lead),
+                    model: kept.model.as_deref(),
+                    effort: kept.effort.as_deref(),
+                    reported: project.lead_model,
+                    rounds: if project.locked { 0 } else { 2 },
+                    above: true,
+                    composing,
+                },
+                &mut state.custom,
+            )
+        })
+        .inner;
+    if told.settings {
+        state.show(Segment::Settings);
+    }
+    if told.model.is_some() || told.effort.is_some() {
+        actions.push(Action::Project(Event::SetLead {
+            project: project.id,
+            model: told.model.unwrap_or_else(|| kept.model.clone()),
+            effort: told.effort.unwrap_or_else(|| kept.effort.clone()),
+        }));
+    }
+    footer(ui, p, hint, project);
 }
 
 /// Says that files held over the chat are attached when they are let go, as
@@ -1841,11 +1854,10 @@ fn drop_target(ui: &Ui, p: Palette, area: Rect) {
     );
 }
 
-/// The line under the composer: which CLI leads and what it runs with,
-/// which opens the settings, and at the trailing edge what its turn is
-/// doing. How long the turn has taken sits where the count of waiting
+/// The line under the composer: at its trailing edge what the lead's turn
+/// is doing. How long the turn has taken sits where the count of waiting
 /// messages does, so nothing of the chat moves as it is counted.
-fn footer(ui: &mut Ui, p: Palette, hint: Rect, project: &Project, state: &mut State) {
+fn footer(ui: &mut Ui, p: Palette, hint: Rect, project: &Project) {
     let centre = hint.center().y + 1.0;
     let running = project.elapsed.map(running_words);
     let trailing = match (project.queued, running) {
@@ -1854,7 +1866,6 @@ fn footer(ui: &mut Ui, p: Palette, hint: Rect, project: &Project, state: &mut St
         (queued, None) => Some(format!("Queued · {queued}")),
         (queued, Some(running)) => Some(format!("Queued · {queued} · {running}")),
     };
-    // What the turn is doing outranks the lead's name where both do not fit.
     let mut right = hint.right() - 4.0;
     if let Some(trailing) = trailing {
         let said = ui
@@ -1868,8 +1879,8 @@ fn footer(ui: &mut Ui, p: Palette, hint: Rect, project: &Project, state: &mut St
         );
         right -= 10.0;
     }
-    let left = hint.left() + 4.0;
     if project.locked {
+        let left = hint.left() + 4.0;
         galley_at(
             ui.painter(),
             Pos2::new(left, centre),
@@ -1881,48 +1892,7 @@ fn footer(ui: &mut Ui, p: Palette, hint: Rect, project: &Project, state: &mut St
                 right - left,
             ),
         );
-        return;
     }
-    // The model its CLI named when it last started stands in where none
-    // was chosen.
-    let words = lead_words(
-        project.lead,
-        project
-            .settings
-            .lead
-            .model
-            .as_deref()
-            .or(project.lead_model),
-        project.settings.lead.effort.as_deref(),
-        project.catalog.of(Setting::Lead, project.lead),
-    );
-    let font = theme::regular(11.0);
-    let chip = elided(ui.painter(), &words, font.clone(), p.muted, right - left);
-    if chip.size().x < 20.0 {
-        return;
-    }
-    let rect = Rect::from_min_size(Pos2::new(left, centre - chip.size().y * 0.5), chip.size());
-    let response = ui
-        .interact(
-            rect.expand2(vec2(3.0, 2.0)),
-            Id::new("project-lead-chip"),
-            Sense::click(),
-        )
-        .on_hover_cursor(CursorIcon::PointingHand);
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Lead settings"));
-    if response.has_focus() {
-        focus_ring(ui.painter(), rect.expand2(vec2(3.0, 1.0)), 5, p);
-    }
-    let chip = if response.hovered() || response.has_focus() {
-        elided(ui.painter(), &words, font, p.secondary, right - left)
-    } else {
-        chip
-    };
-    ui.painter().galley(rect.min, chip, Color32::PLACEHOLDER);
-    if response.clicked() {
-        state.show(Segment::Settings);
-    }
-    response.on_hover_text("What the lead and its agents run with");
 }
 
 /// The tab in `rect`, below the panel's tabs.
