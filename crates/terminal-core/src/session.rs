@@ -31,9 +31,11 @@ pub use limits::MAX_GRID_CELLS;
 use limits::check_grid_budget;
 #[path = "shell_integration/mod.rs"]
 mod shell_integration;
-use shell_integration::{CwdTracker, PromptScanner, PromptState};
 #[cfg(test)]
-use shell_integration::{PromptMark, decode_cwd, decode_path, row_identity};
+use shell_integration::{
+    CwdReport, PromptMark, decode_cwd, decode_path, local_hostname, row_identity,
+};
+use shell_integration::{CwdTracker, PromptScanner, PromptState};
 #[path = "engine.rs"]
 mod engine;
 #[path = "notifications.rs"]
@@ -118,7 +120,8 @@ pub struct SessionMetadata {
     pub shell: String,
     pub cwd: PathBuf,
     /// Last directory explicitly reported by the shell with OSC 7. Unlike
-    /// `cwd`, this never comes from polling the local child process.
+    /// `cwd`, this never comes from polling the local child process, and it
+    /// can be on another host: `cwd` only takes reports naming this machine.
     pub reported_cwd: Option<PathBuf>,
     pub process_id: Option<u32>,
     /// Shell PID reported by Neptune's remote bootstrap; never a local PID.

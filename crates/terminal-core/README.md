@@ -29,7 +29,11 @@ change that arrived between that snapshot and acknowledgement.
 `SessionMetadata::reported_cwd` retains the last valid OSC 7 or OSC 9;9
 directory separately from `cwd`, which can also come from local process polling
 (Linux only). Remote clients use the explicit report because their local process
-directory does not identify the remote shell's directory. Each fresh session
+directory does not identify the remote shell's directory. An OSC 7 report whose
+host is not this machine (empty, `localhost` or the local host name, compared
+case-insensitively and by first label) updates only `reported_cwd`: a shell
+reached by typing `ssh` reports paths on its host, which must not start local
+splits, tabs or restored shells. Each fresh session
 starts with no report. On Windows, a local `cmd` or PowerShell started without
 explicit arguments reports OSC 9;9 from each prompt: cmd through a prefixed
 `PROMPT`, PowerShell through `-NoExit -Command` wrapping the profile's prompt.

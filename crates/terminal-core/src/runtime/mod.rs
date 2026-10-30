@@ -258,11 +258,16 @@ pub(super) fn engine_loop(
                         .parse_nanoseconds
                         .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
-                if let Some(cwd) = cwd_tracker.advance(&buffer[..len]) {
+                if let Some(report) = cwd_tracker.advance(&buffer[..len]) {
                     let mut metadata = shared.metadata.lock();
-                    if metadata.reported_cwd.as_ref() != Some(&cwd) || metadata.cwd != cwd {
-                        metadata.reported_cwd = Some(cwd.clone());
-                        metadata.cwd = cwd;
+                    // A host's directory, e.g. from a shell inside `ssh`, is
+                    // kept as reported but never becomes this shell's cwd.
+                    let local = report.local && metadata.cwd != report.path;
+                    if metadata.reported_cwd.as_ref() != Some(&report.path) || local {
+                        if local {
+                            metadata.cwd.clone_from(&report.path);
+                        }
+                        metadata.reported_cwd = Some(report.path);
                         drop(metadata);
                         shared.force_repaint();
                     }

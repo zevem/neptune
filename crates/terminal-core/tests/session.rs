@@ -55,6 +55,32 @@ fn a_shell_reported_directory_survives_local_process_directory_polling() {
 }
 
 #[test]
+fn a_directory_reported_by_another_host_never_becomes_the_local_cwd() {
+    // A shell reached by typing `ssh` reports its host's paths; later splits
+    // and tabs start local shells in `cwd`, so it must stay on this machine.
+    let local = tempfile::tempdir().unwrap();
+    let start = std::env::current_dir().unwrap();
+    let session = shell(&format!(
+        "printf '\\033]7;file://not-this-machine/srv/on-the-host\\007'; \
+         IFS= read -r line; cd '{}' && \
+         printf '\\033]7;file://localhost%s\\007' \"$PWD\"; exec sleep 30",
+        local.path().display()
+    ));
+    let remote = std::path::Path::new("/srv/on-the-host");
+    wait_for(|| session.metadata().reported_cwd.as_deref() == Some(remote));
+    // Linux process polling would repair `cwd` within a second; macOS has none.
+    assert_eq!(session.metadata().cwd, start);
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(session.metadata().reported_cwd.as_deref(), Some(remote));
+    assert_eq!(session.metadata().cwd, start);
+    session.write(b"back\r").unwrap();
+    let local = local.path().canonicalize().unwrap();
+    wait_for(|| session.metadata().cwd.canonicalize().ok().as_ref() == Some(&local));
+    session.shutdown();
+    wait_for(|| session.metrics().active_workers == 0);
+}
+
+#[test]
 fn real_pty_accepts_input_propagates_resize_and_reports_exit() {
     let session = shell(
         "printf '\\033]0;pty-smoke\\007\\033[38;2;91;166;201mREADY\\033[0m\\r\\n'; \

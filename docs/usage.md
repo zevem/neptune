@@ -84,7 +84,9 @@ offers **Set default directory for group …** when the sidebar is hidden. **Use
 
 Existing workspaces and terminals keep their directories. New tabs and splits
 always follow the current directory of the terminal they open beside; restarts
-and restoration use each terminal's last directory. Moving a workspace between
+and restoration use each terminal's last directory. In a local terminal where you
+typed `ssh`, that is the local directory you ran `ssh` from, not the directory on
+the other machine. Moving a workspace between
 groups does not change its sessions. Group defaults are saved across launches
 and apply to local workspaces; SSH workspaces retain their remote directory
 behavior. If a saved group folder becomes unavailable, edit or remove the default
