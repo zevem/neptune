@@ -357,7 +357,7 @@ fn osc7_survives_fragmentation_and_rejects_invalid_uris() {
     );
     assert!(tracker.advance(b"host/home/dev/my%20project\x1b").is_none());
     assert_eq!(
-        tracker.advance(b"\\"),
+        tracker.advance(b"\\").map(|report| report.path),
         Some(PathBuf::from("/home/dev/my project"))
     );
     assert!(decode_cwd(b"file://host/tmp/%00").is_none());
@@ -366,12 +366,38 @@ fn osc7_survives_fragmentation_and_rejects_invalid_uris() {
 }
 
 #[test]
+fn osc7_from_another_host_is_not_a_local_directory() {
+    let local = |uri: &str| decode_cwd(uri.as_bytes()).map(|report| report.local);
+    assert_eq!(local("file:///home/dev"), Some(true));
+    assert_eq!(local("file://localhost/home/dev"), Some(true));
+    assert_eq!(local("file://LocalHost/home/dev"), Some(true));
+    // A shell reached over SSH, and Neptune's own SSH bootstrap.
+    assert_eq!(
+        local("file://devbox-that-is-not-here/home/dev"),
+        Some(false)
+    );
+    assert_eq!(local("file://neptune/home/dev"), Some(false));
+    if let Some(name) = local_hostname() {
+        assert_eq!(local(&format!("file://{name}/home/dev")), Some(true));
+        let upper = name.to_ascii_uppercase();
+        assert_eq!(local(&format!("file://{upper}/home/dev")), Some(true));
+        // `hostname -s` and `$HOST` can disagree about the domain.
+        let short = name.split('.').next().unwrap();
+        assert_eq!(local(&format!("file://{short}.local/home/dev")), Some(true));
+        assert_eq!(local(&format!("file://{short}/home/dev")), Some(true));
+    }
+}
+
+#[test]
 fn oversized_osc7_has_bounded_storage_and_recovers() {
     let mut tracker = CwdTracker::default();
     let mut input = b"\x1b]7;file://host/".to_vec();
     input.extend(vec![b'x'; MAX_OSC * 2]);
     input.extend_from_slice(b"\x07\x1b]7;file://host/tmp\x07");
-    assert_eq!(tracker.advance(&input), Some(PathBuf::from("/tmp")));
+    assert_eq!(
+        tracker.advance(&input).map(|report| report.path),
+        Some(PathBuf::from("/tmp"))
+    );
     assert!(tracker.bytes.capacity() <= MAX_OSC);
 }
 
@@ -401,13 +427,19 @@ fn osc9_9_reports_native_paths_and_ignores_other_osc9() {
             .advance(b"\x1b]9;4;1;50\x07\x1b]9;Done\x07\x1b]9;9")
             .is_none()
     );
+    let local = |path: &str| {
+        Some(CwdReport {
+            path: PathBuf::from(path),
+            local: true,
+        })
+    };
     assert_eq!(
         tracker.advance(format!(";\"{dir}\"\x1b\\").as_bytes()),
-        Some(PathBuf::from(dir))
+        local(dir)
     );
     assert_eq!(
         tracker.advance(format!("\x1b]9;9;{dir}\x07").as_bytes()),
-        Some(PathBuf::from(dir))
+        local(dir)
     );
     assert!(decode_path(b"relative").is_none());
     assert!(decode_path(b"/tmp\0").is_none());
@@ -421,7 +453,9 @@ fn osc9_9_reports_native_paths_and_ignores_other_osc9() {
             assert!(tracker.advance(report).is_none());
         }
         assert_eq!(
-            tracker.advance(b"\x1b]7;file://neptune/home/dev\x07"),
+            tracker
+                .advance(b"\x1b]7;file://neptune/home/dev\x07")
+                .map(|report| report.path),
             Some(PathBuf::from("/home/dev"))
         );
     }

@@ -36,6 +36,15 @@ pub(super) fn report_cwd(command: &mut CommandBuilder, shell: &str) {
     }
 }
 
+/// A directory a shell reported, and whether it is on this machine.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct CwdReport {
+    pub(super) path: PathBuf,
+    /// False when OSC 7 names another host, as a shell reached over SSH does.
+    /// Its path must not start local shells or be probed locally.
+    pub(super) local: bool,
+}
+
 /// A bounded observer of OSC 7 and ConEmu/Windows Terminal OSC 9;9 directory
 /// reports. Ordinary printable runs are skipped using memchr; only a matching
 /// sequence allocates. VT parsing still belongs to Alacritty.
@@ -47,7 +56,7 @@ pub(super) struct CwdTracker {
 }
 
 impl CwdTracker {
-    pub(super) fn advance(&mut self, mut bytes: &[u8]) -> Option<PathBuf> {
+    pub(super) fn advance(&mut self, mut bytes: &[u8]) -> Option<CwdReport> {
         let mut path = None;
         while !bytes.is_empty() {
             if self.state == 0 {
@@ -128,12 +137,15 @@ fn is_report_prefix(bytes: &[u8]) -> bool {
         .any(|prefix| bytes.iter().zip(*prefix).all(|(a, b)| a == b))
 }
 
-fn decode_report(bytes: &[u8]) -> Option<PathBuf> {
+fn decode_report(bytes: &[u8]) -> Option<CwdReport> {
     match bytes.strip_prefix(REPORTS[0]) {
         Some(uri) => decode_cwd(uri),
-        None => decode_path(bytes.strip_prefix(REPORTS[1])?),
+        // OSC 9;9 carries no host; Windows shells report it from this machine.
+        None => {
+            decode_path(bytes.strip_prefix(REPORTS[1])?).map(|path| CwdReport { path, local: true })
+        }
     }
-    .filter(|path| is_local_report(path))
+    .filter(|report| is_local_report(&report.path))
 }
 
 /// Any program's output can claim a directory, and splits/restoration later
@@ -382,9 +394,9 @@ pub(super) fn row_identity<T: EventListener>(terminal: &Term<T>, line: Line) -> 
     std::ptr::from_ref(&terminal.grid()[Point::new(line, Column(0))]) as usize
 }
 
-pub(super) fn decode_cwd(bytes: &[u8]) -> Option<PathBuf> {
+pub(super) fn decode_cwd(bytes: &[u8]) -> Option<CwdReport> {
     let uri = std::str::from_utf8(bytes).ok()?.strip_prefix("file://")?;
-    let path = &uri[uri.find('/')?..];
+    let (host, path) = uri.split_at(uri.find('/')?);
     let mut decoded = Vec::with_capacity(path.len());
     let mut bytes = path.as_bytes().iter().copied();
     while let Some(byte) = bytes.next() {
@@ -409,5 +421,44 @@ pub(super) fn decode_cwd(bytes: &[u8]) -> Option<PathBuf> {
     } else {
         path
     };
-    Some(PathBuf::from(path))
+    Some(CwdReport {
+        path: PathBuf::from(path),
+        local: is_local_host(host),
+    })
+}
+
+/// OSC 7 names the machine whose filesystem holds the directory. Shells name
+/// it as `$HOST`, `$HOSTNAME` or `hostname`, which can differ from each other
+/// in case and domain. Neptune's SSH bootstrap reports the placeholder
+/// `neptune` rather than its host's name.
+fn is_local_host(host: &str) -> bool {
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Some(local) = local_hostname() else {
+        return false;
+    };
+    fn label(name: &str) -> &str {
+        name.split('.').next().unwrap_or_default()
+    }
+    let short = label(host);
+    host.eq_ignore_ascii_case(&local)
+        || (!short.is_empty() && short.eq_ignore_ascii_case(label(&local)))
+}
+
+/// Read per report: macOS renames the machine when it changes networks.
+#[cfg(unix)]
+pub(super) fn local_hostname() -> Option<String> {
+    let mut name = [0u8; 256];
+    // SAFETY: the buffer is writable for the length passed.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return None;
+    }
+    let end = name.iter().position(|byte| *byte == 0)?;
+    String::from_utf8(name[..end].to_vec()).ok()
+}
+
+#[cfg(windows)]
+pub(super) fn local_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
 }

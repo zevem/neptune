@@ -2567,7 +2567,7 @@ fn a_remote_split_inherits_the_reported_host_directory_and_keeps_its_local_direc
         seen = app
             .sessions
             .get(pane)
-            .is_some_and(|session| session.metadata().cwd == reported);
+            .is_some_and(|session| session.metadata().reported_cwd.as_deref() == Some(reported));
         assert!(
             Instant::now() < deadline,
             "the client never reported its directory: {:?}",
