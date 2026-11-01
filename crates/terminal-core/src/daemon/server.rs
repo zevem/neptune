@@ -337,10 +337,15 @@ impl Daemon {
         size: Option<(u16, u16)>,
     ) {
         let session = &hosted.session;
-        if let Some((cols, rows)) = size {
+        // An ended session keeps its final size: its terminal is gone, also
+        // when its program ends just as it is resized.
+        if let Some((cols, rows)) = size
+            && session.metadata().status == SessionStatus::Running
+        {
             let current = *session.shared.size.lock();
             if (current.cols, current.rows) != (cols, rows)
                 && let Err(error) = session.resize(cols, rows, 0, 0)
+                && error.kind() != SessionErrorKind::Closed
             {
                 let _ = send(&mut stream, &failed(error));
                 return;

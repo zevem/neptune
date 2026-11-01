@@ -711,10 +711,11 @@ const EXITED_3: SessionStatus = SessionStatus::Exited {
 };
 
 /// A client takes the exited session: its final screen and status, after
-/// which the daemon lets the session go.
+/// which the daemon lets the session go. It attaches at another size than
+/// the session had, as a reattaching pane often does.
 #[track_caller]
 fn take_exited(client: &DaemonClient, id: daemon::SessionId) {
-    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    let attached = client.attach(id, 100, 30, repaint()).unwrap();
     let screen = attached.session.screen_text();
     assert!(screen.contains("final words"), "{screen}");
     wait_for(|| attached.session.metadata().status == EXITED_3);
@@ -755,19 +756,18 @@ fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> (u8, Vec<u8>) {
     (kind, frame)
 }
 
-#[test]
-fn an_exit_sent_to_a_client_that_leaves_without_taking_it_is_kept() {
+/// Attach over a raw connection, which never takes an exit: the connection
+/// and the kind of the daemon's reply.
+fn raw_attach(
+    daemon: &Daemon,
+    id: daemon::SessionId,
+    cols: u16,
+    rows: u16,
+) -> (std::os::unix::net::UnixStream, u8) {
     use std::io::Write;
-    use std::os::unix::net::UnixStream;
-    let daemon = Daemon::start();
-    let go = daemon.root.path().join("go");
-    let client = daemon.client();
-    let (session, id) = client.start(exits_on(&go), repaint()).unwrap();
-    wait_for(|| session.screen_text().contains("READY"));
-    drop(session);
-    // A client that departs right after the daemon sends it the exit must
-    // not be the one that takes it.
-    let mut stream = UnixStream::connect(daemon.dir().join("session-daemon-v1.sock")).unwrap();
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(daemon.dir().join("session-daemon-v1.sock"))
+            .unwrap();
     stream.write_all(&hello(1)).unwrap();
     assert_eq!(read_frame(&mut stream).0, 64, "welcome");
     // Attach: kind 6, the id, then the size.
@@ -777,10 +777,56 @@ fn an_exit_sent_to_a_client_that_leaves_without_taking_it_is_kept() {
             .unwrap()
             .to_le_bytes(),
     );
-    attach.extend(80u16.to_le_bytes());
-    attach.extend(12u16.to_le_bytes());
+    attach.extend(cols.to_le_bytes());
+    attach.extend(rows.to_le_bytes());
     stream.write_all(&attach).unwrap();
-    assert_eq!(read_frame(&mut stream).0, 69, "attached");
+    let reply = read_frame(&mut stream).0;
+    (stream, reply)
+}
+
+#[test]
+fn a_pane_of_any_size_can_attach_long_after_its_session_exited() {
+    let daemon = Daemon::start();
+    let go = daemon.root.path().join("go");
+    let client = daemon.client();
+    let (session, id) = client.start(exits_on(&go), repaint()).unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    drop(session);
+    std::fs::write(&go, b"").unwrap();
+    wait_for(|| {
+        client
+            .list()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.status == EXITED_3)
+    });
+    // Long enough for the ended session's workers to stop, after which its
+    // terminal can no longer be resized.
+    let until = Instant::now() + Duration::from_secs(1);
+    let mut cols = 81;
+    while Instant::now() < until {
+        assert_eq!(
+            raw_attach(&daemon, id, cols, 24).1,
+            69,
+            "attached at {cols}"
+        );
+        cols ^= 1;
+    }
+    take_exited(&client, id);
+}
+
+#[test]
+fn an_exit_sent_to_a_client_that_leaves_without_taking_it_is_kept() {
+    let daemon = Daemon::start();
+    let go = daemon.root.path().join("go");
+    let client = daemon.client();
+    let (session, id) = client.start(exits_on(&go), repaint()).unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    drop(session);
+    // A client that departs right after the daemon sends it the exit must
+    // not be the one that takes it.
+    let (mut stream, reply) = raw_attach(&daemon, id, 80, 12);
+    assert_eq!(reply, 69, "attached");
     std::fs::write(&go, b"").unwrap();
     loop {
         match read_frame(&mut stream).0 {
