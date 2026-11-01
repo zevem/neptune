@@ -191,6 +191,27 @@ impl KeptSessions {
     }
 }
 
+impl KeptSessions {
+    /// End every session the daemon keeps. Without a running daemon there is
+    /// none to end, so this never launches one.
+    pub fn end_all(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use terminal_core::{SessionErrorKind, daemon::DaemonClient};
+            let client = match DaemonClient::connect(&self.dir) {
+                Err(error) if error.kind() == SessionErrorKind::Unavailable => return Ok(()),
+                client => client.map_err(|error| format!("{error:#}"))?,
+            };
+            let sessions = client.list().map_err(|error| format!("{error:#}"))?;
+            // One that already ended, or ends meanwhile, is gone either way.
+            for session in sessions {
+                let _ = client.close(session.id);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(not(unix))]
 const UNSUPPORTED: &str = "Keeping terminals running after quit needs macOS or Linux";
 

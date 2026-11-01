@@ -38,6 +38,8 @@ pub struct PaletteView<'a> {
     pub zoomed: bool,
     /// A message is showing and can be dismissed.
     pub message: bool,
+    /// Quitting keeps the terminals running, so ending them is offered.
+    pub keeps_sessions: bool,
 }
 
 struct Command {
@@ -86,6 +88,15 @@ fn commands(view: &PaletteView) -> Vec<Command> {
         "",
         [Action::Quit],
     ));
+    if view.keeps_sessions {
+        list.push(command(
+            "Application",
+            Icon::Close,
+            "End all sessions and quit",
+            "",
+            [Action::EndAllSessions],
+        ));
+    }
     if let Some(pane) = view.pane {
         for port in view.ports {
             if matches!(
@@ -1071,6 +1082,25 @@ mod tests {
     }
 
     #[test]
+    fn ending_all_sessions_is_offered_while_quitting_would_keep_them_running() {
+        let config = Config::default();
+        let ends = |keeps_sessions| {
+            commands(&PaletteView {
+                keeps_sessions,
+                ..view(&config, &[])
+            })
+            .into_iter()
+            .find(|command| command.title == "End all sessions and quit")
+        };
+        let end = ends(true).unwrap();
+        assert_eq!(end.group, "Application");
+        assert!(matches!(end.actions.as_slice(), [Action::EndAllSessions]));
+        assert!(matches(&end, "end sessions"));
+        // Quitting already ends them.
+        assert!(ends(false).is_none());
+    }
+
+    #[test]
     fn quitting_neptune_keeps_application_scope_with_other_windows_open() {
         let config = Config::default();
         let windows = [(WindowId::new(2), "app".into())];
@@ -1176,6 +1206,7 @@ mod tests {
             config,
             zoomed: false,
             message: false,
+            keeps_sessions: false,
         }
     }
 

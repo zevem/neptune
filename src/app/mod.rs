@@ -112,6 +112,8 @@ pub struct App {
     /// This launch runs its terminals in the session daemon. Fixed at
     /// startup; turning the setting on applies from the next launch.
     keep_sessions: bool,
+    /// Quitting ends every session, kept ones included.
+    end_sessions: bool,
     preference_generation: u64,
     /// An input-method composition is in progress.
     ime_composing: bool,
@@ -279,6 +281,7 @@ impl App {
             session_daemon: (restore && cfg!(unix))
                 .then(|| crate::runtime::kept_sessions::directory(&data)),
             keep_sessions: false,
+            end_sessions: false,
             preference_generation: 0,
             ime_composing: false,
             terminal_focus: None,
@@ -636,6 +639,7 @@ impl App {
         self.keep_sessions = self.session_daemon.is_some()
             && self.config.restore_workspaces
             && self.config.keep_sessions_running;
+        self.ui.preference_view.launch_keeps_sessions = self.keep_sessions;
         if self.keep_sessions
             && let Some(dir) = &self.session_daemon
         {
@@ -1462,6 +1466,7 @@ impl App {
             panel: panel_available.then_some(self.ui.panel.open),
             panel_attention: (!agents_shown && self.agents.waiting_count() > 0)
                 || (!project_shown && project_needs > 0),
+            keeps_sessions: self.keeps_sessions(),
         };
         if edge > 0.0 {
             let side = Rect::from_min_size(
@@ -1774,6 +1779,7 @@ impl App {
         ui::helpers::scrim(ui.painter(), bounds, radius, p, dim);
         let zoomed = self.ui.zoomed;
         let message = self.ui.error.is_some();
+        let keeps_sessions = self.keeps_sessions();
         match self.ui.overlay {
             OverlayState::Notifications => {
                 let model = self.controller.model();
@@ -1901,6 +1907,7 @@ impl App {
                     config: &self.config,
                     zoomed,
                     message,
+                    keeps_sessions,
                 },
                 &mut actions,
             ),
@@ -2015,6 +2022,12 @@ impl App {
                 },
             );
         }
+        // Quitting lets go of kept sessions; every other session ends. Ended
+        // ones are forgotten, so the next launch doesn't look for them.
+        let detaches = self.keeps_sessions() && !self.end_sessions;
+        if self.keep_sessions && !detaches {
+            self.dispatch(&ctx, Command::ForgetSessions);
+        }
         self.save_state();
         self.save_window();
         if let Some(writer) = &self.writer
@@ -2022,13 +2035,19 @@ impl App {
         {
             eprintln!("Could not flush latest persisted state: {error}");
         }
-        // Quitting lets go of kept sessions; every other session ends.
-        if self.keeps_sessions() {
+        if detaches {
             let detach = self.controller.exit_effects();
             self.execute(&ctx, detach);
         }
         let complete = self.sessions.shutdown(Duration::from_secs(2));
         self.diagnostics.shutdown(complete);
+        // Ending them reaches the kept sessions no terminal showed, too.
+        if self.keep_sessions
+            && !detaches
+            && let Err(error) = self.sessions.end_kept()
+        {
+            eprintln!("Could not end the kept sessions: {error}");
+        }
         if self.relaunch
             && let Some(target) = self.updates.installed()
             && let Err(error) = crate::platform::updates::relaunch(target, &self.relaunch_arguments)
