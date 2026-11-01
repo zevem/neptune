@@ -32,6 +32,12 @@ class ScaleMetricsTests(unittest.TestCase):
             (proc / "self").mkdir()
             self.assertEqual(scale.session_daemons(data, proc), [10])
 
+    def test_the_echo_threshold_separates_hidden_from_shown_screenshots(self):
+        trials = [{"requested_after_write_ms": ms, "visible": seen}
+                  for ms, seen in [(-3, False), (-2, False), (-1.5, True), (-1, False), (0, True), (1, True), (2, True)]]
+        self.assertEqual(scale.echo_threshold(trials), -1.125)  # a tie between -1.75 and -0.5
+        self.assertIsNone(scale.echo_threshold([]))
+
     def test_neptune_and_its_daemon_are_compared_as_one(self):
         ticks = scale.os.sysconf("SC_CLK_TCK")
         before = {"cpu_ticks": 0, "context_switches": 100, "rss_bytes": 10, "threads": 4, "start_ticks": 7}

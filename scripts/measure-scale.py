@@ -179,40 +179,92 @@ def throughput(client,address,data,log,pane,mib):
 
 ECHO_PROGRAM=r"""
 import os,sys,termios,time,tty
-log=open(sys.argv[1],'a',buffering=1);fd=sys.stdin.fileno();saved=termios.tcgetattr(fd);tty.setraw(fd);count=0
-os.write(1,b']2;echo-ready')
+log=open(sys.argv[1],'a',buffering=1);fd=sys.stdin.fileno();saved=termios.tcgetattr(fd);tty.setraw(fd)
+cols=os.get_terminal_size(fd).columns
+block=b'\x1b[3;1H\x1b[7m'+(b' '*cols+b'\r\n')*10+b'\x1b[0m';clear=b'\x1b[3;1H\x1b[0m'+b'\x1b[2K\r\n'*10
+os.write(1,b'\x1b[?25l\x1b[2J');open(sys.argv[2],'w').close()
 try:
     while True:
         key=os.read(fd,1)
         if not key or key==b'q':break
-        count+=1;log.write(f"{count} {time.monotonic()}
-")
-        os.write(1,b']2;echo-%d'%count+key)
-finally:termios.tcsetattr(fd,termios.TCSADRAIN,saved)
+        now=time.monotonic()
+        if key==b'k':log.write(f"read {now}\n")
+        elif key==b'x':os.write(1,block)
+        elif key==b'r':os.write(1,clear)
+        elif key==b'y':
+            time.sleep(.05);now=time.monotonic();os.write(1,block);log.write(f"wrote {now}\n")
+finally:
+    os.write(1,b'\x1b[?25h\x1b[2J');termios.tcsetattr(fd,termios.TCSADRAIN,saved)
 """
 
-def title_shown(client,address,title):
-    return any(title in (node["properties"].get("label","")+" "+str(node["properties"].get("value",""))) for node in tree_nodes(client,address))
+def luminance(path,points):
+    from PIL import Image
+    image=Image.open(path).convert("L")
+    return [image.getpixel((min(image.width-1,int(x)),min(image.height-1,int(y)))) for x,y in points]
 
-def echo_delay(client,address,data,pane,samples):
-    """Keystroke to echo: an inspection key reaches a raw-mode program, which answers
-    by setting the terminal title; the delay ends when Neptune's accessibility tree
-    shows that title. The program's own read time splits the input and output legs."""
-    script=data/"echo.py";script.write_text(ECHO_PROGRAM);record=data/"echo.log"
+def echo_threshold(trials):
+    """The request offset that best separates screenshots without the echo from
+    those with it (fewest trials on the wrong side; the middle of the best range)."""
+    points=sorted(t["requested_after_write_ms"] for t in trials)
+    if not points:return None
+    cuts=[points[0]-1]+[(a+b)/2 for a,b in zip(points,points[1:])]+[points[-1]+1]
+    wrong=lambda cut:sum((t["requested_after_write_ms"]>=cut)!=t["visible"] for t in trials)
+    fewest=min(wrong(cut) for cut in cuts);best=[cut for cut in cuts if wrong(cut)==fewest]
+    return (best[0]+best[-1])/2
+
+def echo_delay(client,address,data,pane,repeats,offsets):
+    """Keystroke to echo, in two legs.
+
+    Input: an inspection key reaches a raw-mode program, which records when it
+    read it. Output: the program draws a block 50 ms after a key (so the key's own
+    frame is over) and records when it wrote it; one Neptune screenshot per trial
+    is requested at an offset from the expected write time, and the share of
+    screenshots showing the block, by actual offset from the write, is the
+    output leg's distribution, including frame scheduling."""
+    script=data/"echo.py";script.write_text(ECHO_PROGRAM);record=data/"echo.log";ready=data/"echo.ready";shot=data/"echo.png"
     click(client,address,pane)
-    command(client,address,f"python3 {shlex.quote(str(script))} {shlex.quote(str(record))}")
-    until(lambda:title_shown(client,address,"echo-ready"),15,"echo program title")
-    totals=[];inputs=[];outputs=[]
-    for index in range(1,samples+1):
-        time.sleep(.2)
-        sent=time.monotonic();harness.inspect(client,address,"text","x")
-        until(lambda:title_shown(client,address,f"echo-{index}"),10,"echo title")
-        shown=time.monotonic()
-        read=float(record.read_text().splitlines()[index-1].split()[1])
-        totals.append((shown-sent)*1000);inputs.append((read-sent)*1000);outputs.append((shown-read)*1000)
-    harness.inspect(client,address,"text","q")
-    summary=lambda values:{"p50":percentile(values,.5),"p95":percentile(values,.95),"p99":percentile(values,.99)}
-    return {"scope":"inspection text request to the terminal title shown in the accessibility tree; each poll is a separate inspection client run, not keyboard-to-screen","total_ms":summary(totals),"input_ms":summary(inputs),"output_ms":summary(outputs),"samples_ms":totals}
+    command(client,address,f"python3 {shlex.quote(str(script))} {shlex.quote(str(record))} {shlex.quote(str(ready))}")
+    until(ready.exists,15,"echo program")
+    lines=lambda:record.read_text().splitlines() if record.exists() else []
+    b=pane["properties"]["bounds"];column=(b["x0"]+b["x1"])/2
+    candidates=[(column,y) for y in range(int(b["y0"])+10,int(b["y1"])-10,4)]
+    def capture():
+        harness.inspect(client,address,"screenshot",str(shot));return luminance(shot,candidates)
+    harness.inspect(client,address,"text","x");time.sleep(.5);drawn=capture()
+    harness.inspect(client,address,"text","r");time.sleep(.5);cleared=capture()
+    contrast=[d-c for d,c in zip(drawn,cleared)];best=max(range(len(contrast)),key=lambda i:contrast[i])
+    if contrast[best]<60:raise RuntimeError("The echo block was not found on screen")
+    probe=candidates[best];threshold=(drawn[best]+cleared[best])/2
+    inputs=[]
+    for _ in range(repeats*len(offsets)):
+        time.sleep(.1);count=len(lines())
+        sent=time.monotonic();harness.inspect(client,address,"text","k")
+        until(lambda:len(lines())>count,5,"echo key read")
+        inputs.append((float(lines()[count].split()[1])-sent)*1000)
+    expected=50+percentile(inputs,.5)
+    trials=[]
+    for offset in offsets:
+        for _ in range(repeats):
+            harness.inspect(client,address,"text","r");time.sleep(.12);count=len(lines())
+            sent=time.monotonic();harness.inspect(client,address,"text","y")
+            pause=sent+(expected+offset)/1000-time.monotonic()
+            if pause>0:time.sleep(pause)
+            asked=time.monotonic();harness.inspect(client,address,"screenshot",str(shot))
+            visible=luminance(shot,[probe])[0]>threshold
+            until(lambda:len(lines())>count,5,"echo block written")
+            wrote=float(lines()[count].split()[1])
+            trials.append({"requested_after_write_ms":(asked-wrote)*1000,"visible":visible})
+    buckets={}
+    for trial in trials:
+        key=math.floor(trial["requested_after_write_ms"]*2)/2
+        buckets.setdefault(key,[]).append(trial["visible"])
+    shares={key:sum(v)/len(v) for key,v in sorted(buckets.items())}
+    hidden=[t["requested_after_write_ms"] for t in trials if not t["visible"]];shown=[t["requested_after_write_ms"] for t in trials if t["visible"]]
+    threshold_ms=echo_threshold(trials)
+    return {"scope":"input: inspection key request to the program's read; output: program's write to the block being in a Neptune screenshot requested that long after it (one inspection client run per request). Compare modes, not absolutes",
+            "input_ms":{"p50":percentile(inputs,.5),"p95":percentile(inputs,.95),"samples":len(inputs)},
+            "output_visible_share_by_offset_ms":shares,"output_threshold_ms":threshold_ms,"output_latest_hidden_ms":max(hidden) if hidden else None,"output_earliest_shown_ms":min(shown) if shown else None,
+            "probe":probe,"trials":trials}
 
 def run_case(args,count,scenario,root):
     output=root/f"{count}-{scenario}";data=output/"data";data.mkdir(parents=True)
@@ -275,7 +327,7 @@ def run_case(args,count,scenario,root):
                 result["daemons"]=[usage(before[pid],after[pid],elapsed) for pid in daemons]
                 result["combined"]=combined([result["neptune"],*result["daemons"]])
             elif scenario=="echo":
-                result["echo"]=echo_delay(args.client,address,data,panes[-1],args.echo_samples)
+                result["echo"]=echo_delay(args.client,address,data,panes[-1],args.echo_samples,list(range(args.echo_min_ms,args.echo_max_ms+1,args.echo_step_ms)))
             latencies=[]
             # End-to-end latency is measured separately from internal frame cost.
             for index in range(5 if scenario not in ("throughput","echo") else 0):
@@ -332,7 +384,10 @@ def main():
     parser.add_argument('--keep-sessions',choices=['off','on'],default='off',help='run the panes in a session daemon (on) or in Neptune (off)')
     parser.add_argument('--scrollback',type=int,default=1000,help='scrollback lines per pane (default: 1000)')
     parser.add_argument('--throughput-mib',type=int,default=256,help='output written by the throughput case (default: 256 MiB)')
-    parser.add_argument('--echo-samples',type=int,default=40,help='keystrokes timed by the echo case (default: 40)')
+    parser.add_argument('--echo-samples',type=int,default=10,help='echo trials per offset step (default: 10)')
+    parser.add_argument('--echo-min-ms',type=int,default=-6,help='earliest screenshot request relative to the expected echo write (default: -6 ms)')
+    parser.add_argument('--echo-max-ms',type=int,default=2,help='latest screenshot request after the expected echo write (default: 2 ms)')
+    parser.add_argument('--echo-step-ms',type=int,default=1,help='screenshot request step (default: 1 ms)')
     parser.add_argument('--output',type=Path,default=REPO/'artifacts/scale')
     args=parser.parse_args();args.app=args.app.resolve();args.client=args.client.resolve()
     if not sys.platform.startswith('linux'):parser.error('Process CPU/RSS adapter currently supports Linux only')
