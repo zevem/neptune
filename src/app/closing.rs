@@ -44,6 +44,22 @@ impl App {
         self.config.confirm_close && !self.relaunch
     }
 
+    /// Quitting, or closing the last window, while sessions are kept detaches
+    /// them: their programs keep running, so they need no warning.
+    fn detaches(&self, target: Close) -> bool {
+        self.keeps_sessions()
+            && match target {
+                Close::App => true,
+                Close::Window(window) => !self
+                    .controller
+                    .model()
+                    .workspaces()
+                    .iter()
+                    .any(|workspace| workspace.window() != window),
+                _ => false,
+            }
+    }
+
     pub(super) fn request_close(&mut self, ctx: &egui::Context, target: Close) {
         if self
             .pending_close
@@ -75,14 +91,13 @@ impl App {
             running: 0,
             unknown: usize::from(self.startup.is_some()),
         };
+        let detaches = self.detaches(target);
         if self.config.warn_running_processes {
             for &(pane, generation) in &pending.panes {
-                if self
-                    .controller
-                    .model()
-                    .pane(pane)
-                    .is_some_and(|p| p.kind() == neptune_model::PaneKind::Browser)
-                {
+                if self.controller.model().pane(pane).is_some_and(|p| {
+                    p.kind() == neptune_model::PaneKind::Browser
+                        || (detaches && p.session().is_some())
+                }) {
                     continue;
                 }
                 if let Some(session) = self.sessions.get(pane)
@@ -468,6 +483,7 @@ mod tests {
                     .dispatch(Command::SessionStarted {
                         pane,
                         generation: 1,
+                        session: None,
                     })
                     .unwrap();
                 Command::SessionExited {
@@ -479,6 +495,46 @@ mod tests {
             app.action(&ctx, Action::ClosePane(pane));
             assert!(app.controller.model().pane(pane).is_none());
             assert_eq!(app.ui.overlay, OverlayState::None);
+        }
+    }
+
+    #[test]
+    fn quitting_with_kept_sessions_skips_the_process_warning_but_closing_a_pane_does_not() {
+        for keep in [false, true] {
+            for target in ["quit", "last window", "pane"] {
+                let (mut app, ctx, _root, pane) = setup();
+                app.config.confirm_close = false;
+                app.config.keep_sessions_running = keep;
+                app.keep_sessions = keep;
+                // A terminal reattaching to its kept session, so no process
+                // check can say it is idle.
+                app.controller
+                    .dispatch(Command::SessionStarted {
+                        pane,
+                        generation: 1,
+                        session: Some(neptune_model::SessionRef {
+                            daemon: 1,
+                            id: "00000000000000a1".into(),
+                        }),
+                    })
+                    .unwrap();
+                let close = match target {
+                    "quit" => Close::App,
+                    "last window" => Close::Window(neptune_model::WindowId::ROOT),
+                    _ => Close::Pane(pane),
+                };
+                app.request_close(&ctx, close);
+                let detaches = keep && target != "pane";
+                assert_eq!(
+                    app.ui.overlay == OverlayState::None,
+                    detaches,
+                    "{target}, kept: {keep}"
+                );
+                if !detaches {
+                    assert_eq!(app.ui.close_status, CloseStatus::Unknown);
+                }
+                assert_eq!(app.exit_approved, detaches);
+            }
         }
     }
 

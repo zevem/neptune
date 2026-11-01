@@ -3,6 +3,7 @@ pub mod agent_mcp;
 mod agent_remote;
 pub mod agents;
 pub(crate) mod browser;
+pub mod kept_sessions;
 pub mod persistence;
 pub(crate) mod ports;
 pub mod project_lead;

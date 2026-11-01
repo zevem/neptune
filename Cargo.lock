@@ -2596,6 +2596,7 @@ dependencies = [
  "fontdb",
  "hex",
  "image",
+ "libc",
  "mac-notification-sys",
  "neptune-model",
  "notify-rust",

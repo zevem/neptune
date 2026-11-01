@@ -7,9 +7,11 @@ fn main() -> anyhow::Result<()> {
     unsafe {
         neptune_terminal::platform::host_env::restore()
     };
-    if let Some(code) =
-        neptune_terminal::runtime::agents::cli(&std::env::args().skip(1).collect::<Vec<_>>())?
-    {
+    let private = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(code) = neptune_terminal::runtime::agents::cli(&private)? {
+        std::process::exit(code);
+    }
+    if let Some(code) = neptune_terminal::runtime::kept_sessions::cli(&private) {
         std::process::exit(code);
     }
     let mut launch = Launch::default();

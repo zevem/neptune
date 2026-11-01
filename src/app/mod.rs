@@ -106,6 +106,12 @@ pub struct App {
     directory_check: Option<directory::PendingDirectory>,
     folder_picker: crate::platform::folders::Picker,
     ephemeral: bool,
+    /// Where this launch's kept sessions run. Only a launch that restores
+    /// workspaces, on Unix, may keep them.
+    session_daemon: Option<PathBuf>,
+    /// This launch runs its terminals in the session daemon. Fixed at
+    /// startup; turning the setting on applies from the next launch.
+    keep_sessions: bool,
     preference_generation: u64,
     /// An input-method composition is in progress.
     ime_composing: bool,
@@ -260,6 +266,9 @@ impl App {
             directory_check: None,
             folder_picker: crate::platform::folders::Picker::new(cc),
             ephemeral,
+            session_daemon: (restore && cfg!(unix))
+                .then(|| crate::runtime::kept_sessions::directory(&data)),
+            keep_sessions: false,
             preference_generation: 0,
             ime_composing: false,
             terminal_focus: None,
@@ -380,6 +389,7 @@ impl App {
                     pane,
                     generation,
                     elapsed,
+                    session,
                 } => {
                     if let Some(render) = self.renders.get_mut(&pane) {
                         render.cache.retry_resize();
@@ -389,7 +399,14 @@ impl App {
                         set_session_palette(session, Palette::for_config(&self.config));
                         let _ = session.focus(self.pane_native_focused(ctx, pane));
                     }
-                    self.dispatch(ctx, Command::SessionStarted { pane, generation });
+                    self.dispatch(
+                        ctx,
+                        Command::SessionStarted {
+                            pane,
+                            generation,
+                            session,
+                        },
+                    );
                     self.diagnostics
                         .operation("spawn", pane, generation, elapsed);
                 }
@@ -606,6 +623,22 @@ impl App {
         }
         self.controller = Controller::new(startup.report.model.unwrap_or_default());
         self.adopt_restored_host();
+        self.keep_sessions = self.session_daemon.is_some()
+            && self.config.restore_workspaces
+            && self.config.keep_sessions_running;
+        if self.keep_sessions
+            && let Some(dir) = &self.session_daemon
+        {
+            // Tests reach a daemon they run themselves; they never launch one.
+            let program = (!cfg!(test))
+                .then(std::env::current_exe)
+                .and_then(Result::ok);
+            self.sessions
+                .keep_sessions(crate::runtime::kept_sessions::KeptSessions::new(
+                    dir.clone(),
+                    program,
+                ));
+        }
         let repaint = ctx.clone();
         match PersistenceWriter::new(
             self.state_path.clone(),
@@ -638,11 +671,15 @@ impl App {
             self.open_beside(ctx, pane, None);
         }
         // Bind the CLI command before queued user actions can change focus.
+        // It is typed into a new shell, never into a program kept running.
         self.command_target = self.controller.model().active_pane().and_then(|id| {
             self.controller
                 .model()
                 .pane(id)
-                .filter(|pane| pane.kind() == neptune_model::PaneKind::Terminal)
+                .filter(|pane| {
+                    pane.kind() == neptune_model::PaneKind::Terminal
+                        && !(self.keep_sessions && pane.session().is_some())
+                })
                 .map(|pane| (id, pane.generation()))
         });
         if self.command.is_some() && self.command_target.is_none() {
@@ -1915,6 +1952,11 @@ impl App {
         self.sync_carried_workspace(&ctx);
         self.record_window_keyboard(&ctx);
     }
+    /// Whether quitting now leaves the terminals running: this launch keeps
+    /// them, and the setting is still on. Turning it off applies at once.
+    pub(super) fn keeps_sessions(&self) -> bool {
+        self.keep_sessions && self.config.keep_sessions_running && self.config.restore_workspaces
+    }
     fn exit(&mut self) {
         self.browsers.shutdown();
         self.usage.shutdown();
@@ -1969,6 +2011,11 @@ impl App {
             && let Err(error) = writer.flush()
         {
             eprintln!("Could not flush latest persisted state: {error}");
+        }
+        // Quitting lets go of kept sessions; every other session ends.
+        if self.keeps_sessions() {
+            let detach = self.controller.exit_effects();
+            self.execute(&ctx, detach);
         }
         let complete = self.sessions.shutdown(Duration::from_secs(2));
         self.diagnostics.shutdown(complete);

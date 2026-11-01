@@ -43,6 +43,11 @@ pub struct Config {
     pub cursor_blink: bool,
     pub sidebar_width: f32,
     pub restore_workspaces: bool,
+    /// Quitting leaves terminals running in a session daemon, and the next
+    /// launch reattaches to them. Unix only, and only while workspaces are
+    /// restored. Written only when on, so older versions still load settings.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub keep_sessions_running: bool,
     pub confirm_close: bool,
     /// Independent protection for sessions with active or unknown jobs.
     pub warn_running_processes: bool,
@@ -218,6 +223,7 @@ impl Default for Config {
             cursor_blink: false,
             sidebar_width: 216.0,
             restore_workspaces: true,
+            keep_sessions_running: false,
             confirm_close: true,
             warn_running_processes: true,
             desktop_notifications: true,
@@ -1209,6 +1215,22 @@ font_size = 15.0
                 );
             }
         }
+    }
+
+    #[test]
+    fn kept_sessions_default_off_and_are_omitted_until_turned_on() {
+        let config = Config::default();
+        assert!(!config.keep_sessions_running);
+        // Older builds refuse unknown keys, so the key is written only when on.
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("keep_sessions_running")
+        );
+        let on: Config = toml::from_str("keep_sessions_running = true").unwrap();
+        assert!(on.keep_sessions_running);
+        let restored: Config = toml::from_str(&toml::to_string(&on).unwrap()).unwrap();
+        assert!(restored.keep_sessions_running);
     }
 
     #[test]

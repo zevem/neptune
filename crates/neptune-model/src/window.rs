@@ -70,6 +70,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane: running,
                 generation: 2,
+                session: None,
             })
             .unwrap();
         let exited = tab(&mut controller, moved);
@@ -77,6 +78,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane: exited,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         controller
@@ -209,6 +211,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane: child,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         let neighbour = tab(&mut controller, original);
@@ -403,6 +406,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         assert_eq!(
@@ -413,6 +417,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane,
                 generation: 2,
+                session: None,
             })
             .unwrap();
         assert_eq!(

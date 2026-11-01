@@ -3,6 +3,8 @@ use super::*;
 
 mod processes;
 pub(super) use processes::process_activity;
+#[cfg(unix)]
+pub(in crate::session) use processes::shell_activity;
 
 #[cfg(unix)]
 pub(in crate::session) fn poll_pty(

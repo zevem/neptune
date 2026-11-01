@@ -669,6 +669,7 @@ impl Browsers {
                         completions.push(Completion::Started {
                             pane: PaneId::new(target.pane),
                             generation: target.generation,
+                            session: None,
                         });
                     }
                 }

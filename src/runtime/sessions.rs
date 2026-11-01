@@ -1,8 +1,8 @@
 //! Owns live, starting and closing sessions. No PTY is opened on the UI thread.
 //! Closing sessions retain their reservation until every worker has stopped.
-use neptune_model::PaneId;
+use neptune_model::{PaneId, SessionRef};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -45,6 +45,8 @@ pub struct SessionLaunch {
     pub agent: AgentLaunch,
     /// Give this SSH pane its own private connection-sharing socket.
     pub ssh_control: bool,
+    /// Reattach to this kept session rather than start a program.
+    pub attach: Option<SessionRef>,
 }
 pub enum AgentLaunch {
     Disabled,
@@ -64,6 +66,7 @@ impl From<SessionOptions> for SessionLaunch {
             terminal,
             agent: AgentLaunch::Disabled,
             ssh_control: false,
+            attach: None,
         }
     }
 }
@@ -72,6 +75,8 @@ struct Request {
     generation: u64,
     launch: SessionLaunch,
     wake: Wake,
+    /// Where sessions are kept, while Neptune keeps them.
+    kept: Option<Arc<super::kept_sessions::KeptSessions>>,
 }
 struct Completion {
     pane: PaneId,
@@ -95,6 +100,8 @@ pub enum SessionCompletion {
         pane: PaneId,
         generation: u64,
         elapsed: Duration,
+        /// The kept session it started in or reattached to.
+        session: Option<SessionRef>,
     },
     Failed {
         pane: PaneId,
@@ -106,6 +113,8 @@ struct Entry {
     generation: u64,
     session: TerminalSession,
     control: Option<Arc<tempfile::TempDir>>,
+    /// Names the kept session in the session daemon; `None` runs in Neptune.
+    reference: Option<SessionRef>,
 }
 
 pub struct SessionManager {
@@ -120,6 +129,9 @@ pub struct SessionManager {
     in_flight: BTreeMap<(PaneId, u64), Instant>,
     diagnostics: bool,
     agents: Arc<super::agents::AgentBridge>,
+    kept: Option<Arc<super::kept_sessions::KeptSessions>>,
+    /// Starts whose results are let go of, not closed, when they arrive.
+    detached: BTreeSet<(PaneId, u64)>,
 }
 impl SessionManager {
     pub fn new(policy: ResourcePolicy, diagnostics: bool) -> Self {
@@ -162,6 +174,26 @@ impl SessionManager {
                         };
                         let tick = Instant::now();
                         let result = (|| {
+                            if let Some(reference) = request.launch.attach.take() {
+                                let kept = request
+                                    .kept
+                                    .as_ref()
+                                    .ok_or("Terminals are not kept running after quit")?;
+                                let terminal = &request.launch.terminal;
+                                return kept
+                                    .attach(
+                                        &reference,
+                                        terminal.cols,
+                                        terminal.rows,
+                                        request.wake.clone(),
+                                    )
+                                    .map(|session| Entry {
+                                        generation: request.generation,
+                                        session,
+                                        control: None,
+                                        reference: Some(reference),
+                                    });
+                            }
                             let mut control = None;
                             if request.launch.ssh_control && cfg!(unix) {
                                 let directory = tempfile::Builder::new()
@@ -207,13 +239,23 @@ impl SessionManager {
                                     )
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
                             }
-                            TerminalSession::spawn(request.launch.terminal, request.wake.clone())
-                                .map(|session| Entry {
-                                    generation: request.generation,
-                                    session,
-                                    control,
-                                })
-                                .map_err(|error| format!("{error:#}"))
+                            let (session, reference) = match &request.kept {
+                                Some(kept) => kept
+                                    .start(request.launch.terminal, request.wake.clone())
+                                    .map(|(session, reference)| (session, Some(reference)))?,
+                                None => TerminalSession::spawn(
+                                    request.launch.terminal,
+                                    request.wake.clone(),
+                                )
+                                .map(|session| (session, None))
+                                .map_err(|error| format!("{error:#}"))?,
+                            };
+                            Ok(Entry {
+                                generation: request.generation,
+                                session,
+                                control,
+                                reference,
+                            })
                         })();
                         if sender
                             .send(Completion {
@@ -245,7 +287,14 @@ impl SessionManager {
             in_flight: BTreeMap::new(),
             diagnostics,
             agents,
+            kept: None,
+            detached: BTreeSet::new(),
         }
+    }
+    /// From now on, start and attach terminals in the session daemon `kept`
+    /// reaches, so that they outlive Neptune.
+    pub fn keep_sessions(&mut self, kept: super::kept_sessions::KeptSessions) {
+        self.kept = Some(Arc::new(kept));
     }
     pub fn policy(&self) -> &ResourcePolicy {
         &self.policy
@@ -336,6 +385,7 @@ impl SessionManager {
             generation,
             launch,
             wake,
+            kept: self.kept.clone(),
         };
         if count >= self.policy.max_sessions || self.in_flight.keys().any(|(id, _)| *id == pane) {
             self.deferred.insert(pane, request);
@@ -416,6 +466,24 @@ impl SessionManager {
             });
         }
     }
+    /// Let go of a pane's kept session without ending it, as Neptune quits.
+    /// A start or reattach still under way is let go of when it completes.
+    /// A session that runs in Neptune closes.
+    pub fn detach(&mut self, pane: PaneId) {
+        if self
+            .live
+            .get(&pane)
+            .is_some_and(|entry| entry.reference.is_none())
+        {
+            return self.close(pane);
+        }
+        self.desired.remove(&pane);
+        self.cancel_pending(pane);
+        // Dropping a daemon-backed handle detaches it.
+        self.live.remove(&pane);
+        self.detached
+            .extend(self.in_flight.keys().filter(|(id, _)| *id == pane).copied());
+    }
     fn reap(&mut self) {
         self.closing.retain(|closing| {
             let pending = closing.session.metrics().active_workers != 0;
@@ -429,6 +497,12 @@ impl SessionManager {
         while let Ok(completion) = self.completions.try_recv() {
             self.in_flight
                 .remove(&(completion.pane, completion.generation));
+            if self
+                .detached
+                .remove(&(completion.pane, completion.generation))
+            {
+                continue;
+            }
             if self.desired.get(&completion.pane) != Some(&completion.generation) {
                 self.agents
                     .close_generation(completion.pane, completion.generation);
@@ -446,11 +520,13 @@ impl SessionManager {
             }
             match completion.result {
                 Ok(entry) => {
+                    let session = entry.reference.clone();
                     self.live.insert(completion.pane, entry);
                     events.push(SessionCompletion::Started {
                         pane: completion.pane,
                         generation: completion.generation,
                         elapsed: completion.elapsed,
+                        session,
                     });
                 }
                 Err(message) => {
@@ -612,6 +688,157 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
     }
+    /// A session daemon serving a temporary directory, on a thread of this
+    /// test. It exits shortly after its last session and client are gone.
+    fn daemon() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        thread::JoinHandle<()>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = super::super::kept_sessions::directory(root.path());
+        let serving = dir.clone();
+        let daemon = thread::spawn(move || {
+            terminal_core::daemon::run(
+                &serving,
+                terminal_core::daemon::DaemonOptions {
+                    idle_exit: Duration::from_millis(200),
+                },
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while terminal_core::daemon::DaemonClient::connect(&dir).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the session daemon never listened"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        (root, dir, daemon)
+    }
+    fn kept(dir: &std::path::Path) -> SessionManager {
+        let mut manager = SessionManager::new(policy(), false);
+        manager.keep_sessions(super::super::kept_sessions::KeptSessions::new(
+            dir.into(),
+            None,
+        ));
+        manager
+    }
+    fn started(events: &[SessionCompletion]) -> Option<Option<SessionRef>> {
+        events.first().map(|event| match event {
+            SessionCompletion::Started { session, .. } => session.clone(),
+            SessionCompletion::Failed { message, .. } => panic!("{message}"),
+        })
+    }
+    fn listed(dir: &std::path::Path) -> Vec<(String, terminal_core::SessionStatus)> {
+        terminal_core::daemon::DaemonClient::connect(dir)
+            .unwrap()
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.id.to_string(), entry.status))
+            .collect()
+    }
+    fn activity(manager: &SessionManager, pane: PaneId) -> terminal_core::ProcessActivity {
+        manager
+            .get(pane)
+            .unwrap()
+            .check_process_activity()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+    }
+
+    #[test]
+    fn kept_sessions_outlive_their_manager_reattach_and_end_on_close() {
+        let (_root, dir, daemon) = daemon();
+        let pane = PaneId::new(1);
+        let wake: Wake = Arc::new(|| {});
+        let mut first = kept(&dir);
+        first
+            .start(pane, 1, false, options(), wake.clone())
+            .unwrap();
+        let mut reference = None;
+        until(&mut first, |manager, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some()
+                && manager
+                    .get(pane)
+                    .is_some_and(|session| session.screen_text().contains("READY"))
+        });
+        let reference = reference.unwrap().expect("a kept session has a reference");
+        // Its shell has a program running, which a close would stop.
+        assert_eq!(
+            activity(&first, pane),
+            terminal_core::ProcessActivity::Running
+        );
+        first.detach(pane);
+        assert!(first.shutdown(Duration::from_secs(2)));
+        drop(first);
+        assert_eq!(
+            listed(&dir),
+            vec![(reference.id.clone(), terminal_core::SessionStatus::Running)]
+        );
+
+        let mut second = kept(&dir);
+        second
+            .start(
+                pane,
+                1,
+                false,
+                SessionLaunch {
+                    attach: Some(reference.clone()),
+                    ..options().into()
+                },
+                wake.clone(),
+            )
+            .unwrap();
+        let mut attached = None;
+        until(&mut second, |manager, events| {
+            attached = attached.take().or_else(|| started(events));
+            attached.is_some()
+                && manager
+                    .get(pane)
+                    .is_some_and(|session| session.screen_text().contains("READY"))
+        });
+        assert_eq!(attached, Some(Some(reference)));
+        second.close(pane);
+        until(&mut second, |manager, _| manager.usage().closing == 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !listed(&dir).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "closing left the session running"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(second);
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_kept_shell_at_its_prompt_is_idle() {
+        let (_root, dir, daemon) = daemon();
+        let pane = PaneId::new(1);
+        let mut manager = kept(&dir);
+        let shell = SessionOptions {
+            shell: Some("/bin/sh".into()),
+            args: Vec::new(),
+            ..options()
+        };
+        manager
+            .start(pane, 1, false, shell, Arc::new(|| {}))
+            .unwrap();
+        until(&mut manager, |manager, _| manager.get(pane).is_some());
+        assert_eq!(
+            activity(&manager, pane),
+            terminal_core::ProcessActivity::Idle
+        );
+        assert!(manager.shutdown(Duration::from_secs(2)));
+        drop(manager);
+        daemon.join().unwrap();
+    }
+
     #[test]
     fn aggregate_history_policy_accounts_for_both_visible_grids() {
         let manager = SessionManager::new(policy(), false);

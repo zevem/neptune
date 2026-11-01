@@ -385,8 +385,10 @@ impl transport::Process for ReplicaProcess {
         self.link.exit.lock().clone()
     }
 
-    fn activity(&self, _: u32) -> ProcessActivity {
-        ProcessActivity::Unknown
+    /// The daemon's program runs on this host, under the process id the
+    /// daemon reported.
+    fn activity(&self, pid: u32) -> ProcessActivity {
+        transport::shell_activity(pid)
     }
 
     /// Close asks the daemon to end the session; detach only disconnects.

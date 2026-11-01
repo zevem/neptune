@@ -2650,6 +2650,7 @@ mod tests {
                         spawned_by: None,
                         project: None,
                         worktree: None,
+                        session: None,
                     }],
                     layout: neptune_model::Layout::pane(PaneId::new(*id)),
                     active: PaneId::new(*id),

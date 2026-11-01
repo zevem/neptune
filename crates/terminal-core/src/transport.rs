@@ -13,6 +13,8 @@ use platform::close_conpty;
 #[cfg(unix)]
 pub(super) use platform::poll_pty;
 pub(super) use platform::process_cwd;
+#[cfg(unix)]
+pub(super) use platform::shell_activity;
 
 /// One session's transport, split across the reader, writer and engine workers.
 pub(super) struct Transport {

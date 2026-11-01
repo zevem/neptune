@@ -886,6 +886,7 @@ mod tests {
             spawned_by: None,
             project: None,
             worktree: None,
+            session: None,
         });
         assert!(Model::restore(specs, None, true, Default::default()).is_err());
     }

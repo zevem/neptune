@@ -175,6 +175,7 @@ impl App {
                     let launch = crate::runtime::sessions::SessionLaunch {
                         terminal: options,
                         ssh_control: remote.is_some(),
+                        attach: None,
                         agent: if remote.is_none() {
                             crate::runtime::sessions::AgentLaunch::Local {
                                 resume: self
@@ -209,6 +210,55 @@ impl App {
                         self.ui.error = Some(format!("Pane {pane}: {error}"));
                     }
                 }
+                Effect::AttachSession {
+                    pane,
+                    generation,
+                    session,
+                } => {
+                    if !self.keep_sessions {
+                        // This launch doesn't keep sessions: the terminal
+                        // gets a new shell, and forgets the kept one.
+                        if let Some(start) = self.start_afresh(pane, generation) {
+                            self.execute(ctx, vec![start]);
+                        }
+                        continue;
+                    }
+                    self.renders.insert(pane, PaneRender::new(pane));
+                    let wake = ctx.clone();
+                    let launch = crate::runtime::sessions::SessionLaunch {
+                        // Only the size matters; the session keeps its program.
+                        terminal: session_options(
+                            &self.config,
+                            &self.ssh_client,
+                            default_cwd(),
+                            None,
+                            None,
+                        ),
+                        agent: crate::runtime::sessions::AgentLaunch::Disabled,
+                        ssh_control: false,
+                        attach: Some(session),
+                    };
+                    if let Err(error) = self.sessions.start(
+                        pane,
+                        generation,
+                        false,
+                        launch,
+                        Arc::new(move || wake.request_repaint_of(egui::ViewportId::ROOT)),
+                    ) {
+                        self.diagnostics
+                            .failure("attach", Some(pane), Some(generation), "Runtime");
+                        self.dispatch(
+                            ctx,
+                            Command::SessionFailed {
+                                pane,
+                                generation,
+                                error: error.clone(),
+                            },
+                        );
+                        self.ui.error = Some(format!("Pane {pane}: {error}"));
+                    }
+                }
+                Effect::DetachSession { pane, .. } => self.sessions.detach(pane),
                 Effect::StopSession { pane, .. } => {
                     self.browsers.close(pane);
                     self.desktop_notifier.cancel(pane);
@@ -261,6 +311,19 @@ impl App {
                 }
             }
         }
+    }
+    /// A new shell in a terminal's saved directory, as a launch that doesn't
+    /// keep sessions starts every terminal.
+    fn start_afresh(&self, pane: PaneId, generation: u64) -> Option<Effect> {
+        let item = self.controller.model().pane(pane)?;
+        Some(Effect::StartSession {
+            pane,
+            generation,
+            cwd: item.cwd().into(),
+            remote: self.remote_of(pane).cloned(),
+            remote_cwd: item.remote_cwd().map(Into::into),
+            replacement: false,
+        })
     }
     pub(super) fn save_state(&mut self) {
         if self.ephemeral || !self.state_writable {

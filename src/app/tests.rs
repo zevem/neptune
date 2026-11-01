@@ -46,6 +46,8 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         directory_check: None,
         folder_picker: Default::default(),
         ephemeral: true,
+        session_daemon: Some(crate::runtime::kept_sessions::directory(root)),
+        keep_sessions: false,
         preference_generation: 0,
         ime_composing: false,
         terminal_focus: None,
@@ -4753,4 +4755,146 @@ fn custom_keybindings_clipboard_uses_modifiers_at_the_event_even_if_released_in_
     .textures_delta
     .clear();
     assert_eq!(app.config.font_size, 15.0);
+}
+
+/// A session daemon for `root`'s data, on a thread of this test. It exits
+/// shortly after its last session and client are gone.
+#[cfg(unix)]
+fn session_daemon(root: &std::path::Path) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+    let dir = crate::runtime::kept_sessions::directory(root);
+    let serving = dir.clone();
+    let daemon = std::thread::spawn(move || {
+        terminal_core::daemon::run(
+            &serving,
+            terminal_core::daemon::DaemonOptions {
+                idle_exit: Duration::from_millis(200),
+            },
+        )
+        .unwrap()
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while terminal_core::daemon::DaemonClient::connect(&dir).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the session daemon never listened"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    (dir, daemon)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restoring_launch_reattaches_kept_sessions_and_quitting_leaves_them_running() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    // An earlier launch kept a session and saved the terminal that shows it.
+    let client = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let (session, id) = client
+        .start(
+            SessionOptions {
+                cwd: root.path().into(),
+                shell: Some("/bin/sh".into()),
+                args: vec!["-c".into(), "printf 'KEPT\\r\\n'; sleep 30".into()],
+                ..Default::default()
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+    drop(session);
+    let reference = neptune_model::SessionRef {
+        daemon: terminal_core::daemon::PROTOCOL_VERSION,
+        id: id.to_string(),
+    };
+    let mut earlier = Controller::new(Model::default());
+    earlier
+        .dispatch(Command::AddWorkspace {
+            group: None,
+            cwd: root.path().into(),
+            name: "Kept".into(),
+            remote: None,
+        })
+        .unwrap();
+    let pane = earlier.model().active_pane().unwrap();
+    earlier
+        .complete(neptune_model::Completion::Started {
+            pane,
+            generation: 1,
+            session: Some(reference.clone()),
+        })
+        .unwrap();
+    let saved = Model::restore(
+        earlier.model().specs(),
+        earlier.model().active_workspace(),
+        true,
+        Limits::default(),
+    )
+    .unwrap();
+
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    let config = Config {
+        keep_sessions_running: true,
+        confirm_close: false,
+        ..app.config.clone()
+    };
+    app.complete_startup(&ctx, loaded(config, saved));
+    // The startup command is never typed into a program that kept running.
+    assert_eq!(app.command_target, None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(app.controller.model().pane(pane).unwrap().lifecycle() == &Lifecycle::Running
+        && app
+            .sessions
+            .get(pane)
+            .is_some_and(|session| session.screen_text().contains("KEPT")))
+    {
+        assert!(Instant::now() < deadline, "the terminal never reattached");
+        app.poll(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        app.controller.model().pane(pane).unwrap().session(),
+        Some(&reference)
+    );
+    app.action(&ctx, Action::Quit);
+    assert_eq!(app.ui.overlay, OverlayState::None);
+    assert!(app.exit_approved);
+    eframe::App::on_exit(&mut app);
+    let listed = client.list().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (listed[0].id, &listed[0].status),
+        (id, &SessionStatus::Running)
+    );
+    client.close(id).unwrap();
+    drop(client);
+    drop(app);
+    daemon.join().unwrap();
+}
+
+#[test]
+fn only_a_restoring_launch_with_restore_on_keeps_sessions() {
+    for (restoring, restore, keep) in [
+        (true, true, true),
+        (false, true, true),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, _sender) = fixture(root.path());
+        if !restoring {
+            app.session_daemon = None;
+        }
+        let config = Config {
+            restore_workspaces: restore,
+            keep_sessions_running: keep,
+            ..app.config.clone()
+        };
+        app.complete_startup(&egui::Context::default(), loaded(config, Model::default()));
+        assert_eq!(
+            app.keep_sessions,
+            restoring && restore && keep,
+            "restoring: {restoring}, restore: {restore}, keep: {keep}"
+        );
+    }
 }

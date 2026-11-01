@@ -1,7 +1,7 @@
 use crate::{
     Axis, Edge, Error, Layout, Lifecycle, Model, Pane, PaneId, PaneKind, Project, ProjectId,
-    ProjectKey, Remote, SidebarItem, SplitId, Window, WindowId, Workspace, WorkspaceGroup,
-    WorkspaceGroupId, WorkspaceId,
+    ProjectKey, Remote, SessionRef, SidebarItem, SplitId, Window, WindowId, Workspace,
+    WorkspaceGroup, WorkspaceGroupId, WorkspaceId,
 };
 use std::path::PathBuf;
 
@@ -150,9 +150,13 @@ pub enum Command {
     AcknowledgeSave {
         generation: u64,
     },
+    /// A session started or was reattached. `session` names the kept session
+    /// it runs in, which the pane records so that a later launch reattaches
+    /// to it; `None` is a session that ends with Neptune.
     SessionStarted {
         pane: PaneId,
         generation: u64,
+        session: Option<SessionRef>,
     },
     SessionFailed {
         pane: PaneId,
@@ -258,7 +262,19 @@ pub enum Effect {
         remote_cwd: Option<PathBuf>,
         replacement: bool,
     },
+    /// Reattach a restored terminal to the kept session it showed.
+    AttachSession {
+        pane: PaneId,
+        generation: u64,
+        session: SessionRef,
+    },
+    /// Close a terminal's session.
     StopSession {
+        pane: PaneId,
+        generation: u64,
+    },
+    /// Let go of a kept session without ending it, as Neptune quits.
+    DetachSession {
         pane: PaneId,
         generation: u64,
     },
@@ -278,6 +294,8 @@ pub enum Completion {
     Started {
         pane: PaneId,
         generation: u64,
+        /// The kept session it started in or reattached to, if any.
+        session: Option<SessionRef>,
     },
     Failed {
         pane: PaneId,
@@ -334,6 +352,12 @@ impl Controller {
                             pane: pane.id,
                             generation: pane.generation,
                         }
+                    } else if let Some(session) = &pane.session {
+                        Effect::AttachSession {
+                            pane: pane.id,
+                            generation: pane.generation,
+                            session: session.clone(),
+                        }
                     } else {
                         Effect::StartSession {
                             pane: pane.id,
@@ -349,11 +373,33 @@ impl Controller {
             .collect()
     }
 
+    /// Quitting while sessions are kept: every terminal that shows a kept
+    /// session, or is reattaching to one, lets go of it. Closing a pane, tab
+    /// or workspace still stops its session.
+    pub fn exit_effects(&self) -> Vec<Effect> {
+        self.model
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.panes)
+            .filter(|pane| pane.session.is_some())
+            .map(|pane| Effect::DetachSession {
+                pane: pane.id,
+                generation: pane.generation,
+            })
+            .collect()
+    }
+
     pub fn complete(&mut self, completion: Completion) -> Result<Vec<Effect>, Error> {
         self.dispatch(match completion {
-            Completion::Started { pane, generation } => {
-                Command::SessionStarted { pane, generation }
-            }
+            Completion::Started {
+                pane,
+                generation,
+                session,
+            } => Command::SessionStarted {
+                pane,
+                generation,
+                session,
+            },
             Completion::Failed {
                 pane,
                 generation,
@@ -498,6 +544,7 @@ impl Controller {
                         spawned_by: None,
                         project: None,
                         worktree: None,
+                        session: None,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
                     }],
@@ -839,6 +886,7 @@ impl Controller {
                         pane.attachments.clear();
                         pane.spawned_by = None;
                         pane.worktree = None;
+                        pane.session = None;
                         effects.push(Effect::StopSession {
                             pane: pane.id,
                             generation: previous,
@@ -898,6 +946,7 @@ impl Controller {
                 dirty |= item.agent.take().is_some();
                 dirty |= item.spawned_by.take().is_some();
                 dirty |= item.project.take().is_some();
+                dirty |= item.session.take().is_some();
                 effects.push(Effect::StopSession {
                     pane,
                     generation: previous,
@@ -933,8 +982,22 @@ impl Controller {
                     self.saved_generation = self.saved_generation.max(generation);
                 }
             }
-            Command::SessionStarted { pane, generation } => {
-                self.lifecycle(pane, generation, Lifecycle::Running)
+            Command::SessionStarted {
+                pane,
+                generation,
+                session,
+            } => {
+                self.lifecycle(pane, generation, Lifecycle::Running);
+                // The terminal shows this session now; a new shell forgets
+                // the kept session it had.
+                if let Ok(item) = self.model.pane_mut(pane)
+                    && item.generation == generation
+                    && item.lifecycle == Lifecycle::Running
+                    && item.session != session
+                {
+                    item.session = session;
+                    dirty = true;
+                }
             }
             Command::SessionFailed {
                 pane,
@@ -947,6 +1010,7 @@ impl Controller {
                 {
                     dirty |= item.spawned_by.take().is_some();
                     dirty |= item.project.take().is_some();
+                    dirty |= item.session.take().is_some();
                     self.close_background(pane, &mut effects);
                 }
             }
@@ -962,6 +1026,8 @@ impl Controller {
                     dirty |= item.agent.take().is_some();
                     dirty |= item.spawned_by.take().is_some();
                     dirty |= item.project.take().is_some();
+                    // The daemon lets an exited session go once it was shown.
+                    dirty |= item.session.take().is_some();
                     self.close_background(pane, &mut effects);
                 }
             }
@@ -1065,6 +1131,7 @@ impl Controller {
                     spawned_by: Some(parent),
                     project: None,
                     worktree: None,
+                    session: None,
                     generation: 1,
                     lifecycle: Lifecycle::Starting,
                 });
@@ -1193,6 +1260,7 @@ impl Controller {
                     spawned_by: None,
                     project: Some(project),
                     worktree,
+                    session: None,
                     generation: 1,
                     lifecycle: Lifecycle::Starting,
                 });
@@ -1471,6 +1539,7 @@ impl Controller {
             spawned_by: None,
             project: None,
             worktree: None,
+            session: None,
             generation: 1,
             lifecycle: Lifecycle::Starting,
         });
@@ -1839,6 +1908,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane: browser,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         let effects = controller
@@ -1875,6 +1945,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane: browser,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         assert_eq!(
@@ -1930,6 +2001,7 @@ mod tests {
                         .complete(Completion::Started {
                             pane: *pane,
                             generation: *generation,
+                            session: None,
                         })
                         .unwrap();
                 }
@@ -2632,6 +2704,7 @@ mod tests {
             .complete(Completion::Started {
                 pane: second,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         assert_eq!(
@@ -3101,6 +3174,7 @@ mod tests {
             .complete(Completion::Started {
                 pane,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         assert_eq!(
@@ -3128,12 +3202,200 @@ mod tests {
             controller
                 .complete(Completion::Started {
                     pane,
-                    generation: 1
+                    generation: 1,
+                    session: None,
                 })
                 .unwrap()
                 .is_empty()
         );
         assert!(controller.model().pane(pane).is_none());
+    }
+
+    fn kept(id: &str) -> SessionRef {
+        SessionRef {
+            daemon: 1,
+            id: id.into(),
+        }
+    }
+
+    #[test]
+    fn restored_panes_attach_to_their_kept_sessions_and_the_others_start() {
+        let (mut controller, workspace, kept_pane) = setup();
+        let fresh = split(&mut controller, kept_pane, Axis::Vertical);
+        let saved = controller.generation();
+        controller
+            .complete(Completion::Started {
+                pane: kept_pane,
+                generation: 1,
+                session: Some(kept("00000000000000a1")),
+            })
+            .unwrap();
+        controller
+            .complete(Completion::Started {
+                pane: fresh,
+                generation: 1,
+                session: None,
+            })
+            .unwrap();
+        // The reference is saved once its session has started.
+        assert!(controller.generation() > saved);
+        assert_eq!(
+            controller.model().pane(kept_pane).unwrap().session(),
+            Some(&kept("00000000000000a1"))
+        );
+        let restored = Model::restore(
+            controller.model().specs(),
+            Some(workspace),
+            true,
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            Controller::new(restored).start_effects(),
+            vec![
+                Effect::AttachSession {
+                    pane: kept_pane,
+                    generation: 1,
+                    session: kept("00000000000000a1"),
+                },
+                Effect::StartSession {
+                    pane: fresh,
+                    generation: 1,
+                    cwd: PathBuf::from("/fake"),
+                    remote: None,
+                    remote_cwd: None,
+                    replacement: false,
+                },
+            ]
+        );
+    }
+
+    /// A controller restored with one terminal that shows a kept session.
+    fn reattaching() -> (Controller, PaneId) {
+        let (mut controller, workspace, pane) = setup();
+        controller
+            .complete(Completion::Started {
+                pane,
+                generation: 1,
+                session: Some(kept("00000000000000a1")),
+            })
+            .unwrap();
+        let restored = Model::restore(
+            controller.model().specs(),
+            Some(workspace),
+            true,
+            Limits::default(),
+        )
+        .unwrap();
+        (Controller::new(restored), pane)
+    }
+
+    #[test]
+    fn a_stale_attach_completion_cannot_restore_a_replaced_session() {
+        let (mut controller, pane) = reattaching();
+        let effects = controller.dispatch(Command::RestartPane(pane)).unwrap();
+        assert!(effects.contains(&Effect::StopSession {
+            pane,
+            generation: 1
+        }));
+        // The restarted terminal no longer shows the session it replaced.
+        assert_eq!(controller.model().pane(pane).unwrap().session(), None);
+        controller
+            .complete(Completion::Started {
+                pane,
+                generation: 1,
+                session: Some(kept("00000000000000a1")),
+            })
+            .unwrap();
+        let item = controller.model().pane(pane).unwrap();
+        assert_eq!(item.lifecycle(), &Lifecycle::Starting);
+        assert_eq!(item.session(), None);
+        controller
+            .complete(Completion::Started {
+                pane,
+                generation: 2,
+                session: Some(kept("00000000000000b2")),
+            })
+            .unwrap();
+        let item = controller.model().pane(pane).unwrap();
+        assert_eq!(item.lifecycle(), &Lifecycle::Running);
+        assert_eq!(item.session(), Some(&kept("00000000000000b2")));
+    }
+
+    #[test]
+    fn a_terminal_started_afresh_forgets_its_kept_session() {
+        let (mut controller, pane) = reattaching();
+        let saved = controller.generation();
+        controller
+            .complete(Completion::Started {
+                pane,
+                generation: 1,
+                session: None,
+            })
+            .unwrap();
+        assert_eq!(controller.model().pane(pane).unwrap().session(), None);
+        assert!(controller.generation() > saved);
+    }
+
+    #[test]
+    fn restoration_refuses_malformed_or_browser_session_references() {
+        let (controller, workspace, _) = setup();
+        let restore = |change: &dyn Fn(&mut PaneSpec)| {
+            let mut specs = controller.model().specs();
+            change(&mut specs[0].panes[0]);
+            Model::restore(specs, Some(workspace), true, Limits::default())
+        };
+        assert!(restore(&|pane| pane.session = Some(kept("00000000000000a1"))).is_ok());
+        assert!(restore(&|pane| pane.session = Some(kept("../socket"))).is_err());
+        assert!(restore(&|pane| pane.session = Some(kept(""))).is_err());
+        assert!(
+            restore(&|pane| {
+                pane.kind = PaneKind::Browser;
+                pane.session = Some(kept("00000000000000a1"));
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn quitting_detaches_kept_sessions_and_closing_stops_them() {
+        let (mut controller, kept_pane) = reattaching();
+        // Still reattaching when Neptune quits: the session is kept all the same.
+        assert_eq!(
+            controller.exit_effects(),
+            vec![Effect::DetachSession {
+                pane: kept_pane,
+                generation: 1
+            }]
+        );
+        controller
+            .complete(Completion::Started {
+                pane: kept_pane,
+                generation: 1,
+                session: Some(kept("00000000000000a1")),
+            })
+            .unwrap();
+        let local = split(&mut controller, kept_pane, Axis::Vertical);
+        controller
+            .complete(Completion::Started {
+                pane: local,
+                generation: 1,
+                session: None,
+            })
+            .unwrap();
+        assert_eq!(
+            controller.exit_effects(),
+            vec![Effect::DetachSession {
+                pane: kept_pane,
+                generation: 1
+            }]
+        );
+        let effects = controller.dispatch(Command::ClosePane(kept_pane)).unwrap();
+        assert!(effects.contains(&Effect::StopSession {
+            pane: kept_pane,
+            generation: 1
+        }));
+        assert!(controller.exit_effects().is_empty());
     }
 
     #[test]
@@ -3402,6 +3664,7 @@ mod tests {
                 .complete(Completion::Started {
                     pane,
                     generation: 1,
+                    session: None,
                 })
                 .unwrap();
         }
@@ -3593,6 +3856,7 @@ mod tests {
                     spawned_by: None,
                     project: None,
                     worktree: None,
+                    session: None,
                 },
                 PaneSpec {
                     id: PaneId::new(2),
@@ -3605,6 +3869,7 @@ mod tests {
                     spawned_by: None,
                     project: None,
                     worktree: None,
+                    session: None,
                 },
             ],
             layout: Layout::pane(PaneId::new(1)),
