@@ -332,9 +332,20 @@ fn ssh(
     }
 }
 
-/// Title, consequence and confirming verb for each close target.
-pub fn close_copy(close: Close) -> (&'static str, &'static str, &'static str) {
+/// Title, consequence and confirming verb for each close target. Quitting,
+/// or closing the last window, `detaches` while terminals are kept running.
+pub fn close_copy(close: Close, detaches: bool) -> (&'static str, &'static str, &'static str) {
     match close {
+        Close::App if detaches => (
+            "Quit Neptune?",
+            "Terminals keep running and reopen where you left them.",
+            "Quit",
+        ),
+        Close::Window(_) if detaches => (
+            "Close window?",
+            "Neptune quits. Terminals keep running and reopen where you left them.",
+            "Close",
+        ),
         Close::Pane(_) => (
             "Close terminal?",
             "Any process running in this terminal will stop.",
@@ -360,15 +371,23 @@ pub fn close_copy(close: Close) -> (&'static str, &'static str, &'static str) {
             "Running processes in all terminals will stop. Workspaces reopen with fresh shells.",
             "Quit",
         ),
+        Close::AllSessions => (
+            "End all sessions and quit?",
+            "Every terminal will close, including those kept running, and running processes will stop. Workspaces reopen with fresh shells.",
+            "End all and quit",
+        ),
     }
 }
 
+// Each close fact is read separately from the overlay state.
+#[allow(clippy::too_many_arguments)]
 fn confirm_close(
     ctx: &egui::Context,
     p: Palette,
     close: Close,
     status: CloseStatus,
     browser: bool,
+    detaches: bool,
     actions: &mut Vec<Action>,
 ) {
     let (title, consequence, verb) = if browser && matches!(close, Close::Pane(_)) {
@@ -378,7 +397,7 @@ fn confirm_close(
             "Close",
         )
     } else {
-        close_copy(close)
+        close_copy(close, detaches)
     };
     let message = match status {
         CloseStatus::General => consequence.to_owned(),
@@ -397,6 +416,10 @@ fn confirm_close(
                 format!("Processes are still running in {terminals} terminals.")
             };
             let consequence = match close {
+                // Only terminals not kept running were checked.
+                Close::App | Close::Window(_) if detaches => {
+                    "Quitting will stop the processes there. Other terminals keep running and reopen where you left them."
+                }
                 Close::Pane(_) => "Closing this terminal will stop the process.",
                 Close::Workspace(_) => {
                     "Closing this workspace will close its terminals and stop their processes."
@@ -407,7 +430,7 @@ fn confirm_close(
                 Close::Connection(_) => {
                     "Disconnecting will stop these connections and restart the terminals as local shells."
                 }
-                Close::App => {
+                Close::App | Close::AllSessions => {
                     "Quitting will stop running processes. Workspaces reopen with fresh shells."
                 }
             };
@@ -622,6 +645,7 @@ pub fn show(ctx: &egui::Context, p: Palette, state: &mut UiState, actions: &mut 
             close,
             state.close_status,
             state.close_browser,
+            state.close_detaches,
             actions,
         ),
         OverlayState::NewWorktree(_) => {
@@ -714,7 +738,7 @@ mod tests {
                     frame(&mut state);
                 }
                 assert!(frame(&mut state).iter().any(|shape| {
-                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == close_copy(close).0)
+                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == close_copy(close, false).0)
                 }), "{close:?}: {status:?}");
                 assert!(actions.is_empty());
             }
@@ -1013,13 +1037,74 @@ mod tests {
         );
     }
 
+    /// Every line of text the confirmation sheet for `close` shows.
+    fn sheet_text(close: Close, status: CloseStatus, detaches: bool) -> String {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        let config = crate::config::Config::default();
+        theme::apply(&ctx, &config);
+        let p = Palette::for_config(&config);
+        let mut state = UiState {
+            overlay: OverlayState::ConfirmClose(close),
+            close_status: status,
+            close_detaches: detaches,
+            ..UiState::default()
+        };
+        let mut text = String::new();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(640.0, 480.0))),
+                    ..Default::default()
+                },
+                |ui| show(ui.ctx(), p, &mut state, &mut Vec::new()),
+            );
+            output.textures_delta.clear();
+            text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        text
+    }
+
+    #[test]
+    fn quitting_while_terminals_are_kept_running_says_they_keep_running() {
+        for close in [Close::App, Close::Window(WindowId::new(2))] {
+            let general = sheet_text(close, CloseStatus::General, true);
+            assert!(general.contains("keep running"), "{close:?}: {general}");
+            assert!(!general.contains("fresh shells"), "{close:?}: {general}");
+            assert!(!general.contains("will stop"), "{close:?}: {general}");
+            // Only a terminal not kept running is checked, and only it stops.
+            let running = CloseStatus::Running {
+                terminals: 1,
+                unknown: 0,
+            };
+            let running = sheet_text(close, running, true);
+            assert!(running.contains("keep running"), "{close:?}: {running}");
+            assert!(!running.contains("fresh shells"), "{close:?}: {running}");
+        }
+        // Without kept sessions, quitting still says what it always did.
+        let quit = sheet_text(Close::App, CloseStatus::General, false);
+        assert!(quit.contains("fresh shells"), "{quit}");
+        // Ending all sessions never keeps one running.
+        let end = sheet_text(Close::AllSessions, CloseStatus::General, false);
+        assert!(end.contains("End all sessions and quit?"), "{end}");
+        assert!(end.contains("fresh shells"), "{end}");
+    }
+
     #[test]
     fn each_close_target_names_its_own_consequence() {
-        let pane = close_copy(Close::Pane(PaneId::new(1)));
-        let workspace = close_copy(Close::Workspace(WorkspaceId::new(1)));
-        let window = close_copy(Close::Window(WindowId::new(2)));
-        let app = close_copy(Close::App);
-        let connection = close_copy(Close::Connection(WorkspaceId::new(1)));
+        let pane = close_copy(Close::Pane(PaneId::new(1)), false);
+        let workspace = close_copy(Close::Workspace(WorkspaceId::new(1)), false);
+        let window = close_copy(Close::Window(WindowId::new(2)), false);
+        let app = close_copy(Close::App, false);
+        let connection = close_copy(Close::Connection(WorkspaceId::new(1)), false);
         assert_eq!(pane.0, "Close terminal?");
         assert_ne!(pane.0, workspace.0);
         assert_eq!(window.0, "Close window?");

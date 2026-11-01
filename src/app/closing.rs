@@ -92,6 +92,7 @@ impl App {
             unknown: usize::from(self.startup.is_some()),
         };
         let detaches = self.detaches(target);
+        self.ui.close_detaches = detaches;
         if self.config.warn_running_processes {
             for &(pane, generation) in &pending.panes {
                 if self.controller.model().pane(pane).is_some_and(|p| {
@@ -199,7 +200,8 @@ impl App {
         self.pending_close = None;
         self.ui.overlay = OverlayState::None;
         match target {
-            Close::App => {
+            Close::App | Close::AllSessions => {
+                self.end_sessions = target == Close::AllSessions;
                 self.exit_approved = true;
                 // Quit can be requested from any window. Closing a child
                 // viewport alone would leave the application running.
@@ -287,7 +289,7 @@ mod tests {
     fn has_close_sheet(shapes: &[egui::epaint::ClippedShape], target: Close) -> bool {
         shapes.iter().any(|shape| {
             matches!(&shape.shape, egui::Shape::Text(text)
-                if text.galley.text() == ui::dialogs::close_copy(target).0)
+                if text.galley.text() == ui::dialogs::close_copy(target, false).0)
         })
     }
 
@@ -536,6 +538,73 @@ mod tests {
                 assert_eq!(app.exit_approved, detaches);
             }
         }
+    }
+
+    #[test]
+    fn turning_kept_sessions_off_applies_at_once_but_turning_them_on_waits_for_the_next_launch() {
+        // (this launch keeps sessions, the setting after the change)
+        for (launched, now) in [(true, false), (false, true)] {
+            let (mut app, ctx, _root, pane) = setup();
+            app.config.confirm_close = false;
+            app.config.keep_sessions_running = launched;
+            app.keep_sessions = launched;
+            app.controller
+                .dispatch(Command::SessionStarted {
+                    pane,
+                    generation: 1,
+                    session: launched.then(|| neptune_model::SessionRef {
+                        daemon: 1,
+                        id: "00000000000000a1".into(),
+                    }),
+                })
+                .unwrap();
+            let config = Config {
+                keep_sessions_running: now,
+                ..app.config.clone()
+            };
+            app.action(&ctx, Action::Preferences(Box::new(config)));
+            assert_eq!(app.config.keep_sessions_running, now);
+            // This quit ends the terminal, so it still warns.
+            app.action(&ctx, Action::Quit);
+            assert_eq!(
+                app.ui.overlay,
+                OverlayState::ConfirmClose(Close::App),
+                "launched keeping: {launched}"
+            );
+            assert!(!app.ui.close_detaches);
+            assert!(!app.exit_approved);
+        }
+    }
+
+    #[test]
+    fn ending_all_sessions_warns_even_while_quitting_would_keep_them() {
+        let (mut app, ctx, _root, pane) = setup();
+        app.config.confirm_close = false;
+        app.config.keep_sessions_running = true;
+        app.keep_sessions = true;
+        app.controller
+            .dispatch(Command::SessionStarted {
+                pane,
+                generation: 1,
+                session: Some(neptune_model::SessionRef {
+                    daemon: 1,
+                    id: "00000000000000a1".into(),
+                }),
+            })
+            .unwrap();
+        app.action(&ctx, Action::EndAllSessions);
+        assert_eq!(
+            app.ui.overlay,
+            OverlayState::ConfirmClose(Close::AllSessions)
+        );
+        assert!(!app.ui.close_detaches);
+        assert!(!app.exit_approved);
+        app.action(&ctx, Action::CancelClose);
+        assert!(!app.exit_approved);
+        // A plain quit keeps it running, so it doesn't ask.
+        app.action(&ctx, Action::Quit);
+        assert_eq!(app.ui.overlay, OverlayState::None);
+        assert!(app.exit_approved);
     }
 
     #[test]

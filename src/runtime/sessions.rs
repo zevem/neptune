@@ -598,6 +598,11 @@ impl SessionManager {
             .set_scrollback(target_history)
             .map_err(|error| error.to_string())
     }
+    /// End every kept session, those no terminal shows included. Only a
+    /// running session daemon is asked; none is launched for it.
+    pub fn end_kept(&self) -> Result<(), String> {
+        self.kept.as_ref().map_or(Ok(()), |kept| kept.end_all())
+    }
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
         let ids: Vec<_> = self.desired.keys().copied().collect();
         for id in ids {

@@ -63,12 +63,15 @@ running processes. Other windows keep working. **Quit Neptune** in the palette
 quits all windows and checks every terminal. Closing the last visible window
 also quits Neptune. Quitting retains the organization for the next launch;
 closing a workspace or a window while others remain removes its workspaces from
-the saved organization. All windows share Neptune's session and resource limits.
+the saved organization and ends its terminals' sessions. All windows share
+Neptune's session and resource limits.
 
 With workspace restoration enabled, Neptune reopens the saved windows,
 workspaces, tabs and splits with fresh shells in their remembered directories.
-Live processes and terminal contents are not restored. Settings and themes are
-shared by every window. See [storage and restoration](#storage-and-restoration).
+Live processes and terminal contents are not restored, unless
+[terminals are kept running after quit](#keeping-terminals-running-after-quit).
+Settings and themes are shared by every window. See
+[storage and restoration](#storage-and-restoration).
 
 ## Workspace groups
 
@@ -216,7 +219,11 @@ switch is off. They apply to terminals, whole workspaces, SSH disconnects and
 closing windows and quitting Neptune, including terminals in hidden workspaces. One confirmation
 covers the whole action; Cancel preserves the sessions. Process checks do not
 show a dialog or dim the window until confirmation is needed; Escape can cancel
-a pending check.
+a pending check. While
+[terminals are kept running after quit](#keeping-terminals-running-after-quit),
+quitting and closing the last window don't warn about them, because their
+processes keep running; **End all sessions and quit** warns as quitting
+otherwise does.
 
 The process check runs on session workers only when closing is requested. It
 uses OS metadata rather than terminal titles or output, detects foreground,
@@ -381,7 +388,7 @@ neptune --help
 
 ## Preferences and themes
 
-[config.example.toml](../config.example.toml) documents the supported settings: 715 themes shared by the window and terminal, custom themes, light and dark mode themes that follow the system, window zoom, terminal font family, font size and line height, scrollback limit, shell executable and arguments, [custom keybindings](#custom-keybindings), cursor style/blink, sidebar width, workspace restoration, and the two independent close warnings. Window zoom is available in Preferences under Appearance; changes there or through zoom shortcuts are saved and restored on the next launch, including with workspace restoration disabled. Settings are validated; unknown keys are rejected. Workspace restoration restores directories, split positions, and focused panes, and launches fresh shell processes; a remote workspace opens new SSH connections to its host. Recognized coding agents can resume their provider-owned conversations through saved session references; arbitrary commands and process memory are never serialized.
+[config.example.toml](../config.example.toml) documents the supported settings: 715 themes shared by the window and terminal, custom themes, light and dark mode themes that follow the system, window zoom, terminal font family, font size and line height, scrollback limit, shell executable and arguments, [custom keybindings](#custom-keybindings), cursor style/blink, sidebar width, workspace restoration, keeping terminals running after quit, and the two independent close warnings. Window zoom is available in Preferences under Appearance; changes there or through zoom shortcuts are saved and restored on the next launch, including with workspace restoration disabled. Settings are validated; unknown keys are rejected. Workspace restoration restores directories, split positions, and focused panes, and launches fresh shell processes unless terminals were kept running; a remote workspace opens new SSH connections to its host. Recognized coding agents can resume their provider-owned conversations through saved session references; arbitrary commands and process memory are never serialized.
 
 Preferences → Shell lists the shells found on this computer, as Windows Terminal lists profiles. On Windows it offers Command Prompt, Windows PowerShell, PowerShell 7, WSL distributions, Git Bash, Visual Studio developer prompts and Windows Terminal profiles that have their own command line (such as the Anaconda prompts). On macOS and Linux it offers the shells in `/etc/shells` and common shells on `PATH` or in Homebrew. **System default** keeps the platform's own startup, including a login shell on macOS and Linux; **Custom…** takes any program. A new choice applies to new terminals.
 
@@ -450,6 +457,34 @@ Restoration reopens windows with fresh shells; it does not restore running
 processes or monitor placement. Damaged organization is copied aside before it
 can be replaced, and an unreadable or unsupported future schema remains
 protected from writes.
+
+### Keeping terminals running after quit
+
+On macOS and Linux, **Preferences → General → Keep terminals running after
+quit** (`keep_sessions_running`, off by default) keeps each terminal's shell and
+programs running when Neptune quits, closes its last window or crashes. They run
+in a session daemon, a background Neptune process for the data directory, and
+the next launch reattaches each terminal to its session: its screen, scrollback,
+full-screen program, title and directory are as they are now, including output
+produced while Neptune was closed. Sessions end when you log out or restart your
+computer; Neptune then restores the workspaces with fresh shells. The setting
+needs workspace restoration, so it is unavailable while **Restore workspaces on
+launch** is off, and Windows doesn't offer it yet.
+
+Quitting and closing the last window don't warn about running processes in
+these terminals, because they keep running. Closing a terminal, tab, workspace
+or one of several windows still ends its sessions, with the usual
+confirmations. **End all sessions and quit**, in the command palette and in the
+**More actions** menu of a narrow window, ends every session, including any the
+session daemon keeps that no terminal shows, after the usual running-process
+warning. The workspaces then reopen with fresh shells.
+
+Turning the setting off takes effect at once: the next quit ends every session,
+with the usual warning. Turning it on applies from the next launch, which
+Preferences notes; until then, quitting still ends the terminals. Launches that
+don't restore workspaces (`--no-restore`, `--cwd`, `--ssh` and `--screenshot`)
+neither keep nor reattach sessions. Terminal contents stay in memory; Neptune
+never writes them to disk.
 
 Neptune also remembers the main window's size and maximized state when closed. Window state is saved as `window.json` in the data directory, independently of workspace restoration; `--no-restore` and `restore_workspaces = false` only affect workspaces and their window organization. Restored extra windows use the remembered normal size; the operating system places them. Use `--size WIDTHxHEIGHT` to override the saved geometry and start with a non-maximized window. Screenshot launches use the default or explicit size and do not save window state.
 
