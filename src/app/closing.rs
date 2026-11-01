@@ -94,9 +94,12 @@ impl App {
         let detaches = self.detaches(target);
         if self.config.warn_running_processes {
             for &(pane, generation) in &pending.panes {
+                // An ended terminal has nothing to stop, even when its handle
+                // remains, as one does whose session daemon went away.
                 if self.controller.model().pane(pane).is_some_and(|p| {
                     p.kind() == neptune_model::PaneKind::Browser
                         || (detaches && p.session().is_some())
+                        || matches!(p.lifecycle(), Lifecycle::Exited | Lifecycle::Failed(_))
                 }) {
                     continue;
                 }
@@ -496,6 +499,52 @@ mod tests {
             assert!(app.controller.model().pane(pane).is_none());
             assert_eq!(app.ui.overlay, OverlayState::None);
         }
+    }
+
+    /// A kept session whose session daemon went away still has its handle,
+    /// whose engine has stopped and answers no process check. Its terminal
+    /// shows "Session ended unexpectedly" and has nothing left to stop.
+    #[cfg(unix)]
+    #[test]
+    fn close_skips_terminals_that_ended_even_while_their_handle_remains() {
+        let (mut app, ctx, root, pane) = setup();
+        app.config.confirm_close = false;
+        app.sessions
+            .start(
+                pane,
+                1,
+                false,
+                terminal_core::SessionOptions {
+                    cwd: root.path().into(),
+                    shell: Some("/bin/sh".into()),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    ..Default::default()
+                },
+                std::sync::Arc::new(|| {}),
+            )
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.sessions.get(pane).is_none() {
+            assert!(Instant::now() < deadline, "the session never started");
+            app.sessions.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for command in [
+            Command::SessionStarted {
+                pane,
+                generation: 1,
+                session: None,
+            },
+            Command::SessionExited {
+                pane,
+                generation: 1,
+            },
+        ] {
+            app.controller.dispatch(command).unwrap();
+        }
+        app.request_close(&ctx, Close::Pane(pane));
+        assert_eq!(app.ui.overlay, OverlayState::None);
+        assert!(app.controller.model().pane(pane).is_none());
     }
 
     #[test]
