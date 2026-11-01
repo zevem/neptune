@@ -217,7 +217,7 @@ impl Daemon {
         }
     }
 
-    /// An ended session is released once a client has received its end.
+    /// An ended session is released once a client has taken its end.
     fn release(&self, hosted: &Arc<Hosted>) {
         let mut sessions = self.sessions.lock();
         if sessions
@@ -337,10 +337,15 @@ impl Daemon {
         size: Option<(u16, u16)>,
     ) {
         let session = &hosted.session;
-        if let Some((cols, rows)) = size {
+        // An ended session keeps its final size: its terminal is gone, also
+        // when its program ends just as it is resized.
+        if let Some((cols, rows)) = size
+            && session.metadata().status == SessionStatus::Running
+        {
             let current = *session.shared.size.lock();
             if (current.cols, current.rows) != (cols, rows)
                 && let Err(error) = session.resize(cols, rows, 0, 0)
+                && error.kind() != SessionErrorKind::Closed
             {
                 let _ = send(&mut stream, &failed(error));
                 return;
@@ -394,9 +399,13 @@ impl Daemon {
             let result = match tap.next() {
                 Tapped::Bytes(bytes) => send(&mut stream, &Reply::Output(bytes)),
                 Tapped::Ended => {
+                    // The session stays until the client says it took the
+                    // end: one that is leaving may never show it. Its input
+                    // thread hears that, or the connection closing.
                     let exit = exit_of(&hosted.session.metadata().status);
                     if send(&mut stream, &Reply::Ended(exit)).is_ok() {
-                        self.release(hosted);
+                        hosted.session.shared.output_tap.lock().unsubscribe(tap);
+                        return;
                     }
                     break;
                 }
@@ -414,7 +423,7 @@ impl Daemon {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 
-    fn forward_input(&self, stream: &mut UnixStream, hosted: &Hosted) {
+    fn forward_input(&self, stream: &mut UnixStream, hosted: &Arc<Hosted>) {
         let session = &hosted.session;
         loop {
             let request = match protocol::read_frame(stream, MAX_CLIENT_FRAME)
@@ -443,6 +452,12 @@ impl Daemon {
                 Request::Focus(focused) => session.focus(focused),
                 Request::End => {
                     self.close(hosted.id);
+                    return;
+                }
+                Request::Taken => {
+                    if exit_of(&session.metadata().status).is_some() {
+                        self.release(hosted);
+                    }
                     return;
                 }
                 _ => {

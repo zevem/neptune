@@ -93,6 +93,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
 
 fn loaded(config: Config, model: Model) -> Startup {
     Startup {
+        live: None,
         config,
         report: LoadReport {
             model: Some(model),
@@ -2711,6 +2712,7 @@ fn remote_directories_survive_shutdown_and_restoration_per_terminal() {
             config: app.config.clone(),
             report,
             error: None,
+            live: None,
         },
     );
     wait_for_directory(&mut reopened, first, &project);
@@ -4580,6 +4582,7 @@ fn custom_keybindings_invalid_config_cannot_be_overwritten_by_preferences() {
                 migrated: false,
             },
             error: Some(format!("{error:#}")),
+            live: None,
         },
     );
     app.action(
@@ -4898,6 +4901,222 @@ fn only_a_restoring_launch_with_restore_on_keeps_sessions() {
             "restoring: {restoring}, restore: {restore}, keep: {keep}"
         );
     }
+}
+
+/// A launch whose earlier one kept `kept` in the panes of one workspace.
+#[cfg(unix)]
+fn kept_panes(root: &std::path::Path, kept: &[&neptune_model::SessionRef]) -> (Model, Vec<PaneId>) {
+    let mut earlier = Controller::new(Model::default());
+    earlier
+        .dispatch(Command::AddWorkspace {
+            group: None,
+            cwd: root.into(),
+            name: "Kept".into(),
+            remote: None,
+        })
+        .unwrap();
+    let mut panes = vec![earlier.model().active_pane().unwrap()];
+    while panes.len() < kept.len() {
+        let workspace = earlier.model().active_workspace().unwrap();
+        earlier
+            .dispatch(Command::SplitPane {
+                workspace,
+                pane: panes[0],
+                axis: neptune_model::Axis::Vertical,
+                cwd: root.into(),
+            })
+            .unwrap();
+        panes.push(earlier.model().active_pane().unwrap());
+    }
+    for (pane, reference) in panes.iter().zip(kept) {
+        earlier
+            .complete(neptune_model::Completion::Started {
+                pane: *pane,
+                generation: 1,
+                session: Some((*reference).clone()),
+            })
+            .unwrap();
+    }
+    let saved = Model::restore(
+        earlier.model().specs(),
+        earlier.model().active_workspace(),
+        true,
+        Limits::default(),
+    )
+    .unwrap();
+    (saved, panes)
+}
+
+#[cfg(unix)]
+fn kept_session(
+    client: &terminal_core::daemon::DaemonClient,
+    root: &std::path::Path,
+    text: &str,
+) -> neptune_model::SessionRef {
+    let (session, id) = client
+        .start(
+            SessionOptions {
+                cwd: root.into(),
+                shell: Some("/bin/sh".into()),
+                args: vec!["-c".into(), format!("printf '{text}\\r\\n'; sleep 30")],
+                ..Default::default()
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+    drop(session);
+    neptune_model::SessionRef {
+        daemon: terminal_core::daemon::PROTOCOL_VERSION,
+        id: id.to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn keeping(app: &App) -> Config {
+    Config {
+        keep_sessions_running: true,
+        confirm_close: false,
+        ..app.config.clone()
+    }
+}
+
+#[cfg(unix)]
+#[track_caller]
+fn poll_until(app: &mut App, ctx: &egui::Context, mut done: impl FnMut(&App) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(app) {
+        assert!(Instant::now() < deadline, "condition timed out");
+        app.poll(ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn shows(app: &App, pane: PaneId, text: &str) -> bool {
+    app.controller.model().pane(pane).unwrap().lifecycle() == &Lifecycle::Running
+        && app
+            .sessions
+            .get(pane)
+            .is_some_and(|session| session.screen_text().contains(text))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restoring_launch_reattaches_restores_lost_sessions_and_adopts_recovered_ones() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let client = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let alive = kept_session(&client, root.path(), "ALIVE");
+    let stray = kept_session(&client, root.path(), "STRAY");
+    // A session the daemon no longer has.
+    let gone = neptune_model::SessionRef {
+        daemon: terminal_core::daemon::PROTOCOL_VERSION,
+        id: "00000000000000a1".into(),
+    };
+    let (saved, panes) = kept_panes(root.path(), &[&alive, &gone]);
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    let startup = Startup {
+        live: crate::runtime::kept_sessions::live(&dir),
+        ..loaded(keeping(&app), saved)
+    };
+    let error = app.ui.error.clone();
+    app.complete_startup(&ctx, startup);
+    // One notice says the lost session was restored; it is no error.
+    assert!(
+        app.ui
+            .notice
+            .as_ref()
+            .is_some_and(|(said, _)| said.contains("restored")),
+        "{:?}",
+        app.ui.notice
+    );
+    assert_eq!(app.ui.error, error);
+    // The lost terminal forgot its session and starts afresh.
+    assert_eq!(
+        app.controller.model().pane(panes[1]).unwrap().session(),
+        None
+    );
+    // The stray session is a tab of its own workspace.
+    let recovered = app.controller.model().workspaces().last().unwrap();
+    assert_eq!(recovered.name(), "Recovered sessions");
+    let adopted = recovered.panes()[0].id();
+    assert_eq!(recovered.panes()[0].session(), Some(&stray));
+    // The kept terminal is still the one in view.
+    assert_eq!(app.controller.model().active_pane(), Some(panes[1]));
+    poll_until(&mut app, &ctx, |app| {
+        shows(app, panes[0], "ALIVE") && shows(app, adopted, "STRAY")
+    });
+
+    app.action(&ctx, Action::Quit);
+    eframe::App::on_exit(&mut app);
+    let mut listed: Vec<_> = client
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id.to_string())
+        .collect();
+    listed.sort();
+    let mut kept = vec![alive.id.clone(), stray.id.clone()];
+    kept.sort();
+    // Quitting kept both; the fresh shell in the fixture never started.
+    assert_eq!(listed, kept);
+    for entry in client.list().unwrap() {
+        client.close(entry.id).unwrap();
+    }
+    drop(client);
+    drop(app);
+    daemon.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reattach_that_fails_restores_the_terminal_with_one_notice() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let gone = |id: &str| neptune_model::SessionRef {
+        daemon: terminal_core::daemon::PROTOCOL_VERSION,
+        id: id.into(),
+    };
+    let (saved, panes) = kept_panes(
+        root.path(),
+        &[&gone("00000000000000a1"), &gone("00000000000000b2")],
+    );
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    // The daemon couldn't be listed, so every terminal tries to reattach.
+    let error = app.ui.error.clone();
+    app.complete_startup(&ctx, loaded(keeping(&app), saved));
+    assert_eq!(app.ui.notice, None);
+    poll_until(&mut app, &ctx, |app| {
+        panes.iter().all(|pane| {
+            app.controller
+                .model()
+                .pane(*pane)
+                .unwrap()
+                .session()
+                .is_none()
+        })
+    });
+    assert!(
+        app.ui
+            .notice
+            .as_ref()
+            .is_some_and(|(said, _)| said.contains("restored"))
+    );
+    // Restored, not failed: the terminals start afresh, and only the fresh
+    // shell, which this fixture can't start, reports an error.
+    assert!(
+        app.ui
+            .error
+            .as_ref()
+            .is_none_or(|error| !error.contains("session daemon")),
+        "{:?} (was {error:?})",
+        app.ui.error
+    );
+    drop(app);
+    let _ = dir;
+    daemon.join().unwrap();
 }
 
 /// A launch that keeps sessions, reattached to `count` terminals that an

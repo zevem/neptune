@@ -57,6 +57,10 @@ struct Startup {
     config: Config,
     report: LoadReport,
     error: Option<String>,
+    /// The sessions running in the session daemon, listed for a launch that
+    /// keeps sessions. `None` when they couldn't be listed: every terminal
+    /// then tries to reattach, and one that can't is restored.
+    live: Option<Vec<neptune_model::SessionRef>>,
 }
 struct ActiveSearch {
     pane: PaneId,
@@ -195,9 +199,12 @@ impl App {
         let ephemeral = launch.screenshot.is_some();
         let restore =
             !launch.no_restore && launch.cwd.is_none() && launch.ssh.is_none() && !ephemeral;
+        let session_daemon =
+            (restore && cfg!(unix)).then(|| crate::runtime::kept_sessions::directory(&data));
         let (sender, startup) = mpsc::sync_channel(1);
         let settings = config_path.clone();
         let state = state_path.clone();
+        let kept = session_daemon.clone();
         let wake = cc.egui_ctx.clone();
         let thread_result = std::thread::Builder::new()
             .name("neptune-restore".into())
@@ -216,10 +223,16 @@ impl App {
                         migrated: false,
                     }
                 };
+                // Which kept sessions survived, so that each terminal is
+                // reattached or restored, and strays are recovered.
+                let live = kept
+                    .filter(|_| config.restore_workspaces && config.keep_sessions_running)
+                    .and_then(|dir| crate::runtime::kept_sessions::live(&dir));
                 let _ = sender.send(Startup {
                     config,
                     report,
                     error,
+                    live,
                 });
                 wake.request_repaint();
             });
@@ -278,8 +291,7 @@ impl App {
             directory_check: None,
             folder_picker: crate::platform::folders::Picker::new(cc),
             ephemeral,
-            session_daemon: (restore && cfg!(unix))
-                .then(|| crate::runtime::kept_sessions::directory(&data)),
+            session_daemon,
             keep_sessions: false,
             end_sessions: false,
             preference_generation: 0,
@@ -385,6 +397,7 @@ impl App {
                         migrated: false,
                     },
                     error: Some("Restoration worker stopped before returning state".into()),
+                    live: None,
                 }),
                 Err(mpsc::TryRecvError::Empty) => None,
             });
@@ -428,6 +441,13 @@ impl App {
                     generation,
                     message,
                 } => {
+                    if self.reattaching(pane, generation) {
+                        // Its kept session is gone: restore the terminal.
+                        self.diagnostics
+                            .failure("attach", Some(pane), Some(generation), "Attach");
+                        self.dispatch(ctx, Command::SessionLost { pane, generation });
+                        continue;
+                    }
                     self.diagnostics
                         .failure("spawn", Some(pane), Some(generation), "Spawn");
                     self.dispatch(
@@ -668,7 +688,7 @@ impl App {
                 self.ui.error = Some(format!("Persistence worker: {error}"));
             }
         }
-        self.execute(ctx, self.controller.start_effects());
+        self.reattach(ctx, startup.live);
         if self.controller.model().workspaces().is_empty() {
             let cwd = self.initial_cwd.take().unwrap_or_else(default_cwd);
             let remote = self.initial_remote.take();

@@ -393,14 +393,22 @@ impl transport::Process for ReplicaProcess {
         transport::shell_activity(pid)
     }
 
-    /// Close asks the daemon to end the session; detach only disconnects.
+    /// Close asks the daemon to end the session, and a reported exit is
+    /// taken, so the daemon lets the session go. Detach only disconnects: a
+    /// handle dropped as its program exits leaves the exit to the next client.
     fn release(&mut self, shared: &Arc<Shared>) {
-        let running = self.link.exit.lock().is_none() && !self.link.lost.load(Ordering::Acquire);
-        if running
+        let request = if self.link.lost.load(Ordering::Acquire) {
+            None
+        } else if self.link.exit.lock().is_some() {
+            Some(Request::Taken)
+        } else {
+            Some(Request::End)
+        };
+        if let Some(request) = request
             && !shared.detached.load(Ordering::Acquire)
             && let Some(mut writer) = self.writer.try_lock_for(Duration::from_secs(1))
         {
-            let _ = send_frame(&mut writer, &Request::End);
+            let _ = send_frame(&mut writer, &request);
         }
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
