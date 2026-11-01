@@ -10,10 +10,15 @@
   hidden panes keep processing output. Quiet terminals sleep between events and
   cursor deadlines.
 - **Correct state and recoverable work.** Preserve terminal input, output and
-  history through resize and lifecycle changes. Workspace restoration retains
-  organization and directories and starts fresh shells; it does not restore live
-  processes or serialize commands/process memory. Protect damaged or unsupported
-  saved state before allowing replacement.
+  history through resize and lifecycle changes. With Keep terminals running
+  after quit on, quitting, closing the last window, a crash or an update
+  detaches, and the next launch reattaches through the session daemon
+  ([ADR 0001](docs/adr/0001-sessions-outlive-neptune-in-a-session-daemon.md)).
+  Closing a pane, tab, workspace or one of several windows still ends its
+  sessions. When no session survived, as after a logout or reboot, restoration
+  retains organization and directories and starts fresh shells. Never
+  serialize commands or process memory, or write terminal contents to disk.
+  Protect damaged or unsupported saved state before allowing replacement.
 - **Honest evidence and private contents.** Diagnostics exclude terminal contents
   and input. Platform support and performance claims require evidence from the
   actual host/build; dependencies, configured CI jobs and parser benchmarks alone
