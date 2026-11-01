@@ -581,6 +581,11 @@ and distributions for performance claims.
 
 Current scope excludes Kitty graphics and comprehensive complex-script shaping.
 Keyboard encoding also inherits egui's missing keypad identity, lock-state, and
-some physical/layout information. Workspace restoration launches new shells, or
-new SSH connections for a remote workspace; it does not restore live processes. Those boundaries must remain explicit in release
-notes until implementation and native verification expand them.
+some physical/layout information. Restoring workspaces with fresh sessions
+launches new shells, or new SSH connections for a remote workspace. Keeping
+sessions running after quit ([ADR 0001](adr/0001-sessions-outlive-neptune-in-a-session-daemon.md))
+preserves live processes only while their session daemon survives: nothing
+survives a logout or reboot, and Windows keeps fresh shells until its own path
+is built and verified. Those boundaries must remain explicit in release notes,
+which claim only the preservation that implementation and native verification
+on each platform establish.
