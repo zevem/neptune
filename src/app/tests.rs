@@ -5,6 +5,8 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
     let (sender, receiver) = mpsc::sync_channel(1);
     let config = Config {
         shell: Some("/nonexistent/neptune-startup-test-shell".into()),
+        // Tests opt in to the session daemon; this one has no daemon program.
+        keep_sessions_running: false,
         ..Config::default()
     };
     let app = App {
@@ -5553,9 +5555,9 @@ fn keeping_terminals_running_round_trips_through_preference_saves() {
         eframe::App::on_exit(&mut app);
         let saved = Config::load(&app.config_path).unwrap();
         assert_eq!(saved.keep_sessions_running, keep);
-        // Off is the default, which older versions can read.
+        // On is the default, so only off is written.
         let text = std::fs::read_to_string(&app.config_path).unwrap();
-        assert_eq!(text.contains("keep_sessions_running"), keep);
+        assert_eq!(text.contains("keep_sessions_running"), !keep);
     }
 }
 
@@ -5768,6 +5770,7 @@ fn a_restoring_launch_that_doesnt_keep_sessions_warns_about_and_ends_those_runni
     Config {
         shell: Some("/bin/sh".into()),
         confirm_close: false,
+        keep_sessions_running: false,
         ..Config::default()
     }
     .save(&settings)

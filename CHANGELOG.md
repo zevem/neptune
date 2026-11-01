@@ -11,6 +11,26 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- On macOS and Linux, terminals keep running when you quit Neptune, close its
+  last window or it crashes, and the next launch reattaches them with their
+  screen, scrollback and running programs, including output produced while
+  Neptune was closed. Sessions end when you log out or restart your computer.
+  Turn this off with **Keep terminals running after quit** in Preferences →
+  General. **End all sessions and quit**, in the command palette, ends every
+  session.
+
+### Acceptance notes and known limitations
+
+- Each kept terminal wakes Neptune's background session process about 30 times
+  a second while idle, and heavy output uses about 65% more CPU than with the
+  setting off ([#177](https://github.com/zevem/neptune/issues/177),
+  [#178](https://github.com/zevem/neptune/issues/178)).
+- Saved workspaces use schema version 16 to remember each terminal's session.
+  Earlier candidates cannot restore or save over layouts written by this
+  version, and once you turn off **Keep terminals running after quit** they
+  cannot read the settings file. Back both up before returning to an earlier
+  candidate.
+
 ## [0.1.0-rc.8] - 2026-10-19
 
 ### What's New
