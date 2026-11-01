@@ -12,14 +12,13 @@ pub struct SessionRef {
 }
 
 impl SessionRef {
-    /// The longest id a reference may carry.
-    pub const MAX_ID: usize = 64;
+    /// A session daemon's session ids are this many hex digits.
+    pub const ID_LEN: usize = 16;
 
     pub fn is_valid(&self) -> bool {
         self.daemon > 0
-            && !self.id.is_empty()
-            && self.id.len() <= Self::MAX_ID
-            && self.id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            && self.id.len() == Self::ID_LEN
+            && self.id.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 }
 

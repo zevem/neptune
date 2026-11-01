@@ -893,7 +893,8 @@ impl Model {
         let mut workspace_ids = HashSet::new();
         let mut pane_ids = HashSet::new();
         let mut split_ids = HashSet::new();
-        for spec in specs {
+        let mut sessions = HashSet::new();
+        for mut spec in specs {
             if let Some(group) = spec.group
                 && !group_ids.contains(&group)
             {
@@ -911,6 +912,15 @@ impl Model {
             }
             if spec.panes.len() > limits.panes_per_workspace {
                 return Err(Error::PaneLimit);
+            }
+            // Two terminals can't show one kept session: the first keeps it,
+            // and any other starts afresh.
+            for pane in &mut spec.panes {
+                if let Some(session) = &pane.session
+                    && !sessions.insert(session.clone())
+                {
+                    pane.session = None;
+                }
             }
             let mut members = HashSet::new();
             for pane in &spec.panes {

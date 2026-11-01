@@ -3808,12 +3808,45 @@ mod tests {
         assert!(restore(&|pane| pane.session = Some(kept("00000000000000a1"))).is_ok());
         assert!(restore(&|pane| pane.session = Some(kept("../socket"))).is_err());
         assert!(restore(&|pane| pane.session = Some(kept(""))).is_err());
+        // A session id is what a session daemon gives: 16 hex digits.
+        assert!(restore(&|pane| pane.session = Some(kept("a1"))).is_err());
+        assert!(restore(&|pane| pane.session = Some(kept("00000000000000g1"))).is_err());
+        assert!(restore(&|pane| pane.session = Some(kept(&"a".repeat(64)))).is_err());
         assert!(
             restore(&|pane| {
                 pane.kind = PaneKind::Browser;
                 pane.session = Some(kept("00000000000000a1"));
             })
             .is_err()
+        );
+    }
+
+    /// Two terminals can't show one session: the first keeps it, and the
+    /// other starts afresh.
+    #[test]
+    fn restoration_keeps_a_session_reference_for_the_first_terminal_that_has_it() {
+        let (mut controller, workspace, first) = setup();
+        let second = split(&mut controller, first, Axis::Vertical);
+        let mut specs = controller.model().specs();
+        for pane in &mut specs[0].panes {
+            pane.session = Some(kept("00000000000000a1"));
+        }
+        let restored = Model::restore(specs, Some(workspace), true, Limits::default()).unwrap();
+        assert_eq!(
+            restored.pane(first).unwrap().session(),
+            Some(&kept("00000000000000a1"))
+        );
+        assert_eq!(restored.pane(second).unwrap().session(), None);
+        let effects = Controller::new(restored).start_effects();
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::AttachSession { pane, .. } if *pane == first)
+            )
+        );
+        assert!(
+            effects.iter().any(
+                |effect| matches!(effect, Effect::StartSession { pane, .. } if *pane == second)
+            )
         );
     }
 
