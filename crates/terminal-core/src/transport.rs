@@ -11,7 +11,7 @@ mod platform;
 #[cfg(windows)]
 use platform::close_conpty;
 #[cfg(unix)]
-use platform::poll_pty;
+pub(super) use platform::poll_pty;
 pub(super) use platform::process_cwd;
 
 /// One session's transport, split across the reader, writer and engine workers.
@@ -22,6 +22,10 @@ pub(super) struct Transport {
     /// The program shown in metadata.
     pub(super) shell: String,
     pub(super) process_id: Option<u32>,
+    /// Set when another engine, the session daemon's, is authoritative for
+    /// the program: the state its output continues from. This engine is then
+    /// a replica, and dropping its handle detaches instead of closing.
+    pub(super) replica: Option<Snapshot>,
 }
 
 /// Output from the program, read by the reader worker.
@@ -47,6 +51,11 @@ pub(super) trait Sink: Send {
     /// drops them, so the program never receives a reply twice.
     fn reply(&mut self, bytes: &[u8], shared: &Shared) -> Result<()> {
         write_all(self, bytes, shared)
+    }
+    /// The pane's focus, sent only by replicas: the authoritative engine
+    /// tracks focus and reports it to programs that ask.
+    fn focus(&mut self, _focused: bool) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -149,6 +158,7 @@ pub(super) fn spawn_pty(options: &SessionOptions, size: Size) -> Result<Transpor
         }),
         shell,
         process_id,
+        replica: None,
     })
 }
 

@@ -250,6 +250,13 @@ impl TerminalSession {
     }
     /// Update focus and send a report only when requested by the application.
     pub fn focus(&self, focused: bool) -> std::result::Result<(), crate::SessionError> {
+        if self.shared.replica.load(Ordering::Acquire) {
+            // The authoritative engine reports focus, including when a
+            // program enables reports later, so it needs every change.
+            self.terminal.lock().is_focused = focused;
+            self.shared.changed();
+            return self.shared.enqueue(&self.input, Input::Focus(focused));
+        }
         let reporting = {
             let mut terminal = self.terminal.lock();
             terminal.is_focused = focused;

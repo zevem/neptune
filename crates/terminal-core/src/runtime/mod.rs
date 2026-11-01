@@ -120,6 +120,7 @@ pub(super) fn write_loop(mut sink: Box<dyn Sink>, input: Receiver<Input>, shared
             Input::Resize(size) => sink.resize(size),
             Input::Write(bytes) => write_all(&mut *sink, &bytes, &shared),
             Input::Reply(bytes) => sink.reply(&bytes, &shared),
+            Input::Focus(focused) => sink.focus(focused),
         };
         if let Err(error) = result {
             shared.error(format!("PTY write: {error}"));
@@ -203,6 +204,9 @@ pub(super) fn engine_loop(
                         offset = end;
                     }
                     processor.advance(&mut *grid, &chunk[offset..]);
+                    if let Some(tap) = &shared.output_tap.lock().subscriber {
+                        tap.push(chunk);
+                    }
                     report_focus_on_enable(
                         &grid,
                         was_reporting_focus,
@@ -241,6 +245,10 @@ pub(super) fn engine_loop(
                 }
                 shared.bytes_parsed.fetch_add(len as u64, Ordering::Relaxed);
                 let _ = pool.try_send(buffer);
+                let tap = shared.output_tap.lock().subscriber.clone();
+                if let Some(tap) = tap {
+                    tap.wait_for_room(&shared);
+                }
                 // Follow Alacritty's wakeup policy: a synchronized application
                 // frame should not rebuild visible rows for every buffered chunk.
             }
@@ -346,6 +354,7 @@ pub(super) fn engine_loop(
         };
     }
     shared.stopped.store(true, Ordering::Release);
+    shared.output_tap.lock().end();
     if let Some(reply) = shared.process_check.lock().take() {
         let _ = reply.try_send(ProcessActivity::Idle);
     }

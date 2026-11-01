@@ -40,8 +40,14 @@ use shell_integration::{CwdTracker, PromptScanner, PromptState};
 mod engine;
 #[path = "notifications.rs"]
 mod notifications;
+#[path = "snapshot.rs"]
+mod snapshot;
 #[path = "transport.rs"]
 mod transport;
+use snapshot::Snapshot;
+#[cfg(unix)]
+#[path = "daemon/mod.rs"]
+pub mod daemon;
 use crate::{SessionError, SessionErrorKind};
 use portable_pty::PtySize;
 use transport::{ProcessGuard, Transport};
@@ -242,6 +248,7 @@ impl TerminalSession {
             process,
             shell,
             process_id,
+            replica,
         } = transport;
         let mut process_guard = ProcessGuard(Some(process));
         let (input, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
@@ -271,7 +278,12 @@ impl TerminalSession {
             shared: shared.clone(),
             input: input.clone(),
         };
-        let terminal = Arc::new(Mutex::new(Term::new(config, &size, proxy)));
+        let mut term = Term::new(config, &size, proxy);
+        if let Some(snapshot) = &replica {
+            snapshot.restore(&mut term);
+            shared.replica.store(true, Ordering::Release);
+        }
+        let terminal = Arc::new(Mutex::new(term));
         let session = Self {
             terminal: terminal.clone(),
             shared: shared.clone(),
@@ -528,7 +540,7 @@ impl TerminalSession {
         Ok(())
     }
 
-    /// Stop without joining workers or closing ConPTY on the UI thread. The
+    /// Close: stop without joining workers or closing ConPTY on the UI thread. The
     /// engine reaps the shell and escalates if it ignores SIGHUP; closing the
     /// last Unix PTY descriptor also hangs up its foreground process group.
     pub fn shutdown(&self) {
@@ -543,7 +555,14 @@ impl TerminalSession {
 }
 
 impl Drop for TerminalSession {
+    /// A daemon-backed session detaches: its program keeps running in the
+    /// session daemon. Call [`TerminalSession::shutdown`] first to close it.
     fn drop(&mut self) {
+        if self.shared.replica.load(Ordering::Acquire)
+            && !self.shared.stopped.load(Ordering::Acquire)
+        {
+            self.shared.detached.store(true, Ordering::Release);
+        }
         self.shutdown();
     }
 }

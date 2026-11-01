@@ -578,6 +578,7 @@ fn fake_session(cols: u16, rows: u16) -> (mpsc::Sender<Vec<u8>>, Receiver<Sent>,
         process: Box::new(FakeProcess(sent_tx)),
         shell: "fake".into(),
         process_id: None,
+        replica: None,
     };
     let size = Size {
         cols,

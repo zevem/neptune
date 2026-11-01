@@ -9,6 +9,12 @@ pub enum SessionErrorKind {
     InvalidOptions,
     Spawn,
     InvalidSearch,
+    /// No session daemon is listening, or the connection to it was lost.
+    Unavailable,
+    /// The session daemon speaks another protocol version.
+    Incompatible,
+    /// The session daemon has no session with that id.
+    NotFound,
 }
 
 #[derive(Debug)]

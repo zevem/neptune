@@ -11,6 +11,8 @@ mod session;
 mod view;
 pub use error::{SessionError, SessionErrorKind};
 pub use search::{SearchBudget, SearchProgress, SearchQuery, SearchTask};
+#[cfg(unix)]
+pub use session::daemon;
 pub use session::{
     MAX_GRID_CELLS, ProcessActivity, Repaint, SessionMetadata, SessionMetrics, SessionOptions,
     SessionStatus, ShutdownCompletion, TRANSPORT_BUFFER_BUDGET, TerminalSession,

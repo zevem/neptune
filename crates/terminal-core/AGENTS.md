@@ -1,6 +1,8 @@
 # Terminal core ownership
 
-The public seam is `lib.rs`, `view.rs`, `input.rs`, `search.rs`, and `error.rs`.
+The public seam is `lib.rs`, `view.rs`, `input.rs`, `search.rs`, `error.rs`,
+and the Unix-only session daemon and client in `daemon/` (`mod.rs`, `client.rs`,
+`server.rs`).
 Desktop code uses owned snapshots and semantic session operations. Backend types
 remain private to `session`, `engine`, `runtime`, `transport` and
 `shell_integration`.
@@ -10,11 +12,16 @@ remain private to `session`, `engine`, `runtime`, `transport` and
 - `transport.rs`: what feeds a session's engine (source, sink, process) and the
   PTY/ConPTY transport. Engine replies go to `Sink::reply`, separate from input.
 - `engine.rs`: backend mapping and damage-aware snapshot extraction.
+- `snapshot.rs`: the terminal-core-owned state a replica engine continues from.
+- `daemon/`: session daemon (`server.rs`), client and replica transport
+  (`client.rs`), and the versioned wire protocol (`protocol.rs`). Released
+  encodings never change; pinned byte fixtures live in `tests/daemon.rs`.
 - `platform/mod.rs`: interruptible Unix I/O, Linux cwd polling, ConPTY teardown.
 - `shell_integration/mod.rs`: portable OSC 7/9;9 and OSC 133 tracking, Windows
   shell prompt reporting.
-- `tests.rs`: headless parser/API contracts; `tests/session.rs` and
-  `tests/windows_conpty.rs`: actual transport/process contracts.
+- `tests.rs`: headless parser/API contracts; `tests/session.rs`,
+  `tests/daemon.rs` and `tests/windows_conpty.rs`: actual transport/process
+  contracts. `tests/daemon.rs` reruns its own test binary as the daemon process.
 
 Grid mutations commit revisions while holding the terminal mutex. Snapshot
 extraction locks terminal before viewport cache; resize locks config then terminal
@@ -34,6 +41,7 @@ Choose the narrowest meaningful test target/filter; these are alternatives:
 ```sh
 cargo test -p terminal-core --lib --locked
 cargo test -p terminal-core --test session TEST_NAME --locked
+cargo test -p terminal-core --test daemon TEST_NAME --locked
 cargo test -p terminal-core --test windows_conpty TEST_NAME --locked
 cargo clippy -p terminal-core --lib --locked -- -D warnings
 ```

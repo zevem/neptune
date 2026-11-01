@@ -5,7 +5,11 @@ mod processes;
 pub(super) use processes::process_activity;
 
 #[cfg(unix)]
-pub(super) fn poll_pty(fd: libc::c_int, events: libc::c_short, shared: &Shared) -> bool {
+pub(in crate::session) fn poll_pty(
+    fd: libc::c_int,
+    events: libc::c_short,
+    shared: &Shared,
+) -> bool {
     while !shared.stopped.load(Ordering::Acquire) {
         let mut descriptor = libc::pollfd {
             fd,
