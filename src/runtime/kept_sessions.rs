@@ -8,6 +8,30 @@ use terminal_core::{SessionOptions, TerminalSession};
 
 type Repaint = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+/// What Neptune keeps with a session in the daemon, for the launch that
+/// reattaches it. Fields a later build adds are ignored by this one.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionData {
+    /// The connection sharing of an SSH terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshData>,
+}
+impl SessionData {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn decode(bytes: &[u8]) -> Self {
+        serde_json::from_slice(bytes).unwrap_or_default()
+    }
+}
+
+/// An SSH terminal's control socket, which lives with its session, and the
+/// forwards Neptune made through it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshData {
+    pub control: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<super::ssh_control::KeptForward>,
+}
+
 /// The private mode that runs a session daemon: `--session-daemon DIR`.
 pub const DAEMON_MODE: &str = "--session-daemon";
 
@@ -138,26 +162,41 @@ impl KeptSessions {
         }
     }
 
-    /// Reattach to a kept session; it takes this size.
+    /// Where kept SSH terminals' control sockets live, each in a directory
+    /// of its own.
+    pub fn ssh_directory(&self) -> PathBuf {
+        self.dir.join("ssh")
+    }
+
+    /// Keep `data` with a session, in place of what it had.
+    pub fn set_data(&self, reference: &SessionRef, data: &SessionData) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let id = self.id(reference)?;
+            let bytes = serde_json::to_vec(data).map_err(|error| error.to_string())?;
+            self.request(|client| client.set_data(id, &bytes))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (reference, data);
+            Err(UNSUPPORTED.into())
+        }
+    }
+
+    /// Reattach to a kept session, with what Neptune kept with it; it takes
+    /// this size.
     pub fn attach(
         &self,
         reference: &SessionRef,
         cols: u16,
         rows: u16,
         repaint: Repaint,
-    ) -> Result<TerminalSession, String> {
+    ) -> Result<(TerminalSession, SessionData), String> {
         #[cfg(unix)]
         {
-            use terminal_core::daemon::{PROTOCOL_VERSION, SessionId};
-            if reference.daemon != PROTOCOL_VERSION {
-                return Err(format!(
-                    "This session runs in a session daemon of protocol version {}",
-                    reference.daemon
-                ));
-            }
-            let id: SessionId = reference.id.parse().map_err(|error| format!("{error:#}"))?;
+            let id = self.id(reference)?;
             self.request(|client| client.attach(id, cols, rows, repaint.clone()))
-                .map(|attached| attached.session)
+                .map(|attached| (attached.session, SessionData::decode(&attached.data)))
         }
         #[cfg(not(unix))]
         {
@@ -206,6 +245,21 @@ mod unix {
     const LAUNCH_FAILED: &str = "The session daemon could not be launched";
 
     impl KeptSessions {
+        /// The daemon's id for a session this build can reach.
+        pub(super) fn id(
+            &self,
+            reference: &SessionRef,
+        ) -> Result<terminal_core::daemon::SessionId, String> {
+            use terminal_core::daemon::PROTOCOL_VERSION;
+            if reference.daemon != PROTOCOL_VERSION {
+                return Err(format!(
+                    "This session runs in a session daemon of protocol version {}",
+                    reference.daemon
+                ));
+            }
+            reference.id.parse().map_err(|error| format!("{error:#}"))
+        }
+
         /// Run a request on the connected client, connecting first if need
         /// be. A daemon that went away since is reconnected, or relaunched,
         /// once. The lock is held only to connect, so that both startup

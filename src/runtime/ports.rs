@@ -1,4 +1,5 @@
 //! One coalescing worker owns discovery and SSH forwards for all pane generations.
+use super::ssh_control::{KeptForward, SshControl};
 use crate::platform::ports::{self, Listener};
 use neptune_model::PaneId;
 use std::{
@@ -15,15 +16,15 @@ const MAX_FORWARDS: usize = 64;
 pub struct RemoteTarget {
     pub client: String,
     pub destination: String,
-    // Keeps the private directory alive until in-flight helpers finish.
-    pub control: Option<Arc<tempfile::TempDir>>,
+    // Keeps a private directory alive until in-flight helpers finish.
+    pub control: Option<Arc<SshControl>>,
 }
 impl RemoteTarget {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.client);
         command.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=2"]);
         if let Some(control) = &self.control {
-            command.arg("-S").arg(control.path().join("control"));
+            command.arg("-S").arg(control.path());
             // A missing master must fail, never silently open another session.
             command.args(["-o", "ProxyCommand=false"]);
         }
@@ -37,9 +38,7 @@ impl RemoteTarget {
         let mut command = Command::new(&self.client);
         // Mux operations need only the exact private socket. Skip configured
         // forwards so a request/cancel cannot affect unrelated user forwards.
-        command
-            .args(["-F", "none", "-S"])
-            .arg(control.path().join("control"));
+        command.args(["-F", "none", "-S"]).arg(control.path());
         Ok(command)
     }
     fn check(&self) -> Result<(), String> {
@@ -271,6 +270,50 @@ struct State {
     next_scan: Instant,
     tunnels: BTreeMap<Listener, Tunnel>,
 }
+impl State {
+    /// A kept session's forwards are listed again as they were; the first
+    /// scan cancels any whose server has gone.
+    fn new(target: Target) -> Self {
+        let ports = target
+            .remote
+            .iter()
+            .filter_map(|remote| remote.control.as_ref())
+            .flat_map(|control| control.forwards())
+            .map(|kept| Port {
+                listener: kept.listener,
+                remote: true,
+                forward: Forward::On(kept.local),
+            })
+            .collect();
+        Self {
+            target,
+            ports,
+            next_scan: Instant::now(),
+            tunnels: BTreeMap::new(),
+        }
+    }
+    /// Keep the forwards through the control socket with its session.
+    fn record(&self) {
+        let Some(control) = self.target.remote.as_ref().and_then(|r| r.control.as_ref()) else {
+            return;
+        };
+        let forwards: Vec<_> = self
+            .ports
+            .iter()
+            .filter_map(|port| match port.forward {
+                Forward::On(local)
+                | Forward::Failed {
+                    local: Some(local), ..
+                } if !self.tunnels.contains_key(&port.listener) => Some(KeptForward {
+                    listener: port.listener,
+                    local,
+                }),
+                _ => None,
+            })
+            .collect();
+        control.record(&forwards);
+    }
+}
 
 /// Separate clients (Windows OpenSSH has no multiplexing) are owned/reaped on
 /// the port worker, including disappearance, restart and application shutdown.
@@ -362,6 +405,7 @@ fn forwarding(
 }
 
 fn publish(shared: &Arc<(Mutex<Shared>, Condvar)>, state: &State, wake: &dyn Fn()) {
+    state.record();
     if let Ok(mut shared) = shared.0.lock()
         && shared
             .targets
@@ -394,12 +438,12 @@ fn worker(shared: Arc<(Mutex<Shared>, Condvar)>, wake: Arc<dyn Fn() + Send + Syn
         };
         states.retain(|pane, state| targets.get(pane).is_some_and(|t| t.same(&state.target)));
         for (pane, target) in targets {
-            states.entry(pane).or_insert_with(|| State {
-                target,
-                ports: Vec::new(),
-                next_scan: Instant::now(),
-                tunnels: BTreeMap::new(),
-            });
+            if let std::collections::btree_map::Entry::Vacant(entry) = states.entry(pane) {
+                let state = entry.insert(State::new(target));
+                if !state.ports.is_empty() {
+                    publish(&shared, state, &*wake);
+                }
+            }
         }
         for request in requests {
             if shared.0.lock().map_or(true, |mailbox| mailbox.stop) {
@@ -678,6 +722,96 @@ mod tests {
         );
         monitor.sync(Vec::new(), wake);
         assert!(monitor.views.is_empty());
+        assert!(monitor.shutdown(Duration::from_secs(4)));
+    }
+
+    /// After a reattach, the forwards kept with the session are listed again
+    /// and are cancelled through the same control socket. Each change is
+    /// kept with the session.
+    #[cfg(unix)]
+    #[test]
+    fn kept_forwards_are_listed_again_cancelled_through_their_socket_and_recorded() {
+        use super::super::ssh_control::{KeptForward, SshControl};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        // An ssh stand-in: every master operation succeeds, and the host's
+        // shell listens on port 3000.
+        let client = root.path().join("ssh");
+        std::fs::write(
+            &client,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\ncase \"$*\" in *neptune-ports*) printf 'ip 127.0.0.1 3000\\n';; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = || std::fs::read_to_string(root.path().join("ssh.log")).unwrap_or_default();
+        let listener = Listener {
+            address: Ipv4Addr::LOCALHOST.into(),
+            port: 3000,
+        };
+        let socket = root.path().join("control").join("s");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let record = recorded.clone();
+        let control = SshControl::kept(
+            socket.clone(),
+            vec![KeptForward {
+                listener,
+                local: 4000,
+            }],
+            Box::new(move |forwards| record.lock().unwrap().push(forwards.to_vec())),
+        )
+        .unwrap();
+        let pane = PaneId::new(3);
+        let targets = vec![Target {
+            pane,
+            generation: 1,
+            pid: 42,
+            remote: Some(RemoteTarget {
+                client: client.to_str().unwrap().into(),
+                destination: "devbox".into(),
+                control: Some(Arc::new(control)),
+            }),
+        }];
+        let mut monitor = Ports::default();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let until = |monitor: &mut Ports, forward: Forward| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while monitor.view(pane, 1).first().map(|port| &port.forward) != Some(&forward) {
+                assert!(
+                    Instant::now() < deadline,
+                    "never {forward:?}: {:?}\n{}",
+                    monitor.view(pane, 1),
+                    log()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+                monitor.sync(targets.clone(), wake.clone());
+            }
+        };
+        until(&mut monitor, Forward::On(4000));
+        assert_eq!(monitor.view(pane, 1)[0].label(), "localhost:4000");
+
+        monitor.request(pane, 1, listener, true).unwrap();
+        until(&mut monitor, Forward::Off);
+        let cancel = format!(
+            "-F none -S {} -o ExitOnForwardFailure=yes -O cancel -L 127.0.0.1:4000:127.0.0.1:3000 -- devbox",
+            socket.display()
+        );
+        assert!(log().lines().any(|line| line == cancel), "{}", log());
+        assert_eq!(recorded.lock().unwrap().last(), Some(&Vec::new()));
+
+        monitor.request(pane, 1, listener, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let local = loop {
+            if let Some(Forward::On(local)) = monitor.view(pane, 1).first().map(|p| &p.forward) {
+                break *local;
+            }
+            assert!(Instant::now() < deadline, "{}", log());
+            std::thread::sleep(Duration::from_millis(10));
+            monitor.sync(targets.clone(), wake.clone());
+        };
+        assert_eq!(
+            recorded.lock().unwrap().last(),
+            Some(&vec![KeptForward { listener, local }])
+        );
         assert!(monitor.shutdown(Duration::from_secs(4)));
     }
 

@@ -11,6 +11,7 @@ pub mod project_store;
 pub mod pull_request;
 pub mod pull_requests;
 pub mod sessions;
+pub mod ssh_control;
 pub mod updates;
 pub mod usage;
 pub mod worktrees;
