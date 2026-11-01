@@ -1,4 +1,4 @@
-//! Session synchronization and bounded event delivery. Lock ordering: config, terminal, prompt/size; viewport extraction locks terminal then its cache.
+//! Session synchronization and bounded event delivery. Lock ordering: config, terminal, parser, prompt/size/metadata; viewport extraction locks terminal then its cache.
 use super::*;
 use alacritty_terminal::event::{Event, WindowSize};
 use parking_lot::Condvar;
@@ -104,6 +104,8 @@ pub(super) struct Shared {
     /// A replica stopping because its handle was dropped leaves the program running.
     pub(super) detached: AtomicBool,
     pub(super) output_tap: Mutex<OutputTap>,
+    /// Locked after the terminal, by the engine and by snapshots.
+    pub(super) parser: Mutex<Parser>,
 }
 
 impl Shared {
@@ -144,6 +146,7 @@ impl Shared {
             replica: AtomicBool::new(false),
             detached: AtomicBool::new(false),
             output_tap: Mutex::new(OutputTap::default()),
+            parser: Mutex::new(Parser::default()),
         }
     }
 

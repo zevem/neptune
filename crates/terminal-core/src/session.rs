@@ -15,7 +15,9 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Processor, Rgb};
+#[cfg(test)]
+use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::Rgb;
 use anyhow::{Context, Result, bail};
 use parking_lot::{Mutex, MutexGuard};
 
@@ -40,11 +42,13 @@ use shell_integration::{CwdTracker, PromptScanner, PromptState};
 mod engine;
 #[path = "notifications.rs"]
 mod notifications;
+// Only the Unix session daemon takes snapshots so far.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[path = "snapshot.rs"]
 mod snapshot;
 #[path = "transport.rs"]
 mod transport;
-use snapshot::Snapshot;
+use snapshot::{Parser, Snapshot};
 #[cfg(unix)]
 #[path = "daemon/mod.rs"]
 pub mod daemon;
@@ -280,7 +284,7 @@ impl TerminalSession {
         };
         let mut term = Term::new(config, &size, proxy);
         if let Some(snapshot) = &replica {
-            snapshot.restore(&mut term);
+            snapshot.restore(&mut term, &shared);
             shared.replica.store(true, Ordering::Release);
         }
         let terminal = Arc::new(Mutex::new(term));
@@ -551,6 +555,32 @@ impl TerminalSession {
         *started = Some(Instant::now());
         drop(started);
         self.shared.force_repaint();
+    }
+}
+
+impl TerminalSession {
+    /// Capture the terminal's state, then run `then` before any more output
+    /// is parsed, so what it starts follows the snapshot exactly. A
+    /// synchronized update in progress is applied first, as at its deadline.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn snapshot<R>(&self, then: impl FnOnce() -> R) -> (Snapshot, R) {
+        let mut terminal = self.terminal.lock();
+        let mut parser = self.shared.parser.lock();
+        if parser.sync_deadline().is_some() {
+            let was_reporting_focus = terminal.mode().contains(TermMode::FOCUS_IN_OUT);
+            parser.stop_sync(&mut *terminal);
+            runtime::report_focus_on_enable(
+                &terminal,
+                was_reporting_focus,
+                &self.shared,
+                &self.input,
+            );
+            self.shared.changed();
+        }
+        let pending = parser.unfinished();
+        drop(parser);
+        let snapshot = Snapshot::capture(&mut *terminal, &self.shared, pending);
+        (snapshot, then())
     }
 }
 

@@ -325,6 +325,37 @@ impl PromptState {
         }
     }
 
+    /// Where the current prompt starts, searched from the newest line.
+    pub(super) fn anchor_point<T: EventListener>(
+        &self,
+        terminal: &Term<T>,
+    ) -> Option<(Line, usize)> {
+        let anchor = self.anchor.as_ref()?;
+        (terminal.topmost_line().0..terminal.screen_lines() as i32)
+            .rev()
+            .map(Line)
+            .find(|line| row_identity(terminal, *line) == anchor.row_identity)
+            .map(|line| (line, anchor.column))
+    }
+
+    pub(super) fn redraw(&self) -> bool {
+        self.redraw
+    }
+
+    /// Mark a prompt at `point` of a rebuilt grid, as a snapshot recorded it.
+    pub(super) fn restore<T: EventListener>(
+        &mut self,
+        terminal: &Term<T>,
+        point: Option<(Line, usize)>,
+        redraw: bool,
+    ) {
+        self.redraw = redraw;
+        self.anchor = point.map(|(line, column)| PromptAnchor {
+            row_identity: row_identity(terminal, line),
+            column,
+        });
+    }
+
     pub(super) fn resize<T: EventListener>(&mut self, terminal: &mut Term<T>, size: Size) {
         if terminal.columns() == size.cols as usize && terminal.screen_lines() == size.rows as usize
         {
