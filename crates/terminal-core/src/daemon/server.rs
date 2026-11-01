@@ -38,6 +38,8 @@ pub fn run(dir: &Path, options: DaemonOptions) -> std::result::Result<(), Sessio
         connections: AtomicUsize::new(0),
         wake,
         owner: effective_uid(),
+        client: Mutex::new(None),
+        serial: AtomicU64::new(0),
     });
 
     let mut idle_since = None;
@@ -79,6 +81,10 @@ struct Daemon {
     /// Wakes the listener to recheck whether the daemon is idle.
     wake: UnixStream,
     owner: u32,
+    /// The client that took over last, by its takeover connection.
+    client: Mutex<Option<(u64, UnixStream)>>,
+    /// Tells connections apart.
+    serial: AtomicU64,
 }
 
 /// A session the daemon runs with its authoritative engine.
@@ -86,6 +92,8 @@ struct Hosted {
     id: u64,
     session: TerminalSession,
     data: Mutex<Vec<u8>>,
+    /// The connection that streams the session, if one does.
+    streaming: Mutex<Option<(u64, UnixStream)>>,
 }
 
 /// Counts a connection until its thread ends.
@@ -305,6 +313,7 @@ impl Daemon {
                             id,
                             session,
                             data: Mutex::new(Vec::new()),
+                            streaming: Mutex::new(None),
                         });
                         sessions.insert(id, hosted.clone());
                         drop(sessions);
@@ -316,6 +325,7 @@ impl Daemon {
                     Some(hosted) => return self.stream(stream, hosted, Some((cols, rows))),
                     None => not_found(),
                 },
+                Request::TakeOver => return self.take_over(stream),
                 _ => {
                     diagnose("read request", &io::ErrorKind::InvalidData.into());
                     return;
@@ -357,10 +367,19 @@ impl Daemon {
             data: hosted.data.lock().clone(),
             snapshot,
         };
+        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         let writer = match send(&mut stream, &Reply::Attached(Box::new(attached)))
             .and_then(|()| stream.try_clone())
+            .and_then(|writer| Ok((writer, stream.try_clone()?)))
         {
-            Ok(writer) => writer,
+            Ok((writer, streaming)) => {
+                // An earlier connection lost the session when this one
+                // subscribed; one that stopped reading is let go of too.
+                if let Some((_, earlier)) = hosted.streaming.lock().replace((serial, streaming)) {
+                    let _ = earlier.shutdown(std::net::Shutdown::Both);
+                }
+                writer
+            }
             Err(error) => {
                 diagnose("write snapshot", &error);
                 session.shared.output_tap.lock().unsubscribe(&tap);
@@ -386,6 +405,58 @@ impl Daemon {
                 diagnose("start output", &error);
                 session.shared.output_tap.lock().unsubscribe(&tap);
             }
+        }
+        let mut streaming = hosted.streaming.lock();
+        if streaming
+            .as_ref()
+            .is_some_and(|(current, _)| *current == serial)
+        {
+            *streaming = None;
+        }
+    }
+
+    /// Make this connection's client the daemon's client. The earlier one is
+    /// told, and every session's stream is let go of, so a client that
+    /// stopped reading never holds a program or the daemon. The connection is
+    /// held until its client goes.
+    fn take_over(self: &Arc<Self>, mut stream: UnixStream) {
+        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+        let held = match stream.try_clone() {
+            Ok(held) => held,
+            Err(error) => return diagnose("take over", &error),
+        };
+        {
+            let mut client = self.client.lock();
+            if let Some((_, earlier)) = client.replace((serial, held)) {
+                // One short frame, on a connection its client never writes
+                // to, so it never waits for a client that stopped reading.
+                if let Err(error) = earlier
+                    .set_nonblocking(true)
+                    .and_then(|()| (&earlier).write_all(&Reply::Replaced.encode()))
+                {
+                    diagnose("tell replaced", &error);
+                }
+                let _ = earlier.shutdown(std::net::Shutdown::Read);
+            }
+            for hosted in self.sessions.lock().values() {
+                if let Some((_, streaming)) = hosted.streaming.lock().take() {
+                    let _ = streaming.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            if let Err(error) = send(&mut stream, &Reply::Done) {
+                diagnose("write reply", &error);
+            }
+        }
+        // Nothing more is read from it; it ends when its client goes or a
+        // newer client takes over.
+        let mut ignored = [0; 64];
+        while matches!(stream.read(&mut ignored), Ok(len) if len > 0) {}
+        let mut client = self.client.lock();
+        if client
+            .as_ref()
+            .is_some_and(|(current, _)| *current == serial)
+        {
+            *client = None;
         }
     }
 

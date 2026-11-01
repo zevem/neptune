@@ -47,6 +47,35 @@ fn client_process() {
     }
 }
 
+/// A client that takes over, starts a session that writes without pause,
+/// and is then stopped by its test.
+const HOLDING_CLIENT_DIR: &str = "TERMINAL_CORE_TEST_HOLDING_CLIENT_DIR";
+/// Where that session's program records how far it counted.
+const HOLDING_CLIENT_COUNT: &str = "TERMINAL_CORE_TEST_HOLDING_CLIENT_COUNT";
+
+#[test]
+fn holding_client_process() {
+    let Ok(dir) = std::env::var(HOLDING_CLIENT_DIR) else {
+        return;
+    };
+    let client = DaemonClient::connect(Path::new(&dir)).unwrap();
+    let _held = client.take_over(repaint()).unwrap();
+    let counted = std::env::var(HOLDING_CLIENT_COUNT).unwrap();
+    let (session, id) = client
+        .start(
+            shell(&format!(
+                "i=0; while :; do i=$((i+1)); echo \"count $i\"; echo $i > '{counted}'; done"
+            )),
+            repaint(),
+        )
+        .unwrap();
+    wait_for(|| session.screen_text().contains("count"));
+    println!("SESSION {id}");
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
 struct Daemon {
     root: tempfile::TempDir,
     child: Child,
@@ -760,4 +789,135 @@ fn a_reattached_session_keeps_the_history_its_scrollback_allows() {
     assert_eq!(attached.session.history_size(), 50);
     assert_eq!(attached.session.history_text(), history);
     assert!(history.starts_with("line440\n"), "{history}");
+}
+
+#[test]
+fn a_newer_client_takes_over_every_session_and_the_earlier_one_is_told() {
+    let daemon = Daemon::start();
+    let earlier = daemon.client();
+    let (told, notice) = std::sync::mpsc::channel();
+    let held = earlier
+        .take_over(Arc::new(move || {
+            let _ = told.send(());
+        }))
+        .unwrap();
+    let (first, first_id) = earlier
+        .start(shell("printf 'FIRST\\n'; exec cat"), repaint())
+        .unwrap();
+    let (second, second_id) = earlier
+        .start(shell("printf 'SECOND\\n'; exec cat"), repaint())
+        .unwrap();
+    wait_for(|| first.screen_text().contains("FIRST") && second.screen_text().contains("SECOND"));
+    assert!(!held.replaced());
+
+    let newer = daemon.client();
+    let holding = newer.take_over(repaint()).unwrap();
+    // The earlier client knows as soon as the newer one holds the daemon.
+    assert!(held.replaced());
+    assert!(!holding.replaced());
+    notice
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the earlier client was never told");
+    // Its handles were let go of: closing them no longer reaches the daemon.
+    wait_for(|| first.metadata().status != SessionStatus::Running);
+    first.shutdown();
+    second.shutdown();
+    drop((first, second));
+
+    let mut listed: Vec<_> = newer
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.id, entry.status))
+        .collect();
+    listed.sort_by_key(|(id, _)| id.to_string());
+    let mut expected = vec![
+        (first_id, SessionStatus::Running),
+        (second_id, SessionStatus::Running),
+    ];
+    expected.sort_by_key(|(id, _)| id.to_string());
+    assert_eq!(listed, expected);
+    for (id, marker) in [(first_id, "FIRST"), (second_id, "SECOND")] {
+        let attached = newer.attach(id, 80, 12, repaint()).unwrap();
+        assert!(attached.session.screen_text().contains(marker));
+        attached.session.write(b"taken\r").unwrap();
+        wait_for(|| attached.session.screen_text().matches("taken").count() == 2);
+    }
+}
+
+/// The highest count `path` held.
+fn recorded_count(path: &Path, highest: &mut u64) -> u64 {
+    if let Some(count) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+    {
+        *highest = (*highest).max(count);
+    }
+    *highest
+}
+
+/// A stopped test process, continued and ended however its test ends.
+struct Stopped(Child);
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let pid = self.0.id().to_string();
+        let _ = Command::new("kill").args(["-CONT", &pid]).status();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_client_that_stopped_responding_never_holds_back_the_sessions_taken_over_from_it() {
+    use std::io::BufRead;
+    let daemon = Daemon::start();
+    drop(daemon.client());
+    let counted = daemon.root.path().join("count");
+    let mut holding = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "holding_client_process",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HOLDING_CLIENT_DIR, daemon.dir())
+        .env(HOLDING_CLIENT_COUNT, &counted)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let output = holding.stdout.take().unwrap();
+    let holding = Stopped(holding);
+    let id: daemon::SessionId = std::io::BufReader::new(output)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| line.split_once("SESSION ").map(|(_, id)| id.to_owned()))
+        .expect("the holding client never started its session")
+        .parse()
+        .unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-STOP", &holding.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Its program soon fills everything queued for the stopped client, and waits.
+    let mut highest = 0;
+    let mut last = u64::MAX;
+    wait_for(|| {
+        std::thread::sleep(Duration::from_millis(200));
+        let count = recorded_count(&counted, &mut highest);
+        std::mem::replace(&mut last, count) == count
+    });
+    let stalled = highest;
+
+    let client = daemon.client();
+    let _held = client.take_over(repaint()).unwrap();
+    // Taken over, it runs on before anything attaches to it.
+    wait_for(|| recorded_count(&counted, &mut highest) > stalled + 1000);
+    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    attached.session.shutdown();
+    wait_for(|| client.list().unwrap().is_empty());
 }

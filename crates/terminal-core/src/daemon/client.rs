@@ -140,6 +140,19 @@ impl DaemonClient {
         }
     }
 
+    /// Become the daemon's client in place of any earlier one. The daemon
+    /// tells the earlier client, and lets go of every session's stream, so
+    /// sessions attached elsewhere, even by a client that stopped responding,
+    /// can be attached here. `replaced` runs once, on a thread of this client,
+    /// if a newer client takes over in turn.
+    pub fn take_over(&self, replaced: Repaint) -> std::result::Result<Takeover, SessionError> {
+        let mut stream = open(&self.dir, PROTOCOL_VERSION)?;
+        match exchange(&mut stream, &Request::TakeOver)? {
+            Reply::Done => Takeover::watch(stream, replaced).map_err(unavailable),
+            reply => Err(reply_error(reply)),
+        }
+    }
+
     /// Attach to a session, which takes this pane size. Its screen,
     /// scrollback and cursor are those of the running session.
     pub fn attach(
@@ -173,6 +186,99 @@ impl DaemonClient {
             }
             reply => Err(reply_error(reply)),
         }
+    }
+}
+
+/// Held while a client is the daemon's client; dropping it lets go.
+pub struct Takeover {
+    stream: UnixStream,
+    replaced: Arc<AtomicBool>,
+}
+
+/// What the daemon sent on a takeover connection, without consuming it.
+#[derive(PartialEq)]
+enum Heard {
+    /// A newer client took over.
+    Replaced,
+    /// The daemon went away.
+    Gone,
+    Nothing,
+}
+
+fn peek(stream: &UnixStream) -> Heard {
+    let mut byte = 0u8;
+    // SAFETY: reads at most one byte into `byte`, without consuming it.
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    match read {
+        1.. => Heard::Replaced,
+        0 => Heard::Gone,
+        _ => match io::Error::last_os_error().kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Heard::Nothing,
+            _ => Heard::Gone,
+        },
+    }
+}
+
+impl Takeover {
+    fn watch(stream: UnixStream, replaced: Repaint) -> io::Result<Self> {
+        let watched = stream.try_clone()?;
+        let flag = Arc::new(AtomicBool::new(false));
+        let told = flag.clone();
+        thread::Builder::new()
+            .name("session-daemon-takeover".into())
+            .spawn(move || {
+                loop {
+                    let mut descriptor = libc::pollfd {
+                        fd: watched.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: one valid descriptor, for as long as `watched` lives.
+                    unsafe { libc::poll(&mut descriptor, 1, -1) };
+                    match peek(&watched) {
+                        Heard::Replaced => {
+                            told.store(true, Ordering::Release);
+                            replaced();
+                            return;
+                        }
+                        Heard::Gone => return,
+                        Heard::Nothing => {}
+                    }
+                }
+            })?;
+        Ok(Self {
+            stream,
+            replaced: flag,
+        })
+    }
+
+    /// Whether a newer client took over from this one. True as soon as that
+    /// client's [`DaemonClient::take_over`] has returned.
+    pub fn replaced(&self) -> bool {
+        if !self.replaced.load(Ordering::Acquire) && peek(&self.stream) == Heard::Replaced {
+            self.replaced.store(true, Ordering::Release);
+        }
+        self.replaced.load(Ordering::Acquire)
+    }
+
+    /// Whether this client still holds the daemon: no newer client took over,
+    /// and the daemon is still there.
+    pub fn held(&self) -> bool {
+        !self.replaced() && peek(&self.stream) == Heard::Nothing
+    }
+}
+
+impl Drop for Takeover {
+    fn drop(&mut self) {
+        // Also ends the watching thread.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
