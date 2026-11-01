@@ -7,6 +7,9 @@ use crate::runtime::persistence::SaveKind;
 
 /// The system OpenSSH client, resolved through `PATH`.
 pub(super) const SSH_CLIENT: &str = "ssh";
+/// Said once in a launch whose kept sessions didn't all survive.
+const SESSIONS_RESTORED: &str =
+    "Some sessions didn't survive, so their terminals were restored with fresh shells.";
 
 /// A local pane runs the configured shell. A remote pane runs the SSH client
 /// in the same local directory and gets the login shell of its host. A remote
@@ -259,6 +262,7 @@ impl App {
                     }
                 }
                 Effect::DetachSession { pane, .. } => self.sessions.detach(pane),
+                Effect::SessionsRestored => self.ui.say(ctx, SESSIONS_RESTORED.into()),
                 Effect::StopSession { pane, .. } => {
                     self.browsers.close(pane);
                     self.desktop_notifier.cancel(pane);
@@ -311,6 +315,48 @@ impl App {
                 }
             }
         }
+    }
+    /// Start the restored workspaces. With `live`, the kept sessions that
+    /// survived, each terminal reattaches to its session or, if it is gone,
+    /// is restored with a fresh shell, and sessions no terminal refers to are
+    /// adopted as Recovered sessions.
+    pub(super) fn reattach(
+        &mut self,
+        ctx: &egui::Context,
+        live: Option<Vec<neptune_model::SessionRef>>,
+    ) {
+        let plan = live
+            .filter(|_| self.keep_sessions)
+            .map(|live| self.controller.model().plan_reattach(&live))
+            .unwrap_or_default();
+        let mut effects = self.controller.start_effects();
+        effects.retain(|effect| {
+            !matches!(effect, Effect::AttachSession { pane, .. } if plan.restore.contains(pane))
+        });
+        self.execute(ctx, effects);
+        for pane in plan.restore {
+            if let Some(generation) = self.controller.model().pane(pane).map(|p| p.generation()) {
+                self.dispatch(ctx, Command::SessionLost { pane, generation });
+            }
+        }
+        if !plan.recovered.is_empty() {
+            self.dispatch(
+                ctx,
+                Command::AdoptSessions {
+                    sessions: plan.recovered,
+                    cwd: default_cwd(),
+                },
+            );
+        }
+    }
+    /// Whether `pane` is still reattaching to its kept session.
+    pub(super) fn reattaching(&self, pane: PaneId, generation: u64) -> bool {
+        self.keep_sessions
+            && self.controller.model().pane(pane).is_some_and(|item| {
+                item.generation() == generation
+                    && item.lifecycle() == &neptune_model::Lifecycle::Starting
+                    && item.session().is_some()
+            })
     }
     /// A new shell in a terminal's saved directory, as a launch that doesn't
     /// keep sessions starts every terminal.

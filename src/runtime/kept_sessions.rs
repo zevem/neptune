@@ -92,6 +92,39 @@ fn with_environment(mut options: SessionOptions) -> SessionOptions {
     options
 }
 
+/// The sessions running in the session daemon that serves `dir`, of this
+/// build's protocol version. Without a daemon there are none. `None` when a
+/// daemon is there but couldn't be asked. Never launches a daemon.
+pub fn live(dir: &Path) -> Option<Vec<SessionRef>> {
+    #[cfg(unix)]
+    {
+        use terminal_core::{
+            SessionErrorKind,
+            daemon::{DaemonClient, PROTOCOL_VERSION},
+        };
+        let client = match DaemonClient::connect(dir) {
+            Ok(client) => client,
+            Err(error) if error.kind() == SessionErrorKind::Unavailable => return Some(Vec::new()),
+            Err(_) => return None,
+        };
+        let entries = client.list().ok()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|entry| SessionRef {
+                    daemon: PROTOCOL_VERSION,
+                    id: entry.id.to_string(),
+                })
+                .collect(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct KeptSessions {
     dir: PathBuf,

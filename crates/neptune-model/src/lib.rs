@@ -21,7 +21,7 @@ pub use ids::{
 pub use layout::{Axis, Edge, FocusDirection, Layout};
 pub use project::{Project, ProjectKey, ProjectSpec};
 pub use remote::Remote;
-pub use session::SessionRef;
+pub use session::{ReattachPlan, SessionRef};
 pub use window::{Window, WindowSpec};
 pub use workspace::{
     Error, Lifecycle, Limits, Model, Pane, PaneKind, PaneSpec, Workspace, WorkspaceSpec,
