@@ -725,49 +725,157 @@ fn attaching_during_sustained_output_delivers_every_byte_exactly_once() {
     assert_eq!(numbers, (1..=LINES).collect::<Vec<_>>());
 }
 
+/// A program that prints READY, then its last words and exits 3 once `go` exists.
+fn exits_on(go: &Path) -> SessionOptions {
+    shell(&format!(
+        "printf 'READY\\n'; while [ ! -e '{go}' ]; do sleep 0.02; done; \
+         printf '\\033[1mfinal words\\033[m'; exit 3",
+        go = go.display()
+    ))
+}
+
+const EXITED_3: SessionStatus = SessionStatus::Exited {
+    code: 3,
+    signal: None,
+};
+
+/// A client takes the exited session: its final screen and status, after
+/// which the daemon lets the session go. It attaches at another size than
+/// the session had, as a reattaching pane often does.
+#[track_caller]
+fn take_exited(client: &DaemonClient, id: daemon::SessionId) {
+    let attached = client.attach(id, 100, 30, repaint()).unwrap();
+    let screen = attached.session.screen_text();
+    assert!(screen.contains("final words"), "{screen}");
+    wait_for(|| attached.session.metadata().status == EXITED_3);
+    wait_for(|| client.list().unwrap().is_empty());
+    let error = client.attach(id, 80, 12, repaint()).err().unwrap();
+    assert_eq!(error.kind(), terminal_core::SessionErrorKind::NotFound);
+}
+
 #[test]
 fn an_exited_session_keeps_its_final_screen_and_status_until_a_client_takes_them() {
     let daemon = Daemon::start();
     let go = daemon.root.path().join("go");
     let client = daemon.client();
-    let (session, id) = client
-        .start(
-            shell(&format!(
-                "printf 'READY\\n'; while [ ! -e '{go}' ]; do sleep 0.02; done; \
-                 printf '\\033[1mfinal words\\033[m'; exit 3",
-                go = go.display()
-            )),
-            repaint(),
-        )
-        .unwrap();
+    let (session, id) = client.start(exits_on(&go), repaint()).unwrap();
     wait_for(|| session.screen_text().contains("READY"));
+    // The program exits right after its handle is dropped, while the
+    // departing replica may still be connected.
     drop(session);
-    // A dropped handle disconnects within its engine's next poll. Exit only
-    // once the daemon has seen that, or the departing client takes the end.
-    std::thread::sleep(Duration::from_millis(500));
     std::fs::write(&go, b"").unwrap();
-    let exited = SessionStatus::Exited {
-        code: 3,
-        signal: None,
-    };
     wait_for(|| {
         client
             .list()
             .unwrap()
             .iter()
-            .any(|entry| entry.status == exited)
+            .any(|entry| entry.status == EXITED_3)
     });
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(client.list().unwrap().len(), 1, "the daemon kept it");
+    take_exited(&client, id);
+}
 
-    let attached = client.attach(id, 80, 12, repaint()).unwrap();
-    let screen = attached.session.screen_text();
-    assert!(screen.contains("final words"), "{screen}");
-    wait_for(|| attached.session.metadata().status == exited);
-    // Taken, so the daemon releases it.
-    wait_for(|| client.list().unwrap().is_empty());
-    let error = client.attach(id, 80, 12, repaint()).err().unwrap();
-    assert_eq!(error.kind(), terminal_core::SessionErrorKind::NotFound);
+/// One frame from a raw connection: its kind and payload.
+fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> (u8, Vec<u8>) {
+    use std::io::Read;
+    let mut len = [0; 4];
+    stream.read_exact(&mut len).unwrap();
+    let mut frame = vec![0; u32::from_le_bytes(len) as usize];
+    stream.read_exact(&mut frame).unwrap();
+    let kind = frame.remove(0);
+    (kind, frame)
+}
+
+/// Attach over a raw connection, which never takes an exit: the connection
+/// and the kind of the daemon's reply.
+fn raw_attach(
+    daemon: &Daemon,
+    id: daemon::SessionId,
+    cols: u16,
+    rows: u16,
+) -> (std::os::unix::net::UnixStream, u8) {
+    use std::io::Write;
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(daemon.dir().join("session-daemon-v1.sock"))
+            .unwrap();
+    stream.write_all(&hello(1)).unwrap();
+    assert_eq!(read_frame(&mut stream).0, 64, "welcome");
+    // Attach: kind 6, the id, then the size.
+    let mut attach = vec![13, 0, 0, 0, 6];
+    attach.extend(
+        u64::from_str_radix(&id.to_string(), 16)
+            .unwrap()
+            .to_le_bytes(),
+    );
+    attach.extend(cols.to_le_bytes());
+    attach.extend(rows.to_le_bytes());
+    stream.write_all(&attach).unwrap();
+    let reply = read_frame(&mut stream).0;
+    (stream, reply)
+}
+
+#[test]
+fn a_pane_of_any_size_can_attach_long_after_its_session_exited() {
+    let daemon = Daemon::start();
+    let go = daemon.root.path().join("go");
+    let client = daemon.client();
+    let (session, id) = client.start(exits_on(&go), repaint()).unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    drop(session);
+    std::fs::write(&go, b"").unwrap();
+    wait_for(|| {
+        client
+            .list()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.status == EXITED_3)
+    });
+    // Long enough for the ended session's workers to stop, after which its
+    // terminal can no longer be resized.
+    let until = Instant::now() + Duration::from_secs(1);
+    let mut cols = 81;
+    while Instant::now() < until {
+        assert_eq!(
+            raw_attach(&daemon, id, cols, 24).1,
+            69,
+            "attached at {cols}"
+        );
+        cols ^= 1;
+    }
+    take_exited(&client, id);
+}
+
+#[test]
+fn an_exit_sent_to_a_client_that_leaves_without_taking_it_is_kept() {
+    let daemon = Daemon::start();
+    let go = daemon.root.path().join("go");
+    let client = daemon.client();
+    let (session, id) = client.start(exits_on(&go), repaint()).unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    drop(session);
+    // A client that departs right after the daemon sends it the exit must
+    // not be the one that takes it.
+    let (mut stream, reply) = raw_attach(&daemon, id, 80, 12);
+    assert_eq!(reply, 69, "attached");
+    std::fs::write(&go, b"").unwrap();
+    loop {
+        match read_frame(&mut stream).0 {
+            70 => {}
+            71 => break,
+            kind => panic!("unexpected frame {kind}"),
+        }
+    }
+    drop(stream);
+    assert_eq!(
+        client
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.id, entry.status))
+            .collect::<Vec<_>>(),
+        vec![(id, EXITED_3)],
+        "the daemon kept the exited session"
+    );
+    take_exited(&client, id);
 }
 
 #[test]

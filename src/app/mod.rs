@@ -57,6 +57,10 @@ struct Startup {
     config: Config,
     report: LoadReport,
     error: Option<String>,
+    /// The sessions running in the session daemon, listed for a launch that
+    /// keeps sessions. `None` when they couldn't be listed: every terminal
+    /// then tries to reattach, and one that can't is restored.
+    live: Option<Vec<neptune_model::SessionRef>>,
 }
 
 /// Whether a launch restores workspaces. Only such a launch reattaches kept
@@ -72,7 +76,7 @@ fn restores(launch: &crate::Launch) -> bool {
 /// Load the configuration and, if the launch restores them, the saved
 /// workspaces. A launch that keeps sessions first takes over the session
 /// daemon `kept` names, so the Neptune it replaces saves nothing after the
-/// state is read.
+/// state is read, then lists its sessions.
 fn load_startup(
     settings: &Path,
     state: &Path,
@@ -83,13 +87,13 @@ fn load_startup(
         Ok(config) => (config, None),
         Err(error) => (Config::default(), Some(format!("{error:#}"))),
     };
+    let kept =
+        kept.filter(|_| restore && config.restore_workspaces && config.keep_sessions_running);
+    if let Some((dir, claim)) = kept {
+        // Failing here, it takes over once it reaches the daemon.
+        let _ = claim.take_over_running(dir);
+    }
     let report = if restore && config.restore_workspaces {
-        if config.keep_sessions_running
-            && let Some((dir, claim)) = kept
-        {
-            // Failing here, it takes over once it reaches the daemon.
-            let _ = claim.take_over_running(dir);
-        }
         load_state(state, Limits::default())
     } else {
         LoadReport {
@@ -99,10 +103,14 @@ fn load_startup(
             migrated: false,
         }
     };
+    // Which kept sessions survived, so that each terminal is reattached or
+    // restored, and strays are recovered.
+    let live = kept.and_then(|(dir, _)| crate::runtime::kept_sessions::live(dir));
     Startup {
         config,
         report,
         error,
+        live,
     }
 }
 struct ActiveSearch {
@@ -436,6 +444,7 @@ impl App {
                         migrated: false,
                     },
                     error: Some("Restoration worker stopped before returning state".into()),
+                    live: None,
                 }),
                 Err(mpsc::TryRecvError::Empty) => None,
             });
@@ -479,6 +488,13 @@ impl App {
                     generation,
                     message,
                 } => {
+                    if self.reattaching(pane, generation) {
+                        // Its kept session is gone: restore the terminal.
+                        self.diagnostics
+                            .failure("attach", Some(pane), Some(generation), "Attach");
+                        self.dispatch(ctx, Command::SessionLost { pane, generation });
+                        continue;
+                    }
                     self.diagnostics
                         .failure("spawn", Some(pane), Some(generation), "Spawn");
                     self.dispatch(
@@ -726,7 +742,7 @@ impl App {
                 self.ui.error = Some(format!("Persistence worker: {error}"));
             }
         }
-        self.execute(ctx, self.controller.start_effects());
+        self.reattach(ctx, startup.live);
         if self.controller.model().workspaces().is_empty() {
             let cwd = self.initial_cwd.take().unwrap_or_else(default_cwd);
             let remote = self.initial_remote.take();

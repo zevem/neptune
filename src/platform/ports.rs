@@ -13,7 +13,9 @@ use std::{
 pub const MAX_PORTS: usize = 16;
 pub const UNIX_PROBE: &str = include_str!("ports-probe.sh");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Listener {
     pub port: u16,
     /// Wildcard bindings are normalized to the corresponding loopback address.

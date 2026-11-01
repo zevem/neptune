@@ -95,6 +95,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
 
 fn loaded(config: Config, model: Model) -> Startup {
     Startup {
+        live: None,
         config,
         report: LoadReport {
             model: Some(model),
@@ -2713,6 +2714,7 @@ fn remote_directories_survive_shutdown_and_restoration_per_terminal() {
             config: app.config.clone(),
             report,
             error: None,
+            live: None,
         },
     );
     wait_for_directory(&mut reopened, first, &project);
@@ -4582,6 +4584,7 @@ fn custom_keybindings_invalid_config_cannot_be_overwritten_by_preferences() {
                 migrated: false,
             },
             error: Some(format!("{error:#}")),
+            live: None,
         },
     );
     app.action(
@@ -4875,6 +4878,145 @@ fn a_restoring_launch_reattaches_kept_sessions_and_quitting_leaves_them_running(
     daemon.join().unwrap();
 }
 
+/// An SSH terminal kept running after quit keeps its connection sharing:
+/// its control socket survives Neptune, and the reattached terminal goes on
+/// reporting its remote folder, which splits start in. Closing it removes
+/// the socket.
+#[cfg(unix)]
+#[test]
+fn a_kept_ssh_terminal_keeps_its_control_socket_and_remote_folder_across_reattach() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let local = root.path().join("local");
+    let home = root.path().join("fake-ssh.home");
+    let project = home.join("Documents/Projects/neptune");
+    for directory in [&local, &project] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(home.join(".zshenv"), "unsetopt GLOBAL_RCS\n").unwrap();
+    std::fs::write(home.join(".zshrc"), "PROMPT='NEPTUNE> '\n").unwrap();
+    // The real remote bootstrap, with an SSH stand-in that listens on its
+    // control socket as a master would.
+    let client = root.path().join("fake-ssh");
+    std::fs::write(&client, "#!/bin/sh\nwhile [ \"$1\" = -o ]; do case \"$2\" in ControlPath=*) : > \"${2#ControlPath=}\";; esac; shift 2; done\n[ \"$1\" = -t ] || exit 1\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ctx = egui::Context::default();
+    let reported = |app: &App, pane| {
+        app.sessions
+            .get(pane)
+            .and_then(|session| session.metadata().reported_cwd)
+    };
+    let wait_for_directory = |app: &mut App, pane, directory: &std::path::Path| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reported(app, pane).as_deref() != Some(directory) {
+            assert!(
+                Instant::now() < deadline,
+                "the terminal never reported {directory:?}: {:?}, {:?}",
+                reported(app, pane),
+                app.ui.error
+            );
+            app.poll(&ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.poll(&ctx);
+    };
+    let config = Config {
+        keep_sessions_running: true,
+        confirm_close: false,
+        ..fixture(root.path()).0.config.clone()
+    };
+    let launch = |model| {
+        let (mut app, sender) = fixture(root.path());
+        app.ephemeral = false;
+        app.command = None;
+        app.ssh_client = client.to_str().unwrap().into();
+        app.complete_startup(&ctx, loaded(config.clone(), model));
+        (app, sender)
+    };
+
+    let (mut app, _sender) = launch(Model::default());
+    app.dispatch(
+        &ctx,
+        Command::AddWorkspace {
+            group: None,
+            cwd: local.clone(),
+            name: "devbox".into(),
+            remote: Some("devbox".into()),
+        },
+    );
+    let pane = app.controller.model().active_pane().unwrap();
+    wait_for_directory(&mut app, pane, &home);
+    let socket = app.sessions.ssh_control(pane).unwrap().path().to_owned();
+    assert!(socket.starts_with(dir.join("ssh")), "{socket:?}");
+    assert!(socket.exists());
+    let reference = app
+        .controller
+        .model()
+        .pane(pane)
+        .unwrap()
+        .session()
+        .cloned()
+        .expect("the terminal is kept");
+    app.action(&ctx, Action::Quit);
+    eframe::App::on_exit(&mut app);
+    drop(app);
+    assert!(socket.exists(), "quitting removed the control socket");
+
+    // While Neptune is closed, the remote shell changes folder.
+    let daemon_client = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let detached = daemon_client
+        .attach(reference.id.parse().unwrap(), 100, 32, Arc::new(|| {}))
+        .unwrap()
+        .session;
+    detached.write(b"cd Documents/Projects/neptune\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while detached.metadata().reported_cwd.as_deref() != Some(project.as_path()) {
+        assert!(Instant::now() < deadline, "the remote shell never moved");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(detached);
+
+    let report = load_state(&root.path().join("workspaces.json"), Limits::default());
+    let (mut app, _sender) = launch(report.model.unwrap());
+    wait_for_directory(&mut app, pane, &project);
+    assert_eq!(
+        app.controller.model().pane(pane).unwrap().remote_cwd(),
+        Some(project.as_path())
+    );
+    assert_eq!(app.sessions.ssh_control(pane).unwrap().path(), socket);
+    // It goes on reporting, and a split starts where it is.
+    app.sessions.get(pane).unwrap().write(b"cd ..\r").unwrap();
+    let projects = home.join("Documents/Projects");
+    wait_for_directory(&mut app, pane, &projects);
+    app.action(&ctx, Action::Split(pane, neptune_model::Axis::Vertical));
+    let split = app.controller.model().active_pane().unwrap();
+    assert_ne!(split, pane);
+    wait_for_directory(&mut app, split, &projects);
+
+    app.action(&ctx, Action::ClosePane(pane));
+    if app.ui.overlay == OverlayState::ConfirmClose(Close::Pane(pane)) {
+        app.action(&ctx, Action::Confirm(Close::Pane(pane)));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "closing the terminal left its control socket"
+        );
+        app.poll(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!socket.parent().unwrap().exists());
+    eframe::App::on_exit(&mut app);
+    drop(app);
+    for session in daemon_client.list().unwrap() {
+        daemon_client.close(session.id).unwrap();
+    }
+    drop(daemon_client);
+    daemon.join().unwrap();
+}
+
 #[test]
 fn only_a_restoring_launch_with_restore_on_keeps_sessions() {
     for (restoring, restore, keep) in [
@@ -4900,6 +5042,222 @@ fn only_a_restoring_launch_with_restore_on_keeps_sessions() {
             "restoring: {restoring}, restore: {restore}, keep: {keep}"
         );
     }
+}
+
+/// A launch whose earlier one kept `kept` in the panes of one workspace.
+#[cfg(unix)]
+fn kept_panes(root: &std::path::Path, kept: &[&neptune_model::SessionRef]) -> (Model, Vec<PaneId>) {
+    let mut earlier = Controller::new(Model::default());
+    earlier
+        .dispatch(Command::AddWorkspace {
+            group: None,
+            cwd: root.into(),
+            name: "Kept".into(),
+            remote: None,
+        })
+        .unwrap();
+    let mut panes = vec![earlier.model().active_pane().unwrap()];
+    while panes.len() < kept.len() {
+        let workspace = earlier.model().active_workspace().unwrap();
+        earlier
+            .dispatch(Command::SplitPane {
+                workspace,
+                pane: panes[0],
+                axis: neptune_model::Axis::Vertical,
+                cwd: root.into(),
+            })
+            .unwrap();
+        panes.push(earlier.model().active_pane().unwrap());
+    }
+    for (pane, reference) in panes.iter().zip(kept) {
+        earlier
+            .complete(neptune_model::Completion::Started {
+                pane: *pane,
+                generation: 1,
+                session: Some((*reference).clone()),
+            })
+            .unwrap();
+    }
+    let saved = Model::restore(
+        earlier.model().specs(),
+        earlier.model().active_workspace(),
+        true,
+        Limits::default(),
+    )
+    .unwrap();
+    (saved, panes)
+}
+
+#[cfg(unix)]
+fn kept_session(
+    client: &terminal_core::daemon::DaemonClient,
+    root: &std::path::Path,
+    text: &str,
+) -> neptune_model::SessionRef {
+    let (session, id) = client
+        .start(
+            SessionOptions {
+                cwd: root.into(),
+                shell: Some("/bin/sh".into()),
+                args: vec!["-c".into(), format!("printf '{text}\\r\\n'; sleep 30")],
+                ..Default::default()
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+    drop(session);
+    neptune_model::SessionRef {
+        daemon: terminal_core::daemon::PROTOCOL_VERSION,
+        id: id.to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn keeping(app: &App) -> Config {
+    Config {
+        keep_sessions_running: true,
+        confirm_close: false,
+        ..app.config.clone()
+    }
+}
+
+#[cfg(unix)]
+#[track_caller]
+fn poll_until(app: &mut App, ctx: &egui::Context, mut done: impl FnMut(&App) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(app) {
+        assert!(Instant::now() < deadline, "condition timed out");
+        app.poll(ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn shows(app: &App, pane: PaneId, text: &str) -> bool {
+    app.controller.model().pane(pane).unwrap().lifecycle() == &Lifecycle::Running
+        && app
+            .sessions
+            .get(pane)
+            .is_some_and(|session| session.screen_text().contains(text))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restoring_launch_reattaches_restores_lost_sessions_and_adopts_recovered_ones() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let client = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let alive = kept_session(&client, root.path(), "ALIVE");
+    let stray = kept_session(&client, root.path(), "STRAY");
+    // A session the daemon no longer has.
+    let gone = neptune_model::SessionRef {
+        daemon: terminal_core::daemon::PROTOCOL_VERSION,
+        id: "00000000000000a1".into(),
+    };
+    let (saved, panes) = kept_panes(root.path(), &[&alive, &gone]);
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    let startup = Startup {
+        live: crate::runtime::kept_sessions::live(&dir),
+        ..loaded(keeping(&app), saved)
+    };
+    let error = app.ui.error.clone();
+    app.complete_startup(&ctx, startup);
+    // One notice says the lost session was restored; it is no error.
+    assert!(
+        app.ui
+            .notice
+            .as_ref()
+            .is_some_and(|(said, _)| said.contains("restored")),
+        "{:?}",
+        app.ui.notice
+    );
+    assert_eq!(app.ui.error, error);
+    // The lost terminal forgot its session and starts afresh.
+    assert_eq!(
+        app.controller.model().pane(panes[1]).unwrap().session(),
+        None
+    );
+    // The stray session is a tab of its own workspace.
+    let recovered = app.controller.model().workspaces().last().unwrap();
+    assert_eq!(recovered.name(), "Recovered sessions");
+    let adopted = recovered.panes()[0].id();
+    assert_eq!(recovered.panes()[0].session(), Some(&stray));
+    // The kept terminal is still the one in view.
+    assert_eq!(app.controller.model().active_pane(), Some(panes[1]));
+    poll_until(&mut app, &ctx, |app| {
+        shows(app, panes[0], "ALIVE") && shows(app, adopted, "STRAY")
+    });
+
+    app.action(&ctx, Action::Quit);
+    eframe::App::on_exit(&mut app);
+    let mut listed: Vec<_> = client
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.id.to_string())
+        .collect();
+    listed.sort();
+    let mut kept = vec![alive.id.clone(), stray.id.clone()];
+    kept.sort();
+    // Quitting kept both; the fresh shell in the fixture never started.
+    assert_eq!(listed, kept);
+    for entry in client.list().unwrap() {
+        client.close(entry.id).unwrap();
+    }
+    drop(client);
+    drop(app);
+    daemon.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reattach_that_fails_restores_the_terminal_with_one_notice() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let gone = |id: &str| neptune_model::SessionRef {
+        daemon: terminal_core::daemon::PROTOCOL_VERSION,
+        id: id.into(),
+    };
+    let (saved, panes) = kept_panes(
+        root.path(),
+        &[&gone("00000000000000a1"), &gone("00000000000000b2")],
+    );
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    // The daemon couldn't be listed, so every terminal tries to reattach.
+    let error = app.ui.error.clone();
+    app.complete_startup(&ctx, loaded(keeping(&app), saved));
+    assert_eq!(app.ui.notice, None);
+    poll_until(&mut app, &ctx, |app| {
+        panes.iter().all(|pane| {
+            app.controller
+                .model()
+                .pane(*pane)
+                .unwrap()
+                .session()
+                .is_none()
+        })
+    });
+    assert!(
+        app.ui
+            .notice
+            .as_ref()
+            .is_some_and(|(said, _)| said.contains("restored"))
+    );
+    // Restored, not failed: the terminals start afresh, and only the fresh
+    // shell, which this fixture can't start, reports an error.
+    assert!(
+        app.ui
+            .error
+            .as_ref()
+            .is_none_or(|error| !error.contains("session daemon")),
+        "{:?} (was {error:?})",
+        app.ui.error
+    );
+    drop(app);
+    let _ = dir;
+    daemon.join().unwrap();
 }
 
 /// A launch that keeps sessions, reattached to `count` terminals that an
@@ -5204,6 +5562,7 @@ fn a_neptune_replaced_by_a_newer_launch_stops_saving_and_closes_without_ending_s
             config,
             report,
             error: None,
+            live: crate::runtime::kept_sessions::live(&dir),
         },
     );
     let deadline = Instant::now() + Duration::from_secs(5);

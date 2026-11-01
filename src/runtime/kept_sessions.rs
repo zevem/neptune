@@ -15,12 +15,24 @@ pub struct SessionData {
     /// What the terminal's agents reach Neptune with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<super::agents::Credential>,
+    /// The connection sharing of an SSH terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshData>,
 }
 impl SessionData {
     #[cfg_attr(not(unix), allow(dead_code))]
     fn decode(bytes: &[u8]) -> Self {
         serde_json::from_slice(bytes).unwrap_or_default()
     }
+}
+
+/// An SSH terminal's control socket, which lives with its session, and the
+/// forwards Neptune made through it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshData {
+    pub control: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<super::ssh_control::KeptForward>,
 }
 
 /// The private mode that runs a session daemon: `--session-daemon DIR`.
@@ -204,6 +216,39 @@ impl Claim {
     }
 }
 
+/// The sessions running in the session daemon that serves `dir`, of this
+/// build's protocol version. Without a daemon there are none. `None` when a
+/// daemon is there but couldn't be asked. Never launches a daemon.
+pub fn live(dir: &Path) -> Option<Vec<SessionRef>> {
+    #[cfg(unix)]
+    {
+        use terminal_core::{
+            SessionErrorKind,
+            daemon::{DaemonClient, PROTOCOL_VERSION},
+        };
+        let client = match DaemonClient::connect(dir) {
+            Ok(client) => client,
+            Err(error) if error.kind() == SessionErrorKind::Unavailable => return Some(Vec::new()),
+            Err(_) => return None,
+        };
+        let entries = client.list().ok()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|entry| SessionRef {
+                    daemon: PROTOCOL_VERSION,
+                    id: entry.id.to_string(),
+                })
+                .collect(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct KeptSessions {
     dir: PathBuf,
@@ -251,6 +296,12 @@ impl KeptSessions {
             let _ = (options, repaint, with_environment);
             Err(UNSUPPORTED.into())
         }
+    }
+
+    /// Where kept SSH terminals' control sockets live, each in a directory
+    /// of its own.
+    pub fn ssh_directory(&self) -> PathBuf {
+        self.dir.join("ssh")
     }
 
     /// Keep `data` with a session, in place of what it had.

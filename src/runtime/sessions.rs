@@ -1,5 +1,9 @@
 //! Owns live, starting and closing sessions. No PTY is opened on the UI thread.
 //! Closing sessions retain their reservation until every worker has stopped.
+use super::{
+    kept_sessions::{KeptSessions, SessionData, SshData},
+    ssh_control::SshControl,
+};
 use neptune_model::{PaneId, SessionRef};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -76,7 +80,7 @@ struct Request {
     launch: SessionLaunch,
     wake: Wake,
     /// Where sessions are kept, while Neptune keeps them.
-    kept: Option<Arc<super::kept_sessions::KeptSessions>>,
+    kept: Option<Arc<KeptSessions>>,
 }
 struct Completion {
     pane: PaneId,
@@ -93,7 +97,7 @@ struct Closing {
     generation: u64,
     session: TerminalSession,
     since: Instant,
-    _control: Option<Arc<tempfile::TempDir>>,
+    control: Option<Arc<SshControl>>,
 }
 pub enum SessionCompletion {
     Started {
@@ -112,7 +116,7 @@ pub enum SessionCompletion {
 struct Entry {
     generation: u64,
     session: TerminalSession,
-    control: Option<Arc<tempfile::TempDir>>,
+    control: Option<Arc<SshControl>>,
     /// Names the kept session in the session daemon; `None` runs in Neptune.
     reference: Option<SessionRef>,
 }
@@ -129,7 +133,7 @@ pub struct SessionManager {
     in_flight: BTreeMap<(PaneId, u64), Instant>,
     diagnostics: bool,
     agents: Arc<super::agents::AgentBridge>,
-    kept: Option<Arc<super::kept_sessions::KeptSessions>>,
+    kept: Option<Arc<KeptSessions>>,
     /// Starts whose results are let go of, not closed, when they arrive.
     detached: BTreeSet<(PaneId, u64)>,
 }
@@ -173,6 +177,8 @@ impl SessionManager {
                             continue;
                         };
                         let tick = Instant::now();
+                        // A kept SSH session's control socket, reserved for it.
+                        let mut reserved = None;
                         let result = (|| {
                             if let Some(reference) = request.launch.attach.take() {
                                 let kept = request
@@ -207,19 +213,31 @@ impl SessionManager {
                                 return Ok(Entry {
                                     generation: request.generation,
                                     session,
-                                    control: None,
+                                    control: kept_control(kept, &reference, data),
                                     reference: Some(reference),
                                 });
                             }
+                            // A kept session's control socket lives with it;
+                            // otherwise it goes with Neptune.
                             let mut control = None;
                             if request.launch.ssh_control && cfg!(unix) {
-                                let directory = tempfile::Builder::new()
-                                    .prefix("neptune-ssh-")
-                                    .tempdir()
-                                    .map_err(|_| {
-                                        "Could not prepare SSH connection sharing".to_owned()
-                                    })?;
-                                let path = directory.path().join("control");
+                                const FAILED: &str = "Could not prepare SSH connection sharing";
+                                reserved = match &request.kept {
+                                    Some(kept) => SshControl::reserve(&kept.ssh_directory())
+                                        .map_err(|_| FAILED.to_owned())?,
+                                    None => None,
+                                };
+                                let path = match &reserved {
+                                    Some(path) => path.clone(),
+                                    None => {
+                                        let private = Arc::new(
+                                            SshControl::private().map_err(|_| FAILED.to_owned())?,
+                                        );
+                                        let path = private.path().to_owned();
+                                        control = Some(private);
+                                        path
+                                    }
+                                };
                                 request.launch.terminal.args.splice(
                                     0..0,
                                     [
@@ -231,7 +249,6 @@ impl SessionManager {
                                         format!("ControlPath={}", path.display()),
                                     ],
                                 );
-                                control = Some(Arc::new(directory));
                             }
                             let mut credential = None;
                             if let AgentLaunch::Local { resume, spawned_by } = &request.launch.agent
@@ -261,14 +278,21 @@ impl SessionManager {
                                 Some(kept) => {
                                     let (session, reference) =
                                         kept.start(request.launch.terminal, request.wake.clone())?;
-                                    // Without it, the session still runs; only
-                                    // its agents go unrecognized after a reattach.
-                                    if let Some(credential) = credential {
-                                        let data = super::kept_sessions::SessionData {
-                                            agent: Some(credential),
-                                        };
+                                    let data = SessionData {
+                                        agent: credential,
+                                        ssh: reserved.clone().map(|control| SshData {
+                                            control,
+                                            forwards: Vec::new(),
+                                        }),
+                                    };
+                                    if data != SessionData::default() {
+                                        // Without it, the session still runs; only its
+                                        // agents go unrecognized and its forwards
+                                        // unlisted after a reattach.
                                         let _ = kept.set_data(&reference, &data);
                                     }
+                                    control =
+                                        control.or_else(|| kept_control(kept, &reference, data));
                                     (session, Some(reference))
                                 }
                                 None => TerminalSession::spawn(
@@ -285,6 +309,11 @@ impl SessionManager {
                                 reference,
                             })
                         })();
+                        if result.is_err()
+                            && let Some(directory) = reserved.as_deref().and_then(|s| s.parent())
+                        {
+                            let _ = std::fs::remove_dir_all(directory);
+                        }
                         if sender
                             .send(Completion {
                                 pane: request.pane,
@@ -321,7 +350,7 @@ impl SessionManager {
     }
     /// From now on, start and attach terminals in the session daemon `kept`
     /// reaches, so that they outlive Neptune.
-    pub fn keep_sessions(&mut self, kept: super::kept_sessions::KeptSessions) {
+    pub fn keep_sessions(&mut self, kept: KeptSessions) {
         self.kept = Some(Arc::new(kept));
     }
     pub fn policy(&self) -> &ResourcePolicy {
@@ -330,7 +359,7 @@ impl SessionManager {
     pub fn get(&self, pane: PaneId) -> Option<&TerminalSession> {
         self.live.get(&pane).map(|entry| &entry.session)
     }
-    pub fn ssh_control(&self, pane: PaneId) -> Option<Arc<tempfile::TempDir>> {
+    pub fn ssh_control(&self, pane: PaneId) -> Option<Arc<SshControl>> {
         self.live.get(&pane).and_then(|entry| entry.control.clone())
     }
     pub fn generation(&self, pane: PaneId) -> Option<u64> {
@@ -405,7 +434,7 @@ impl SessionManager {
                 generation: old.generation,
                 session: old.session,
                 since: Instant::now(),
-                _control: old.control,
+                control: old.control,
             });
         }
         let request = Request {
@@ -490,7 +519,7 @@ impl SessionManager {
                 generation: entry.generation,
                 session: entry.session,
                 since: Instant::now(),
-                _control: entry.control,
+                control: entry.control,
             });
         }
     }
@@ -523,6 +552,10 @@ impl SessionManager {
     fn reap(&mut self) {
         self.closing.retain(|closing| {
             let pending = closing.session.metrics().active_workers != 0;
+            if !pending && let Some(control) = &closing.control {
+                // A kept session's socket outlives Neptune, but not its close.
+                control.remove();
+            }
             if !pending && self.diagnostics { eprintln!("{}", serde_json::json!({"operation":"cleanup","pane":closing.pane.get(),"session_generation":closing.generation,"elapsed_ms":closing.since.elapsed().as_secs_f64()*1000.0})); }
             pending
         });
@@ -549,7 +582,7 @@ impl SessionManager {
                         generation: completion.generation,
                         session: entry.session,
                         since: Instant::now(),
-                        _control: entry.control,
+                        control: entry.control,
                     });
                 }
                 continue;
@@ -662,6 +695,36 @@ impl SessionManager {
         }
     }
 }
+/// A kept SSH terminal's control socket, as recorded with its session. Each
+/// change to the forwards made through it is kept with the session too.
+fn kept_control(
+    kept: &Arc<KeptSessions>,
+    reference: &SessionRef,
+    data: SessionData,
+) -> Option<Arc<SshControl>> {
+    let ssh = data.ssh.clone()?;
+    // Only a socket in a directory of Neptune's own is ever removed.
+    let directory = ssh.control.parent()?;
+    if directory.parent() != Some(kept.ssh_directory().as_path()) {
+        return None;
+    }
+    let (kept, reference, data) = (kept.clone(), reference.clone(), Mutex::new(data));
+    SshControl::kept(
+        ssh.control,
+        ssh.forwards,
+        Box::new(move |forwards| {
+            let Ok(mut data) = data.lock() else {
+                return;
+            };
+            if let Some(ssh) = &mut data.ssh {
+                ssh.forwards = forwards.to_vec();
+            }
+            let _ = kept.set_data(&reference, &data);
+        }),
+    )
+    .map(Arc::new)
+}
+
 impl Drop for SessionManager {
     fn drop(&mut self) {
         self.shutdown(Duration::from_secs(2));
@@ -854,6 +917,87 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        drop(second);
+        daemon.join().unwrap();
+    }
+
+    /// A kept SSH terminal's control socket lives with its session: it
+    /// outlives the manager that started it, comes back with the forwards
+    /// made through it on reattach, and goes when the session closes.
+    #[test]
+    fn a_kept_ssh_terminals_control_socket_outlives_neptune_and_goes_with_close() {
+        use super::super::ssh_control::KeptForward;
+        use std::os::unix::fs::PermissionsExt;
+        let (root, dir, daemon) = daemon();
+        // An ssh stand-in that listens where it is told to, as a master.
+        let client = root.path().join("ssh");
+        std::fs::write(
+            &client,
+            "#!/bin/sh\nwhile [ \"$1\" = -o ]; do case \"$2\" in ControlPath=*) : > \"${2#ControlPath=}\";; esac; shift 2; done\nprintf 'READY\\r\\n'\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pane = PaneId::new(1);
+        let wake: Wake = Arc::new(|| {});
+        let launch = |attach: Option<SessionRef>| SessionLaunch {
+            terminal: SessionOptions {
+                shell: Some(client.to_str().unwrap().into()),
+                args: Vec::new(),
+                ..options()
+            },
+            agent: AgentLaunch::Disabled,
+            ssh_control: attach.is_none(),
+            attach,
+        };
+        let ready = |manager: &SessionManager| {
+            manager
+                .get(pane)
+                .is_some_and(|session| session.screen_text().contains("READY"))
+        };
+        let mut first = kept(&dir);
+        first
+            .start(pane, 1, false, launch(None), wake.clone())
+            .unwrap();
+        let mut reference = None;
+        until(&mut first, |manager, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some() && ready(manager)
+        });
+        let reference = reference.unwrap().unwrap();
+        let control = first.ssh_control(pane).unwrap();
+        let socket = control.path().to_owned();
+        assert!(socket.starts_with(dir.join("ssh")), "{socket:?}");
+        assert!(socket.exists());
+        let forward = KeptForward {
+            listener: crate::platform::ports::Listener {
+                address: std::net::Ipv4Addr::LOCALHOST.into(),
+                port: 3000,
+            },
+            local: 4000,
+        };
+        control.record(&[forward]);
+        drop(control);
+        first.detach(pane);
+        assert!(first.shutdown(Duration::from_secs(2)));
+        drop(first);
+        assert!(
+            socket.exists(),
+            "Neptune quitting removed the control socket"
+        );
+
+        let mut second = kept(&dir);
+        second
+            .start(pane, 2, false, launch(Some(reference)), wake.clone())
+            .unwrap();
+        until(&mut second, |manager, _| ready(manager));
+        let control = second.ssh_control(pane).unwrap();
+        assert_eq!(control.path(), socket);
+        assert_eq!(control.forwards(), [forward]);
+        drop(control);
+        second.close(pane);
+        until(&mut second, |manager, _| manager.usage().closing == 0);
+        assert!(!socket.exists(), "closing left the control socket");
+        assert!(!socket.parent().unwrap().exists());
         drop(second);
         daemon.join().unwrap();
     }

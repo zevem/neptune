@@ -163,9 +163,24 @@ pub enum Command {
         generation: u64,
         error: String,
     },
+    /// A restored terminal's kept session didn't survive. The terminal is
+    /// restored instead: a new shell in its saved folder, or over SSH for a
+    /// remote workspace. The first in a launch also says so, once.
+    SessionLost {
+        pane: PaneId,
+        generation: u64,
+    },
     SessionExited {
         pane: PaneId,
         generation: u64,
+    },
+    /// Adopt sessions that kept running but that no terminal refers to as
+    /// Recovered sessions: tabs of a new "Recovered sessions" workspace in
+    /// `cwd`, or of the selected workspace once the workspace limit is
+    /// reached. Sessions beyond the pane limits are left running, unadopted.
+    AdoptSessions {
+        sessions: Vec<SessionRef>,
+        cwd: PathBuf,
     },
     /// Neptune is ending every session as it quits, kept ones included.
     /// Terminals forget the kept sessions they showed, so the next launch
@@ -282,6 +297,9 @@ pub enum Effect {
         pane: PaneId,
         generation: u64,
     },
+    /// Tell the user that sessions didn't survive and their terminals were
+    /// restored with fresh shells. At most once per launch.
+    SessionsRestored,
     Focus {
         old: Option<PaneId>,
         new: Option<PaneId>,
@@ -315,11 +333,16 @@ pub enum Completion {
     },
 }
 
+/// The workspace that Recovered sessions are adopted into.
+const RECOVERED_SESSIONS: &str = "Recovered sessions";
+
 #[derive(Debug, Clone)]
 pub struct Controller {
     model: Model,
     generation: u64,
     saved_generation: u64,
+    /// This launch has said that sessions were restored.
+    restore_noticed: bool,
 }
 
 impl Controller {
@@ -328,6 +351,7 @@ impl Controller {
             model,
             generation: 0,
             saved_generation: 0,
+            restore_noticed: false,
         }
     }
     pub fn model(&self) -> &Model {
@@ -1018,6 +1042,40 @@ impl Controller {
                     self.close_background(pane, &mut effects);
                 }
             }
+            Command::SessionLost { pane, generation } => {
+                let Some(workspace) = self.model.workspace_for_pane(pane) else {
+                    return Ok(effects);
+                };
+                let remote = self
+                    .model
+                    .workspace(workspace)
+                    .and_then(|workspace| workspace.remote.clone());
+                let item = self.model.pane_mut(pane)?;
+                if item.generation != generation
+                    || item.lifecycle != Lifecycle::Starting
+                    || item.session.take().is_none()
+                {
+                    return Ok(effects);
+                }
+                dirty = true;
+                effects.push(Effect::StartSession {
+                    pane,
+                    generation,
+                    cwd: item.cwd.clone(),
+                    remote,
+                    remote_cwd: item.remote_cwd.clone(),
+                    replacement: false,
+                });
+                if !std::mem::replace(&mut self.restore_noticed, true) {
+                    effects.push(Effect::SessionsRestored);
+                }
+            }
+            Command::AdoptSessions { sessions, cwd } => {
+                if !self.adopt(sessions, cwd, &mut effects)? {
+                    return Ok(effects);
+                }
+                dirty = true;
+            }
             Command::ForgetSessions => {
                 for pane in self
                     .model
@@ -1429,6 +1487,130 @@ impl Controller {
             .ok_or(Error::UnknownProject(id))
     }
 
+    /// Reports whether any session was adopted.
+    fn adopt(
+        &mut self,
+        sessions: Vec<SessionRef>,
+        cwd: PathBuf,
+        effects: &mut Vec<Effect>,
+    ) -> Result<bool, Error> {
+        let mut adopted: Vec<SessionRef> = Vec::new();
+        for session in sessions {
+            if session.is_valid()
+                && !adopted.contains(&session)
+                && !self
+                    .model
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.panes)
+                    .any(|pane| pane.session.as_ref() == Some(&session))
+            {
+                adopted.push(session);
+            }
+        }
+        let own = self.model.workspaces.len() < self.model.limits.workspaces;
+        let target = match own {
+            true => None,
+            false => Some(self.model.active.ok_or(Error::WorkspaceLimit)?),
+        };
+        let beside = match target {
+            Some(id) => self
+                .model
+                .workspace(id)
+                .ok_or(Error::UnknownWorkspace(id))?
+                .panes
+                .len(),
+            None => 0,
+        };
+        let limits = self.model.limits;
+        adopted.truncate(
+            limits
+                .panes_per_workspace
+                .saturating_sub(beside)
+                .min(limits.total_panes.saturating_sub(self.model.pane_count())),
+        );
+        if adopted.is_empty() {
+            return Ok(false);
+        }
+        let first = self.model.next_pane;
+        let next_pane = first
+            .checked_add(adopted.len() as u64)
+            .ok_or(Error::IdentityExhausted)?;
+        let next_workspace = match own {
+            true => self
+                .model
+                .next_workspace
+                .checked_add(1)
+                .ok_or(Error::IdentityExhausted)?,
+            false => self.model.next_workspace,
+        };
+        let panes: Vec<Pane> = adopted
+            .into_iter()
+            .zip(first..)
+            .map(|(session, id)| {
+                let id = PaneId::new(id);
+                effects.push(Effect::AttachSession {
+                    pane: id,
+                    generation: 1,
+                    session: session.clone(),
+                });
+                Pane {
+                    id,
+                    kind: PaneKind::Terminal,
+                    cwd: cwd.clone(),
+                    remote_cwd: None,
+                    agent: None,
+                    pull_requests: Vec::new(),
+                    attachments: Vec::new(),
+                    spawned_by: None,
+                    project: None,
+                    worktree: None,
+                    session: Some(session),
+                    generation: 1,
+                    lifecycle: Lifecycle::Starting,
+                }
+            })
+            .collect();
+        let ids: Vec<PaneId> = panes.iter().map(|pane| pane.id).collect();
+        match target {
+            None => {
+                let id = WorkspaceId::new(self.model.next_workspace);
+                let mut layout = Layout::pane(ids[0]);
+                for pair in ids.windows(2) {
+                    layout.add_tab(pair[0], pair[1], None);
+                }
+                layout.show(ids[0]);
+                self.model.workspaces.push(Workspace {
+                    id,
+                    window: self.model.current_window,
+                    group: None,
+                    name: RECOVERED_SESSIONS.into(),
+                    cwd,
+                    remote: None,
+                    panes,
+                    layout,
+                    active: ids[0],
+                });
+                if self.model.active.is_none() {
+                    self.model.select_workspace(id)?;
+                }
+            }
+            Some(target) => {
+                let workspace = self.model.workspace_mut(target)?;
+                let mut after = workspace.active;
+                for &id in &ids {
+                    workspace.layout.add_tab(after, id, None);
+                    after = id;
+                }
+                workspace.layout.show(workspace.active);
+                workspace.panes.extend(panes);
+            }
+        }
+        self.model.next_pane = next_pane;
+        self.model.next_workspace = next_workspace;
+        Ok(true)
+    }
+
     fn check_pane_capacity(&self, count: usize) -> Result<(), Error> {
         if count >= self.model.limits.panes_per_workspace {
             return Err(Error::PaneLimit);
@@ -1836,7 +2018,8 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Limits, PaneSpec, WorkspaceSpec};
+    use crate::{Limits, PaneSpec, ReattachPlan, WorkspaceSpec};
+    use std::path::Path;
 
     #[test]
     fn browser_tabs_share_layouts_without_starting_a_pty() {
@@ -3302,6 +3485,269 @@ mod tests {
         )
         .unwrap();
         (Controller::new(restored), pane)
+    }
+
+    #[test]
+    fn a_lost_kept_session_starts_afresh_in_its_saved_folder_with_one_notice_per_launch() {
+        let (mut controller, workspace, first) = setup();
+        controller
+            .dispatch(Command::SetWorkspaceRemote {
+                workspace,
+                remote: Some("devbox".into()),
+            })
+            .unwrap();
+        let second = split(&mut controller, first, Axis::Vertical);
+        for (pane, id) in [(first, "00000000000000a1"), (second, "00000000000000b2")] {
+            let generation = controller.model().pane(pane).unwrap().generation();
+            controller
+                .dispatch(Command::PaneRemoteCwdChanged {
+                    pane,
+                    generation,
+                    cwd: PathBuf::from("/srv/project"),
+                })
+                .unwrap();
+            controller
+                .complete(Completion::Started {
+                    pane,
+                    generation,
+                    session: Some(kept(id)),
+                })
+                .unwrap();
+        }
+        let restored = Model::restore(
+            controller.model().specs(),
+            Some(workspace),
+            true,
+            Limits::default(),
+        )
+        .unwrap();
+        let mut controller = Controller::new(restored);
+        let restart = |pane| Effect::StartSession {
+            pane,
+            generation: 1,
+            cwd: PathBuf::from("/fake"),
+            remote: Some(Remote::parse("devbox").unwrap()),
+            remote_cwd: Some(PathBuf::from("/srv/project")),
+            replacement: false,
+        };
+
+        // A stale report changes nothing.
+        assert!(
+            controller
+                .dispatch(Command::SessionLost {
+                    pane: first,
+                    generation: 2,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        let effects = controller
+            .dispatch(Command::SessionLost {
+                pane: first,
+                generation: 1,
+            })
+            .unwrap();
+        assert!(effects.contains(&restart(first)), "{effects:?}");
+        assert!(effects.contains(&Effect::SessionsRestored), "{effects:?}");
+        assert!(matches!(effects.last(), Some(Effect::Persist { .. })));
+        assert_eq!(controller.model().pane(first).unwrap().session(), None);
+        assert_eq!(
+            controller.model().pane(first).unwrap().lifecycle(),
+            &Lifecycle::Starting
+        );
+
+        // A second lost session in the same launch says nothing more.
+        let effects = controller
+            .dispatch(Command::SessionLost {
+                pane: second,
+                generation: 1,
+            })
+            .unwrap();
+        assert!(effects.contains(&restart(second)), "{effects:?}");
+        assert!(!effects.contains(&Effect::SessionsRestored), "{effects:?}");
+
+        // Once its fresh shell runs, the terminal has no kept session to lose.
+        controller
+            .complete(Completion::Started {
+                pane: first,
+                generation: 1,
+                session: None,
+            })
+            .unwrap();
+        assert!(
+            controller
+                .dispatch(Command::SessionLost {
+                    pane: first,
+                    generation: 1,
+                })
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reattach_planning_sorts_every_kept_pane_and_live_session() {
+        let (mut controller, workspace, attached) = setup();
+        let lost = split(&mut controller, attached, Axis::Vertical);
+        let fresh = tab(&mut controller, lost);
+        for (pane, id) in [(attached, "00000000000000a1"), (lost, "00000000000000b2")] {
+            controller
+                .complete(Completion::Started {
+                    pane,
+                    generation: 1,
+                    session: Some(kept(id)),
+                })
+                .unwrap();
+        }
+        controller
+            .complete(Completion::Started {
+                pane: fresh,
+                generation: 1,
+                session: None,
+            })
+            .unwrap();
+        let restored = Model::restore(
+            controller.model().specs(),
+            Some(workspace),
+            true,
+            Limits::default(),
+        )
+        .unwrap();
+        let live = [
+            kept("00000000000000c3"),
+            kept("00000000000000a1"),
+            kept("00000000000000d4"),
+        ];
+        assert_eq!(
+            restored.plan_reattach(&live),
+            ReattachPlan {
+                attach: vec![attached],
+                restore: vec![lost],
+                recovered: vec![kept("00000000000000c3"), kept("00000000000000d4")],
+            }
+        );
+        // A session listed twice is still one Recovered session.
+        assert_eq!(
+            Model::default()
+                .plan_reattach(&[kept("00000000000000c3"), kept("00000000000000c3")])
+                .recovered,
+            vec![kept("00000000000000c3")]
+        );
+    }
+
+    fn attaches(effects: &[Effect]) -> Vec<(PaneId, SessionRef)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::AttachSession {
+                    pane,
+                    generation: 1,
+                    session,
+                } => Some((*pane, session.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recovered_sessions_become_tabs_of_their_own_workspace_within_the_limits() {
+        let (mut controller, main, pane) = setup();
+        let effects = controller
+            .dispatch(Command::AdoptSessions {
+                sessions: vec![kept("00000000000000c3"), kept("00000000000000d4")],
+                cwd: PathBuf::from("/home"),
+            })
+            .unwrap();
+        assert!(matches!(effects.last(), Some(Effect::Persist { .. })));
+        let adopted = attaches(&effects);
+        assert_eq!(
+            adopted
+                .iter()
+                .map(|(_, session)| session.clone())
+                .collect::<Vec<_>>(),
+            vec![kept("00000000000000c3"), kept("00000000000000d4")]
+        );
+        let model = controller.model();
+        let recovered = model.workspaces().last().unwrap();
+        assert_ne!(recovered.id(), main);
+        assert_eq!(recovered.name(), RECOVERED_SESSIONS);
+        assert_eq!(recovered.cwd(), Path::new("/home"));
+        let first = adopted[0].0;
+        let (tabs, shown) = recovered.layout().tabs(first).unwrap();
+        assert_eq!(tabs, [first, adopted[1].0]);
+        assert_eq!((shown, recovered.active()), (first, first));
+        for (pane, session) in &adopted {
+            let item = model.pane(*pane).unwrap();
+            assert_eq!(item.session(), Some(session));
+            assert_eq!(item.cwd(), Path::new("/home"));
+        }
+        // What the user was looking at stays in view.
+        assert_eq!(model.active_workspace(), Some(main));
+        assert_eq!(model.active_pane(), Some(pane));
+        // They are kept like any terminal that shows a kept session.
+        assert_eq!(controller.exit_effects().len(), 2);
+    }
+
+    #[test]
+    fn recovered_sessions_join_the_selected_workspace_at_the_workspace_limit() {
+        let mut controller = Controller::new(Model::new(Limits {
+            workspaces: 1,
+            panes_per_workspace: 3,
+            total_panes: 64,
+        }));
+        let main = create(&mut controller, "main");
+        let pane = controller.model().active_pane().unwrap();
+        let effects = controller
+            .dispatch(Command::AdoptSessions {
+                sessions: vec![
+                    kept("00000000000000c3"),
+                    kept("00000000000000d4"),
+                    kept("00000000000000e5"),
+                ],
+                cwd: PathBuf::from("/home"),
+            })
+            .unwrap();
+        let adopted = attaches(&effects);
+        // Two fit beside the one terminal; the third stays in the daemon.
+        assert_eq!(
+            adopted
+                .iter()
+                .map(|(_, session)| session.clone())
+                .collect::<Vec<_>>(),
+            vec![kept("00000000000000c3"), kept("00000000000000d4")]
+        );
+        let model = controller.model();
+        assert_eq!(model.workspaces().len(), 1);
+        let (tabs, shown) = model.workspace(main).unwrap().layout().tabs(pane).unwrap();
+        assert_eq!(tabs, [pane, adopted[0].0, adopted[1].0]);
+        assert_eq!(shown, pane);
+        assert_eq!(model.active_pane(), Some(pane));
+    }
+
+    #[test]
+    fn recovered_sessions_fill_an_empty_launch() {
+        let mut controller = Controller::new(Model::default());
+        let effects = controller
+            .dispatch(Command::AdoptSessions {
+                sessions: vec![kept("00000000000000c3")],
+                cwd: PathBuf::from("/home"),
+            })
+            .unwrap();
+        let adopted = attaches(&effects);
+        let model = controller.model();
+        assert_eq!(model.workspaces().len(), 1);
+        assert_eq!(model.workspaces()[0].name(), RECOVERED_SESSIONS);
+        assert_eq!(model.active_pane(), Some(adopted[0].0));
+        // Nothing to adopt changes nothing.
+        assert!(
+            controller
+                .dispatch(Command::AdoptSessions {
+                    sessions: Vec::new(),
+                    cwd: PathBuf::from("/home"),
+                })
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
