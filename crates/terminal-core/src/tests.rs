@@ -3,11 +3,10 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::Color;
 
-#[cfg(unix)]
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
-        assert!(Instant::now() < deadline, "PTY condition timed out");
+        assert!(Instant::now() < deadline, "Session condition timed out");
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -502,6 +501,152 @@ fn fixture(cols: u16, rows: u16, history: usize) -> TerminalSession {
         viewport_cache: Mutex::new(None),
     }
 }
+
+/// What a session sent to its transport, in order.
+#[derive(Debug, PartialEq, Eq)]
+enum Sent {
+    Input(Vec<u8>),
+    Reply(Vec<u8>),
+    Resize(u16, u16),
+    Release,
+    Terminate,
+}
+
+struct FakeSource(mpsc::Receiver<Vec<u8>>);
+impl transport::Source for FakeSource {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self.0.recv() {
+            Ok(bytes) => {
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            Err(_) => Ok(0),
+        }
+    }
+    fn wait_readable(&mut self, _: &Shared) -> io::Result<bool> {
+        Ok(false)
+    }
+}
+
+struct FakeSink(mpsc::Sender<Sent>);
+impl transport::Sink for FakeSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let _ = self.0.send(Sent::Input(bytes.to_vec()));
+        Ok(bytes.len())
+    }
+    fn wait_writable(&mut self, _: &Shared) -> io::Result<bool> {
+        Ok(false)
+    }
+    fn resize(&mut self, size: Size) -> Result<()> {
+        let _ = self.0.send(Sent::Resize(size.cols, size.rows));
+        Ok(())
+    }
+    fn reply(&mut self, bytes: &[u8], _: &Shared) -> Result<()> {
+        let _ = self.0.send(Sent::Reply(bytes.to_vec()));
+        Ok(())
+    }
+}
+
+struct FakeProcess(mpsc::Sender<Sent>);
+impl transport::Process for FakeProcess {
+    fn try_wait(&mut self) -> io::Result<Option<transport::Exit>> {
+        Ok(None)
+    }
+    fn terminate(&mut self) -> Option<transport::Exit> {
+        let _ = self.0.send(Sent::Terminate);
+        Some(transport::Exit {
+            code: 1,
+            signal: Some("Hangup".into()),
+        })
+    }
+    fn activity(&self, _: u32) -> ProcessActivity {
+        ProcessActivity::Unknown
+    }
+    fn release(&mut self, _: &Arc<Shared>) {
+        let _ = self.0.send(Sent::Release);
+    }
+}
+
+/// A session engine fed by a fake transport: the test writes the program's
+/// output and observes everything the engine sends back.
+fn fake_session(cols: u16, rows: u16) -> (mpsc::Sender<Vec<u8>>, Receiver<Sent>, TerminalSession) {
+    let (output, source) = mpsc::channel();
+    let (sent_tx, sent) = mpsc::channel();
+    let transport = transport::Transport {
+        source: Box::new(FakeSource(source)),
+        sink: Box::new(FakeSink(sent_tx.clone())),
+        process: Box::new(FakeProcess(sent_tx)),
+        shell: "fake".into(),
+        process_id: None,
+    };
+    let size = Size {
+        cols,
+        rows,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let session =
+        TerminalSession::start(transport, PathBuf::from("."), size, 16, Arc::new(|| {})).unwrap();
+    (output, sent, session)
+}
+
+fn next_sent(sent: &Receiver<Sent>) -> Sent {
+    sent.recv_timeout(Duration::from_secs(5))
+        .expect("the session sent nothing to its transport")
+}
+
+#[test]
+fn engine_replies_input_and_resize_all_go_through_the_transport() {
+    let (output, sent, session) = fake_session(12, 4);
+
+    // A cursor-position query is answered by the engine, not typed by the user.
+    output.send(b"\x1b[6n".to_vec()).unwrap();
+    assert_eq!(next_sent(&sent), Sent::Reply(b"\x1b[1;1R".to_vec()));
+    // So is a notification capability query.
+    output.send(b"\x1b]99;i=7:p=?;\x1b\\".to_vec()).unwrap();
+    assert!(matches!(
+        next_sent(&sent),
+        Sent::Reply(reply) if reply.starts_with(b"\x1b]99;i=7:p=?;")
+    ));
+    // And the focus state a program receives when it turns on focus reports.
+    output.send(b"\x1b[?1004h".to_vec()).unwrap();
+    assert_eq!(next_sent(&sent), Sent::Reply(b"\x1b[O".to_vec()));
+
+    session.write(b"ls\r").unwrap();
+    assert_eq!(next_sent(&sent), Sent::Input(b"ls\r".to_vec()));
+    session.paste("a\nb").unwrap();
+    assert_eq!(next_sent(&sent), Sent::Input(b"a\rb".to_vec()));
+    session.resize(20, 6, 200, 120).unwrap();
+    assert_eq!(next_sent(&sent), Sent::Resize(20, 6));
+    assert!(sent.try_recv().is_err());
+}
+
+#[test]
+fn teardown_releases_the_device_and_ends_the_process_in_platform_order() {
+    let (output, sent, session) = fake_session(12, 4);
+    let completion = session.shutdown_completion();
+    session.shutdown();
+    // The source reaches end of output once its process is gone.
+    drop(output);
+    wait_for(|| completion.is_complete());
+
+    let teardown: Vec<Sent> = sent.try_iter().collect();
+    // Unix closes the terminal device before ending the child; Windows ends
+    // the child first and then closes ConPTY on a counted worker.
+    #[cfg(unix)]
+    assert_eq!(teardown, vec![Sent::Release, Sent::Terminate]);
+    #[cfg(windows)]
+    assert_eq!(teardown, vec![Sent::Terminate, Sent::Release]);
+    assert_eq!(
+        session.metadata().status,
+        SessionStatus::Exited {
+            code: 1,
+            signal: Some("Hangup".into())
+        }
+    );
+    assert_eq!(session.metrics().active_workers, 0);
+}
+
 fn feed(session: &TerminalSession, bytes: &[u8]) {
     let mut terminal = session.terminal.lock();
     let mut parser: Processor = Processor::new();

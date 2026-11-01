@@ -44,8 +44,21 @@ impl Size {
 }
 
 pub(super) enum Input {
+    /// Bytes typed or pasted into the session.
     Write(Vec<u8>),
+    /// Bytes the engine generated in answer to the program's output.
+    Reply(Vec<u8>),
     Resize(Size),
+}
+
+impl Input {
+    /// Bytes counted against the pending input budget.
+    pub(super) fn queued_bytes(&self) -> usize {
+        match self {
+            Input::Write(bytes) | Input::Reply(bytes) => bytes.len(),
+            Input::Resize(_) => 0,
+        }
+    }
 }
 
 pub(super) enum Output {
@@ -127,10 +140,7 @@ impl Shared {
         sender: &SyncSender<Input>,
         input: Input,
     ) -> std::result::Result<(), SessionError> {
-        let bytes = match &input {
-            Input::Write(bytes) => bytes.len(),
-            Input::Resize(_) => 0,
-        };
+        let bytes = input.queued_bytes();
         if self
             .queued_input_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
@@ -216,7 +226,7 @@ impl Shared {
     }
 }
 
-/// PTY replies never run on the UI thread or recursively lock the terminal.
+/// Engine replies never run on the UI thread or recursively lock the terminal.
 #[derive(Clone)]
 pub(super) struct EventProxy {
     pub(super) shared: Arc<Shared>,
@@ -227,7 +237,7 @@ impl EventProxy {
     fn reply(&self, text: String) {
         if let Err(error) = self
             .shared
-            .enqueue(&self.input, Input::Write(text.into_bytes()))
+            .enqueue(&self.input, Input::Reply(text.into_bytes()))
         {
             self.shared.error(error);
         }
@@ -297,5 +307,3 @@ impl EventListener for EventProxy {
         }
     }
 }
-
-pub(super) type Master = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;

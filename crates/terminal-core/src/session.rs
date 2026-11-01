@@ -40,8 +40,11 @@ use shell_integration::{CwdTracker, PromptScanner, PromptState};
 mod engine;
 #[path = "notifications.rs"]
 mod notifications;
+#[path = "transport.rs"]
+mod transport;
 use crate::{SessionError, SessionErrorKind};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::PtySize;
+use transport::{ProcessGuard, Transport};
 
 const READ_SIZE: usize = 64 * 1024;
 const PARSE_SLICE: usize = 16 * 1024;
@@ -220,48 +223,32 @@ impl TerminalSession {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let pair = portable_pty::native_pty_system()
-            .openpty(size.pty())
-            .context("Open pseudoterminal")?;
-        let mut command = match &options.shell {
-            Some(shell) => {
-                let mut command = CommandBuilder::new(shell);
-                command.args(&options.args);
-                command
-            }
-            None => CommandBuilder::new_default_prog(),
-        };
-        command.cwd(&options.cwd);
-        command.env("TERM", "xterm-256color");
-        command.env("COLORTERM", "truecolor");
-        command.env("TERM_PROGRAM", "neptune");
-        command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        for (key, value) in &options.env {
-            command.env(key, value);
-        }
-        let shell = options.shell.clone().unwrap_or_else(|| command.get_shell());
-        // Explicit arguments mean a caller-chosen program, such as SSH.
-        #[cfg(windows)]
-        if options.args.is_empty() {
-            shell_integration::report_cwd(&mut command, &shell);
-        }
-        let mut child_guard = ChildGuard(Some(
-            pair.slave.spawn_command(command).context("Start shell")?,
-        ));
-        let child = child_guard.0.as_ref().unwrap();
-        // Keeping the slave alive prevents EOF after the child exits.
-        drop(pair.slave);
-        let reader = pair.master.try_clone_reader().context("Clone PTY reader")?;
-        let writer = pair.master.take_writer().context("Take PTY writer")?;
+        let transport = transport::spawn_pty(&options, size)?;
+        Self::start(transport, options.cwd, size, options.scrollback, repaint)
+    }
 
-        #[cfg(unix)]
-        let poll_fd = runtime::prepare_nonblocking(&*pair.master)?;
-
+    /// Run a session engine over `transport`, with one reader, one writer and
+    /// one engine worker. A transport that fails to start is terminated.
+    fn start(
+        transport: Transport,
+        cwd: PathBuf,
+        size: Size,
+        scrollback: usize,
+        repaint: Repaint,
+    ) -> Result<Self> {
+        let Transport {
+            source,
+            sink,
+            process,
+            shell,
+            process_id,
+        } = transport;
+        let mut process_guard = ProcessGuard(Some(process));
         let (input, input_rx) = mpsc::sync_channel(INPUT_QUEUE);
         let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_QUEUE);
         let (pool_tx, pool_rx) = mpsc::sync_channel(OUTPUT_QUEUE);
         let config = Config {
-            scrolling_history: options.scrollback,
+            scrolling_history: scrollback,
             kitty_keyboard: true,
             ..Config::default()
         };
@@ -269,9 +256,9 @@ impl TerminalSession {
             SessionMetadata {
                 title: String::new(),
                 shell,
-                cwd: options.cwd,
+                cwd,
                 reported_cwd: None,
-                process_id: child.process_id(),
+                process_id,
                 remote_process_id: None,
                 status: SessionStatus::Running,
                 bell_count: 0,
@@ -285,7 +272,6 @@ impl TerminalSession {
             input: input.clone(),
         };
         let terminal = Arc::new(Mutex::new(Term::new(config, &size, proxy)));
-        let master = Arc::new(Mutex::new(Some(pair.master)));
         let session = Self {
             terminal: terminal.clone(),
             shared: shared.clone(),
@@ -299,32 +285,17 @@ impl TerminalSession {
             .name("terminal-reader".into())
             .spawn(move || {
                 let _worker = reader_worker;
-                read_loop(
-                    reader,
-                    output_tx,
-                    pool_rx,
-                    reader_shared,
-                    #[cfg(unix)]
-                    poll_fd,
-                );
+                read_loop(source, output_tx, pool_rx, reader_shared);
             })
             .context("Start PTY reader worker")?;
 
         let writer_shared = shared.clone();
         let writer_worker = runtime::Worker::new(writer_shared.clone());
-        let writer_master = master.clone();
         thread::Builder::new()
             .name("terminal-writer".into())
             .spawn(move || {
                 let _worker = writer_worker;
-                write_loop(
-                    writer,
-                    input_rx,
-                    writer_master,
-                    writer_shared,
-                    #[cfg(unix)]
-                    poll_fd,
-                );
+                write_loop(sink, input_rx, writer_shared);
             })
             .context("Start PTY writer worker")?;
 
@@ -339,9 +310,8 @@ impl TerminalSession {
                     output_rx,
                     pool_tx,
                     notification_input,
-                    child_guard.0.take().unwrap(),
+                    process_guard.0.take().unwrap(),
                     shared,
-                    master,
                 );
             })
             .context("Start VT parser worker")?;
@@ -575,18 +545,6 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-/// Failed startup must terminate and reap a shell that was already created.
-struct ChildGuard(Option<Box<dyn Child + Send + Sync>>);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 

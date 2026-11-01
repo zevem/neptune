@@ -2,10 +2,13 @@
 
 The public seam is `lib.rs`, `view.rs`, `input.rs`, `search.rs`, and `error.rs`.
 Desktop code uses owned snapshots and semantic session operations. Backend types
-remain private to `session`, `engine`, `runtime`, and `shell_integration`.
+remain private to `session`, `engine`, `runtime`, `transport` and
+`shell_integration`.
 
 - `session.rs`: lifecycle/API orchestration; `runtime/state.rs`: synchronization,
   backpressure and events; `runtime/mod.rs`: reader/writer/parser workers.
+- `transport.rs`: what feeds a session's engine (source, sink, process) and the
+  PTY/ConPTY transport. Engine replies go to `Sink::reply`, separate from input.
 - `engine.rs`: backend mapping and damage-aware snapshot extraction.
 - `platform/mod.rs`: interruptible Unix I/O, Linux cwd polling, ConPTY teardown.
 - `shell_integration/mod.rs`: portable OSC 7/9;9 and OSC 133 tracking, Windows

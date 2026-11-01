@@ -16,7 +16,7 @@ if ($l.Provider.Name -eq 'FileSystem') { \
 /// Windows shells report no directory by default. Add an OSC 9;9 report to
 /// each prompt of a plain local cmd or PowerShell without editing user files.
 #[cfg(windows)]
-pub(super) fn report_cwd(command: &mut CommandBuilder, shell: &str) {
+pub(super) fn report_cwd(command: &mut portable_pty::CommandBuilder, shell: &str) {
     let name = std::path::Path::new(shell)
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_ascii_lowercase());

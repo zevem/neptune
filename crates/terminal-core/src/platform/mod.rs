@@ -46,11 +46,11 @@ pub(super) fn close_conpty(master: &Master, shared: &Arc<Shared>) {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn process_cwd(pid: u32) -> Option<PathBuf> {
+pub(in crate::session) fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 #[cfg(not(target_os = "linux"))]
-pub(super) fn process_cwd(_pid: u32) -> Option<PathBuf> {
+pub(in crate::session) fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
