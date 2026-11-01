@@ -393,7 +393,12 @@ The replacement happens while Neptune is still running, so a failure is reported
 in the sheet with the installation untouched. Neptune then quits through the
 usual close confirmation, including the running-process warning, and starts the
 new version with the same `--config`/`--data-root` once state is flushed and
-sessions are shut down. Workspaces return with fresh shells, as on any launch.
+sessions are shut down. Workspaces return with fresh shells, as on any launch,
+unless terminals are kept running after quit (macOS and Linux): then the
+restart detaches them without the running-process warning, and the new version
+reattaches every one, including those of a session daemon from the earlier
+version, which keeps serving them and exits once they end. Terminals opened
+after the update run in the new version's daemon.
 Cancelling that confirmation keeps the old process running with the new version
 on disk; Preferences → Updates and the sheet offer **Restart to update**, and
 any later launch starts the new version. An installation cannot be cancelled

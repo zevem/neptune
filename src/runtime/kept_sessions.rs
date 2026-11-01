@@ -119,45 +119,32 @@ fn with_environment(mut options: SessionOptions) -> SessionOptions {
     options
 }
 
-/// The sessions running in the session daemon that serves `dir`, of this
-/// build's protocol version. Without a daemon there are none. `None` when a
-/// daemon is there but couldn't be asked. Never launches a daemon.
+/// The sessions running in the session daemons that serve `dir`, of this
+/// build's protocol version and every earlier one it attaches to. Without a
+/// daemon there are none. `None` when a daemon is there but couldn't be
+/// asked. Never launches a daemon.
 pub fn live(dir: &Path) -> Option<Vec<SessionRef>> {
-    #[cfg(unix)]
-    {
-        use terminal_core::{
-            SessionErrorKind,
-            daemon::{DaemonClient, PROTOCOL_VERSION},
-        };
-        let client = match DaemonClient::connect(dir) {
-            Ok(client) => client,
-            Err(error) if error.kind() == SessionErrorKind::Unavailable => return Some(Vec::new()),
-            Err(_) => return None,
-        };
-        let entries = client.list().ok()?;
-        Some(
-            entries
-                .into_iter()
-                .map(|entry| SessionRef {
-                    daemon: PROTOCOL_VERSION,
-                    id: entry.id.to_string(),
-                })
-                .collect(),
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        None
-    }
+    KeptSessions::new(dir.to_owned(), None).live()
 }
 
+/// Kept sessions run in the session daemons of one data root: new ones in the
+/// daemon of this build's protocol version, which Neptune launches when need
+/// be, while daemons of earlier versions, left by the build Neptune updated
+/// from, keep serving the sessions they have until those end.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct KeptSessions {
     dir: PathBuf,
     /// The `neptune` executable that launches a daemon when none serves
     /// `dir`; `None` only connects.
     program: Option<PathBuf>,
+    /// The protocol version new sessions start in.
+    #[cfg(unix)]
+    current: u32,
+    /// Earlier protocol versions whose daemons Neptune still attaches to.
+    #[cfg(unix)]
+    earlier: &'static [u32],
+    /// The current version's daemon. An earlier daemon gets a connection
+    /// only per request, so it can exit once its sessions have ended.
     #[cfg(unix)]
     client: std::sync::Mutex<Option<std::sync::Arc<terminal_core::daemon::DaemonClient>>>,
 }
@@ -168,8 +155,46 @@ impl KeptSessions {
             dir,
             program,
             #[cfg(unix)]
+            current: terminal_core::daemon::PROTOCOL_VERSION,
+            #[cfg(unix)]
+            earlier: terminal_core::daemon::EARLIER_PROTOCOL_VERSIONS,
+            #[cfg(unix)]
             client: Default::default(),
         }
+    }
+
+    /// Kept sessions of a build whose protocol version is `current`, which
+    /// attaches to daemons of `earlier` versions; never launches a daemon.
+    #[cfg(all(test, unix))]
+    pub fn with_versions(dir: PathBuf, current: u32, earlier: &'static [u32]) -> Self {
+        Self {
+            current,
+            earlier,
+            ..Self::new(dir, None)
+        }
+    }
+
+    /// See [`live`].
+    pub fn live(&self) -> Option<Vec<SessionRef>> {
+        #[cfg(unix)]
+        {
+            use terminal_core::SessionErrorKind;
+            let mut live = Vec::new();
+            for version in self.versions() {
+                let client = match self.connect_to(version) {
+                    Ok(client) => client,
+                    Err(error) if error.kind() == SessionErrorKind::Unavailable => continue,
+                    Err(_) => return None,
+                };
+                live.extend(client.list().ok()?.into_iter().map(|entry| SessionRef {
+                    daemon: version,
+                    id: entry.id.to_string(),
+                }));
+            }
+            Some(live)
+        }
+        #[cfg(not(unix))]
+        None
     }
 
     /// Start a program in the daemon. The reference names its session there.
@@ -186,7 +211,7 @@ impl KeptSessions {
             Ok((
                 session,
                 SessionRef {
-                    daemon: terminal_core::daemon::PROTOCOL_VERSION,
+                    daemon: self.current,
                     id: id.to_string(),
                 },
             ))
@@ -208,9 +233,8 @@ impl KeptSessions {
     pub fn set_data(&self, reference: &SessionRef, data: &SessionData) -> Result<(), String> {
         #[cfg(unix)]
         {
-            let id = self.id(reference)?;
             let bytes = serde_json::to_vec(data).map_err(|error| error.to_string())?;
-            self.request(|client| client.set_data(id, &bytes))
+            self.on(reference, |client, id| client.set_data(id, &bytes))
         }
         #[cfg(not(unix))]
         {
@@ -230,9 +254,10 @@ impl KeptSessions {
     ) -> Result<(TerminalSession, SessionData), String> {
         #[cfg(unix)]
         {
-            let id = self.id(reference)?;
-            self.request(|client| client.attach(id, cols, rows, repaint.clone()))
-                .map(|attached| (attached.session, SessionData::decode(&attached.data)))
+            self.on(reference, |client, id| {
+                client.attach(id, cols, rows, repaint.clone())
+            })
+            .map(|attached| (attached.session, SessionData::decode(&attached.data)))
         }
         #[cfg(not(unix))]
         {
@@ -243,22 +268,32 @@ impl KeptSessions {
 }
 
 impl KeptSessions {
-    /// End every session the daemon keeps. Without a running daemon there is
-    /// none to end, so this never launches one.
+    /// End every session the daemons keep, those of earlier versions too.
+    /// Without a running daemon there is none to end, so this never launches
+    /// one. A daemon that can't be asked doesn't stop the others' ending.
     pub fn end_all(&self) -> Result<(), String> {
         #[cfg(unix)]
         {
-            use terminal_core::{SessionErrorKind, daemon::DaemonClient};
-            let client = match DaemonClient::connect(&self.dir) {
-                Err(error) if error.kind() == SessionErrorKind::Unavailable => return Ok(()),
-                client => client.map_err(|error| format!("{error:#}"))?,
-            };
-            let sessions = client.list().map_err(|error| format!("{error:#}"))?;
-            // One that already ended, or ends meanwhile, is gone either way.
-            for session in sessions {
-                let _ = client.close(session.id);
+            use terminal_core::SessionErrorKind;
+            let mut failure = Ok(());
+            for version in self.versions() {
+                let sessions = match self.connect_to(version) {
+                    Err(error) if error.kind() == SessionErrorKind::Unavailable => continue,
+                    client => client.and_then(|client| Ok((client.list()?, client))),
+                };
+                match sessions {
+                    // One that already ended, or ends meanwhile, is gone either way.
+                    Ok((sessions, client)) => {
+                        for session in sessions {
+                            let _ = client.close(session.id);
+                        }
+                    }
+                    Err(error) => failure = failure.and(Err(format!("{error:#}"))),
+                }
             }
+            failure
         }
+        #[cfg(not(unix))]
         Ok(())
     }
 }
@@ -274,26 +309,46 @@ mod unix {
         sync::Arc,
         time::{Duration, Instant},
     };
-    use terminal_core::{SessionError, SessionErrorKind, daemon::DaemonClient};
+    use terminal_core::{
+        SessionError, SessionErrorKind,
+        daemon::{DaemonClient, SessionId},
+    };
 
     /// How long a launched daemon may take to listen.
     const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
     const LAUNCH_FAILED: &str = "The session daemon could not be launched";
 
     impl KeptSessions {
-        /// The daemon's id for a session this build can reach.
-        pub(super) fn id(
+        /// This build's protocol version, then the earlier ones.
+        pub(super) fn versions(&self) -> impl Iterator<Item = u32> + '_ {
+            std::iter::once(self.current).chain(self.earlier.iter().copied())
+        }
+
+        pub(super) fn connect_to(&self, version: u32) -> Result<DaemonClient, SessionError> {
+            DaemonClient::connect_to(&self.dir, version)
+        }
+
+        /// Run a request about a kept session on the daemon that has it. An
+        /// earlier version's daemon is never launched: without it, the
+        /// session is gone.
+        pub(super) fn on<T>(
             &self,
             reference: &SessionRef,
-        ) -> Result<terminal_core::daemon::SessionId, String> {
-            use terminal_core::daemon::PROTOCOL_VERSION;
-            if reference.daemon != PROTOCOL_VERSION {
+            run: impl Fn(&DaemonClient, SessionId) -> Result<T, SessionError>,
+        ) -> Result<T, String> {
+            if !self.versions().any(|version| version == reference.daemon) {
                 return Err(format!(
                     "This session runs in a session daemon of protocol version {}",
                     reference.daemon
                 ));
             }
-            reference.id.parse().map_err(|error| format!("{error:#}"))
+            let id: SessionId = reference.id.parse().map_err(|error| format!("{error:#}"))?;
+            if reference.daemon == self.current {
+                return self.request(|client| run(client, id));
+            }
+            self.connect_to(reference.daemon)
+                .and_then(|client| run(&client, id))
+                .map_err(|error| format!("{error:#}"))
         }
 
         /// Run a request on the connected client, connecting first if need
@@ -332,7 +387,7 @@ mod unix {
         }
 
         fn connect(&self) -> Result<DaemonClient, String> {
-            let error = match DaemonClient::connect(&self.dir) {
+            let error = match self.connect_to(self.current) {
                 Err(error) if error.kind() == SessionErrorKind::Unavailable => error,
                 result => return result.map_err(|error| format!("{error:#}")),
             };
@@ -345,7 +400,7 @@ mod unix {
             let deadline = Instant::now() + LAUNCH_TIMEOUT;
             loop {
                 std::thread::sleep(Duration::from_millis(20));
-                match DaemonClient::connect(&self.dir) {
+                match self.connect_to(self.current) {
                     Err(error)
                         if error.kind() == SessionErrorKind::Unavailable
                             && Instant::now() < deadline => {}

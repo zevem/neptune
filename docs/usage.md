@@ -485,6 +485,11 @@ confirmations. **End all sessions and quit**, in the command palette and in the
 session daemon keeps that no terminal shows, after the usual running-process
 warning. The workspaces then reopen with fresh shells.
 
+Sessions survive updates too. After **Restart to update**, the new version
+reattaches the sessions the earlier version kept; terminals opened afterwards
+run in a session daemon of the new version, and the earlier version's daemon
+exits once its sessions end.
+
 Turning the setting off takes effect at once: the next quit ends every session,
 with the usual warning. Turning it on applies from the next launch, which
 Preferences notes; until then, quitting still ends the terminals. Launches that
@@ -577,7 +582,9 @@ and explicit download/install actions. On macOS and for the Linux AppImage,
 **Restart to update** installs the verified download over the app you are running
 and restarts it; there is nothing to drag, replace or make executable. Your
 workspaces come back with fresh shells, and Neptune asks before quitting while
-commands are running. The Windows installer and the DEB package are still
+commands are running, unless terminals are
+[kept running after quit](#keeping-terminals-running-after-quit): then they
+keep running through the restart and the new version reattaches them. The Windows installer and the DEB package are still
 installed by hand. Running shells are never silently closed
 or replaced. Beta can advance to a newer stable; neither channel downgrades.
 

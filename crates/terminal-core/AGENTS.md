@@ -15,7 +15,13 @@ remain private to `session`, `engine`, `runtime`, `transport` and
 - `snapshot.rs`: the terminal-core-owned state a replica engine continues from.
 - `daemon/`: session daemon (`server.rs`), client and replica transport
   (`client.rs`), and the versioned wire protocol (`protocol.rs`). Released
-  encodings never change; pinned byte fixtures live in `tests/daemon.rs`.
+  encodings never change. The client attaches to daemons of `PROTOCOL_VERSION`
+  and every `EARLIER_PROTOCOL_VERSIONS` entry; when the version moves on, the
+  old one joins that list and keeps its encodings. `tests/daemon_protocol.rs`
+  pins every released version's frames in a module of its own, played by a
+  scripted daemon; a new version adds a module and never edits an earlier one.
+  The `simulated-daemon-versions` feature (test support only) runs this
+  build's daemon under another version, for tests of several daemons.
 - `platform/mod.rs`: interruptible Unix I/O, Linux cwd polling, ConPTY teardown.
 - `shell_integration/mod.rs`: portable OSC 7/9;9 and OSC 133 tracking, Windows
   shell prompt reporting.
@@ -44,6 +50,7 @@ Choose the narrowest meaningful test target/filter; these are alternatives:
 cargo test -p terminal-core --lib --locked
 cargo test -p terminal-core --test session TEST_NAME --locked
 cargo test -p terminal-core --test daemon TEST_NAME --locked
+cargo test -p terminal-core --test daemon_protocol --locked
 cargo test -p terminal-core --test windows_conpty TEST_NAME --locked
 cargo clippy -p terminal-core --lib --locked -- -D warnings
 ```

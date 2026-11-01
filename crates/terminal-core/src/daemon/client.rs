@@ -9,6 +9,8 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// A connection to the session daemon serving one directory.
 pub struct DaemonClient {
     dir: PathBuf,
+    /// The protocol version its daemon speaks.
+    version: u32,
     control: Mutex<UnixStream>,
 }
 
@@ -71,12 +73,32 @@ fn exchange(
 }
 
 impl DaemonClient {
-    /// Connect to the daemon serving `dir`, which must be user-only.
+    /// Connect to the daemon of this build's [`PROTOCOL_VERSION`] serving
+    /// `dir`, which must be user-only.
     pub fn connect(dir: &Path) -> std::result::Result<Self, SessionError> {
+        Self::connect_to(dir, PROTOCOL_VERSION)
+    }
+
+    /// Connect to the daemon of protocol `version` serving `dir`: this
+    /// build's, or one of [`EARLIER_PROTOCOL_VERSIONS`]. Each version has a
+    /// daemon of its own, so several can serve one directory.
+    pub fn connect_to(dir: &Path, version: u32) -> std::result::Result<Self, SessionError> {
+        if !attaches_to(version) {
+            return Err(SessionError::new(
+                SessionErrorKind::Incompatible,
+                format!("This client doesn't speak session daemon protocol version {version}"),
+            ));
+        }
         Ok(Self {
             dir: dir.to_owned(),
-            control: Mutex::new(open(dir, PROTOCOL_VERSION)?),
+            version,
+            control: Mutex::new(open(dir, version)?),
         })
+    }
+
+    /// The protocol version of the daemon this client reaches.
+    pub fn version(&self) -> u32 {
+        self.version
     }
 
     fn request(&self, request: &Request) -> std::result::Result<Reply, SessionError> {
@@ -122,15 +144,17 @@ impl DaemonClient {
         }
     }
 
-    /// Start a session in the daemon with the same options as
-    /// [`TerminalSession::spawn`], attached to this client.
+    /// Start a session in this client's daemon with the same options as
+    /// [`TerminalSession::spawn`], attached to this client. New sessions
+    /// belong in a daemon of [`PROTOCOL_VERSION`]; an earlier version's
+    /// daemon only keeps serving the sessions it has.
     pub fn start(
         &self,
         options: SessionOptions,
         repaint: Repaint,
     ) -> std::result::Result<(TerminalSession, SessionId), SessionError> {
         validate_options(&options)?;
-        let mut stream = open(&self.dir, PROTOCOL_VERSION)?;
+        let mut stream = open(&self.dir, self.version)?;
         match exchange(&mut stream, &Request::Start(options))? {
             Reply::Attached(attached) => {
                 let id = SessionId(attached.id);
@@ -155,7 +179,7 @@ impl DaemonClient {
                 "Invalid terminal dimensions",
             ));
         }
-        let mut stream = open(&self.dir, PROTOCOL_VERSION)?;
+        let mut stream = open(&self.dir, self.version)?;
         match exchange(
             &mut stream,
             &Request::Attach {

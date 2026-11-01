@@ -192,6 +192,10 @@ impl SessionManager {
                                     terminal.rows,
                                     request.wake.clone(),
                                 )?;
+                                // It keeps the history this launch's budget
+                                // allows, whichever build started it; the
+                                // budget always fits its grid.
+                                let _ = session.set_scrollback(terminal.scrollback);
                                 // Its agents reach this launch with the
                                 // credential they were started with.
                                 if let Some(credential) = &data.agent {
@@ -1098,6 +1102,144 @@ mod tests {
         until(&mut second, |manager, _| manager.usage().closing == 0);
         drop(second);
         daemon.join().unwrap();
+    }
+
+    /// An update relaunch, as two builds whose protocol versions differ:
+    /// the later one reattaches the earlier daemon's session, starts new
+    /// terminals in a daemon of its own version, counts every attached
+    /// session against its limits, and the earlier daemon exits once its
+    /// last session closes.
+    #[test]
+    fn an_update_reattaches_the_earlier_daemons_sessions_and_starts_new_ones_in_its_own() {
+        use super::super::kept_sessions::KeptSessions;
+        use terminal_core::daemon::{DaemonClient, DaemonOptions, PROTOCOL_VERSION, simulated};
+        let (_root, dir, earlier_daemon) = daemon();
+        // The earlier build kept a session whose history its budget allowed.
+        let earlier = DaemonClient::connect(&dir).unwrap();
+        let (session, id) = earlier
+            .start(
+                SessionOptions {
+                    args: vec![
+                        "-c".into(),
+                        "i=0; while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); done; printf 'READY\\r\\n'; sleep 30".into(),
+                    ],
+                    scrollback: 1000,
+                    ..options()
+                },
+                Arc::new(|| {}),
+            )
+            .unwrap();
+        drop(session);
+        drop(earlier);
+        let kept = SessionRef {
+            daemon: PROTOCOL_VERSION,
+            id: id.to_string(),
+        };
+
+        // The update speaks a later version, and attaches to the earlier one.
+        let later = PROTOCOL_VERSION + 1;
+        let serving = dir.clone();
+        let later_daemon = thread::spawn(move || {
+            simulated::run(
+                &serving,
+                DaemonOptions {
+                    idle_exit: Duration::from_millis(200),
+                },
+                later,
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while DaemonClient::connect_to(&dir, later).is_err() {
+            assert!(Instant::now() < deadline, "the later daemon never listened");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let sessions = KeptSessions::with_versions(dir.clone(), later, &[PROTOCOL_VERSION]);
+        assert_eq!(sessions.live(), Some(vec![kept.clone()]));
+        let mut manager = SessionManager::new(
+            ResourcePolicy {
+                max_sessions: 2,
+                ..policy()
+            },
+            false,
+        );
+        manager.keep_sessions(sessions);
+        let wake: Wake = Arc::new(|| {});
+        let (reattached, opened) = (PaneId::new(1), PaneId::new(2));
+        manager
+            .start(
+                reattached,
+                1,
+                false,
+                SessionLaunch {
+                    attach: Some(kept.clone()),
+                    ..options().into()
+                },
+                wake.clone(),
+            )
+            .unwrap();
+        manager
+            .start(opened, 1, false, options(), wake.clone())
+            .unwrap();
+        let mut references = BTreeMap::new();
+        until(&mut manager, |manager, events| {
+            for event in events {
+                match event {
+                    SessionCompletion::Started { pane, session, .. } => {
+                        references.insert(*pane, session.clone());
+                    }
+                    SessionCompletion::Failed { message, .. } => panic!("{message}"),
+                }
+            }
+            [reattached, opened].iter().all(|pane| {
+                manager
+                    .get(*pane)
+                    .is_some_and(|session| session.screen_text().contains("READY"))
+            })
+        });
+        assert_eq!(references[&reattached], Some(kept.clone()));
+        let fresh = references[&opened].clone().unwrap();
+        assert_eq!(fresh.daemon, later);
+        // Both count against the limits, whichever daemon runs them.
+        assert_eq!(manager.usage().running, 2);
+        assert!(
+            manager
+                .start(PaneId::new(3), 1, false, options(), wake.clone())
+                .unwrap_err()
+                .starts_with("Up to 2 sessions")
+        );
+        // The reattached terminal keeps only the history this launch's
+        // budget allows, though the earlier build kept more.
+        let allowed = manager.history_limit(80, 12, usize::MAX);
+        let history = manager.get(reattached).unwrap().history_size();
+        assert!(
+            history <= allowed,
+            "{history} lines of history, {allowed} allowed"
+        );
+
+        // Closing the earlier daemon's last session lets it exit, while the
+        // later daemon keeps serving.
+        manager.close(reattached);
+        until(&mut manager, |manager, _| manager.usage().closing == 0);
+        earlier_daemon.join().unwrap();
+        assert_eq!(listed_in(&dir, later), vec![fresh.id.clone()]);
+        manager.detach(opened);
+        drop(manager);
+        assert_eq!(listed_in(&dir, later), vec![fresh.id.clone()]);
+        let ended = KeptSessions::with_versions(dir.clone(), later, &[PROTOCOL_VERSION]);
+        ended.end_all().unwrap();
+        drop(ended);
+        later_daemon.join().unwrap();
+    }
+
+    fn listed_in(dir: &std::path::Path, version: u32) -> Vec<String> {
+        terminal_core::daemon::DaemonClient::connect_to(dir, version)
+            .unwrap()
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect()
     }
 
     #[test]

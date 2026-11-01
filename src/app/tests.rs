@@ -5405,6 +5405,36 @@ fn ending_all_sessions_and_quitting_ends_every_kept_session_after_the_process_wa
     daemon.join().unwrap();
 }
 
+/// The update relaunch is a quit that detaches: every kept session keeps
+/// running for the new version to reattach, with no running-process question.
+#[cfg(unix)]
+#[test]
+fn restarting_for_an_update_keeps_every_session_running_without_asking() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let mut launch = KeptLaunch::new(root.path(), &dir, 2);
+    assert!(launch.app.config.warn_running_processes);
+    crate::runtime::updates::tests::installed(&mut launch.app.updates);
+    launch.app.action(&launch.ctx, Action::RestartUpdate);
+    launch.until("the quit finished", |app| app.exit_approved);
+    assert_eq!(launch.app.ui.overlay, OverlayState::None);
+    assert!(launch.app.relaunch);
+    // Detaching doesn't depend on starting the installed version, which
+    // this test has none of.
+    launch.app.relaunch = false;
+    eframe::App::on_exit(&mut launch.app);
+    assert_eq!(launch.running(), 3);
+    for pane in &launch.panes {
+        let pane = launch.app.controller.model().pane(*pane).unwrap();
+        assert!(pane.session().is_some(), "the next launch can't reattach");
+    }
+    for entry in launch.client.list().unwrap() {
+        launch.client.close(entry.id).unwrap();
+    }
+    drop(launch);
+    daemon.join().unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn turning_kept_sessions_off_makes_the_next_quit_warn_and_end_every_kept_session() {

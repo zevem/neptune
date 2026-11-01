@@ -7,22 +7,33 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::net::UnixListener;
 
-/// Run a session daemon on `dir` until it has had neither a session nor a
-/// client for `options.idle_exit`. `dir` is created user-only, or an existing
-/// directory of this user's is closed to others. Fails if another daemon of
-/// this protocol version already serves `dir`.
+/// Run a session daemon of [`PROTOCOL_VERSION`] on `dir` until it has had
+/// neither a session nor a client for `options.idle_exit`. `dir` is created
+/// user-only, or an existing directory of this user's is closed to others.
+/// Fails if another daemon of this protocol version already serves `dir`;
+/// daemons of other versions serving it are left alone.
 pub fn run(dir: &Path, options: DaemonOptions) -> std::result::Result<(), SessionError> {
+    serve(dir, options, PROTOCOL_VERSION)
+}
+
+/// Serve `dir` as the daemon of protocol `version`, whose lock and socket
+/// carry its version.
+pub(super) fn serve(
+    dir: &Path,
+    options: DaemonOptions,
+    version: u32,
+) -> std::result::Result<(), SessionError> {
     make_private_dir(dir).map_err(unavailable)?;
     let lock = File::options()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(lock_path(dir, PROTOCOL_VERSION))
+        .open(lock_path(dir, version))
         .map_err(unavailable)?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(unavailable("another session daemon serves this directory"));
     }
-    let socket = socket_path(dir, PROTOCOL_VERSION);
+    let socket = socket_path(dir, version);
     match std::fs::remove_file(&socket) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -38,6 +49,7 @@ pub fn run(dir: &Path, options: DaemonOptions) -> std::result::Result<(), Sessio
         connections: AtomicUsize::new(0),
         wake,
         owner: effective_uid(),
+        version,
     });
 
     let mut idle_since = None;
@@ -79,6 +91,8 @@ struct Daemon {
     /// Wakes the listener to recheck whether the daemon is idle.
     wake: UnixStream,
     owner: u32,
+    /// The protocol version it speaks.
+    version: u32,
 }
 
 /// A session the daemon runs with its authoritative engine.
@@ -255,14 +269,14 @@ impl Daemon {
             }
         };
         let reply = match request(&mut stream) {
-            Some(Request::Hello { version }) if version == PROTOCOL_VERSION => {
+            Some(Request::Hello { version }) if version == self.version => {
                 Reply::Welcome { version }
             }
             Some(Request::Hello { .. }) => {
                 let _ = send(
                     &mut stream,
                     &Reply::Refused {
-                        version: PROTOCOL_VERSION,
+                        version: self.version,
                     },
                 );
                 return;

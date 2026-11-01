@@ -64,6 +64,8 @@ sha1 = "0.10"
 winresource = { version = "0.1.31", default-features = false }
 
 [dev-dependencies]
+# Kept-session tests run daemons of two protocol versions side by side.
+terminal-core = { path = "crates/terminal-core", features = ["simulated-daemon-versions"] }
 # Already Neptune's window backend. Allows the Linux native visual test to run
 # its event loop on the Rust test thread, without a production fixture switch.
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }

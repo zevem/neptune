@@ -29,8 +29,62 @@ mod server;
 pub use client::{Attached, DaemonClient, SessionEntry};
 pub use server::run;
 
-/// The protocol this build's client and daemon speak.
+/// The protocol this build's daemon speaks, and the version new sessions
+/// start in.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Released protocol versions before [`PROTOCOL_VERSION`], oldest first,
+/// whose daemons this build's client still attaches to. Every release attaches
+/// to daemons of every earlier released version, so none is ever removed: when
+/// `PROTOCOL_VERSION` moves on, the version it had joins this list, its
+/// encodings stay in `protocol`, and its pinned fixtures stay in
+/// `tests/daemon_protocol.rs`.
+pub const EARLIER_PROTOCOL_VERSIONS: &[u32] = &[];
+
+/// Whether this build's client speaks protocol `version`.
+fn attaches_to(version: u32) -> bool {
+    version == PROTOCOL_VERSION
+        || EARLIER_PROTOCOL_VERSIONS.contains(&version)
+        || simulated::serves(version)
+}
+
+/// Test support: this build's daemon under another protocol version's name,
+/// standing in for a daemon of another release, so that tests can run several
+/// daemons for one directory. It speaks this build's encodings; the client in
+/// the same process attaches to it. Never part of a released build.
+#[cfg(any(test, feature = "simulated-daemon-versions"))]
+pub mod simulated {
+    use super::*;
+
+    static VERSIONS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    /// Run a daemon as [`super::run`] does, named and speaking as version
+    /// `version`.
+    pub fn run(
+        dir: &Path,
+        options: DaemonOptions,
+        version: u32,
+    ) -> std::result::Result<(), SessionError> {
+        {
+            let mut versions = VERSIONS.lock();
+            if !versions.contains(&version) {
+                versions.push(version);
+            }
+        }
+        server::serve(dir, options, version)
+    }
+
+    pub(super) fn serves(version: u32) -> bool {
+        VERSIONS.lock().contains(&version)
+    }
+}
+
+#[cfg(not(any(test, feature = "simulated-daemon-versions")))]
+mod simulated {
+    pub(super) fn serves(_: u32) -> bool {
+        false
+    }
+}
 
 /// A session's identity within its session daemon. It stays the same across
 /// detach and reattach; its text form round-trips through [`str::parse`].

@@ -17,7 +17,7 @@ Neptune exiting (by quitting, closing its last window, crashing or updating) whi
 _Avoid_: Suspend, background, close
 
 **Session daemon**:
-The background process that keeps one data root's sessions running, whether or not Neptune is open.
+The background process that keeps a data root's sessions running, whether or not Neptune is open. Each protocol version has its own, so after an update the earlier version's daemon keeps serving its sessions until they end.
 _Avoid_: Server, host, mux, multiplexer
 
 **Reattach**:
