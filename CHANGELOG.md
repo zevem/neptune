@@ -11,6 +11,10 @@ their preparation records remain in Git history.
 
 ### What's New
 
+## [0.1.0-rc.9] - 2026-11-01
+
+### What's New
+
 - On macOS and Linux, terminals keep running when you quit Neptune, close its
   last window or it crashes, and the next launch reattaches them with their
   screen, scrollback and running programs, including output produced while
@@ -18,18 +22,68 @@ their preparation records remain in Git history.
   Turn this off with **Keep terminals running after quit** in Preferences →
   General. **End all sessions and quit**, in the command palette, ends every
   session.
+- On macOS, new tabs and splits beside a terminal where you typed `ssh` no
+  longer fail with "Working directory does not exist".
 
 ### Acceptance notes and known limitations
 
+- Full native acceptance on every platform remains pending; this is a release
+  candidate for acceptance testing, not a production-stable release.
+- Saved workspaces use schema version 16 to remember each terminal's kept
+  session. Earlier workspace files still load, but RC8 and earlier cannot
+  restore or save over layouts written by this version. Back up workspace state
+  before testing if you need to return to an earlier candidate. Terminals that
+  were not kept running start fresh shells and SSH connections; commands,
+  process memory and terminal contents are never written to disk. Browser tabs
+  reopen their last page in their selected profile; private tabs restore blank.
+- Once you turn on **Match system appearance**, choose a light-mode or
+  dark-mode theme, or turn off **Keep terminals running after quit**, earlier
+  candidates cannot read the settings file. Back it up before returning to an
+  earlier candidate.
+- Kept terminals were verified on development builds on Linux (Ubuntu 26.04,
+  X11) and macOS 26, not yet with installed candidates. They are not available
+  on Windows. Sessions end when you log out or restart. This is the first
+  candidate that keeps sessions, so updating to it from RC8 starts fresh shells;
+  reattaching through **Restart to update** applies from this candidate onward
+  and still needs verification with an installed update.
 - Each kept terminal wakes Neptune's background session process about 30 times
   a second while idle, and heavy output uses about 65% more CPU than with the
   setting off ([#177](https://github.com/zevem/neptune/issues/177),
   [#178](https://github.com/zevem/neptune/issues/178)).
-- Saved workspaces use schema version 16 to remember each terminal's session.
-  Earlier candidates cannot restore or save over layouts written by this
-  version, and once you turn off **Keep terminals running after quit** they
-  cannot read the settings file. Back both up before returning to an earlier
-  candidate.
+- Browser previews include a separate Chromium runtime, increasing installer
+  size. On Linux hosts that block the AppImage's Chromium sandbox, previews run
+  without it and the blank tab displays a warning; see the
+  [installation guide](https://github.com/zevem/neptune/blob/v0.1.0-rc.9/docs/installation.md#browser-previews-and-chromiums-sandbox)
+  for enabling it. The DEB includes the sandbox helper. A browser startup
+  failure leaves terminals usable. Browser sandbox, clipboard, IME, DPI and
+  installer behavior still need native acceptance on macOS and Windows.
+- Projects require Claude Code or Codex installed and signed in, and a local
+  workspace; they are not available on Windows yet. Pull request actions require
+  the GitHub CLI (`gh`) signed in with the necessary repository permissions.
+- Windows installers remain unsigned and may show an unverified-publisher or
+  SmartScreen warning. Both macOS installers require signing and notarization;
+  all installers are covered by signed update metadata and build attestations.
+- Linux x64 packages require glibc 2.35 or newer and working host graphics
+  drivers. Browser-downloaded AppImages need execute permission before launch;
+  enable it in file Properties or run `chmod u+x` on the downloaded file.
+- The macOS browser Dock fix, workspace dragging between windows and in-place
+  updates still need native acceptance of the installed candidate on macOS.
+  On Windows, a workspace dragged out of the sidebar opens its own window but
+  cannot join another window's sidebar while held; use **Move to window**.
+- Following the system's light or dark mode was checked on Linux/X11 only;
+  macOS, Windows, native Wayland and live GNOME/KDE mode switches still need
+  native acceptance.
+- The reported intermittent native Wayland freeze still needs a capture of the
+  blocking state; XWayland checks do not establish native Wayland acceptance.
+  File-manager drops on native Wayland currently work only in the original
+  window.
+- SSH requires an installed OpenSSH client and a POSIX remote shell. Remote
+  directory tracking is integrated for zsh; other shells need OSC 7 integration.
+- Kitty graphics and comprehensive complex-script shaping remain unsupported.
+  Keypad identity and some keyboard-layout information depend on the window
+  toolkit. IME, accessibility and mixed-DPI behavior still need native acceptance.
+- Automatic updates never downgrade. After this candidate is published, select
+  Beta in Preferences → Updates to receive it; private drafts are not offered.
 
 ## [0.1.0-rc.8] - 2026-10-19
 
