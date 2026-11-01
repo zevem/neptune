@@ -1,6 +1,6 @@
 # Resuming coding agents
 
-On Unix desktops, local terminals started by Neptune add temporary `claude`,
+On Unix desktops, local terminals started by Neptune add `claude`,
 `codex`, `opencode`, `gemini`, `pi` and `omp` adapters to their command search path.
 Launch any of them normally. When
 workspace restoration is enabled, closing and reopening Neptune opens each
@@ -68,7 +68,15 @@ saved reference is kept.
 
 `--command` takes precedence in its target pane and starts a shell there.
 `--no-restore` and `restore_workspaces = false` retain their existing meaning.
-Neptune restores new processes, not unfinished tool execution or process memory.
+Without kept sessions, Neptune restores new processes, not unfinished tool
+execution or process memory.
+
+With **Keep terminals running after quit** on, an agent keeps working in its
+terminal while Neptune is closed. Its hooks are dropped then, without holding
+it up, and its Neptune tools answer "Neptune isn't open". When Neptune opens
+again and reattaches the terminal, the agent is not resumed: it is still
+running, and the [agents tab](#agent-activity) shows what it does from its
+next hook event and its title.
 Only provider, session ID, directory, the addresses of
 [linked pull requests](#linked-pull-requests), the paths and titles of
 [attached files](#attached-files), the terminal whose agent
@@ -583,7 +591,7 @@ started agents, are not members of the project, get none of its context and
 cannot start more. A project has at most six agents open and starts at most
 forty in a day.
 
-Credentials. A lead gets a token and run of its own for the loopback
+Credentials. A lead gets a token and run of its own for the bridge's
 channel, and the role `NEPTUNE_AGENT_ROLE=lead`; a project agent's shell has
 `NEPTUNE_AGENT_ROLE=member`. The role only chooses which tools the tool
 server lists: authority follows the token, and a lead's token is refused once
@@ -669,7 +677,7 @@ Code bypasses permissions is not a wait, and a wait shorter than 0.4 seconds
 
 Each hook runs the Neptune executable, which reads the event's input, sends at
 most the kind of moment and the tool's name to the application over the pane's
-private loopback channel, prints nothing and exits 0, so it never decides
+private channel, prints nothing and exits 0, so it never decides
 anything for the agent. Prompts, commands, tool input and results, and the
 transcript are not sent, logged or saved; the state itself is not saved either.
 The one exception is the last message of a turn of an agent that
@@ -778,9 +786,17 @@ CLIs are found on its search path only, as locally.
 
 The pure model validates resume references and accepts generation-tagged
 `PaneAgentChanged` commands. Persistence stores a reference on each pane. The
-desktop startup workers install private adapters, and a single blocking loopback
-listener receives bounded metadata messages. Each pane generation has a random
-callback credential, and each CLI invocation has its own identity. Closed or
+desktop startup workers install private adapters, and a single blocking listener
+on a Unix socket receives bounded metadata messages. A launch that restores
+workspaces keeps the adapters and the socket in `agents/` in the data root, a
+folder readable by your account alone, and listens there again on every launch,
+because terminals kept running in the session daemon hold that folder in their
+`PATH` and environment. Other launches use a private temporary folder. A hook
+gives up within 200 ms when nothing listens. Each pane generation has a random
+callback credential, and each CLI invocation has its own identity. A kept
+session holds its terminal's credential in the session daemon, never on disk.
+The launch that reattaches the terminal accepts it again, and takes the first
+invocation it hears from for the agent the pane last named. Closed or
 replaced panes and late hooks from exited invocations cannot overwrite a newer
 session. A linked pull request is accepted only from the invocation that is open
 in its pane, and reaches the model as a generation-tagged
@@ -817,7 +833,7 @@ when the pane's generation, lifecycle or agent reference changes, and wakes
 itself only for the two-second and 0.4-second deadlines above.
 
 Starting an agent uses the same channel, credentials and startup path. The
-tool server's requests are answered over the loopback connection; those that
+tool server's requests are answered over the same connection; those that
 change the workspace wait for the next frame, where a generation-tagged
 `SpawnAgent` command adds a pane that is in no layout, so focus and view do
 not move, and the model records which pane's agent started it. Only such a

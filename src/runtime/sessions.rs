@@ -180,19 +180,36 @@ impl SessionManager {
                                     .as_ref()
                                     .ok_or("Terminals are not kept running after quit")?;
                                 let terminal = &request.launch.terminal;
-                                return kept
-                                    .attach(
-                                        &reference,
-                                        terminal.cols,
-                                        terminal.rows,
+                                let (session, data) = kept.attach(
+                                    &reference,
+                                    terminal.cols,
+                                    terminal.rows,
+                                    request.wake.clone(),
+                                )?;
+                                // Its agents reach this launch with the
+                                // credential they were started with.
+                                if let Some(credential) = &data.agent {
+                                    let (agent, spawned_by) = match &request.launch.agent {
+                                        AgentLaunch::Local { resume, spawned_by } => {
+                                            (resume.as_ref(), *spawned_by)
+                                        }
+                                        _ => (None, None),
+                                    };
+                                    agents.adopt(
+                                        request.pane,
+                                        request.generation,
+                                        credential,
+                                        agent,
+                                        spawned_by,
                                         request.wake.clone(),
-                                    )
-                                    .map(|session| Entry {
-                                        generation: request.generation,
-                                        session,
-                                        control: None,
-                                        reference: Some(reference),
-                                    });
+                                    );
+                                }
+                                return Ok(Entry {
+                                    generation: request.generation,
+                                    session,
+                                    control: None,
+                                    reference: Some(reference),
+                                });
                             }
                             let mut control = None;
                             if request.launch.ssh_control && cfg!(unix) {
@@ -216,9 +233,10 @@ impl SessionManager {
                                 );
                                 control = Some(Arc::new(directory));
                             }
+                            let mut credential = None;
                             if let AgentLaunch::Local { resume, spawned_by } = &request.launch.agent
                             {
-                                agents
+                                credential = agents
                                     .prepare(
                                         request.pane,
                                         request.generation,
@@ -230,7 +248,7 @@ impl SessionManager {
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
                             }
                             if matches!(request.launch.agent, AgentLaunch::Remote) {
-                                agents
+                                credential = agents
                                     .prepare_remote(
                                         request.pane,
                                         request.generation,
@@ -240,9 +258,19 @@ impl SessionManager {
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
                             }
                             let (session, reference) = match &request.kept {
-                                Some(kept) => kept
-                                    .start(request.launch.terminal, request.wake.clone())
-                                    .map(|(session, reference)| (session, Some(reference)))?,
+                                Some(kept) => {
+                                    let (session, reference) =
+                                        kept.start(request.launch.terminal, request.wake.clone())?;
+                                    // Without it, the session still runs; only
+                                    // its agents go unrecognized after a reattach.
+                                    if let Some(credential) = credential {
+                                        let data = super::kept_sessions::SessionData {
+                                            agent: Some(credential),
+                                        };
+                                        let _ = kept.set_data(&reference, &data);
+                                    }
+                                    (session, Some(reference))
+                                }
                                 None => TerminalSession::spawn(
                                     request.launch.terminal,
                                     request.wake.clone(),
@@ -817,6 +845,113 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        drop(second);
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_kept_terminals_agents_reach_the_launch_that_reattaches_it() {
+        use super::super::agents::{Event, Signal, exchange_with};
+        let (root, dir, daemon) = daemon();
+        let bridge = root.path().join("agents");
+        let pane = PaneId::new(1);
+        let wake: Wake = Arc::new(|| {});
+        let terminal = SessionOptions {
+            args: vec![
+                "-c".into(),
+                "printf 'AT=%s\\r\\nAS=%s\\r\\n' \"$NEPTUNE_AGENT_ENDPOINT\" \"$NEPTUNE_AGENT_TOKEN\"; sleep 30"
+                    .into(),
+            ],
+            ..options()
+        };
+        let launch = |resume, attach| SessionLaunch {
+            terminal: terminal.clone(),
+            agent: AgentLaunch::Local {
+                resume,
+                spawned_by: None,
+            },
+            ssh_control: false,
+            attach,
+        };
+        let mut first = kept(&dir);
+        first.agents().listen_in(bridge.clone());
+        first
+            .start(pane, 1, false, launch(None, None), wake.clone())
+            .unwrap();
+        let mut reference = None;
+        until(&mut first, |manager, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some()
+                && manager
+                    .get(pane)
+                    .is_some_and(|session| session.screen_text().contains("AS="))
+        });
+        let reference = reference.unwrap().unwrap();
+        let screen = first.get(pane).unwrap().screen_text();
+        let shown = |name: &str| {
+            screen
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(name))
+                .unwrap()
+                .to_owned()
+        };
+        let (endpoint, token) = (shown("AT="), shown("AS="));
+        assert_eq!(std::path::Path::new(&endpoint), bridge.join("bridge.sock"));
+        first.detach(pane);
+        assert!(first.shutdown(Duration::from_secs(2)));
+        drop(first);
+        // Its startup workers let go of the bridge as they stop; Neptune's
+        // own process would have exited.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&endpoint).exists() {
+            assert!(Instant::now() < deadline, "the bridge outlived its launch");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let tool = || Event::Activity {
+            signal: Signal::Tool,
+        };
+        // While Neptune is closed, its agents are not heard, and not held up.
+        let asked = Instant::now();
+        assert!(exchange_with(&endpoint, &token, tool(), "a").is_err());
+        assert!(asked.elapsed() < Duration::from_secs(1));
+
+        // The next launch knows the agent it saved from its next hook.
+        let saved = neptune_model::AgentSession {
+            kind: neptune_model::AgentKind::Claude,
+            session_id: Some("019a1234-5678-7000-8000-123456789abc".into()),
+            cwd: root.path().into(),
+        };
+        let mut second = kept(&dir);
+        second.agents().listen_in(bridge);
+        second
+            .start(
+                pane,
+                2,
+                false,
+                launch(Some(saved), Some(reference)),
+                wake.clone(),
+            )
+            .unwrap();
+        until(&mut second, |manager, _| manager.get(pane).is_some());
+        assert_eq!(
+            exchange_with(&endpoint, "guess", tool(), "a").unwrap(),
+            b"no"
+        );
+        assert_eq!(
+            exchange_with(&endpoint, &token, tool(), "a").unwrap(),
+            b"ok"
+        );
+        assert_eq!(
+            second.agent_activity(),
+            [(
+                pane,
+                2,
+                Some(crate::agent_activity::Activity::Working),
+                None
+            )]
+        );
+        second.close(pane);
+        until(&mut second, |manager, _| manager.usage().closing == 0);
         drop(second);
         daemon.join().unwrap();
     }
