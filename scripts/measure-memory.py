@@ -5,6 +5,11 @@ Linux/X11 only. Each repetition owns its process, endpoint and fresh storage.
 RSS includes shared mappings; PSS/private bytes exclude more shared memory, but
 none of these measure GPU memory or the shell's memory. Fixture contents are
 synthetic. Build the two release inspection binaries before running.
+
+`--keep-sessions off|on` launches restoring a saved workspace with the setting
+written explicitly. With `on`, each sample also reads the case's session daemon
+(which holds the authoritative copy of every terminal) and reports the sum, and
+the case ends through "End all sessions and quit".
 """
 
 from __future__ import annotations
@@ -68,49 +73,75 @@ def run(args, output, scenario, source):
     output.mkdir(parents=True)
     data = output / "data"
     data.mkdir()
+    keep = args.keep_sessions == "on"
     (data / "config.toml").write_text(
         'shell="/bin/sh"\nscrollback=10000\ncursor_blink=false\n'
         'confirm_close=false\nwarn_running_processes=false\n'
+        + ("" if args.keep_sessions is None else f"keep_sessions_running={str(keep).lower()}\n")
     )
+    if args.keep_sessions is None:
+        launch = ["--cwd", str(source), "--no-restore"]
+    else:
+        # Only a launch that restores workspaces keeps its terminals in a daemon.
+        (data / "workspaces.json").write_text(json.dumps(scale.make_state(source, 1)))
+        launch = []
     address = harness.free_endpoint()
     env = os.environ.copy()
     env.pop("WAYLAND_DISPLAY", None)
+    for name in [name for name in env if name.startswith("NEPTUNE_AGENT")]:
+        env.pop(name)
     env["EGUI_INSPECTION"] = address
     log = output / "app.log"
-    report = {"scenario": scenario, "status": "running", "endpoint": address,
-              "data_root": str(data), "samples": []}
+    report = {"scenario": scenario, "keep_sessions": args.keep_sessions, "status": "running",
+              "endpoint": address, "data_root": str(data), "samples": []}
     process = None
+    daemons = {}
     started = time.monotonic()
 
     def sample(label):
         time.sleep(args.settle)
         readings = []
+        daemon_readings = []
         for _ in range(5):
             readings.append(memory(process.pid))
+            daemon_readings.append([memory(pid) for pid in daemons])
             time.sleep(0.1)
         result = {"label": label, "elapsed_seconds": time.monotonic() - started,
                   "readings": readings}
         for field in readings[0]:
             result[field] = sorted(r[field] for r in readings)[2]
+        if daemons:
+            result["daemon_readings"] = daemon_readings
+            for field in ("rss_bytes", "pss_bytes", "private_bytes"):
+                daemon = sorted(sum(r[field] for r in reading) for reading in daemon_readings)[2]
+                result["daemon_" + field] = daemon
+                result["combined_" + field] = result[field] + daemon
         events = scale.frames(log)
         if events:
             result["parsed_bytes"] = sum(p["parsed"] for p in events[-1]["panes"])
             result["cache_estimated_bytes"] = events[-1]["cache_estimated_bytes"]
         report["samples"].append(result)
         print(f"{output.name} {label}: RSS {result['rss_bytes'] / 2**20:.1f} MiB; "
-              f"private {result['private_bytes'] / 2**20:.1f} MiB", flush=True)
+              f"private {result['private_bytes'] / 2**20:.1f} MiB"
+              + (f"; with the daemon PSS {result['combined_pss_bytes'] / 2**20:.1f} MiB" if daemons else ""),
+              flush=True)
 
     try:
         with log.open("w") as sink:
             process = subprocess.Popen(
-                [str(args.app), "--data-root", str(data), "--cwd", str(source),
-                 "--no-restore", "--diagnostics", "--size", "1180x760"],
+                [str(args.app), "--data-root", str(data), *launch,
+                 "--diagnostics", "--size", "1180x760"],
                 env=env, stdout=sink, stderr=subprocess.STDOUT, start_new_session=True,
             )
             report["pid"] = process.pid
             harness.wait_ready(process, args.client, address, 40)
             scale.until(lambda: scale.frames(log) and
                         scale.frames(log)[-1]["resources"]["running"] == 1, 30, "shell")
+            found = scale.session_daemons(data)
+            report["daemon_pids"] = found
+            if len(found) != (1 if keep else 0):
+                raise RuntimeError(f"Expected {1 if keep else 0} session daemon, found {found}")
+            daemons = {pid: scale.proc_sample(pid)["start_ticks"] for pid in found}
             time.sleep(3)
             if scenario == "terminal":
                 ready = data / "shell-ready"
@@ -180,8 +211,15 @@ def run(args, output, scenario, source):
                                 30, "all output parsed")
                     sample(f"output-{batch + 1}")
                 harness.inspect(args.client, address, "screenshot", str(output / "terminal.png"))
-            click_label(args.client, address, "Close window")
-            process.wait(timeout=10)
+            if keep:
+                # Closing the window would only detach: end the sessions instead.
+                scale.end_all_sessions(args.client, address, process)
+                scale.until(lambda: not any(scale.alive(pid, start) for pid, start in daemons.items()),
+                            30, "session daemon exit once empty")
+                report["daemon_exited"] = True
+            else:
+                click_label(args.client, address, "Close window")
+                process.wait(timeout=10)
             shutdowns = [json.loads(line) for line in log.read_text().splitlines()
                          if line.startswith("{") and '"operation":"shutdown"' in line]
             report["shutdown_complete"] = bool(shutdowns and shutdowns[-1]["complete"])
@@ -199,6 +237,11 @@ def run(args, output, scenario, source):
     finally:
         if process is not None:
             harness.stop_owned(process)
+        # A daemon this case started and could not end through the app.
+        for pid, start in daemons.items():
+            if scale.alive(pid, start):
+                os.kill(pid, 15)
+                report.setdefault("stopped_daemons", []).append(pid)
         (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
@@ -214,6 +257,8 @@ def main():
     parser.add_argument("--folders", type=int, default=20)
     parser.add_argument("--entries", type=int, default=10000)
     parser.add_argument("--settle", type=float, default=1)
+    parser.add_argument("--keep-sessions", choices=["off", "on"],
+                        help="launch restoring a workspace with the setting off or on (default: a --cwd launch)")
     parser.add_argument("--fixture", type=Path, help="Reuse a synthetic fixture from an earlier run")
     args = parser.parse_args()
     if platform.system() != "Linux":
@@ -243,7 +288,8 @@ def main():
         "binary_sha256": hashlib.sha256(args.app.read_bytes()).hexdigest(),
         "lock_sha256": hashlib.sha256((REPO / "Cargo.lock").read_bytes()).hexdigest(),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "folders": args.folders, "entries_per_folder": args.entries, "cases": [],
+        "folders": args.folders, "entries_per_folder": args.entries,
+        "keep_sessions": args.keep_sessions, "cases": [],
     }
     for repeat in range(args.repeats):
         for scenario in args.scenarios:

@@ -4,6 +4,9 @@
 /proc/<tgid>/stat aggregates CPU time across the process's threads, including
 terminated threads. Child-process CPU and GPU work are outside this scope.
 Whether the application is actually idle must be verified by the caller.
+
+Wakeups are the voluntary context switches of each thread present at both ends of
+the sample (a thread blocks once per wakeup), from /proc/<tgid>/task/*/status.
 """
 
 from __future__ import annotations
@@ -87,6 +90,54 @@ def snapshot(pid: int) -> Snapshot:
     )
 
 
+def thread_switches(pid: int) -> dict[int, tuple[str, int, int]]:
+    """Thread name and voluntary/involuntary context switches, by thread ID."""
+    threads = {}
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            status = read_status_path(task / "status")
+        except OSError:
+            continue
+        threads[int(task.name)] = (
+            status["Name"],
+            int(status["voluntary_ctxt_switches"]),
+            int(status["nonvoluntary_ctxt_switches"]),
+        )
+    return threads
+
+
+def read_status_path(path: Path) -> dict[str, str]:
+    return {
+        name: value.strip()
+        for line in path.read_text().splitlines()
+        if ":" in line
+        for name, value in [line.split(":", 1)]
+    }
+
+
+def wakeups(first: dict[int, tuple[str, int, int]], last: dict[int, tuple[str, int, int]], elapsed: float) -> dict:
+    """Context switches per second, in total and by thread name, for threads alive throughout."""
+    by_name: dict[str, float] = {}
+    voluntary = involuntary = 0
+    for tid, (name, vol, invol) in last.items():
+        if tid not in first:
+            continue
+        delta = vol - first[tid][1]
+        voluntary += delta
+        involuntary += invol - first[tid][2]
+        by_name[name] = by_name.get(name, 0) + delta
+    return {
+        "scope": "voluntary switches of threads alive at both ends of the sample",
+        "voluntary_per_second": round(voluntary / elapsed, 3),
+        "involuntary_per_second": round(involuntary / elapsed, 3),
+        "threads_compared": sum(1 for tid in last if tid in first),
+        "threads_started_or_ended": len(set(first) ^ set(last)),
+        "voluntary_per_second_by_thread_name": {
+            name: round(count / elapsed, 3) for name, count in sorted(by_name.items(), key=lambda item: -item[1])
+        },
+    }
+
+
 def finite_duration(value: str) -> float:
     duration = float(value)
     if not math.isfinite(duration) or duration < 0:
@@ -132,6 +183,7 @@ def measure(args: argparse.Namespace) -> dict:
         executable = None
 
     time.sleep(args.warmup)
+    first_threads = thread_switches(pid)
     first = snapshot(pid)
     if first.start_ticks != identity:
         raise RuntimeError("process identity changed during warmup (PID reused)")
@@ -145,6 +197,7 @@ def measure(args: argparse.Namespace) -> dict:
             raise RuntimeError("process identity changed during sampling (PID reused)")
         samples.append(current)
 
+    last_threads = thread_switches(pid)
     last = samples[-1]
     elapsed = last.timestamp - first.timestamp
     if elapsed <= 0:
@@ -180,6 +233,7 @@ def measure(args: argparse.Namespace) -> dict:
             "percent_of_one_core": round(100 * cpu_seconds / elapsed, 4),
             "resolution_seconds": 1 / ticks_per_second,
         },
+        "wakeups": wakeups(first_threads, last_threads, elapsed),
         "memory": {
             "rss_start_kib": rss[0],
             "rss_end_kib": rss[-1],
