@@ -1234,6 +1234,19 @@ font_size = 15.0
     }
 
     #[test]
+    fn keeping_terminals_running_is_a_yes_or_no_setting() {
+        for invalid in [
+            "keep_sessions_running = \"yes\"",
+            "keep_sessions_running = 1",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("config.toml");
+            std::fs::write(&path, invalid).unwrap();
+            assert!(Config::load(&path).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn shell_arguments_round_trip_and_are_omitted_when_empty() {
         let plain = toml::to_string(&Config::default()).unwrap();
         assert!(!plain.contains("shell_args"));

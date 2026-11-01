@@ -42,6 +42,8 @@ pub enum Close {
     /// Close one native window and the workspaces it contains.
     Window(WindowId),
     App,
+    /// End every session, kept ones included, and quit.
+    AllSessions,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum OverlayState {
@@ -93,6 +95,9 @@ pub struct UiState {
     pub overlay: OverlayState,
     pub close_status: CloseStatus,
     pub close_browser: bool,
+    /// The close lets go of kept sessions, which keep running: quitting, or
+    /// closing the last window, while terminals are kept running.
+    pub close_detaches: bool,
     pub preferences: theme_browser::State,
     /// The Preferences pane in view and the settings search.
     pub preference_view: preferences::View,
@@ -275,6 +280,8 @@ pub enum Action {
     WindowClose,
     /// Quit Neptune, confirming every terminal in every native window.
     Quit,
+    /// Quit Neptune, ending every session rather than keeping it running.
+    EndAllSessions,
     Create(PathBuf, Option<String>),
     SetName(WorkspaceId, String),
     /// Boxed: settings are far larger than any other action.

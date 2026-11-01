@@ -182,6 +182,10 @@ pub enum Command {
         sessions: Vec<SessionRef>,
         cwd: PathBuf,
     },
+    /// Neptune is ending every session as it quits, kept ones included.
+    /// Terminals forget the kept sessions they showed, so the next launch
+    /// starts fresh shells rather than reattach to ended ones.
+    ForgetSessions,
     PaneAgentChanged {
         pane: PaneId,
         generation: u64,
@@ -1071,6 +1075,16 @@ impl Controller {
                     return Ok(effects);
                 }
                 dirty = true;
+            }
+            Command::ForgetSessions => {
+                for pane in self
+                    .model
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|workspace| &mut workspace.panes)
+                {
+                    dirty |= pane.session.take().is_some();
+                }
             }
             Command::SessionExited { pane, generation } => {
                 self.lifecycle(pane, generation, Lifecycle::Exited);
@@ -3842,6 +3856,41 @@ mod tests {
             generation: 1
         }));
         assert!(controller.exit_effects().is_empty());
+    }
+
+    #[test]
+    fn ending_every_session_forgets_the_kept_ones_so_the_next_launch_starts_afresh() {
+        let (mut controller, pane) = reattaching();
+        controller
+            .complete(Completion::Started {
+                pane,
+                generation: 1,
+                session: Some(kept("00000000000000a1")),
+            })
+            .unwrap();
+        let saved = controller.generation();
+        // The desktop ends the sessions themselves; the model only forgets
+        // them, and saves that.
+        assert_eq!(
+            controller.dispatch(Command::ForgetSessions).unwrap(),
+            vec![Effect::Persist {
+                generation: saved + 1
+            }]
+        );
+        assert_eq!(controller.model().pane(pane).unwrap().session(), None);
+        assert!(controller.exit_effects().is_empty());
+        assert!(
+            controller
+                .model()
+                .specs()
+                .iter()
+                .flat_map(|workspace| &workspace.panes)
+                .all(|pane| pane.session.is_none())
+        );
+        // Nothing kept, nothing changed.
+        let unchanged = controller.generation();
+        controller.dispatch(Command::ForgetSessions).unwrap();
+        assert_eq!(controller.generation(), unchanged);
     }
 
     #[test]

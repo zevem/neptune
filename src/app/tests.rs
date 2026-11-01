@@ -48,6 +48,7 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         ephemeral: true,
         session_daemon: Some(crate::runtime::kept_sessions::directory(root)),
         keep_sessions: false,
+        end_sessions: false,
         preference_generation: 0,
         ime_composing: false,
         terminal_focus: None,
@@ -5116,4 +5117,260 @@ fn a_reattach_that_fails_restores_the_terminal_with_one_notice() {
     drop(app);
     let _ = dir;
     daemon.join().unwrap();
+}
+
+/// A launch that keeps sessions, reattached to `count` terminals that an
+/// earlier launch kept running in `dir`'s daemon, each in its own workspace,
+/// with a stray kept session no terminal shows.
+#[cfg(unix)]
+struct KeptLaunch {
+    app: App,
+    ctx: egui::Context,
+    client: terminal_core::daemon::DaemonClient,
+    panes: Vec<PaneId>,
+}
+
+#[cfg(unix)]
+impl KeptLaunch {
+    fn new(root: &std::path::Path, dir: &std::path::Path, count: usize) -> Self {
+        let client = terminal_core::daemon::DaemonClient::connect(dir).unwrap();
+        let keep = |client: &terminal_core::daemon::DaemonClient| {
+            let (session, id) = client
+                .start(
+                    SessionOptions {
+                        cwd: root.into(),
+                        shell: Some("/bin/sh".into()),
+                        args: vec!["-c".into(), "printf 'KEPT\\r\\n'; sleep 30".into()],
+                        ..Default::default()
+                    },
+                    Arc::new(|| {}),
+                )
+                .unwrap();
+            drop(session);
+            neptune_model::SessionRef {
+                daemon: terminal_core::daemon::PROTOCOL_VERSION,
+                id: id.to_string(),
+            }
+        };
+        keep(&client);
+        let mut earlier = Controller::new(Model::default());
+        let mut panes = Vec::new();
+        for index in 0..count {
+            earlier
+                .dispatch(Command::AddWorkspace {
+                    group: None,
+                    cwd: root.into(),
+                    name: format!("Kept {index}"),
+                    remote: None,
+                })
+                .unwrap();
+            let pane = earlier.model().active_pane().unwrap();
+            earlier
+                .complete(neptune_model::Completion::Started {
+                    pane,
+                    generation: 1,
+                    session: Some(keep(&client)),
+                })
+                .unwrap();
+            panes.push(pane);
+        }
+        let saved = Model::restore(
+            earlier.model().specs(),
+            earlier.model().active_workspace(),
+            true,
+            Limits::default(),
+        )
+        .unwrap();
+        let (mut app, _sender) = fixture(root);
+        let ctx = egui::Context::default();
+        let config = Config {
+            keep_sessions_running: true,
+            confirm_close: false,
+            ..app.config.clone()
+        };
+        app.complete_startup(&ctx, loaded(config, saved));
+        let mut launch = Self {
+            app,
+            ctx,
+            client,
+            panes,
+        };
+        launch.until("every terminal reattached", |app| {
+            app.controller.model().workspaces().iter().all(|workspace| {
+                workspace.panes().iter().all(|pane| {
+                    pane.lifecycle() == &Lifecycle::Running
+                        && app
+                            .sessions
+                            .get(pane.id())
+                            .is_some_and(|session| session.screen_text().contains("KEPT"))
+                })
+            })
+        });
+        launch
+    }
+
+    fn until(&mut self, what: &str, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(&self.app) {
+            assert!(Instant::now() < deadline, "{what}");
+            self.app.poll(&self.ctx);
+            self.app.poll_close(&self.ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Confirm the running-process warning `target` raised.
+    fn confirm_running(&mut self, target: Close) {
+        self.until("the process check finished", |app| {
+            app.ui.close_status != ui::CloseStatus::Checking
+        });
+        assert_eq!(self.app.ui.overlay, OverlayState::ConfirmClose(target));
+        assert!(
+            matches!(self.app.ui.close_status, ui::CloseStatus::Running { .. }),
+            "{:?}",
+            self.app.ui.close_status
+        );
+        self.app.action(&self.ctx, Action::Confirm(target));
+    }
+
+    fn running(&self) -> usize {
+        self.client
+            .list()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.status == SessionStatus::Running)
+            .count()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ending_all_sessions_and_quitting_ends_every_kept_session_after_the_process_warning() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let mut launch = KeptLaunch::new(root.path(), &dir, 1);
+    assert_eq!(launch.running(), 2);
+    launch.app.action(&launch.ctx, Action::EndAllSessions);
+    launch.confirm_running(Close::AllSessions);
+    assert!(launch.app.exit_approved);
+    eframe::App::on_exit(&mut launch.app);
+    // The stray kept session no terminal showed ended too.
+    assert_eq!(launch.running(), 0);
+    // The next launch looks for none of them.
+    let pane = launch.panes[0];
+    assert_eq!(
+        launch.app.controller.model().pane(pane).unwrap().session(),
+        None
+    );
+    drop(launch);
+    daemon.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn turning_kept_sessions_off_makes_the_next_quit_warn_and_end_every_kept_session() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let mut launch = KeptLaunch::new(root.path(), &dir, 1);
+    let config = Config {
+        keep_sessions_running: false,
+        ..launch.app.config.clone()
+    };
+    launch
+        .app
+        .action(&launch.ctx, Action::Preferences(Box::new(config)));
+    launch.app.action(&launch.ctx, Action::Quit);
+    launch.confirm_running(Close::App);
+    assert!(launch.app.exit_approved);
+    eframe::App::on_exit(&mut launch.app);
+    assert_eq!(launch.running(), 0);
+    drop(launch);
+    daemon.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn closing_one_of_several_windows_ends_its_kept_sessions_and_closing_the_last_detaches() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let mut launch = KeptLaunch::new(root.path(), &dir, 2);
+    let model = launch.app.controller.model();
+    let torn = model.workspace_for_pane(launch.panes[1]).unwrap();
+    launch
+        .app
+        .controller
+        .dispatch(Command::DetachWorkspace(torn))
+        .unwrap();
+    let sibling = launch
+        .app
+        .controller
+        .model()
+        .workspace(torn)
+        .unwrap()
+        .window();
+    assert_ne!(sibling, neptune_model::WindowId::ROOT);
+    // Two terminals and a stray kept session no terminal shows.
+    assert_eq!(launch.running(), 3);
+    launch
+        .app
+        .request_close(&launch.ctx, Close::Window(sibling));
+    launch.confirm_running(Close::Window(sibling));
+    assert!(!launch.app.exit_approved);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while launch.running() != 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the closed window's session kept running"
+        );
+        launch.app.poll(&launch.ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The last window detaches without asking, like quitting.
+    launch
+        .app
+        .request_close(&launch.ctx, Close::Window(neptune_model::WindowId::ROOT));
+    assert_eq!(launch.app.ui.overlay, OverlayState::None);
+    assert!(launch.app.exit_approved);
+    eframe::App::on_exit(&mut launch.app);
+    assert_eq!(launch.running(), 2);
+    let pane = launch.panes[0];
+    assert!(
+        launch
+            .app
+            .controller
+            .model()
+            .pane(pane)
+            .unwrap()
+            .session()
+            .is_some()
+    );
+    for entry in launch.client.list().unwrap() {
+        launch.client.close(entry.id).unwrap();
+    }
+    drop(launch);
+    daemon.join().unwrap();
+}
+
+#[test]
+fn keeping_terminals_running_round_trips_through_preference_saves() {
+    let root = tempfile::tempdir().unwrap();
+    for keep in [true, false] {
+        let (mut app, _sender) = fixture(root.path());
+        app.ephemeral = false;
+        let ctx = egui::Context::default();
+        app.complete_startup(&ctx, loaded(app.config.clone(), Model::default()));
+        app.action(
+            &ctx,
+            Action::Preferences(Box::new(Config {
+                keep_sessions_running: keep,
+                ..app.config.clone()
+            })),
+        );
+        eframe::App::on_exit(&mut app);
+        let saved = Config::load(&app.config_path).unwrap();
+        assert_eq!(saved.keep_sessions_running, keep);
+        // Off is the default, which older versions can read.
+        let text = std::fs::read_to_string(&app.config_path).unwrap();
+        assert_eq!(text.contains("keep_sessions_running"), keep);
+    }
 }

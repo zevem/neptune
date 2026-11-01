@@ -768,6 +768,10 @@ impl App {
                 self.relaunch = false;
                 self.request_close(ctx, Close::App);
             }
+            Action::EndAllSessions => {
+                self.relaunch = false;
+                self.request_close(ctx, Close::AllSessions);
+            }
             Action::New => {
                 if let Some(dirs) = directories::BaseDirs::new() {
                     self.action(ctx, Action::Create(dirs.home_dir().into(), None));
