@@ -107,21 +107,121 @@ fn with_environment(mut options: SessionOptions) -> SessionOptions {
     options
 }
 
+/// What a launch that was taken over is told when it asks for a session.
+const REPLACED: &str = "A newer Neptune took over these terminals";
+
+/// A launch's hold on its data root's session daemon. Holding it takes over
+/// from an earlier launch, which closes its windows and saves nothing more;
+/// a newer launch takes over from this one in turn.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct Claim {
+    /// Runs once a newer launch takes over.
+    wake: Repaint,
+    replaced: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    held: std::sync::Mutex<Option<terminal_core::daemon::Takeover>>,
+}
+
+impl Default for Claim {
+    fn default() -> Self {
+        Self::new(std::sync::Arc::new(|| {}))
+    }
+}
+
+impl Claim {
+    pub fn new(wake: Repaint) -> Self {
+        Self {
+            wake,
+            replaced: Default::default(),
+            #[cfg(unix)]
+            held: Default::default(),
+        }
+    }
+
+    /// Whether a newer launch took over. True as soon as that launch holds
+    /// the daemon.
+    pub fn replaced(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        #[cfg(unix)]
+        if !self.replaced.load(Ordering::Acquire)
+            // A hold under way waits for the daemon; until then the flag
+            // answers.
+            && let Ok(held) = self.held.try_lock()
+            && held.as_ref().is_some_and(|held| held.replaced())
+        {
+            self.replaced.store(true, Ordering::Release);
+        }
+        self.replaced.load(Ordering::Acquire)
+    }
+
+    /// Take over the daemon serving `dir`, if one runs; none is launched.
+    pub fn take_over_running(&self, dir: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use terminal_core::{SessionErrorKind, daemon::DaemonClient};
+            match DaemonClient::connect(dir) {
+                Err(error) if error.kind() == SessionErrorKind::Unavailable => Ok(()),
+                Err(error) => Err(format!("{error:#}")),
+                Ok(client) => self.hold(&client),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
+
+    /// Hold the daemon `client` reaches, unless this launch already holds it.
+    #[cfg(unix)]
+    fn hold(&self, client: &terminal_core::daemon::DaemonClient) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let mut held = self.held.lock().map_err(|_| REPLACED.to_owned())?;
+        if self.replaced.load(Ordering::Acquire)
+            || held.as_ref().is_some_and(|held| held.replaced())
+        {
+            self.replaced.store(true, Ordering::Release);
+            return Err(REPLACED.into());
+        }
+        // A daemon that went away was replaced by the one `client` reaches.
+        if held
+            .as_ref()
+            .is_some_and(terminal_core::daemon::Takeover::held)
+        {
+            return Ok(());
+        }
+        let replaced = self.replaced.clone();
+        let wake = self.wake.clone();
+        *held = Some(
+            client
+                .take_over(std::sync::Arc::new(move || {
+                    replaced.store(true, Ordering::Release);
+                    wake();
+                }))
+                .map_err(|error| format!("{error:#}"))?,
+        );
+        Ok(())
+    }
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 pub struct KeptSessions {
     dir: PathBuf,
     /// The `neptune` executable that launches a daemon when none serves
     /// `dir`; `None` only connects.
     program: Option<PathBuf>,
+    /// Every daemon this launch connects to, it takes over.
+    claim: std::sync::Arc<Claim>,
     #[cfg(unix)]
     client: std::sync::Mutex<Option<std::sync::Arc<terminal_core::daemon::DaemonClient>>>,
 }
 
 impl KeptSessions {
-    pub fn new(dir: PathBuf, program: Option<PathBuf>) -> Self {
+    pub fn new(dir: PathBuf, program: Option<PathBuf>, claim: std::sync::Arc<Claim>) -> Self {
         Self {
             dir,
             program,
+            claim,
             #[cfg(unix)]
             client: Default::default(),
         }
@@ -195,6 +295,10 @@ impl KeptSessions {
     /// End every session the daemon keeps. Without a running daemon there is
     /// none to end, so this never launches one.
     pub fn end_all(&self) -> Result<(), String> {
+        // They are a newer launch's now.
+        if self.claim.replaced() {
+            return Err(REPLACED.into());
+        }
         #[cfg(unix)]
         {
             use terminal_core::{SessionErrorKind, daemon::DaemonClient};
@@ -253,6 +357,9 @@ mod unix {
             &self,
             run: impl Fn(&DaemonClient) -> Result<T, SessionError>,
         ) -> Result<T, String> {
+            if self.claim.replaced() {
+                return Err(REPLACED.into());
+            }
             let client = self.client(None)?;
             let result = match run(&client) {
                 // Starting and attaching open their own connections; one
@@ -274,6 +381,7 @@ mod unix {
                 }
                 _ => {
                     let client = Arc::new(self.connect()?);
+                    self.claim.hold(&client)?;
                     *cached = Some(client.clone());
                     Ok(client)
                 }

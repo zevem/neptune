@@ -512,6 +512,14 @@ impl SessionManager {
         self.detached
             .extend(self.in_flight.keys().filter(|(id, _)| *id == pane).copied());
     }
+    /// Let go of every kept session, those still starting or reattaching
+    /// too, as a launch that was taken over closes.
+    pub fn detach_all(&mut self) {
+        let panes: Vec<_> = self.desired.keys().copied().collect();
+        for pane in panes {
+            self.detach(pane);
+        }
+    }
     fn reap(&mut self) {
         self.closing.retain(|closing| {
             let pending = closing.session.metrics().active_workers != 0;
@@ -755,6 +763,7 @@ mod tests {
         manager.keep_sessions(super::super::kept_sessions::KeptSessions::new(
             dir.into(),
             None,
+            Default::default(),
         ));
         manager
     }
