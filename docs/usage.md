@@ -471,11 +471,13 @@ full-screen program, title and directory are as they are now, including output
 produced while Neptune was closed. Sessions end when you log out or restart your
 computer; Neptune then restores the workspaces with fresh shells. An SSH
 terminal stays connected while Neptune is closed: its connection-sharing socket
-lives in the `sessions/ssh` folder of the data directory until the terminal
+lives in the `sessions` folder of the data directory until the terminal
 closes, so its port forwards keep running, port discovery resumes and the
 remote folder keeps updating once it reattaches. The setting
 needs workspace restoration, so it is unavailable while **Restore workspaces on
-launch** is off, and Windows doesn't offer it yet.
+launch** is off, and Windows doesn't offer it yet. A data directory whose path
+is too long for the session daemon's socket keeps terminals in Neptune, as if
+the setting were off.
 
 Quitting and closing the last window don't warn about running processes in
 these terminals, because they keep running. Closing a terminal, tab, workspace
@@ -485,12 +487,14 @@ confirmations. **End all sessions and quit**, in the command palette and in the
 session daemon keeps that no terminal shows, after the usual running-process
 warning. The workspaces then reopen with fresh shells.
 
-Sessions survive updates too. After **Restart to update**, the new version
-reattaches the sessions the earlier version kept; terminals opened afterwards
-run in a session daemon of the new version, and the earlier version's daemon
-exits once its sessions end. If the earlier version is still open when the new
-one starts, it closes its windows without ending its sessions, and the new
-version reattaches them.
+Sessions are designed to survive updates from the first release that keeps
+them onward. After **Restart to update**, the new version reattaches the
+sessions the earlier version kept; terminals opened afterwards run in a session
+daemon of the new version, and the earlier version's daemon exits once its
+sessions end. If the earlier version is still open when the new one starts, it
+closes its windows without ending its sessions, and the new version reattaches
+them. This has been tested only on Linux development builds that simulate a
+new version, not yet through an installed update or on macOS.
 
 Turning the setting off takes effect at once: the next quit ends every session,
 with the usual warning. Turning it on applies from the next launch, which
@@ -586,7 +590,8 @@ and restarts it; there is nothing to drag, replace or make executable. Your
 workspaces come back with fresh shells, and Neptune asks before quitting while
 commands are running, unless terminals are
 [kept running after quit](#keeping-terminals-running-after-quit): then they
-keep running through the restart and the new version reattaches them. The Windows installer and the DEB package are still
+keep running through the restart and, by design, the new version reattaches
+them (not yet verified through an installed update). The Windows installer and the DEB package are still
 installed by hand. Running shells are never silently closed
 or replaced. Beta can advance to a newer stable; neither channel downgrades.
 
