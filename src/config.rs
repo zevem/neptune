@@ -45,8 +45,9 @@ pub struct Config {
     pub restore_workspaces: bool,
     /// Quitting leaves terminals running in a session daemon, and the next
     /// launch reattaches to them. Unix only, and only while workspaces are
-    /// restored. Written only when on, so older versions still load settings.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// restored. On by default, and written only when off, so a missing key
+    /// means on.
+    #[serde(skip_serializing_if = "is_on")]
     pub keep_sessions_running: bool,
     pub confirm_close: bool,
     /// Independent protection for sessions with active or unknown jobs.
@@ -199,6 +200,10 @@ pub enum Cursor {
     Underline,
 }
 
+fn is_on(on: &bool) -> bool {
+    *on
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -223,7 +228,7 @@ impl Default for Config {
             cursor_blink: false,
             sidebar_width: 216.0,
             restore_workspaces: true,
-            keep_sessions_running: false,
+            keep_sessions_running: true,
             confirm_close: true,
             warn_running_processes: true,
             desktop_notifications: true,
@@ -1218,19 +1223,26 @@ font_size = 15.0
     }
 
     #[test]
-    fn kept_sessions_default_off_and_are_omitted_until_turned_on() {
+    fn kept_sessions_default_on_and_are_written_only_when_turned_off() {
         let config = Config::default();
-        assert!(!config.keep_sessions_running);
-        // Older builds refuse unknown keys, so the key is written only when on.
+        assert!(config.keep_sessions_running);
         assert!(
             !toml::to_string(&config)
                 .unwrap()
                 .contains("keep_sessions_running")
         );
-        let on: Config = toml::from_str("keep_sessions_running = true").unwrap();
-        assert!(on.keep_sessions_running);
-        let restored: Config = toml::from_str(&toml::to_string(&on).unwrap()).unwrap();
-        assert!(restored.keep_sessions_running);
+        // Settings saved before the default changed omit the key, and keep
+        // terminals running.
+        let older: Config = toml::from_str("restore_workspaces = true").unwrap();
+        assert!(older.keep_sessions_running);
+        let off = Config {
+            keep_sessions_running: false,
+            ..Config::default()
+        };
+        let saved = toml::to_string(&off).unwrap();
+        assert!(saved.contains("keep_sessions_running = false"));
+        let restored: Config = toml::from_str(&saved).unwrap();
+        assert!(!restored.keep_sessions_running);
     }
 
     #[test]

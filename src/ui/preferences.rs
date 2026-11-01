@@ -1748,7 +1748,10 @@ mod tests {
         const HELP: &str = "Shells and programs keep running when Neptune quits, and reopen where you left them. They end when you log out or restart your computer.";
         const NEXT_LAUNCH: &str = "Applies from the next launch.";
         const NEEDS_RESTORE: &str = "Needs Restore workspaces on launch.";
-        let off = Config::default();
+        let off = Config {
+            keep_sessions_running: false,
+            ..Config::default()
+        };
         let (toggle, text) = keep_running_row(&off, false);
         if cfg!(windows) {
             assert_eq!(toggle, None);

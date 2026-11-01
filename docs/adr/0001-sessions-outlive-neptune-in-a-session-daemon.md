@@ -16,5 +16,5 @@ Neptune used to end every session when it exited and restore workspaces with fre
 
 - Output is parsed twice, and history memory roughly doubles while Neptune is attached.
 - Saved panes gain a session reference, which needs a new workspace state version.
-- Persistence ships off by default until 0.1.0 stable is tagged, then becomes the default once its performance gate passes. It can be turned off, and it requires workspace restoration.
+- Persistence is on by default and can be turned off. It requires workspace restoration. It first merged off by default; the default was turned on before its performance gate passed, with the idle-wakeup and output-CPU costs tracked in #177 and #178.
 - After an update, an old session daemon keeps serving its existing sessions until they end, and new sessions start in a daemon of the new version. The daemon protocol is versioned, and every release must still attach to daemons from earlier releases. We rejected handing PTYs over to a new daemon: the shells would remain children of the old process, so their exit statuses would be lost.

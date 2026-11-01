@@ -67,9 +67,11 @@ the saved organization and ends its terminals' sessions. All windows share
 Neptune's session and resource limits.
 
 With workspace restoration enabled, Neptune reopens the saved windows,
-workspaces, tabs and splits with fresh shells in their remembered directories.
-Live processes and terminal contents are not restored, unless
-[terminals are kept running after quit](#keeping-terminals-running-after-quit).
+workspaces, tabs and splits in their remembered directories. On macOS and Linux,
+[terminals are kept running after quit](#keeping-terminals-running-after-quit)
+by default, so they come back with their programs and contents. Otherwise, and
+on Windows, they start fresh shells: live processes and terminal contents are
+not restored.
 Settings and themes are shared by every window. See
 [storage and restoration](#storage-and-restoration).
 
@@ -455,15 +457,16 @@ launches bypass migration.
 
 Workspace organization is saved in `workspaces.json`, including which window
 holds each workspace, each window's selected workspace and sidebar visibility.
-Restoration reopens windows with fresh shells; it does not restore running
-processes or monitor placement. Damaged organization is copied aside before it
+Restoration itself starts fresh shells and does not restore running processes
+or monitor placement; only terminals kept running after quit come back with
+their processes. Damaged organization is copied aside before it
 can be replaced, and an unreadable or unsupported future schema remains
 protected from writes.
 
 ### Keeping terminals running after quit
 
 On macOS and Linux, **Preferences → General → Keep terminals running after
-quit** (`keep_sessions_running`, off by default) keeps each terminal's shell and
+quit** (`keep_sessions_running`, on by default) keeps each terminal's shell and
 programs running when Neptune quits, closes its last window or crashes. They run
 in a session daemon, a background Neptune process for the data directory, and
 the next launch reattaches each terminal to its session: its screen, scrollback,
@@ -586,12 +589,13 @@ Preferences → Updates controls automatic checks and Stable/Beta channels.
 Checks/downloads run off the UI thread; updates require signature/hash verification
 and explicit download/install actions. On macOS and for the Linux AppImage,
 **Restart to update** installs the verified download over the app you are running
-and restarts it; there is nothing to drag, replace or make executable. Your
-workspaces come back with fresh shells, and Neptune asks before quitting while
-commands are running, unless terminals are
-[kept running after quit](#keeping-terminals-running-after-quit): then they
+and restarts it; there is nothing to drag, replace or make executable. On
+macOS and Linux, terminals
+[kept running after quit](#keeping-terminals-running-after-quit), the default,
 keep running through the restart and, by design, the new version reattaches
-them (not yet verified through an installed update). The Windows installer and the DEB package are still
+them (not yet verified through an installed update). Otherwise your workspaces
+come back with fresh shells, and Neptune asks before quitting while commands are
+running. The Windows installer and the DEB package are still
 installed by hand. Running shells are never silently closed
 or replaced. Beta can advance to a newer stable; neither channel downgrades.
 

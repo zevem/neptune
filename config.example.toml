@@ -81,8 +81,9 @@ restore_workspaces = true
 
 # macOS and Linux: quitting leaves terminals running in a session daemon, and
 # the next launch reattaches to them. Needs restore_workspaces. Sessions end when
-# you log out or restart. Turning it on applies from the next launch.
-keep_sessions_running = false
+# you log out or restart. On by default. Turning it off takes effect at once;
+# turning it on applies from the next launch.
+keep_sessions_running = true
 
 # The profile new browser tabs start in: "default" keeps sign-ins on this
 # computer, "private" keeps nothing, or the id of a profile below.
