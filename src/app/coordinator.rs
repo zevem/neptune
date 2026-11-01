@@ -234,7 +234,21 @@ impl App {
                             None,
                             None,
                         ),
-                        agent: crate::runtime::sessions::AgentLaunch::Disabled,
+                        // The agents still running in it are known again
+                        // by the credential the session kept.
+                        agent: if self.remote_of(pane).is_some() {
+                            crate::runtime::sessions::AgentLaunch::Remote
+                        } else {
+                            let pane = self.controller.model().pane(pane);
+                            crate::runtime::sessions::AgentLaunch::Local {
+                                resume: pane.and_then(|pane| pane.agent()).cloned(),
+                                spawned_by: pane.and_then(|pane| {
+                                    pane.spawned_by()
+                                        .map(Starter::Pane)
+                                        .or(pane.project().map(Starter::Project))
+                                }),
+                            }
+                        },
                         ssh_control: false,
                         attach: Some(session),
                     };

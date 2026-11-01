@@ -231,7 +231,17 @@ impl App {
         Self {
             _font_shortcut_monitor: crate::platform::keyboard::FontShortcutMonitor::install(),
             controller: Controller::new(Model::default()),
-            sessions: SessionManager::new(ResourcePolicy::default(), launch.diagnostics),
+            sessions: {
+                let sessions = SessionManager::new(ResourcePolicy::default(), launch.diagnostics);
+                // Terminals an earlier launch kept running reach the one
+                // that restores after it where they reached that one.
+                if restore {
+                    sessions
+                        .agents()
+                        .listen_in(crate::runtime::agents::directory(&data));
+                }
+                sessions
+            },
             renders: BTreeMap::new(),
             config: Config::default(),
             config_path,
