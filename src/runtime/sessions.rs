@@ -1066,7 +1066,7 @@ mod tests {
             attach,
         };
         let mut first = kept(&dir);
-        first.agents().listen_in(bridge.clone());
+        first.agents().listen_in(bridge.clone(), Arc::new(|| false));
         first
             .start(pane, 1, false, launch(None, None), wake.clone())
             .unwrap();
@@ -1114,7 +1114,7 @@ mod tests {
             cwd: root.path().into(),
         };
         let mut second = kept(&dir);
-        second.agents().listen_in(bridge);
+        second.agents().listen_in(bridge, Arc::new(|| false));
         second
             .start(
                 pane,

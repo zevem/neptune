@@ -296,9 +296,11 @@ impl App {
                 // Terminals an earlier launch kept running reach the one
                 // that restores after it where they reached that one.
                 if restore {
-                    sessions
-                        .agents()
-                        .listen_in(crate::runtime::agents::directory(&data));
+                    let claim = claim.clone();
+                    sessions.agents().listen_in(
+                        crate::runtime::agents::directory(&data),
+                        Arc::new(move || claim.replaced()),
+                    );
                 }
                 sessions
             },

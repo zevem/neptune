@@ -11,10 +11,7 @@ use std::{
     collections::VecDeque,
     io::{IsTerminal, Read, Write},
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -56,6 +53,9 @@ const ENDPOINT: &str = "NEPTUNE_AGENT_ENDPOINT";
 /// The bridge's socket, in the directory that also holds the adapters.
 #[cfg(unix)]
 const SOCKET: &str = "bridge.sock";
+/// Held while the socket file is replaced or removed.
+#[cfg(unix)]
+const LOCK: &str = "bridge.lock";
 /// How long a hook waits to reach the bridge, which is not open while
 /// Neptune is closed.
 #[cfg(unix)]
@@ -1035,22 +1035,66 @@ struct Listener {
     /// The socket file this listener bound, as (device, inode): a later
     /// launch may have bound its own there since.
     bound: (u64, u64),
-    stop: Arc<AtomicBool>,
+    /// Closing it stops the worker. The socket's path may lead to a later
+    /// launch's listener by then, so it cannot wake this one.
+    stop: Option<UnixStream>,
     worker: Option<thread::JoinHandle<()>>,
 }
 #[cfg(unix)]
 impl Drop for Listener {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
-        self.stop.store(true, Ordering::Release);
-        let _ = UnixStream::connect(&self.socket);
+        self.stop = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        // A launch binding there now owns the path, socket file and all.
+        let Ok(_held) = Ownership::try_take(&self.directory) else {
+            return;
+        };
         if std::fs::symlink_metadata(&self.socket)
             .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.bound)
         {
             let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+}
+/// The hold on a bridge directory's socket path, while a launch replaces
+/// the socket file there or removes its own: another launch may be doing
+/// either at the same time.
+#[cfg(unix)]
+struct Ownership {
+    _lock: std::fs::File,
+}
+#[cfg(unix)]
+impl Ownership {
+    fn try_take(dir: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(dir.join(LOCK))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { _lock: file })
+    }
+    /// Waits briefly: the holder is removing or binding one file.
+    fn take(dir: &std::path::Path) -> std::io::Result<Self> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match Self::try_take(dir) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                held => return held,
+            }
         }
     }
 }
@@ -1059,9 +1103,10 @@ pub struct AgentBridge {
     #[cfg(unix)]
     listener: Mutex<Option<Listener>>,
     /// Where the bridge listens and keeps its adapters, the same for every
-    /// launch; without it, a directory of this launch's own.
+    /// launch, and whether a newer launch took this one over; without it, a
+    /// directory of this launch's own.
     #[cfg_attr(not(unix), allow(dead_code))]
-    home: std::sync::OnceLock<PathBuf>,
+    home: std::sync::OnceLock<(PathBuf, super::persistence::Stop)>,
     shared: Arc<Mutex<Shared>>,
 }
 /// Where the bridge of a launch that restores the data root's workspaces
@@ -1079,10 +1124,12 @@ fn adapter(kind: AgentKind, executable: &std::path::Path, directory: &std::path:
     )
 }
 /// Makes `dir` the bridge's: this user's alone, without the socket and the
-/// old startup files a launch before left there.
+/// old startup files a launch before left there. Bind the new socket while
+/// holding what it returns.
 #[cfg(unix)]
-fn claim(dir: &std::path::Path) -> std::io::Result<()> {
+fn claim(dir: &std::path::Path) -> std::io::Result<Ownership> {
     terminal_core::daemon::make_private_dir(dir)?;
+    let held = Ownership::take(dir)?;
     // A shell reads its startup files only while it starts, so those of
     // terminals still running are no longer needed either.
     for entry in std::fs::read_dir(dir)?.flatten() {
@@ -1096,7 +1143,7 @@ fn claim(dir: &std::path::Path) -> std::io::Result<()> {
     }
     match std::fs::remove_file(dir.join(SOCKET)) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
+        _ => Ok(held),
     }
 }
 /// Writes `content` to `path` whole: a shell may be running the file it
@@ -1138,16 +1185,17 @@ impl Listener {
         let socket = directory.join(SOCKET);
         let listener = UnixListener::bind(&socket)?;
         let metadata = std::fs::symlink_metadata(&socket)?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = stop.clone();
+        listener.set_nonblocking(true)?;
+        let (stop, stopping) = UnixStream::pair()?;
         let worker = thread::Builder::new()
             .name("neptune-agent-hooks".into())
             .spawn(move || {
-                for stream in listener.incoming() {
-                    if stopping.load(Ordering::Acquire) {
-                        break;
-                    }
+                while let Some(stream) = accept(&listener, &stopping) {
                     let Ok(mut stream) = stream else { break };
+                    // Some systems hand out the listener's nonblocking mode.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
                     let mut bytes = Vec::new();
                     if read_message(&mut stream, &mut bytes).is_err() {
@@ -1171,18 +1219,47 @@ impl Listener {
             directory,
             socket,
             bound: (metadata.dev(), metadata.ino()),
-            stop,
+            stop: Some(stop),
             worker: Some(worker),
         })
+    }
+}
+/// The next caller of `listener`, waiting without a timeout; `None` once
+/// `stop`'s other end is closed.
+#[cfg(unix)]
+fn accept(listener: &UnixListener, stop: &UnixStream) -> Option<std::io::Result<UnixStream>> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let mut ready = [listener.as_raw_fd(), stop.as_raw_fd()].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        if unsafe { libc::poll(ready.as_mut_ptr(), 2, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Some(Err(error));
+        }
+        if ready[1].revents != 0 {
+            return None;
+        }
+        match listener.accept() {
+            // The caller gave up before it was answered.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            accepted => return Some(accepted.map(|(stream, _)| stream)),
+        }
     }
 }
 impl AgentBridge {
     /// Listen in `dir` from the first terminal on, as every launch that
     /// keeps sessions does, so that the terminals an earlier launch left
     /// running reach this one. Without it, the bridge has a directory of
-    /// its own that goes with it.
-    pub fn listen_in(&self, dir: PathBuf) {
-        let _ = self.home.set(dir);
+    /// its own that goes with it. Once `replaced`, `dir` is the newer
+    /// launch's.
+    pub fn listen_in(&self, dir: PathBuf, replaced: super::persistence::Stop) {
+        let _ = self.home.set((dir, replaced));
     }
     /// The listener every local caller reports to, started on first use.
     /// It binds a socket and writes the adapters, so only workers call it.
@@ -1193,10 +1270,11 @@ impl AgentBridge {
             .lock()
             .map_err(|_| std::io::Error::other("Agent bridge unavailable"))?;
         if state.is_none() {
-            let kept = self.home.get().and_then(|dir| {
-                claim(dir)
-                    .and_then(|()| Listener::open(dir.clone(), None, self.shared.clone()))
-                    .ok()
+            // Once taken over, the directory is the newer launch's.
+            let kept = self.home.get().filter(|(_, replaced)| !replaced());
+            let kept = kept.and_then(|(dir, _)| {
+                let _held = claim(dir).ok()?;
+                Listener::open(dir.clone(), None, self.shared.clone()).ok()
             });
             let listener = match kept {
                 Some(listener) => listener,
@@ -4249,6 +4327,7 @@ fn run_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     fn agent(id: &str) -> AgentSession {
         AgentSession {
             kind: AgentKind::Claude,
@@ -7151,7 +7230,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("agents");
         let first = AgentBridge::default();
-        first.listen_in(dir.clone());
+        first.listen_in(dir.clone(), Arc::new(|| false));
         let (endpoint, shims, _) = reached(&first, 1);
         assert_eq!(std::path::Path::new(&shims), dir);
         assert_eq!(std::path::Path::new(&endpoint), dir.join("bridge.sock"));
@@ -7172,7 +7251,7 @@ mod tests {
         assert!(asked.elapsed() < Duration::from_secs(1));
 
         let second = AgentBridge::default();
-        second.listen_in(dir.clone());
+        second.listen_in(dir.clone(), Arc::new(|| false));
         let (again, shims_again, credential) = reached(&second, 1);
         assert_eq!((&again, &shims_again), (&endpoint, &shims));
         let open = || Event::Open {
@@ -7185,6 +7264,59 @@ mod tests {
         assert_eq!(
             exchange_with(&again, "guess", open(), "run").unwrap(),
             b"no"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_a_newer_one_listened_over_stops_without_taking_its_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents");
+        let earlier = AgentBridge::default();
+        earlier.listen_in(dir.clone(), Arc::new(|| false));
+        let (endpoint, _, _) = reached(&earlier, 1);
+        let newer = AgentBridge::default();
+        newer.listen_in(dir.clone(), Arc::new(|| false));
+        let (again, _, credential) = reached(&newer, 1);
+        assert_eq!(again, endpoint);
+
+        // The earlier launch quits while the newer one listens at the path.
+        let (done, stopped) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(earlier);
+            let _ = done.send(());
+        });
+        assert!(
+            stopped.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the earlier bridge never stopped listening"
+        );
+        let open = Event::Open {
+            agent: agent(FIRST),
+        };
+        assert_eq!(
+            exchange_with(&endpoint, &credential.token, open, "run").unwrap(),
+            b"ok"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_taken_over_never_listens_where_the_newer_one_does() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents");
+        let newer = AgentBridge::default();
+        newer.listen_in(dir.clone(), Arc::new(|| false));
+        let (endpoint, _, credential) = reached(&newer, 1);
+        // Frozen before its first terminal started, it resumes taken over.
+        let earlier = AgentBridge::default();
+        earlier.listen_in(dir.clone(), Arc::new(|| true));
+        let (elsewhere, _, _) = reached(&earlier, 1);
+        assert_ne!(elsewhere, endpoint);
+        drop(earlier);
+        let open = Event::Open {
+            agent: agent(FIRST),
+        };
+        assert_eq!(
+            exchange_with(&endpoint, &credential.token, open, "run").unwrap(),
+            b"ok"
         );
     }
     #[test]
