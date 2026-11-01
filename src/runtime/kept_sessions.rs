@@ -29,6 +29,7 @@ pub fn cli(args: &[String]) -> Option<i32> {
     };
     #[cfg(unix)]
     {
+        close_inherited();
         // SAFETY: setsid has no memory effects; it fails harmlessly if this
         // process already leads a session.
         unsafe { libc::setsid() };
@@ -50,6 +51,30 @@ pub fn cli(args: &[String]) -> Option<i32> {
         let _ = dir;
         eprintln!("neptune session daemon: this platform keeps sessions in Neptune");
         Some(2)
+    }
+}
+
+/// The daemon outlives whatever launched Neptune, so it lets go of every
+/// descriptor it inherited beyond the standard three (a launcher's lock or
+/// terminal, say). Runs before any thread starts.
+#[cfg(unix)]
+fn close_inherited() {
+    let listed = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let inherited: Vec<i32> = std::fs::read_dir(listed)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    for fd in inherited {
+        // SAFETY: nothing in this process uses these descriptors yet; the
+        // one that listed them is already closed, which close reports.
+        unsafe { libc::close(fd) };
     }
 }
 
@@ -247,10 +272,18 @@ mod unix {
             .arg(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            // Out of Neptune's process group until it starts its own session.
-            .process_group(0)
-            .spawn()
+            .stderr(Stdio::null());
+        // Its own session from the start, so a hangup of the terminal that
+        // launched Neptune never reaches it. A process group leader could
+        // not start one.
+        // SAFETY: setsid is async-signal-safe and touches no memory.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        command.spawn()
     }
 
     /// The daemon outlives Neptune; while Neptune runs, collect its exit.
