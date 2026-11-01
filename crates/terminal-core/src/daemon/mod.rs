@@ -26,7 +26,7 @@ use transport::Exit;
 mod client;
 pub(super) mod protocol;
 mod server;
-pub use client::{Attached, DaemonClient, SessionEntry};
+pub use client::{Attached, DaemonClient, SessionEntry, Takeover};
 pub use server::run;
 
 /// The protocol this build's daemon speaks, and the version new sessions

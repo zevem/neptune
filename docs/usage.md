@@ -488,7 +488,9 @@ warning. The workspaces then reopen with fresh shells.
 Sessions survive updates too. After **Restart to update**, the new version
 reattaches the sessions the earlier version kept; terminals opened afterwards
 run in a session daemon of the new version, and the earlier version's daemon
-exits once its sessions end.
+exits once its sessions end. If the earlier version is still open when the new
+one starts, it closes its windows without ending its sessions, and the new
+version reattaches them.
 
 Turning the setting off takes effect at once: the next quit ends every session,
 with the usual warning. Turning it on applies from the next launch, which

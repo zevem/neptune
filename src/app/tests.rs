@@ -47,6 +47,8 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         folder_picker: Default::default(),
         ephemeral: true,
         session_daemon: Some(crate::runtime::kept_sessions::directory(root)),
+        claim: Default::default(),
+        replaced: false,
         keep_sessions: false,
         end_sessions: false,
         preference_generation: 0,
@@ -5272,6 +5274,20 @@ struct KeptLaunch {
 #[cfg(unix)]
 impl KeptLaunch {
     fn new(root: &std::path::Path, dir: &std::path::Path, count: usize) -> Self {
+        Self::launch(root, dir, count, true)
+    }
+
+    /// Like `new`, for a launch that saves its workspaces.
+    fn saving(root: &std::path::Path, dir: &std::path::Path, count: usize) -> Self {
+        Self::launch(root, dir, count, false)
+    }
+
+    fn launch(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        count: usize,
+        ephemeral: bool,
+    ) -> Self {
         let client = terminal_core::daemon::DaemonClient::connect(dir).unwrap();
         let keep = |client: &terminal_core::daemon::DaemonClient| {
             let (session, id) = client
@@ -5321,6 +5337,7 @@ impl KeptLaunch {
         )
         .unwrap();
         let (mut app, _sender) = fixture(root);
+        app.ephemeral = ephemeral;
         let ctx = egui::Context::default();
         let config = Config {
             keep_sessions_running: true,
@@ -5542,4 +5559,195 @@ fn keeping_terminals_running_round_trips_through_preference_saves() {
         let text = std::fs::read_to_string(&app.config_path).unwrap();
         assert_eq!(text.contains("keep_sessions_running"), keep);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_neptune_replaced_by_a_newer_launch_stops_saving_and_closes_without_ending_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let mut earlier = KeptLaunch::saving(root.path(), &dir, 2);
+    if let Some(writer) = &earlier.app.writer {
+        writer.flush().unwrap();
+    }
+    let report = load_state(&root.path().join("workspaces.json"), Limits::default());
+    assert!(report.model.is_some());
+    // Its own quit would now end every session.
+    let config = earlier.app.config.clone();
+    earlier.app.action(
+        &earlier.ctx,
+        Action::Preferences(Box::new(Config {
+            keep_sessions_running: false,
+            ..config.clone()
+        })),
+    );
+
+    // A newer launch restores the same workspaces and reattaches.
+    let (mut newer, _sender) = fixture(root.path());
+    newer.ephemeral = false;
+    let ctx = egui::Context::default();
+    newer.complete_startup(
+        &ctx,
+        Startup {
+            config,
+            report,
+            error: None,
+            live: crate::runtime::kept_sessions::live(&dir),
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !earlier.panes.iter().all(|pane| {
+        newer
+            .sessions
+            .get(*pane)
+            .is_some_and(|session| session.screen_text().contains("KEPT"))
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "the newer launch never reattached"
+        );
+        newer.poll(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let renamed = |app: &mut App, ctx: &egui::Context, name: &str| {
+        let workspace = app.controller.model().active_workspace().unwrap();
+        app.dispatch(
+            ctx,
+            Command::RenameWorkspace {
+                workspace,
+                name: name.into(),
+            },
+        );
+    };
+    renamed(&mut newer, &ctx, "Newer");
+    newer.writer.as_ref().unwrap().flush().unwrap();
+    let saved = std::fs::read(root.path().join("workspaces.json")).unwrap();
+
+    // The earlier Neptune closes at once: no question, nothing saved.
+    earlier.until("the earlier Neptune closed", |app| app.exit_approved);
+    assert_eq!(earlier.app.ui.overlay, OverlayState::None);
+    renamed(&mut earlier.app, &earlier.ctx, "Earlier");
+    earlier.app.poll(&earlier.ctx);
+    eframe::App::on_exit(&mut earlier.app);
+    assert_eq!(
+        std::fs::read(root.path().join("workspaces.json")).unwrap(),
+        saved
+    );
+
+    // Every session still runs, shown by the newer launch.
+    assert_eq!(earlier.running(), 3);
+    for pane in &earlier.panes {
+        let session = newer.sessions.get(*pane).unwrap();
+        session.write(b"echo TAKEN\r").unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !earlier.panes.iter().all(|pane| {
+        newer
+            .sessions
+            .get(*pane)
+            .is_some_and(|session| session.screen_text().contains("TAKEN"))
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "the newer launch lost its terminals"
+        );
+        newer.poll(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for entry in earlier.client.list().unwrap() {
+        earlier.client.close(entry.id).unwrap();
+    }
+    drop(earlier);
+    drop(newer);
+    daemon.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn launches_that_dont_restore_never_attach_or_take_over() {
+    use std::path::PathBuf;
+    let restoring = crate::Launch::default();
+    assert!(restores(&restoring));
+    for launch in [
+        crate::Launch {
+            no_restore: true,
+            ..Default::default()
+        },
+        crate::Launch {
+            cwd: Some(PathBuf::from("/tmp")),
+            ..Default::default()
+        },
+        crate::Launch {
+            ssh: Some("example".into()),
+            ..Default::default()
+        },
+        crate::Launch {
+            screenshot: Some(PathBuf::from("/tmp/neptune.png")),
+            ..Default::default()
+        },
+    ] {
+        assert!(!restores(&launch));
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    // A Neptune that keeps sessions is running, with a kept terminal.
+    let earlier = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let held = earlier.take_over(Arc::new(|| {})).unwrap();
+    let (session, _) = earlier
+        .start(
+            SessionOptions {
+                cwd: root.path().into(),
+                shell: Some("/bin/sh".into()),
+                args: vec!["-c".into(), "sleep 30".into()],
+                ..Default::default()
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+    drop(session);
+    let settings = root.path().join("config.toml");
+    let config = Config {
+        shell: Some("/bin/sh".into()),
+        keep_sessions_running: true,
+        confirm_close: false,
+        ..Config::default()
+    };
+    config.save(&settings).unwrap();
+    let claim = crate::runtime::kept_sessions::Claim::default();
+    let state = root.path().join("workspaces.json");
+
+    let startup = load_startup(&settings, &state, false, Some((&dir, &claim)));
+    assert!(startup.config.keep_sessions_running);
+    assert!(!held.replaced());
+    let (mut app, _sender) = fixture(root.path());
+    app.session_daemon = None;
+    let ctx = egui::Context::default();
+    app.complete_startup(&ctx, startup);
+    assert!(!app.keep_sessions);
+    let pane = app.controller.model().active_pane().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.controller.model().pane(pane).unwrap().lifecycle() != &Lifecycle::Running {
+        assert!(Instant::now() < deadline, "the terminal never started");
+        app.poll(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Its terminal runs in process; the kept one is left alone.
+    assert_eq!(app.controller.model().pane(pane).unwrap().session(), None);
+    assert_eq!(earlier.list().unwrap().len(), 1);
+    assert!(!held.replaced());
+    eframe::App::on_exit(&mut app);
+    assert_eq!(earlier.list().unwrap().len(), 1);
+    assert!(!held.replaced());
+
+    // A launch that restores takes over before it reads the saved state.
+    let startup = load_startup(&settings, &state, true, Some((&dir, &claim)));
+    assert!(startup.report.can_write);
+    assert!(held.replaced());
+
+    for entry in earlier.list().unwrap() {
+        earlier.close(entry.id).unwrap();
+    }
+    drop((held, earlier, app, claim));
+    daemon.join().unwrap();
 }

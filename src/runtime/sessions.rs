@@ -545,6 +545,14 @@ impl SessionManager {
         self.detached
             .extend(self.in_flight.keys().filter(|(id, _)| *id == pane).copied());
     }
+    /// Let go of every kept session, those still starting or reattaching
+    /// too, as a launch that was taken over closes.
+    pub fn detach_all(&mut self) {
+        let panes: Vec<_> = self.desired.keys().copied().collect();
+        for pane in panes {
+            self.detach(pane);
+        }
+    }
     fn reap(&mut self) {
         self.closing.retain(|closing| {
             let pending = closing.session.metrics().active_workers != 0;
@@ -822,6 +830,7 @@ mod tests {
         manager.keep_sessions(super::super::kept_sessions::KeptSessions::new(
             dir.into(),
             None,
+            Default::default(),
         ));
         manager
     }
@@ -1229,6 +1238,55 @@ mod tests {
         let ended = KeptSessions::with_versions(dir.clone(), later, &[PROTOCOL_VERSION]);
         ended.end_all().unwrap();
         drop(ended);
+        later_daemon.join().unwrap();
+    }
+
+    /// An earlier build still open when the updated one launches gives way,
+    /// though it holds only its own version's daemon, and that daemon still
+    /// exits once it has no session.
+    #[test]
+    fn an_updated_launch_takes_over_from_an_earlier_build_still_open() {
+        use super::super::kept_sessions::Claim;
+        use terminal_core::daemon::{DaemonClient, DaemonOptions, PROTOCOL_VERSION, simulated};
+        let (_root, dir, earlier_daemon) = daemon();
+        let earlier = Claim::default();
+        earlier.take_over_running(&dir).unwrap();
+        assert!(!earlier.replaced());
+
+        let later = PROTOCOL_VERSION + 1;
+        let serving = dir.clone();
+        let later_daemon = thread::spawn(move || {
+            simulated::run(
+                &serving,
+                DaemonOptions {
+                    idle_exit: Duration::from_millis(200),
+                },
+                later,
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while DaemonClient::connect_to(&dir, later).is_err() {
+            assert!(Instant::now() < deadline, "the later daemon never listened");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let claim = Claim::default();
+        claim
+            .take_over_versions(&dir, later, &[PROTOCOL_VERSION])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !earlier.replaced() {
+            assert!(
+                Instant::now() < deadline,
+                "the earlier build was never told"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!claim.replaced());
+        // The earlier build exits; nothing holds its daemon any more.
+        drop(earlier);
+        earlier_daemon.join().unwrap();
+        drop(claim);
         later_daemon.join().unwrap();
     }
 

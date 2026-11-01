@@ -119,12 +119,143 @@ fn with_environment(mut options: SessionOptions) -> SessionOptions {
     options
 }
 
+/// What a launch that was taken over is told when it asks for a session.
+const REPLACED: &str = "A newer Neptune took over these terminals";
+
+/// A launch's hold on its data root's session daemon. Holding it takes over
+/// from an earlier launch, which closes its windows and saves nothing more;
+/// a newer launch takes over from this one in turn.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct Claim {
+    /// Runs once a newer launch takes over.
+    wake: Repaint,
+    replaced: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    held: std::sync::Mutex<Option<terminal_core::daemon::Takeover>>,
+}
+
+impl Default for Claim {
+    fn default() -> Self {
+        Self::new(std::sync::Arc::new(|| {}))
+    }
+}
+
+impl Claim {
+    pub fn new(wake: Repaint) -> Self {
+        Self {
+            wake,
+            replaced: Default::default(),
+            #[cfg(unix)]
+            held: Default::default(),
+        }
+    }
+
+    /// Whether a newer launch took over. True as soon as that launch holds
+    /// the daemon.
+    pub fn replaced(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        #[cfg(unix)]
+        if !self.replaced.load(Ordering::Acquire)
+            // A hold under way waits for the daemon; until then the flag
+            // answers.
+            && let Ok(held) = self.held.try_lock()
+            && held.as_ref().is_some_and(|held| held.replaced())
+        {
+            self.replaced.store(true, Ordering::Release);
+        }
+        self.replaced.load(Ordering::Acquire)
+    }
+
+    /// Take over the daemons serving `dir` that run; none is launched. An
+    /// earlier build may still be open on an earlier version's daemon, so
+    /// those are taken over too.
+    pub fn take_over_running(&self, dir: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use terminal_core::daemon::{EARLIER_PROTOCOL_VERSIONS, PROTOCOL_VERSION};
+            self.take_over_versions(dir, PROTOCOL_VERSION, EARLIER_PROTOCOL_VERSIONS)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
+
+    /// Hold the daemon of `current`, and take over those of `earlier`
+    /// versions only to tell whoever holds them: holding an earlier daemon
+    /// would keep it from exiting once its sessions end. A newer launch
+    /// takes over this build's daemon too, which tells this one.
+    #[cfg(unix)]
+    pub(super) fn take_over_versions(
+        &self,
+        dir: &Path,
+        current: u32,
+        earlier: &[u32],
+    ) -> Result<(), String> {
+        use terminal_core::{SessionErrorKind, daemon::DaemonClient};
+        let running = |version| match DaemonClient::connect_to(dir, version) {
+            Err(error) if error.kind() == SessionErrorKind::Unavailable => Ok(None),
+            client => client.map(Some).map_err(|error| format!("{error:#}")),
+        };
+        let mut result = match running(current) {
+            Ok(Some(client)) => self.hold(&client),
+            other => other.map(drop),
+        };
+        if self.replaced() {
+            return Err(REPLACED.into());
+        }
+        for version in earlier {
+            let told = running(*version).and_then(|client| match client {
+                Some(client) => client
+                    .take_over(std::sync::Arc::new(|| {}))
+                    .map(drop)
+                    .map_err(|error| format!("{error:#}")),
+                None => Ok(()),
+            });
+            result = result.and(told);
+        }
+        result
+    }
+
+    /// Hold the daemon `client` reaches, unless this launch already holds it.
+    #[cfg(unix)]
+    fn hold(&self, client: &terminal_core::daemon::DaemonClient) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let mut held = self.held.lock().map_err(|_| REPLACED.to_owned())?;
+        if self.replaced.load(Ordering::Acquire)
+            || held.as_ref().is_some_and(|held| held.replaced())
+        {
+            self.replaced.store(true, Ordering::Release);
+            return Err(REPLACED.into());
+        }
+        // A daemon that went away was replaced by the one `client` reaches.
+        if held
+            .as_ref()
+            .is_some_and(terminal_core::daemon::Takeover::held)
+        {
+            return Ok(());
+        }
+        let replaced = self.replaced.clone();
+        let wake = self.wake.clone();
+        *held = Some(
+            client
+                .take_over(std::sync::Arc::new(move || {
+                    replaced.store(true, Ordering::Release);
+                    wake();
+                }))
+                .map_err(|error| format!("{error:#}"))?,
+        );
+        Ok(())
+    }
+}
+
 /// The sessions running in the session daemons that serve `dir`, of this
 /// build's protocol version and every earlier one it attaches to. Without a
 /// daemon there are none. `None` when a daemon is there but couldn't be
 /// asked. Never launches a daemon.
 pub fn live(dir: &Path) -> Option<Vec<SessionRef>> {
-    KeptSessions::new(dir.to_owned(), None).live()
+    KeptSessions::new(dir.to_owned(), None, Default::default()).live()
 }
 
 /// Kept sessions run in the session daemons of one data root: new ones in the
@@ -137,6 +268,8 @@ pub struct KeptSessions {
     /// The `neptune` executable that launches a daemon when none serves
     /// `dir`; `None` only connects.
     program: Option<PathBuf>,
+    /// Every daemon this launch connects to, it takes over.
+    claim: std::sync::Arc<Claim>,
     /// The protocol version new sessions start in.
     #[cfg(unix)]
     current: u32,
@@ -150,10 +283,11 @@ pub struct KeptSessions {
 }
 
 impl KeptSessions {
-    pub fn new(dir: PathBuf, program: Option<PathBuf>) -> Self {
+    pub fn new(dir: PathBuf, program: Option<PathBuf>, claim: std::sync::Arc<Claim>) -> Self {
         Self {
             dir,
             program,
+            claim,
             #[cfg(unix)]
             current: terminal_core::daemon::PROTOCOL_VERSION,
             #[cfg(unix)]
@@ -170,7 +304,7 @@ impl KeptSessions {
         Self {
             current,
             earlier,
-            ..Self::new(dir, None)
+            ..Self::new(dir, None, Default::default())
         }
     }
 
@@ -272,6 +406,10 @@ impl KeptSessions {
     /// Without a running daemon there is none to end, so this never launches
     /// one. A daemon that can't be asked doesn't stop the others' ending.
     pub fn end_all(&self) -> Result<(), String> {
+        // They are a newer launch's now.
+        if self.claim.replaced() {
+            return Err(REPLACED.into());
+        }
         #[cfg(unix)]
         {
             use terminal_core::SessionErrorKind;
@@ -336,6 +474,9 @@ mod unix {
             reference: &SessionRef,
             run: impl Fn(&DaemonClient, SessionId) -> Result<T, SessionError>,
         ) -> Result<T, String> {
+            if self.claim.replaced() {
+                return Err(REPLACED.into());
+            }
             if !self.versions().any(|version| version == reference.daemon) {
                 return Err(format!(
                     "This session runs in a session daemon of protocol version {}",
@@ -359,6 +500,9 @@ mod unix {
             &self,
             run: impl Fn(&DaemonClient) -> Result<T, SessionError>,
         ) -> Result<T, String> {
+            if self.claim.replaced() {
+                return Err(REPLACED.into());
+            }
             let client = self.client(None)?;
             let result = match run(&client) {
                 // Starting and attaching open their own connections; one
@@ -380,6 +524,7 @@ mod unix {
                 }
                 _ => {
                     let client = Arc::new(self.connect()?);
+                    self.claim.hold(&client)?;
                     *cached = Some(client.clone());
                     Ok(client)
                 }

@@ -68,6 +68,8 @@ enum Step {
     Send(Vec<u8>),
     /// The client closes the connection, sending nothing more.
     Closed,
+    /// Wait until the test says to go on.
+    Await(std::sync::mpsc::Receiver<()>),
 }
 
 /// A daemon of one protocol version that plays a script per connection, in
@@ -129,9 +131,16 @@ fn play(mut stream: UnixStream, script: Vec<Step>) {
                 assert_eq!(received, expected, "step {index}");
             }
             Step::Send(bytes) => stream.write_all(&bytes).unwrap(),
+            Step::Await(go) => go.recv().unwrap(),
             Step::Closed => {
                 let mut rest = Vec::new();
-                stream.read_to_end(&mut rest).unwrap();
+                match stream.read_to_end(&mut rest) {
+                    Ok(_) => {}
+                    // A client closing with what it only peeked at unread
+                    // resets the connection.
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    Err(error) => panic!("step {index}: {error}"),
+                }
                 assert_eq!(rest, [], "step {index}: the client sent more");
             }
         }
@@ -158,7 +167,7 @@ fn id(text: &str) -> SessionId {
 /// Protocol version 1, the first released version.
 mod v1 {
     use super::*;
-    use Step::{Closed, Expect, Send};
+    use Step::{Await, Closed, Expect, Send};
 
     const VERSION: u32 = 1;
 
@@ -459,6 +468,43 @@ mod v1 {
         session.shutdown();
         wait_for(|| session.shutdown_completion().is_complete());
         drop((session, client));
+        daemon.finish();
+    }
+
+    #[test]
+    fn a_client_takes_over_a_version_1_daemon_and_hears_when_a_newer_one_does() {
+        let (go, wait) = std::sync::mpsc::channel();
+        let daemon = Scripted::serve(
+            VERSION,
+            vec![
+                vec![Expect(hello()), Send(welcome()), Closed],
+                vec![
+                    Expect(hello()),
+                    Send(welcome()),
+                    Expect(Frame::new(7).done()),
+                    Send(done()),
+                    Await(wait),
+                    // Replaced: a newer client took over.
+                    Send(Frame::new(72).done()),
+                    Closed,
+                ],
+            ],
+        );
+
+        let client = DaemonClient::connect_to(&daemon.dir(), VERSION).unwrap();
+        let (told, heard) = std::sync::mpsc::channel();
+        let told = std::sync::Mutex::new(told);
+        let takeover = client
+            .take_over(Arc::new(move || told.lock().unwrap().send(()).unwrap()))
+            .unwrap();
+        drop(client);
+        assert!(takeover.held());
+        assert!(!takeover.replaced());
+        go.send(()).unwrap();
+        heard.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(takeover.replaced());
+        assert!(!takeover.held());
+        drop(takeover);
         daemon.finish();
     }
 

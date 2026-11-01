@@ -36,6 +36,10 @@ pub(super) enum Request {
         cols: u16,
         rows: u16,
     },
+    /// Become the daemon's client in place of any earlier one, which is told
+    /// and let go of. The connection then stays open while this client holds
+    /// the daemon.
+    TakeOver,
     // Sent only on a session's stream.
     Input(Vec<u8>),
     Resize {
@@ -72,6 +76,8 @@ pub(super) enum Reply {
     Output(Vec<u8>),
     /// The streamed session ended; `None` when it failed without an exit status.
     Ended(Option<Exit>),
+    /// Sent on a client's takeover connection: a newer client took over.
+    Replaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +105,7 @@ mod kind {
     pub(super) const CLOSE: u8 = 4;
     pub(super) const START: u8 = 5;
     pub(super) const ATTACH: u8 = 6;
+    pub(super) const TAKE_OVER: u8 = 7;
     pub(super) const INPUT: u8 = 16;
     pub(super) const RESIZE: u8 = 17;
     pub(super) const FOCUS: u8 = 18;
@@ -112,6 +119,7 @@ mod kind {
     pub(super) const ATTACHED: u8 = 69;
     pub(super) const OUTPUT: u8 = 70;
     pub(super) const ENDED: u8 = 71;
+    pub(super) const REPLACED: u8 = 72;
 }
 
 #[derive(Default)]
@@ -602,6 +610,7 @@ impl Request {
                 frame.u32(*version);
             }
             Request::List => frame = Encoder::frame(kind::LIST),
+            Request::TakeOver => frame = Encoder::frame(kind::TAKE_OVER),
             Request::SetData { id, data } => {
                 frame = Encoder::frame(kind::SET_DATA);
                 frame.u64(*id).bytes(data);
@@ -674,6 +683,7 @@ impl Request {
                 }
             }
             kind::LIST => Request::List,
+            kind::TAKE_OVER => Request::TakeOver,
             kind::SET_DATA => Request::SetData {
                 id: data.u64()?,
                 data: data.bytes()?,
@@ -746,6 +756,7 @@ impl Reply {
                 }
             }
             Reply::Done => frame = Encoder::frame(kind::DONE),
+            Reply::Replaced => frame = Encoder::frame(kind::REPLACED),
             Reply::Failed { kind, detail } => {
                 frame = Encoder::frame(kind::FAILED);
                 frame.u8(error_kind_code(*kind)).str(detail);
@@ -799,6 +810,7 @@ impl Reply {
                 Reply::Sessions(entries)
             }
             kind::DONE => Reply::Done,
+            kind::REPLACED => Reply::Replaced,
             kind::FAILED => Reply::Failed {
                 kind: error_kind(data.u8()?)?,
                 detail: data.string()?,
