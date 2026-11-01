@@ -832,6 +832,10 @@ fn general(
                         rows.note(ui, "Applies from the next launch.");
                     }
                 });
+                // Readable while the row above is dimmed.
+                if !config.restore_workspaces {
+                    rows.note(ui, "Needs Restore workspaces on launch.");
+                }
             }
         },
     );
@@ -1738,6 +1742,7 @@ mod tests {
     fn keeping_terminals_running_sits_beside_restore_and_needs_it() {
         const HELP: &str = "Shells and programs keep running when Neptune quits, and reopen where you left them. They end when you log out or restart your computer.";
         const NEXT_LAUNCH: &str = "Applies from the next launch.";
+        const NEEDS_RESTORE: &str = "Needs Restore workspaces on launch.";
         let off = Config::default();
         let (toggle, text) = keep_running_row(&off, false);
         if cfg!(windows) {
@@ -1747,12 +1752,15 @@ mod tests {
         assert_eq!(toggle, Some(true));
         assert!(text.contains(HELP), "{text}");
         assert!(!text.contains(NEXT_LAUNCH), "{text}");
-        // Reattaching needs the saved layout.
+        assert!(!text.contains(NEEDS_RESTORE), "{text}");
+        // Reattaching needs the saved layout, and the row says so.
         let unrestored = Config {
             restore_workspaces: false,
             ..Config::default()
         };
-        assert_eq!(keep_running_row(&unrestored, false).0, Some(false));
+        let (toggle, text) = keep_running_row(&unrestored, false);
+        assert_eq!(toggle, Some(false));
+        assert!(text.contains(NEEDS_RESTORE), "{text}");
         // Turned on after this launch started its terminals.
         let on = Config {
             keep_sessions_running: true,
