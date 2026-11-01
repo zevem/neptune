@@ -900,6 +900,13 @@ mod tests {
         first.detach(pane);
         assert!(first.shutdown(Duration::from_secs(2)));
         drop(first);
+        // Its startup workers let go of the bridge as they stop; Neptune's
+        // own process would have exited.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&endpoint).exists() {
+            assert!(Instant::now() < deadline, "the bridge outlived its launch");
+            thread::sleep(Duration::from_millis(10));
+        }
         let tool = || Event::Activity {
             signal: Signal::Tool,
         };
