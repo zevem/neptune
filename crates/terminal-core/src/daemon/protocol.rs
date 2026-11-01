@@ -47,6 +47,10 @@ pub(super) enum Request {
     Focus(bool),
     /// Close the streamed session.
     End,
+    /// The client received the streamed session's exit and shows it, so the
+    /// daemon may let the session go. Until then it keeps the exited session
+    /// for whichever client attaches next.
+    Taken,
 }
 
 /// What the daemon sends.
@@ -99,6 +103,7 @@ mod kind {
     pub(super) const RESIZE: u8 = 17;
     pub(super) const FOCUS: u8 = 18;
     pub(super) const END: u8 = 19;
+    pub(super) const TAKEN: u8 = 20;
     pub(super) const WELCOME: u8 = 64;
     pub(super) const REFUSED: u8 = 65;
     pub(super) const SESSIONS: u8 = 66;
@@ -651,6 +656,7 @@ impl Request {
                 frame.u8(*focused as u8);
             }
             Request::End => frame = Encoder::frame(kind::END),
+            Request::Taken => frame = Encoder::frame(kind::TAKEN),
         }
         frame.finish()
     }
@@ -712,6 +718,7 @@ impl Request {
             },
             kind::FOCUS => Request::Focus(data.bool()?),
             kind::END => Request::End,
+            kind::TAKEN => Request::Taken,
             _ => return Err(invalid()),
         };
         data.end()?;
