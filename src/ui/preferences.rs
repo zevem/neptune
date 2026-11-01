@@ -1676,6 +1676,11 @@ mod tests {
         for (index, (setting, pane, label, _)) in INDEX.iter().enumerate() {
             assert_eq!(pane_of(*setting), *pane);
             assert!(!INDEX[..index].iter().any(|entry| entry.0 == *setting));
+            // A hidden setting is never found; Windows hides this one.
+            if *setting == Setting::KeepSessions && !KEEPS_SESSIONS {
+                assert!(!finds(label).contains(setting), "{label}");
+                continue;
+            }
             assert!(finds(label).contains(setting), "{label}");
         }
     }

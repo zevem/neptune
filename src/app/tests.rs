@@ -5033,9 +5033,10 @@ fn only_a_restoring_launch_with_restore_on_keeps_sessions() {
             ..app.config.clone()
         };
         app.complete_startup(&egui::Context::default(), loaded(config, Model::default()));
+        // Windows has no session daemon yet, so it never keeps sessions.
         assert_eq!(
             app.keep_sessions,
-            restoring && restore && keep,
+            cfg!(unix) && restoring && restore && keep,
             "restoring: {restoring}, restore: {restore}, keep: {keep}"
         );
     }
