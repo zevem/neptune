@@ -59,6 +59,19 @@ pub(super) trait Sink: Send {
     fn focus(&mut self, _focused: bool) -> Result<()> {
         Ok(())
     }
+    /// The history limit and palette colours, sent only by replicas: the
+    /// authoritative engine keeps the history and answers colour queries.
+    fn scrollback(&mut self, _lines: usize) -> Result<()> {
+        Ok(())
+    }
+    fn color(&mut self, _index: usize, _color: crate::Rgb) -> Result<()> {
+        Ok(())
+    }
+    /// Signal the program to redraw, as a resize does, without changing the
+    /// size.
+    fn redraw(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The program's lifetime, owned and reaped by the engine worker.
@@ -230,6 +243,23 @@ impl Sink for PtySink {
             .as_ref()
             .map(|master| master.resize(size.pty()))
             .unwrap_or(Ok(()))
+    }
+
+    /// A resize to the same size signals nothing, so send the foreground
+    /// process group the signal a resize would.
+    #[cfg(unix)]
+    fn redraw(&mut self) -> Result<()> {
+        if let Some(group) = self
+            .master
+            .lock()
+            .as_ref()
+            .and_then(|master| master.process_group_leader())
+            .filter(|group| *group > 0)
+        {
+            // SAFETY: killpg only sends a signal.
+            unsafe { libc::killpg(group, libc::SIGWINCH) };
+        }
+        Ok(())
     }
 }
 

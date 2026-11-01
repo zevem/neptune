@@ -17,49 +17,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use terminal_core::daemon::{DaemonClient, SessionEntry, SessionId};
+use terminal_core::daemon::{DaemonClient, PROTOCOL_VERSION, SessionEntry, SessionId};
 use terminal_core::{SessionOptions, SessionStatus};
 
-/// One frame: a little-endian `u32` length, a kind byte and its payload.
-struct Frame(Vec<u8>);
-
-impl Frame {
-    fn new(kind: u8) -> Self {
-        Self(vec![kind])
-    }
-    fn u8(mut self, value: u8) -> Self {
-        self.0.push(value);
-        self
-    }
-    fn u16(mut self, value: u16) -> Self {
-        self.0.extend(value.to_le_bytes());
-        self
-    }
-    fn u32(mut self, value: u32) -> Self {
-        self.0.extend(value.to_le_bytes());
-        self
-    }
-    fn u64(mut self, value: u64) -> Self {
-        self.0.extend(value.to_le_bytes());
-        self
-    }
-    fn raw(mut self, value: &[u8]) -> Self {
-        self.0.extend(value);
-        self
-    }
-    /// A length-prefixed byte string.
-    fn bytes(self, value: &[u8]) -> Self {
-        self.u32(value.len() as u32).raw(value)
-    }
-    fn str(self, value: &str) -> Self {
-        self.bytes(value.as_bytes())
-    }
-    fn done(self) -> Vec<u8> {
-        let mut frame = (self.0.len() as u32).to_le_bytes().to_vec();
-        frame.extend(self.0);
-        frame
-    }
-}
+mod support;
+use support::Frame;
 
 /// What a scripted connection does next.
 enum Step {
@@ -86,8 +48,7 @@ impl Scripted {
         let dir = root.path().join("sessions");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let listener =
-            UnixListener::bind(dir.join(format!("session-daemon-v{version}.sock"))).unwrap();
+        let listener = UnixListener::bind(support::socket(&dir, version)).unwrap();
         let listener = std::thread::spawn(move || {
             scripts
                 .into_iter()
@@ -172,10 +133,10 @@ mod v1 {
     const VERSION: u32 = 1;
 
     fn hello() -> Vec<u8> {
-        Frame::new(1).raw(b"NEPTUNE-SESSIONS").u32(VERSION).done()
+        support::hello(VERSION)
     }
     fn welcome() -> Vec<u8> {
-        Frame::new(64).u32(VERSION).done()
+        support::welcome(VERSION)
     }
     fn done() -> Vec<u8> {
         Frame::new(67).done()
@@ -261,7 +222,7 @@ mod v1 {
     }
 
     #[test]
-    fn a_client_lists_keeps_data_with_and_closes_sessions_of_a_version_1_daemon() {
+    fn a_client_lists_keeps_data_with_and_ends_sessions_of_a_version_1_daemon() {
         let failure = Frame::new(68)
             .u8(9)
             .str("The session daemon has no such session")
@@ -297,6 +258,9 @@ mod v1 {
                 Send(done()),
                 Expect(Frame::new(4).u64(0xa4).done()),
                 Send(failure),
+                // End all.
+                Expect(Frame::new(8).done()),
+                Send(done()),
                 Closed,
             ]],
         );
@@ -336,6 +300,7 @@ mod v1 {
         let error = client.close(id("00000000000000a4")).unwrap_err();
         assert_eq!(error.kind(), terminal_core::SessionErrorKind::NotFound);
         assert_eq!(error.to_string(), "The session daemon has no such session");
+        client.end_all().unwrap();
         drop(client);
         daemon.finish();
     }
@@ -357,6 +322,9 @@ mod v1 {
                     Expect(Frame::new(16).bytes(b"typed").done()),
                     Expect(Frame::new(17).u16(30).u16(5).u16(300).u16(100).done()),
                     Expect(Frame::new(18).u8(1).done()),
+                    // The history limit, then palette colour 1.
+                    Expect(Frame::new(21).u32(50).done()),
+                    Expect(Frame::new(22).u16(1).u8(4).u8(5).u8(6).done()),
                     // Ended with code 7 and no signal.
                     Send(Frame::new(71).u8(1).u32(7).u8(0).done()),
                     // The client shows the exit, so the daemon may let it go.
@@ -400,6 +368,8 @@ mod v1 {
         session.write(b"typed").unwrap();
         session.resize(30, 5, 300, 100).unwrap();
         session.focus(true).unwrap();
+        session.set_scrollback(50).unwrap();
+        session.set_color(1, terminal_core::Rgb { r: 4, g: 5, b: 6 });
         wait_for(|| {
             session.metadata().status
                 == SessionStatus::Exited {
@@ -507,15 +477,17 @@ mod v1 {
         drop(takeover);
         daemon.finish();
     }
+}
 
-    #[test]
-    fn a_client_reaches_only_daemons_of_versions_it_attaches_to() {
-        let root = tempfile::tempdir().unwrap();
-        for version in [0, VERSION + 1] {
-            let error = DaemonClient::connect_to(root.path(), version)
-                .err()
-                .expect("connected to an unknown version");
-            assert_eq!(error.kind(), terminal_core::SessionErrorKind::Incompatible);
-        }
+/// Not a version's fixture: no client attaches to a version that isn't
+/// released yet, or to none.
+#[test]
+fn a_client_reaches_only_daemons_of_versions_it_attaches_to() {
+    let root = tempfile::tempdir().unwrap();
+    for version in [0, PROTOCOL_VERSION + 1] {
+        let error = DaemonClient::connect_to(root.path(), version)
+            .err()
+            .expect("connected to an unknown version");
+        assert_eq!(error.kind(), terminal_core::SessionErrorKind::Incompatible);
     }
 }

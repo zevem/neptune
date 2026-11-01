@@ -57,6 +57,8 @@ fn open(dir: &Path, version: u32) -> std::result::Result<UnixStream, SessionErro
                 "The session daemon speaks protocol version {theirs}; this client speaks version {version}"
             ),
         )),
+        // It serves as many connections as it may.
+        reply @ Reply::Failed { .. } => Err(reply_error(reply)),
         _ => Err(unexpected()),
     }
 }
@@ -139,6 +141,15 @@ impl DaemonClient {
     /// End a session's processes, attached or not.
     pub fn close(&self, id: SessionId) -> std::result::Result<(), SessionError> {
         match self.request(&Request::Close { id: id.0 })? {
+            Reply::Done => Ok(()),
+            reply => Err(reply_error(reply)),
+        }
+    }
+
+    /// End every session the daemon runs, attached or not, in one request:
+    /// none started meanwhile by another client survives it.
+    pub fn end_all(&self) -> std::result::Result<(), SessionError> {
+        match self.request(&Request::EndAll)? {
             Reply::Done => Ok(()),
             reply => Err(reply_error(reply)),
         }
@@ -495,6 +506,17 @@ impl transport::Sink for ReplicaSink {
 
     fn focus(&mut self, focused: bool) -> Result<()> {
         Ok(self.send(&Request::Focus(focused))?)
+    }
+
+    fn scrollback(&mut self, lines: usize) -> Result<()> {
+        Ok(self.send(&Request::Scrollback(lines.min(u32::MAX as usize) as u32))?)
+    }
+
+    fn color(&mut self, index: usize, color: crate::Rgb) -> Result<()> {
+        let Ok(index) = u16::try_from(index) else {
+            return Ok(());
+        };
+        Ok(self.send(&Request::Color { index, rgb: color })?)
     }
 }
 

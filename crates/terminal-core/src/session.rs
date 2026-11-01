@@ -444,6 +444,8 @@ impl TerminalSession {
         events.drain(..).collect()
     }
 
+    /// Set a palette colour, which answers programs' colour queries. A
+    /// replica's goes to the engine that answers its program too.
     pub fn set_color(&self, index: usize, color: crate::Rgb) {
         if let Some(slot) = self.shared.palette.lock().get_mut(index) {
             *slot = Rgb {
@@ -451,6 +453,10 @@ impl TerminalSession {
                 g: color.g,
                 b: color.b,
             };
+            if self.shared.replica.load(Ordering::Acquire) {
+                // A session that ended has no engine left to tell.
+                let _ = self.shared.enqueue(&self.input, Input::Color(index, color));
+            }
         }
     }
 
@@ -541,7 +547,22 @@ impl TerminalSession {
         self.shared.changed();
         drop(terminal);
         drop(config);
+        // A replica's history is also kept by the engine that runs its
+        // program, so that one keeps no more than this.
+        if self.shared.replica.load(Ordering::Acquire) {
+            match self.shared.enqueue(&self.input, Input::Scrollback(lines)) {
+                Err(error) if error.kind() != SessionErrorKind::Closed => return Err(error),
+                _ => {}
+            }
+        }
         Ok(())
+    }
+
+    /// Make the program redraw its screen, as a resize to its current size
+    /// would if that signalled it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn redraw(&self) -> std::result::Result<(), SessionError> {
+        self.shared.enqueue(&self.input, Input::Redraw)
     }
 
     /// Close: stop without joining workers or closing ConPTY on the UI thread. The

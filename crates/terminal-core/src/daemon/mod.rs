@@ -74,6 +74,26 @@ pub mod simulated {
         server::serve(dir, options, version)
     }
 
+    /// Run a daemon of `version` on a thread of this process, as [`run`]
+    /// does, and return once it listens.
+    pub fn spawn(
+        dir: &Path,
+        options: DaemonOptions,
+        version: u32,
+    ) -> thread::JoinHandle<std::result::Result<(), SessionError>> {
+        let serving = dir.to_owned();
+        let daemon = thread::spawn(move || run(&serving, options, version));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Err(error) = DaemonClient::connect_to(dir, version) {
+            assert!(
+                !daemon.is_finished() && Instant::now() < deadline,
+                "the session daemon never listened: {error}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        daemon
+    }
+
     pub(super) fn serves(version: u32) -> bool {
         VERSIONS.lock().contains(&version)
     }
@@ -99,10 +119,11 @@ impl fmt::Display for SessionId {
 
 impl std::str::FromStr for SessionId {
     type Err = SessionError;
+    /// Exactly 16 hex digits, as [`SessionId`] displays.
     fn from_str(text: &str) -> std::result::Result<Self, SessionError> {
-        u64::from_str_radix(text, 16)
-            .ok()
-            .filter(|_| text.len() == 16)
+        Some(text)
+            .filter(|text| text.len() == 16 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .and_then(|text| u64::from_str_radix(text, 16).ok())
             .map(Self)
             .ok_or_else(|| SessionError::new(SessionErrorKind::NotFound, "Invalid session id"))
     }
@@ -112,22 +133,42 @@ impl std::str::FromStr for SessionId {
 pub struct DaemonOptions {
     /// How long the daemon waits, with no session and no client, before exiting.
     pub idle_exit: Duration,
+    /// The most sessions it runs at once, running or ended but not yet taken.
+    /// Starting another fails.
+    pub max_sessions: usize,
+    /// The most connections it serves at once: each attached session streams
+    /// over one, besides each client's own. Another is refused.
+    pub max_connections: usize,
 }
 
 impl Default for DaemonOptions {
     fn default() -> Self {
         Self {
             idle_exit: Duration::from_secs(10),
+            // Neptune runs at most 64 sessions.
+            max_sessions: 64,
+            max_connections: 64 + 16,
         }
     }
 }
 
+/// Short names, so that the socket path fits in its address with room to
+/// spare for long data roots and user names (see [`fits`]).
 fn socket_path(dir: &Path, version: u32) -> PathBuf {
-    dir.join(format!("session-daemon-v{version}.sock"))
+    dir.join(format!("v{version}"))
 }
 
 fn lock_path(dir: &Path, version: u32) -> PathBuf {
-    dir.join(format!("session-daemon-v{version}.lock"))
+    dir.join(format!("v{version}.lock"))
+}
+
+/// Whether a session daemon can listen in `dir`: a socket's path must fit
+/// in its address, whose size the platform sets (103 bytes on macOS).
+pub fn fits(dir: &Path) -> bool {
+    // SAFETY: an all-zero sockaddr_un is valid.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // One byte for the terminating NUL.
+    socket_path(dir, PROTOCOL_VERSION).as_os_str().len() < address.sun_path.len()
 }
 
 fn effective_uid() -> u32 {
@@ -146,8 +187,16 @@ fn check_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Create the directory, or close an existing one of this user's to others.
-fn make_private_dir(dir: &Path) -> io::Result<()> {
+/// Create `dir` (and any missing parent) so that only this user can open
+/// it, or close an existing directory of this user's to others. Fails if
+/// `dir` is anything else, or belongs to another user. Session daemons and
+/// Neptune keep their sockets in such directories.
+pub fn make_private_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {

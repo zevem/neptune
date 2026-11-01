@@ -46,7 +46,10 @@ pub(super) fn serve(
     woken.set_nonblocking(true).map_err(unavailable)?;
     let daemon = Arc::new(Daemon {
         sessions: Mutex::new(HashMap::new()),
+        starting: AtomicUsize::new(0),
+        max_sessions: options.max_sessions,
         connections: AtomicUsize::new(0),
+        max_connections: options.max_connections,
         wake,
         owner: effective_uid(),
         version,
@@ -62,7 +65,7 @@ pub(super) fn serve(
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    diagnose("accept", &error);
+                    diagnose("accept", error.kind());
                     break;
                 }
             }
@@ -89,7 +92,11 @@ pub(super) fn serve(
 
 struct Daemon {
     sessions: Mutex<HashMap<u64, Arc<Hosted>>>,
+    /// Sessions being started, counted under the `sessions` lock.
+    starting: AtomicUsize,
+    max_sessions: usize,
     connections: AtomicUsize,
+    max_connections: usize,
     /// Wakes the listener to recheck whether the daemon is idle.
     wake: UnixStream,
     owner: u32,
@@ -121,8 +128,8 @@ impl Drop for Connection {
 }
 
 /// Operation and error kind only: never contents, input, titles or paths.
-fn diagnose(operation: &str, error: &io::Error) {
-    eprintln!("neptune session daemon: {operation}: {:?}", error.kind());
+fn diagnose(operation: &str, kind: impl fmt::Debug) {
+    eprintln!("neptune session daemon: {operation}: {kind:?}");
 }
 
 fn wait_readable(fds: &[libc::c_int], timeout: Option<Duration>) {
@@ -139,6 +146,26 @@ fn wait_readable(fds: &[libc::c_int], timeout: Option<Duration>) {
         (timeout.as_micros().div_ceil(1000)).min(i32::MAX as u128) as libc::c_int
     });
     unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
+}
+
+/// Too many connections: answer the hello with why, and close. The client
+/// sends its hello at once, so waiting a moment for it never holds up the
+/// listener for long; one that sends nothing is closed without an answer.
+fn refuse(mut stream: UnixStream) {
+    const HELLO_WAIT: Duration = Duration::from_millis(100);
+    let hello = stream
+        .set_read_timeout(Some(HELLO_WAIT))
+        .and_then(|()| protocol::read_frame(&mut stream, MAX_CLIENT_FRAME));
+    if let Ok(Some(_)) = hello {
+        let _ = send(
+            &mut stream,
+            &Reply::Failed {
+                kind: SessionErrorKind::Backpressure,
+                detail: "The session daemon has too many connections".into(),
+            },
+        );
+    }
+    diagnose("accept", SessionErrorKind::Backpressure);
 }
 
 fn new_id(sessions: &HashMap<u64, Arc<Hosted>>) -> u64 {
@@ -206,8 +233,11 @@ impl Daemon {
             .set_nonblocking(false)
             .and_then(|()| check_peer(&stream, self.owner))
         {
-            diagnose("accept", &error);
+            diagnose("accept", error.kind());
             return;
+        }
+        if self.connections.load(Ordering::Acquire) >= self.max_connections {
+            return refuse(stream);
         }
         self.connections.fetch_add(1, Ordering::AcqRel);
         let connection = Connection(self.clone());
@@ -219,7 +249,7 @@ impl Daemon {
                 daemon.serve(stream);
             })
         {
-            diagnose("start connection", &error);
+            diagnose("start connection", error.kind());
         }
     }
 
@@ -236,6 +266,49 @@ impl Daemon {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Start a session, unless the daemon already runs as many as it may.
+    fn start(&self, options: SessionOptions) -> std::result::Result<Arc<Hosted>, SessionError> {
+        {
+            let sessions = self.sessions.lock();
+            if sessions.len() + self.starting.load(Ordering::Acquire) >= self.max_sessions {
+                return Err(SessionError::new(
+                    SessionErrorKind::Backpressure,
+                    format!(
+                        "The session daemon already runs {} sessions, as many as it may",
+                        self.max_sessions
+                    ),
+                ));
+            }
+            self.starting.fetch_add(1, Ordering::AcqRel);
+        }
+        let session = TerminalSession::spawn(options, Arc::new(|| {}));
+        let mut sessions = self.sessions.lock();
+        self.starting.fetch_sub(1, Ordering::AcqRel);
+        let hosted = Arc::new(Hosted {
+            id: new_id(&sessions),
+            session: session?,
+            data: Mutex::new(Vec::new()),
+            streaming: Mutex::new(None),
+        });
+        sessions.insert(hosted.id, hosted.clone());
+        Ok(hosted)
+    }
+
+    /// End every session at once: none is left to a client that lists and
+    /// closes them one by one while another starts.
+    fn end_all(&self) {
+        let ended: Vec<_> = self
+            .sessions
+            .lock()
+            .drain()
+            .map(|(_, hosted)| hosted)
+            .collect();
+        self.changed();
+        for hosted in ended {
+            hosted.session.shutdown();
         }
     }
 
@@ -271,7 +344,7 @@ impl Daemon {
             {
                 Ok(request) => request,
                 Err(error) => {
-                    diagnose("read request", &error);
+                    diagnose("read request", error.kind());
                     None
                 }
             }
@@ -290,13 +363,13 @@ impl Daemon {
                 return;
             }
             Some(_) => {
-                diagnose("read hello", &io::ErrorKind::InvalidData.into());
+                diagnose("read hello", io::ErrorKind::InvalidData);
                 return;
             }
             None => return,
         };
         if let Err(error) = send(&mut stream, &reply) {
-            diagnose("write reply", &error);
+            diagnose("write reply", error.kind());
             return;
         }
         while let Some(request) = request(&mut stream) {
@@ -319,34 +392,26 @@ impl Daemon {
                     true => Reply::Done,
                     false => not_found(),
                 },
-                Request::Start(options) => match TerminalSession::spawn(options, Arc::new(|| {})) {
-                    Ok(session) => {
-                        let mut sessions = self.sessions.lock();
-                        let id = new_id(&sessions);
-                        let hosted = Arc::new(Hosted {
-                            id,
-                            session,
-                            data: Mutex::new(Vec::new()),
-                            streaming: Mutex::new(None),
-                        });
-                        sessions.insert(id, hosted.clone());
-                        drop(sessions);
-                        return self.stream(stream, hosted, None);
-                    }
+                Request::Start(options) => match self.start(options) {
+                    Ok(hosted) => return self.stream(stream, hosted, None),
                     Err(error) => failed(error),
                 },
+                Request::EndAll => {
+                    self.end_all();
+                    Reply::Done
+                }
                 Request::Attach { id, cols, rows } => match self.get(id) {
                     Some(hosted) => return self.stream(stream, hosted, Some((cols, rows))),
                     None => not_found(),
                 },
                 Request::TakeOver => return self.take_over(stream),
                 _ => {
-                    diagnose("read request", &io::ErrorKind::InvalidData.into());
+                    diagnose("read request", io::ErrorKind::InvalidData);
                     return;
                 }
             };
             if let Err(error) = send(&mut stream, &reply) {
-                diagnose("write reply", &error);
+                diagnose("write reply", error.kind());
                 return;
             }
         }
@@ -363,19 +428,26 @@ impl Daemon {
         let session = &hosted.session;
         // An ended session keeps its final size: its terminal is gone, also
         // when its program ends just as it is resized.
+        let mut resized = false;
         if let Some((cols, rows)) = size
             && session.metadata().status == SessionStatus::Running
         {
             let current = *session.shared.size.lock();
-            if (current.cols, current.rows) != (cols, rows)
-                && let Err(error) = session.resize(cols, rows, 0, 0)
-                && error.kind() != SessionErrorKind::Closed
-            {
-                let _ = send(&mut stream, &failed(error));
-                return;
+            if (current.cols, current.rows) != (cols, rows) {
+                resized = true;
+                if let Err(error) = session.resize(cols, rows, 0, 0)
+                    && error.kind() != SessionErrorKind::Closed
+                {
+                    let _ = send(&mut stream, &failed(error));
+                    return;
+                }
             }
         }
         let (snapshot, tap) = session.snapshot(|| session.shared.output_tap.lock().subscribe());
+        // A snapshot can't carry a full-screen program's scroll region, tab
+        // stops or character sets, so on attach it redraws, as after a
+        // resize; a resize already told it.
+        let redraw = size.is_some() && !resized && snapshot.alternate.is_some();
         let metadata = session.metadata();
         let attached = AttachedFrame {
             id: hosted.id,
@@ -400,11 +472,14 @@ impl Daemon {
                 writer
             }
             Err(error) => {
-                diagnose("write snapshot", &error);
+                diagnose("write snapshot", error.kind());
                 session.shared.output_tap.lock().unsubscribe(&tap);
                 return;
             }
         };
+        if redraw && let Err(error) = session.redraw() {
+            diagnose("redraw", error.kind());
+        }
         let output = {
             let daemon = self.clone();
             let hosted = hosted.clone();
@@ -421,7 +496,7 @@ impl Daemon {
                 let _ = output.join();
             }
             Err(error) => {
-                diagnose("start output", &error);
+                diagnose("start output", error.kind());
                 session.shared.output_tap.lock().unsubscribe(&tap);
             }
         }
@@ -442,7 +517,7 @@ impl Daemon {
         let serial = self.serial.fetch_add(1, Ordering::Relaxed);
         let held = match stream.try_clone() {
             Ok(held) => held,
-            Err(error) => return diagnose("take over", &error),
+            Err(error) => return diagnose("take over", error.kind()),
         };
         {
             let mut client = self.client.lock();
@@ -453,7 +528,7 @@ impl Daemon {
                     .set_nonblocking(true)
                     .and_then(|()| (&earlier).write_all(&Reply::Replaced.encode()))
                 {
-                    diagnose("tell replaced", &error);
+                    diagnose("tell replaced", error.kind());
                 }
                 let _ = earlier.shutdown(std::net::Shutdown::Read);
             }
@@ -463,7 +538,7 @@ impl Daemon {
                 }
             }
             if let Err(error) = send(&mut stream, &Reply::Done) {
-                diagnose("write reply", &error);
+                diagnose("write reply", error.kind());
             }
         }
         // Nothing more is read from it; it ends when its client goes or a
@@ -498,7 +573,7 @@ impl Daemon {
             };
             if let Err(error) = result {
                 if error.kind() != io::ErrorKind::BrokenPipe {
-                    diagnose("write output", &error);
+                    diagnose("write output", error.kind());
                 }
                 break;
             }
@@ -521,7 +596,7 @@ impl Daemon {
                         error.kind(),
                         io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
                     ) {
-                        diagnose("read input", &error);
+                        diagnose("read input", error.kind());
                     }
                     return;
                 }
@@ -535,6 +610,11 @@ impl Daemon {
                     pixel_height,
                 } => session.resize(cols, rows, pixel_width, pixel_height),
                 Request::Focus(focused) => session.focus(focused),
+                Request::Scrollback(lines) => session.set_scrollback(lines as usize),
+                Request::Color { index, rgb } => {
+                    session.set_color(usize::from(index), rgb);
+                    Ok(())
+                }
                 Request::End => {
                     self.close(hosted.id);
                     return;
@@ -546,14 +626,14 @@ impl Daemon {
                     return;
                 }
                 _ => {
-                    diagnose("read input", &io::ErrorKind::InvalidData.into());
+                    diagnose("read input", io::ErrorKind::InvalidData);
                     return;
                 }
             };
             if let Err(error) = result
                 && error.kind() != SessionErrorKind::Closed
             {
-                eprintln!("neptune session daemon: forward input: {:?}", error.kind());
+                diagnose("forward input", error.kind());
             }
         }
     }

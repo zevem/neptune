@@ -40,6 +40,8 @@ pub(super) enum Request {
     /// and let go of. The connection then stays open while this client holds
     /// the daemon.
     TakeOver,
+    /// End every session at once, attached or not.
+    EndAll,
     // Sent only on a session's stream.
     Input(Vec<u8>),
     Resize {
@@ -51,6 +53,14 @@ pub(super) enum Request {
     Focus(bool),
     /// Close the streamed session.
     End,
+    /// The history the streamed session keeps, in lines.
+    Scrollback(u32),
+    /// A colour of the streamed session's palette, which answers programs'
+    /// colour queries.
+    Color {
+        index: u16,
+        rgb: view::Rgb,
+    },
     /// The client received the streamed session's exit and shows it, so the
     /// daemon may let the session go. Until then it keeps the exited session
     /// for whichever client attaches next.
@@ -106,11 +116,14 @@ mod kind {
     pub(super) const START: u8 = 5;
     pub(super) const ATTACH: u8 = 6;
     pub(super) const TAKE_OVER: u8 = 7;
+    pub(super) const END_ALL: u8 = 8;
     pub(super) const INPUT: u8 = 16;
     pub(super) const RESIZE: u8 = 17;
     pub(super) const FOCUS: u8 = 18;
     pub(super) const END: u8 = 19;
     pub(super) const TAKEN: u8 = 20;
+    pub(super) const SCROLLBACK: u8 = 21;
+    pub(super) const COLOR: u8 = 22;
     pub(super) const WELCOME: u8 = 64;
     pub(super) const REFUSED: u8 = 65;
     pub(super) const SESSIONS: u8 = 66;
@@ -611,6 +624,7 @@ impl Request {
             }
             Request::List => frame = Encoder::frame(kind::LIST),
             Request::TakeOver => frame = Encoder::frame(kind::TAKE_OVER),
+            Request::EndAll => frame = Encoder::frame(kind::END_ALL),
             Request::SetData { id, data } => {
                 frame = Encoder::frame(kind::SET_DATA);
                 frame.u64(*id).bytes(data);
@@ -666,6 +680,14 @@ impl Request {
             }
             Request::End => frame = Encoder::frame(kind::END),
             Request::Taken => frame = Encoder::frame(kind::TAKEN),
+            Request::Scrollback(lines) => {
+                frame = Encoder::frame(kind::SCROLLBACK);
+                frame.u32(*lines);
+            }
+            Request::Color { index, rgb } => {
+                frame = Encoder::frame(kind::COLOR);
+                frame.u16(*index).u8(rgb.r).u8(rgb.g).u8(rgb.b);
+            }
         }
         frame.finish()
     }
@@ -684,6 +706,7 @@ impl Request {
             }
             kind::LIST => Request::List,
             kind::TAKE_OVER => Request::TakeOver,
+            kind::END_ALL => Request::EndAll,
             kind::SET_DATA => Request::SetData {
                 id: data.u64()?,
                 data: data.bytes()?,
@@ -729,6 +752,15 @@ impl Request {
             kind::FOCUS => Request::Focus(data.bool()?),
             kind::END => Request::End,
             kind::TAKEN => Request::Taken,
+            kind::SCROLLBACK => Request::Scrollback(data.u32()?),
+            kind::COLOR => Request::Color {
+                index: data.u16()?,
+                rgb: view::Rgb {
+                    r: data.u8()?,
+                    g: data.u8()?,
+                    b: data.u8()?,
+                },
+            },
             _ => return Err(invalid()),
         };
         data.end()?;

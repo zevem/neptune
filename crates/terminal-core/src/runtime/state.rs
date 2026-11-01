@@ -52,6 +52,12 @@ pub(super) enum Input {
     Resize(Size),
     /// The pane's focus, for a session whose program another engine answers.
     Focus(bool),
+    /// The history limit and palette of a replica, for the engine that
+    /// answers its program.
+    Scrollback(usize),
+    Color(usize, crate::Rgb),
+    /// Make the program redraw its screen, as after a resize.
+    Redraw,
 }
 
 impl Input {
@@ -59,7 +65,11 @@ impl Input {
     pub(super) fn queued_bytes(&self) -> usize {
         match self {
             Input::Write(bytes) | Input::Reply(bytes) => bytes.len(),
-            Input::Resize(_) | Input::Focus(_) => 0,
+            Input::Resize(_)
+            | Input::Focus(_)
+            | Input::Scrollback(_)
+            | Input::Color(..)
+            | Input::Redraw => 0,
         }
     }
 }

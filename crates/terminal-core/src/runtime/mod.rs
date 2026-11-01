@@ -121,6 +121,9 @@ pub(super) fn write_loop(mut sink: Box<dyn Sink>, input: Receiver<Input>, shared
             Input::Write(bytes) => write_all(&mut *sink, &bytes, &shared),
             Input::Reply(bytes) => sink.reply(&bytes, &shared),
             Input::Focus(focused) => sink.focus(focused),
+            Input::Scrollback(lines) => sink.scrollback(lines),
+            Input::Color(index, color) => sink.color(index, color),
+            Input::Redraw => sink.redraw(),
         };
         if let Err(error) = result {
             shared.error(format!("PTY write: {error}"));

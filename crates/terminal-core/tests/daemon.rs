@@ -7,8 +7,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use terminal_core::daemon::{self, DaemonClient, DaemonOptions};
+use terminal_core::daemon::{self, DaemonClient, DaemonOptions, PROTOCOL_VERSION};
 use terminal_core::{SessionOptions, SessionStatus, TerminalSession};
+
+mod support;
 
 /// The test binary doubles as the daemon process: `Daemon::start` runs it
 /// again with this variable naming the socket directory.
@@ -28,7 +30,14 @@ fn daemon_process() {
         .and_then(|ms| ms.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(10));
-    daemon::run(Path::new(&dir), DaemonOptions { idle_exit }).unwrap();
+    daemon::run(
+        Path::new(&dir),
+        DaemonOptions {
+            idle_exit,
+            ..DaemonOptions::default()
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -362,33 +371,29 @@ fn the_socket_directory_is_user_only_and_clients_refuse_a_shared_one() {
     assert_eq!(error.kind(), terminal_core::SessionErrorKind::Unavailable);
 }
 
-/// Protocol version 1's hello, pinned: length, kind, magic, version.
-fn hello(version: u8) -> Vec<u8> {
-    let mut frame = vec![21, 0, 0, 0, 1];
-    frame.extend(b"NEPTUNE-SESSIONS");
-    frame.extend([version, 0, 0, 0]);
-    frame
-}
-
+/// Every version opens with the same handshake, so the daemon tells a
+/// client of another version which one it speaks.
 #[test]
-fn the_daemon_welcomes_version_1_and_refuses_other_versions() {
+fn the_daemon_welcomes_its_own_version_and_refuses_others() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     let daemon = Daemon::start();
     drop(daemon.client());
-    let socket = daemon.dir().join("session-daemon-v1.sock");
+    let socket = support::socket(&daemon.dir(), PROTOCOL_VERSION);
 
     let mut stream = UnixStream::connect(&socket).unwrap();
-    stream.write_all(&hello(1)).unwrap();
-    let mut welcome = [0; 9];
+    stream.write_all(&support::hello(PROTOCOL_VERSION)).unwrap();
+    let mut welcome = vec![0; support::welcome(PROTOCOL_VERSION).len()];
     stream.read_exact(&mut welcome).unwrap();
-    assert_eq!(welcome, [5, 0, 0, 0, 64, 1, 0, 0, 0]);
+    assert_eq!(welcome, support::welcome(PROTOCOL_VERSION));
 
     let mut stream = UnixStream::connect(&socket).unwrap();
-    stream.write_all(&hello(2)).unwrap();
+    stream
+        .write_all(&support::hello(PROTOCOL_VERSION + 1))
+        .unwrap();
     let mut refusal = Vec::new();
     stream.read_to_end(&mut refusal).unwrap();
-    assert_eq!(refusal, [5, 0, 0, 0, 65, 1, 0, 0, 0]);
+    assert_eq!(refusal, support::refused(PROTOCOL_VERSION));
 }
 
 #[test]
@@ -400,13 +405,14 @@ fn a_client_reports_a_daemon_of_another_version_clearly() {
     std::fs::create_dir(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let listener =
-        std::os::unix::net::UnixListener::bind(dir.join("session-daemon-v1.sock")).unwrap();
+        std::os::unix::net::UnixListener::bind(support::socket(&dir, PROTOCOL_VERSION)).unwrap();
+    let theirs = PROTOCOL_VERSION + 1;
     let daemon = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0; 25];
+        let mut request = vec![0; support::hello(PROTOCOL_VERSION).len()];
         stream.read_exact(&mut request).unwrap();
-        assert_eq!(request.to_vec(), hello(1));
-        stream.write_all(&[5, 0, 0, 0, 65, 2, 0, 0, 0]).unwrap();
+        assert_eq!(request, support::hello(PROTOCOL_VERSION));
+        stream.write_all(&support::refused(theirs)).unwrap();
     });
 
     let error = DaemonClient::connect(&dir)
@@ -415,7 +421,9 @@ fn a_client_reports_a_daemon_of_another_version_clearly() {
     assert_eq!(error.kind(), terminal_core::SessionErrorKind::Incompatible);
     assert_eq!(
         error.to_string(),
-        "The session daemon speaks protocol version 2; this client speaks version 1"
+        format!(
+            "The session daemon speaks protocol version {theirs}; this client speaks version {PROTOCOL_VERSION}"
+        )
     );
     daemon.join().unwrap();
 }
@@ -443,7 +451,7 @@ fn the_daemon_exits_after_its_grace_period_only_without_sessions_and_clients() {
     drop(client);
     wait_for(|| !running());
     assert!(daemon.child.wait().unwrap().success());
-    assert!(!dir.join("session-daemon-v1.sock").exists());
+    assert!(!support::socket(&dir, PROTOCOL_VERSION).exists());
 }
 
 #[test]
@@ -507,9 +515,9 @@ fn daemon_diagnostics_contain_no_contents_input_titles_or_paths() {
     wait_for(|| session.screen_text().matches("input-marker").count() == 2);
     // Give the daemon something to report: a malformed request carrying a marker.
     let mut stream =
-        std::os::unix::net::UnixStream::connect(daemon.dir().join("session-daemon-v1.sock"))
+        std::os::unix::net::UnixStream::connect(support::socket(&daemon.dir(), PROTOCOL_VERSION))
             .unwrap();
-    stream.write_all(&hello(1)).unwrap();
+    stream.write_all(&support::hello(PROTOCOL_VERSION)).unwrap();
     stream.read_exact(&mut [0; 9]).unwrap();
     stream.write_all(b"\x0f\0\0\0\x03request-marker").unwrap();
     let _ = stream.read(&mut [0; 16]);
@@ -795,9 +803,9 @@ fn raw_attach(
 ) -> (std::os::unix::net::UnixStream, u8) {
     use std::io::Write;
     let mut stream =
-        std::os::unix::net::UnixStream::connect(daemon.dir().join("session-daemon-v1.sock"))
+        std::os::unix::net::UnixStream::connect(support::socket(&daemon.dir(), PROTOCOL_VERSION))
             .unwrap();
-    stream.write_all(&hello(1)).unwrap();
+    stream.write_all(&support::hello(PROTOCOL_VERSION)).unwrap();
     assert_eq!(read_frame(&mut stream).0, 64, "welcome");
     // Attach: kind 6, the id, then the size.
     let mut attach = vec![13, 0, 0, 0, 6];
@@ -1028,4 +1036,107 @@ fn a_client_that_stopped_responding_never_holds_back_the_sessions_taken_over_fro
     let attached = client.attach(id, 80, 12, repaint()).unwrap();
     attached.session.shutdown();
     wait_for(|| client.list().unwrap().is_empty());
+}
+
+/// A snapshot can't carry a full-screen program's scroll region, tab stops
+/// or character sets, so attaching at the size it already has makes it
+/// redraw, as a resize would.
+#[test]
+fn a_full_screen_program_redraws_when_a_client_attaches_at_its_size() {
+    let daemon = Daemon::start();
+    let client = daemon.client();
+    let (session, id) = client
+        .start(
+            shell(
+                "printf '\\033[?1049hFULL'; trap 'printf REDRAWN' WINCH; \
+                 while :; do sleep 0.05; done",
+            ),
+            repaint(),
+        )
+        .unwrap();
+    wait_for(|| session.screen_text().contains("FULL"));
+    drop(session);
+
+    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    wait_for(|| attached.session.screen_text().contains("REDRAWN"));
+    attached.session.shutdown();
+}
+
+/// A shell on its own screen is left alone: attaching at its size doesn't
+/// make it redraw a prompt it already shows.
+#[test]
+fn a_shell_on_its_own_screen_is_not_asked_to_redraw_on_attach() {
+    let daemon = Daemon::start();
+    let client = daemon.client();
+    let (session, id) = client
+        .start(
+            shell("printf 'PLAIN'; trap 'printf REDRAWN' WINCH; while :; do sleep 0.05; done"),
+            repaint(),
+        )
+        .unwrap();
+    wait_for(|| session.screen_text().contains("PLAIN"));
+    drop(session);
+
+    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!attached.session.screen_text().contains("REDRAWN"));
+    attached.session.shutdown();
+}
+
+/// The history limit and the palette a client sets reach the daemon's
+/// engine, which keeps the history and answers colour queries.
+#[test]
+fn a_clients_history_limit_and_colours_reach_the_daemon() {
+    let daemon = Daemon::start();
+    let result = daemon.root.path().join("background");
+    let client = daemon.client();
+    let (session, id) = client
+        .start(
+            SessionOptions {
+                scrollback: 1000,
+                ..shell(&format!(
+                    "stty raw -echo min 0; i=0; while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); done; \
+                     printf 'READY'; while [ \"$(dd bs=1 count=1 2>/dev/null)\" != g ]; do :; done; \
+                     printf '\\033]11;?\\033\\\\'; sleep 0.5; dd bs=256 count=1 2>/dev/null > '{result}.part'; \
+                     mv '{result}.part' '{result}'; exec sleep 30",
+                    result = result.display()
+                ))
+            },
+            repaint(),
+        )
+        .unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    session.set_scrollback(50).unwrap();
+    session.set_color(
+        terminal_core::NamedColor::Background as usize,
+        terminal_core::Rgb { r: 1, g: 2, b: 3 },
+    );
+    // Typed after the colour, so the daemon has it before the query.
+    session.write(b"g").unwrap();
+    wait_for(|| result.exists());
+    let reply = String::from_utf8_lossy(&std::fs::read(&result).unwrap()).into_owned();
+    assert!(reply.contains("rgb:0101/0202/0303"), "{reply:?}");
+    drop(session);
+
+    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    assert_eq!(attached.session.history_size(), 50);
+    attached.session.shutdown();
+}
+
+/// End all ends attached and detached sessions in one request.
+#[test]
+fn ending_all_sessions_ends_attached_and_detached_ones_at_once() {
+    let daemon = Daemon::start();
+    let client = daemon.client();
+    let (attached, _, attached_pid) =
+        recorded_session(&client, &daemon.root.path().join("attached"));
+    let (detached, _, detached_pid) =
+        recorded_session(&client, &daemon.root.path().join("detached"));
+    drop(detached);
+    assert_eq!(client.list().unwrap().len(), 2);
+
+    client.end_all().unwrap();
+    assert!(client.list().unwrap().is_empty());
+    wait_for(|| !process_alive(&attached_pid) && !process_alive(&detached_pid));
+    wait_for(|| attached.metadata().status != SessionStatus::Running);
 }
