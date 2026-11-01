@@ -119,8 +119,10 @@ computer. The chip then opens the forwarded address; secondary-click it for
 **Stop forwarding**. Forwards bind only to `127.0.0.1`. If the same local port
 is busy, Neptune chooses a free port and shows that number on the chip.
 Failures appear on the chip with a retry action. Closing, restarting or
-disconnecting a terminal releases its forwards; forwards are not restored
-across launches.
+disconnecting a terminal releases its forwards. Forwards end with Neptune,
+unless the terminal is [kept running after quit](#keeping-terminals-running-after-quit):
+then they keep running, and are listed again, with **Stop forwarding**, when
+Neptune reattaches the terminal.
 
 Discovery runs on a background worker, including for hidden terminals, and
 normally refreshes every two seconds. It reads process ancestry and TCP socket
@@ -467,7 +469,11 @@ in a session daemon, a background Neptune process for the data directory, and
 the next launch reattaches each terminal to its session: its screen, scrollback,
 full-screen program, title and directory are as they are now, including output
 produced while Neptune was closed. Sessions end when you log out or restart your
-computer; Neptune then restores the workspaces with fresh shells. The setting
+computer; Neptune then restores the workspaces with fresh shells. An SSH
+terminal stays connected while Neptune is closed: its connection-sharing socket
+lives in the `sessions/ssh` folder of the data directory until the terminal
+closes, so its port forwards keep running, port discovery resumes and the
+remote folder keeps updating once it reattaches. The setting
 needs workspace restoration, so it is unavailable while **Restore workspaces on
 launch** is off, and Windows doesn't offer it yet.
 

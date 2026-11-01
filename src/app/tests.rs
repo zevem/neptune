@@ -4876,6 +4876,145 @@ fn a_restoring_launch_reattaches_kept_sessions_and_quitting_leaves_them_running(
     daemon.join().unwrap();
 }
 
+/// An SSH terminal kept running after quit keeps its connection sharing:
+/// its control socket survives Neptune, and the reattached terminal goes on
+/// reporting its remote folder, which splits start in. Closing it removes
+/// the socket.
+#[cfg(unix)]
+#[test]
+fn a_kept_ssh_terminal_keeps_its_control_socket_and_remote_folder_across_reattach() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let local = root.path().join("local");
+    let home = root.path().join("fake-ssh.home");
+    let project = home.join("Documents/Projects/neptune");
+    for directory in [&local, &project] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(home.join(".zshenv"), "unsetopt GLOBAL_RCS\n").unwrap();
+    std::fs::write(home.join(".zshrc"), "PROMPT='NEPTUNE> '\n").unwrap();
+    // The real remote bootstrap, with an SSH stand-in that listens on its
+    // control socket as a master would.
+    let client = root.path().join("fake-ssh");
+    std::fs::write(&client, "#!/bin/sh\nwhile [ \"$1\" = -o ]; do case \"$2\" in ControlPath=*) : > \"${2#ControlPath=}\";; esac; shift 2; done\n[ \"$1\" = -t ] || exit 1\nexport HOME=\"$0.home\" SHELL=zsh ZDOTDIR=\"$0.home\" TMPDIR=\"$0.home\"\ncd \"$HOME\"\nexec /bin/sh -c \"$4\"\n").unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ctx = egui::Context::default();
+    let reported = |app: &App, pane| {
+        app.sessions
+            .get(pane)
+            .and_then(|session| session.metadata().reported_cwd)
+    };
+    let wait_for_directory = |app: &mut App, pane, directory: &std::path::Path| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reported(app, pane).as_deref() != Some(directory) {
+            assert!(
+                Instant::now() < deadline,
+                "the terminal never reported {directory:?}: {:?}, {:?}",
+                reported(app, pane),
+                app.ui.error
+            );
+            app.poll(&ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.poll(&ctx);
+    };
+    let config = Config {
+        keep_sessions_running: true,
+        confirm_close: false,
+        ..fixture(root.path()).0.config.clone()
+    };
+    let launch = |model| {
+        let (mut app, sender) = fixture(root.path());
+        app.ephemeral = false;
+        app.command = None;
+        app.ssh_client = client.to_str().unwrap().into();
+        app.complete_startup(&ctx, loaded(config.clone(), model));
+        (app, sender)
+    };
+
+    let (mut app, _sender) = launch(Model::default());
+    app.dispatch(
+        &ctx,
+        Command::AddWorkspace {
+            group: None,
+            cwd: local.clone(),
+            name: "devbox".into(),
+            remote: Some("devbox".into()),
+        },
+    );
+    let pane = app.controller.model().active_pane().unwrap();
+    wait_for_directory(&mut app, pane, &home);
+    let socket = app.sessions.ssh_control(pane).unwrap().path().to_owned();
+    assert!(socket.starts_with(dir.join("ssh")), "{socket:?}");
+    assert!(socket.exists());
+    let reference = app
+        .controller
+        .model()
+        .pane(pane)
+        .unwrap()
+        .session()
+        .cloned()
+        .expect("the terminal is kept");
+    app.action(&ctx, Action::Quit);
+    eframe::App::on_exit(&mut app);
+    drop(app);
+    assert!(socket.exists(), "quitting removed the control socket");
+
+    // While Neptune is closed, the remote shell changes folder.
+    let daemon_client = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let detached = daemon_client
+        .attach(reference.id.parse().unwrap(), 100, 32, Arc::new(|| {}))
+        .unwrap()
+        .session;
+    detached.write(b"cd Documents/Projects/neptune\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while detached.metadata().reported_cwd.as_deref() != Some(project.as_path()) {
+        assert!(Instant::now() < deadline, "the remote shell never moved");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(detached);
+
+    let report = load_state(&root.path().join("workspaces.json"), Limits::default());
+    let (mut app, _sender) = launch(report.model.unwrap());
+    wait_for_directory(&mut app, pane, &project);
+    assert_eq!(
+        app.controller.model().pane(pane).unwrap().remote_cwd(),
+        Some(project.as_path())
+    );
+    assert_eq!(app.sessions.ssh_control(pane).unwrap().path(), socket);
+    // It goes on reporting, and a split starts where it is.
+    app.sessions.get(pane).unwrap().write(b"cd ..\r").unwrap();
+    let projects = home.join("Documents/Projects");
+    wait_for_directory(&mut app, pane, &projects);
+    app.action(&ctx, Action::Split(pane, neptune_model::Axis::Vertical));
+    let split = app.controller.model().active_pane().unwrap();
+    assert_ne!(split, pane);
+    wait_for_directory(&mut app, split, &projects);
+
+    app.action(&ctx, Action::ClosePane(pane));
+    if app.ui.overlay == OverlayState::ConfirmClose(Close::Pane(pane)) {
+        app.action(&ctx, Action::Confirm(Close::Pane(pane)));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "closing the terminal left its control socket"
+        );
+        app.poll(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!socket.parent().unwrap().exists());
+    eframe::App::on_exit(&mut app);
+    drop(app);
+    for session in daemon_client.list().unwrap() {
+        daemon_client.close(session.id).unwrap();
+    }
+    drop(daemon_client);
+    daemon.join().unwrap();
+}
+
 #[test]
 fn only_a_restoring_launch_with_restore_on_keeps_sessions() {
     for (restoring, restore, keep) in [
