@@ -12,6 +12,9 @@ type Repaint = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// reattaches it. Fields a later build adds are ignored by this one.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionData {
+    /// What the terminal's agents reach Neptune with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<super::agents::Credential>,
     /// The connection sharing of an SSH terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshData>,

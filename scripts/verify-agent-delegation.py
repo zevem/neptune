@@ -151,7 +151,7 @@ def main():
     # A run started from a Neptune terminal must not reach that instance's bridge.
     env = {key: value for key, value in os.environ.items() if not key.startswith('NEPTUNE_AGENT_')}
     env.pop('WAYLAND_DISPLAY', None)
-    path = [part for part in env['PATH'].split(':') if '/neptune-agents-' not in part]
+    path = [part for part in env['PATH'].split(':') if '/neptune-agents-' not in part and part != os.environ.get('NEPTUNE_AGENT_SHIMS')]
     env.update(HOME=str(home), EGUI_INSPECTION=endpoint, NEPTUNE_AGENT_TEST_LOG=str(output/'events.jsonl'),
                PATH=':'.join([str(fixtures), *path]))
     process = None
