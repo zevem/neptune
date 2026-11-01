@@ -161,11 +161,7 @@ impl App {
                     }
                     // An agent's terminal answers to the agent that started
                     // it, a project's to the project.
-                    let spawned_by = self.controller.model().pane(pane).and_then(|pane| {
-                        pane.spawned_by()
-                            .map(Starter::Pane)
-                            .or(pane.project().map(Starter::Project))
-                    });
+                    let spawned_by = self.controller.model().pane(pane).and_then(Starter::of);
                     // The task of an agent being started is held for its
                     // shell before the session is requested.
                     if let (Some(parent), Some(spawning)) =
@@ -245,11 +241,7 @@ impl App {
                             let pane = self.controller.model().pane(pane);
                             crate::runtime::sessions::AgentLaunch::Local {
                                 resume: pane.and_then(|pane| pane.agent()).cloned(),
-                                spawned_by: pane.and_then(|pane| {
-                                    pane.spawned_by()
-                                        .map(Starter::Pane)
-                                        .or(pane.project().map(Starter::Project))
-                                }),
+                                spawned_by: pane.and_then(Starter::of),
                             }
                         },
                         ssh_control: false,
@@ -333,15 +325,29 @@ impl App {
     /// Start the restored workspaces. With `live`, the kept sessions that
     /// survived, each terminal reattaches to its session or, if it is gone,
     /// is restored with a fresh shell, and sessions no terminal refers to are
-    /// adopted as Recovered sessions.
+    /// adopted as Recovered sessions. A terminal whose daemon couldn't be
+    /// asked tries to reattach, and is restored if it can't.
     pub(super) fn reattach(
         &mut self,
         ctx: &egui::Context,
-        live: Option<Vec<neptune_model::SessionRef>>,
+        live: Option<crate::runtime::kept_sessions::Live>,
     ) {
+        let model = self.controller.model();
         let plan = live
             .filter(|_| self.keep_sessions)
-            .map(|live| self.controller.model().plan_reattach(&live))
+            .map(|live| {
+                let mut sessions = live.sessions;
+                sessions.extend(
+                    model
+                        .workspaces()
+                        .iter()
+                        .flat_map(|workspace| workspace.panes())
+                        .filter_map(|pane| pane.session())
+                        .filter(|session| live.unlisted.contains(&session.daemon))
+                        .cloned(),
+                );
+                model.plan_reattach(&sessions)
+            })
             .unwrap_or_default();
         let mut effects = self.controller.start_effects();
         effects.retain(|effect| {

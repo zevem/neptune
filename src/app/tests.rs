@@ -48,6 +48,8 @@ pub(super) fn fixture(root: &std::path::Path) -> (App, mpsc::SyncSender<Startup>
         ephemeral: true,
         session_daemon: Some(crate::runtime::kept_sessions::directory(root)),
         claim: Default::default(),
+        daemon_program: None,
+        unseen: Default::default(),
         replaced: false,
         keep_sessions: false,
         end_sessions: false,
@@ -4766,26 +4768,21 @@ fn custom_keybindings_clipboard_uses_modifiers_at_the_event_even_if_released_in_
 /// A session daemon for `root`'s data, on a thread of this test. It exits
 /// shortly after its last session and client are gone.
 #[cfg(unix)]
-fn session_daemon(root: &std::path::Path) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
+fn session_daemon(
+    root: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    std::thread::JoinHandle<Result<(), terminal_core::SessionError>>,
+) {
     let dir = crate::runtime::kept_sessions::directory(root);
-    let serving = dir.clone();
-    let daemon = std::thread::spawn(move || {
-        terminal_core::daemon::run(
-            &serving,
-            terminal_core::daemon::DaemonOptions {
-                idle_exit: Duration::from_millis(200),
-            },
-        )
-        .unwrap()
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while terminal_core::daemon::DaemonClient::connect(&dir).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "the session daemon never listened"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let daemon = terminal_core::daemon::simulated::spawn(
+        &dir,
+        terminal_core::daemon::DaemonOptions {
+            idle_exit: Duration::from_millis(200),
+            ..Default::default()
+        },
+        terminal_core::daemon::PROTOCOL_VERSION,
+    );
     (dir, daemon)
 }
 
@@ -4875,7 +4872,7 @@ fn a_restoring_launch_reattaches_kept_sessions_and_quitting_leaves_them_running(
     client.close(id).unwrap();
     drop(client);
     drop(app);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 /// An SSH terminal kept running after quit keeps its connection sharing:
@@ -4948,7 +4945,7 @@ fn a_kept_ssh_terminal_keeps_its_control_socket_and_remote_folder_across_reattac
     let pane = app.controller.model().active_pane().unwrap();
     wait_for_directory(&mut app, pane, &home);
     let socket = app.sessions.ssh_control(pane).unwrap().path().to_owned();
-    assert!(socket.starts_with(dir.join("ssh")), "{socket:?}");
+    assert_eq!(socket.parent().unwrap().parent(), Some(dir.as_path()));
     assert!(socket.exists());
     let reference = app
         .controller
@@ -5014,7 +5011,7 @@ fn a_kept_ssh_terminal_keeps_its_control_socket_and_remote_folder_across_reattac
         daemon_client.close(session.id).unwrap();
     }
     drop(daemon_client);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 #[test]
@@ -5158,7 +5155,7 @@ fn a_restoring_launch_reattaches_restores_lost_sessions_and_adopts_recovered_one
     let (mut app, _sender) = fixture(root.path());
     let ctx = egui::Context::default();
     let startup = Startup {
-        live: crate::runtime::kept_sessions::live(&dir),
+        live: Some(crate::runtime::kept_sessions::live(&dir)),
         ..loaded(keeping(&app), saved)
     };
     let error = app.ui.error.clone();
@@ -5207,7 +5204,7 @@ fn a_restoring_launch_reattaches_restores_lost_sessions_and_adopts_recovered_one
     }
     drop(client);
     drop(app);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 #[cfg(unix)]
@@ -5257,7 +5254,7 @@ fn a_reattach_that_fails_restores_the_terminal_with_one_notice() {
     );
     drop(app);
     let _ = dir;
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 /// A launch that keeps sessions, reattached to `count` terminals that an
@@ -5419,7 +5416,7 @@ fn ending_all_sessions_and_quitting_ends_every_kept_session_after_the_process_wa
         None
     );
     drop(launch);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 /// The update relaunch is a quit that detaches: every kept session keeps
@@ -5449,7 +5446,7 @@ fn restarting_for_an_update_keeps_every_session_running_without_asking() {
         launch.client.close(entry.id).unwrap();
     }
     drop(launch);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 #[cfg(unix)]
@@ -5471,7 +5468,7 @@ fn turning_kept_sessions_off_makes_the_next_quit_warn_and_end_every_kept_session
     eframe::App::on_exit(&mut launch.app);
     assert_eq!(launch.running(), 0);
     drop(launch);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 #[cfg(unix)]
@@ -5534,7 +5531,7 @@ fn closing_one_of_several_windows_ends_its_kept_sessions_and_closing_the_last_de
         launch.client.close(entry.id).unwrap();
     }
     drop(launch);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 #[test]
@@ -5592,7 +5589,7 @@ fn a_neptune_replaced_by_a_newer_launch_stops_saving_and_closes_without_ending_s
             config,
             report,
             error: None,
-            live: crate::runtime::kept_sessions::live(&dir),
+            live: Some(crate::runtime::kept_sessions::live(&dir)),
         },
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -5659,7 +5656,7 @@ fn a_neptune_replaced_by_a_newer_launch_stops_saving_and_closes_without_ending_s
     }
     drop(earlier);
     drop(newer);
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
 }
 
 #[cfg(unix)]
@@ -5749,5 +5746,154 @@ fn launches_that_dont_restore_never_attach_or_take_over() {
         earlier.close(entry.id).unwrap();
     }
     drop((held, earlier, app, claim));
-    daemon.join().unwrap();
+    daemon.join().unwrap().unwrap();
+}
+
+/// With the setting off, a restoring launch still finds the sessions the
+/// session daemon runs, as a launch that kept them left them: it takes over
+/// whatever holds them, counts them in the quit warning, and ends them all
+/// when it quits.
+#[cfg(unix)]
+#[test]
+fn a_restoring_launch_that_doesnt_keep_sessions_warns_about_and_ends_those_running() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let earlier = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let held = earlier.take_over(Arc::new(|| {})).unwrap();
+    for text in ["FIRST", "SECOND"] {
+        kept_session(&earlier, root.path(), text);
+    }
+    let settings = root.path().join("config.toml");
+    Config {
+        shell: Some("/bin/sh".into()),
+        confirm_close: false,
+        ..Config::default()
+    }
+    .save(&settings)
+    .unwrap();
+    let claim = crate::runtime::kept_sessions::Claim::default();
+    let startup = load_startup(
+        &settings,
+        &root.path().join("workspaces.json"),
+        true,
+        Some((&dir, &claim)),
+    );
+    assert!(held.replaced(), "the Neptune that kept them was not told");
+    assert_eq!(startup.live.as_ref().unwrap().sessions.len(), 2);
+
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    app.complete_startup(&ctx, startup);
+    assert!(!app.keep_sessions);
+    let pane = app.controller.model().active_pane().unwrap();
+    poll_until(&mut app, &ctx, |app| {
+        app.controller.model().pane(pane).unwrap().lifecycle() == &Lifecycle::Running
+    });
+    app.action(&ctx, Action::Quit);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.ui.close_status == ui::CloseStatus::Checking {
+        assert!(
+            Instant::now() < deadline,
+            "the process check never finished"
+        );
+        app.poll(&ctx);
+        app.poll_close(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Its own shell is idle at its prompt; the daemon's two are counted.
+    assert_eq!(
+        app.ui.close_status,
+        ui::CloseStatus::Running {
+            terminals: 2,
+            unknown: 0
+        }
+    );
+    assert!(!app.ui.close_detaches);
+    app.action(&ctx, Action::Confirm(Close::App));
+    assert!(app.exit_approved);
+    eframe::App::on_exit(&mut app);
+    assert_eq!(earlier.list().unwrap(), []);
+    drop((held, earlier, app, claim));
+    daemon.join().unwrap().unwrap();
+}
+
+/// Before startup finishes no terminal has started, and quitting a
+/// restoring launch leaves whatever the session daemon runs alone: there is
+/// nothing to warn about.
+#[test]
+fn quitting_a_restoring_launch_while_it_starts_asks_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    app.config.confirm_close = false;
+    assert!(app.startup.is_some());
+    app.action(&ctx, Action::Quit);
+    assert_eq!(app.ui.overlay, OverlayState::None);
+    assert!(app.exit_approved);
+}
+
+/// A terminal whose session daemon is there but couldn't be asked tries to
+/// reattach, rather than being restored as if its session were gone.
+#[cfg(unix)]
+#[test]
+fn a_terminal_whose_daemon_couldnt_be_listed_still_reattaches() {
+    let root = tempfile::tempdir().unwrap();
+    let (dir, daemon) = session_daemon(root.path());
+    let client = terminal_core::daemon::DaemonClient::connect(&dir).unwrap();
+    let alive = kept_session(&client, root.path(), "ALIVE");
+    let (saved, panes) = kept_panes(root.path(), &[&alive]);
+    let (mut app, _sender) = fixture(root.path());
+    let ctx = egui::Context::default();
+    let startup = Startup {
+        live: Some(crate::runtime::kept_sessions::Live {
+            sessions: Vec::new(),
+            unlisted: vec![terminal_core::daemon::PROTOCOL_VERSION],
+        }),
+        ..loaded(keeping(&app), saved)
+    };
+    app.complete_startup(&ctx, startup);
+    poll_until(&mut app, &ctx, |app| {
+        app.sessions
+            .get(panes[0])
+            .is_some_and(|session| session.screen_text().contains("ALIVE"))
+    });
+    assert_eq!(
+        app.controller.model().pane(panes[0]).unwrap().session(),
+        Some(&alive)
+    );
+    client.close(alive.id.parse().unwrap()).unwrap();
+    drop((client, app));
+    daemon.join().unwrap().unwrap();
+}
+
+/// A data root too deep for a session daemon's socket address keeps its
+/// terminals in Neptune for that launch, rather than failing each one.
+#[cfg(unix)]
+#[test]
+fn a_data_root_too_deep_for_a_socket_keeps_terminals_in_neptune() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut app, _sender) = fixture(root.path());
+    let deep = root.path().join("d".repeat(120));
+    app.session_daemon = Some(crate::runtime::kept_sessions::directory(&deep));
+    let ctx = egui::Context::default();
+    let config = Config {
+        shell: Some("/bin/sh".into()),
+        ..keeping(&app)
+    };
+    app.complete_startup(&ctx, loaded(config, Model::default()));
+    assert!(!app.keep_sessions);
+    assert!(
+        app.diagnostics
+            .said
+            .borrow()
+            .iter()
+            .any(|line| line.contains("\"error_kind\":\"SocketPath\"")),
+        "{:?}",
+        app.diagnostics.said.borrow()
+    );
+    let pane = app.controller.model().active_pane().unwrap();
+    poll_until(&mut app, &ctx, |app| {
+        app.controller.model().pane(pane).unwrap().lifecycle() == &Lifecycle::Running
+    });
+    assert_eq!(app.controller.model().pane(pane).unwrap().session(), None);
 }

@@ -136,6 +136,8 @@ pub struct SessionManager {
     kept: Option<Arc<KeptSessions>>,
     /// Starts whose results are let go of, not closed, when they arrive.
     detached: BTreeSet<(PaneId, u64)>,
+    /// Removes the SSH control folders of closed sessions, off the frame.
+    cleanup: Option<mpsc::Sender<Arc<SshControl>>>,
 }
 impl SessionManager {
     pub fn new(policy: ResourcePolicy, diagnostics: bool) -> Self {
@@ -194,8 +196,14 @@ impl SessionManager {
                                 )?;
                                 // It keeps the history this launch's budget
                                 // allows, whichever build started it; the
-                                // budget always fits its grid.
-                                let _ = session.set_scrollback(terminal.scrollback);
+                                // budget always fits its grid. Without it, the
+                                // terminal still works.
+                                if let Err(error) = session.set_scrollback(terminal.scrollback) {
+                                    eprintln!(
+                                        "Could not limit a reattached terminal's history: {:?}",
+                                        error.kind()
+                                    );
+                                }
                                 // Its agents reach this launch with the
                                 // credential they were started with.
                                 if let Some(credential) = &data.agent {
@@ -350,12 +358,22 @@ impl SessionManager {
             agents,
             kept: None,
             detached: BTreeSet::new(),
+            cleanup: None,
         }
     }
     /// From now on, start and attach terminals in the session daemon `kept`
-    /// reaches, so that they outlive Neptune.
+    /// reaches, so that they outlive Neptune. It connects at once, off the
+    /// frame, so that a newer launch can take over before any terminal starts.
     pub fn keep_sessions(&mut self, kept: KeptSessions) {
-        self.kept = Some(Arc::new(kept));
+        let kept = Arc::new(kept);
+        let connecting = kept.clone();
+        let _ = thread::Builder::new()
+            .name("neptune-kept-sessions".into())
+            .spawn(move || {
+                // Failing now, it connects when a terminal starts.
+                let _ = connecting.connect_now();
+            });
+        self.kept = Some(kept);
     }
     pub fn policy(&self) -> &ResourcePolicy {
         &self.policy
@@ -554,15 +572,41 @@ impl SessionManager {
         }
     }
     fn reap(&mut self) {
-        self.closing.retain(|closing| {
+        let mut controls = Vec::new();
+        self.closing.retain_mut(|closing| {
             let pending = closing.session.metrics().active_workers != 0;
-            if !pending && let Some(control) = &closing.control {
-                // A kept session's socket outlives Neptune, but not its close.
-                control.remove();
+            if !pending && let Some(control) = closing.control.take() {
+                controls.push(control);
             }
             if !pending && self.diagnostics { eprintln!("{}", serde_json::json!({"operation":"cleanup","pane":closing.pane.get(),"session_generation":closing.generation,"elapsed_ms":closing.since.elapsed().as_secs_f64()*1000.0})); }
             pending
         });
+        for control in controls {
+            self.remove_later(control);
+        }
+    }
+    /// A kept session's control socket outlives Neptune, but not its close.
+    /// Its folder is removed on a worker, never on the frame.
+    fn remove_later(&mut self, control: Arc<SshControl>) {
+        if self.cleanup.is_none() {
+            let (sender, controls) = mpsc::channel::<Arc<SshControl>>();
+            if thread::Builder::new()
+                .name("neptune-ssh-cleanup".into())
+                .spawn(move || {
+                    for control in controls {
+                        control.remove();
+                    }
+                })
+                .is_ok()
+            {
+                self.cleanup = Some(sender);
+            }
+        }
+        // Without the worker, the folder stays until the next launch
+        // removes it.
+        if let Some(cleanup) = &self.cleanup {
+            let _ = cleanup.send(control);
+        }
     }
     pub fn poll(&mut self) -> Vec<SessionCompletion> {
         self.reap();
@@ -670,11 +714,6 @@ impl SessionManager {
         session
             .set_scrollback(target_history)
             .map_err(|error| error.to_string())
-    }
-    /// End every kept session, those no terminal shows included. Only a
-    /// running session daemon is asked; none is launched for it.
-    pub fn end_kept(&self) -> Result<(), String> {
-        self.kept.as_ref().map_or(Ok(()), |kept| kept.end_all())
     }
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
         let ids: Vec<_> = self.desired.keys().copied().collect();
@@ -798,32 +837,24 @@ mod tests {
     }
     /// A session daemon serving a temporary directory, on a thread of this
     /// test. It exits shortly after its last session and client are gone.
-    fn daemon() -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
-        thread::JoinHandle<()>,
-    ) {
+    fn daemon() -> (tempfile::TempDir, std::path::PathBuf, Daemon) {
         let root = tempfile::tempdir().unwrap();
         let dir = super::super::kept_sessions::directory(root.path());
-        let serving = dir.clone();
-        let daemon = thread::spawn(move || {
-            terminal_core::daemon::run(
-                &serving,
-                terminal_core::daemon::DaemonOptions {
-                    idle_exit: Duration::from_millis(200),
-                },
-            )
-            .unwrap()
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while terminal_core::daemon::DaemonClient::connect(&dir).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "the session daemon never listened"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        let daemon = daemon_of(&dir, terminal_core::daemon::PROTOCOL_VERSION);
         (root, dir, daemon)
+    }
+    type Daemon = thread::JoinHandle<Result<(), terminal_core::SessionError>>;
+    /// A session daemon of `version` serving `dir`, which exits shortly
+    /// after its last session and client are gone.
+    fn daemon_of(dir: &std::path::Path, version: u32) -> Daemon {
+        terminal_core::daemon::simulated::spawn(
+            dir,
+            terminal_core::daemon::DaemonOptions {
+                idle_exit: Duration::from_millis(200),
+                ..Default::default()
+            },
+            version,
+        )
     }
     fn kept(dir: &std::path::Path) -> SessionManager {
         let mut manager = SessionManager::new(policy(), false);
@@ -922,7 +953,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         drop(second);
-        daemon.join().unwrap();
+        daemon.join().unwrap().unwrap();
     }
 
     /// A kept SSH terminal's control socket lives with its session: it
@@ -970,7 +1001,7 @@ mod tests {
         let reference = reference.unwrap().unwrap();
         let control = first.ssh_control(pane).unwrap();
         let socket = control.path().to_owned();
-        assert!(socket.starts_with(dir.join("ssh")), "{socket:?}");
+        assert_eq!(socket.parent().unwrap().parent(), Some(dir.as_path()));
         assert!(socket.exists());
         let forward = KeptForward {
             listener: crate::platform::ports::Listener {
@@ -1000,10 +1031,14 @@ mod tests {
         drop(control);
         second.close(pane);
         until(&mut second, |manager, _| manager.usage().closing == 0);
-        assert!(!socket.exists(), "closing left the control socket");
-        assert!(!socket.parent().unwrap().exists());
+        // It goes on a worker, after the session has closed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while socket.parent().unwrap().exists() {
+            assert!(Instant::now() < deadline, "closing left the control socket");
+            thread::sleep(Duration::from_millis(5));
+        }
         drop(second);
-        daemon.join().unwrap();
+        daemon.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1110,7 +1145,7 @@ mod tests {
         second.close(pane);
         until(&mut second, |manager, _| manager.usage().closing == 0);
         drop(second);
-        daemon.join().unwrap();
+        daemon.join().unwrap().unwrap();
     }
 
     /// An update relaunch, as two builds whose protocol versions differ:
@@ -1121,7 +1156,7 @@ mod tests {
     #[test]
     fn an_update_reattaches_the_earlier_daemons_sessions_and_starts_new_ones_in_its_own() {
         use super::super::kept_sessions::KeptSessions;
-        use terminal_core::daemon::{DaemonClient, DaemonOptions, PROTOCOL_VERSION, simulated};
+        use terminal_core::daemon::{DaemonClient, PROTOCOL_VERSION};
         let (_root, dir, earlier_daemon) = daemon();
         // The earlier build kept a session whose history its budget allowed.
         let earlier = DaemonClient::connect(&dir).unwrap();
@@ -1147,24 +1182,15 @@ mod tests {
 
         // The update speaks a later version, and attaches to the earlier one.
         let later = PROTOCOL_VERSION + 1;
-        let serving = dir.clone();
-        let later_daemon = thread::spawn(move || {
-            simulated::run(
-                &serving,
-                DaemonOptions {
-                    idle_exit: Duration::from_millis(200),
-                },
-                later,
-            )
-            .unwrap()
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while DaemonClient::connect_to(&dir, later).is_err() {
-            assert!(Instant::now() < deadline, "the later daemon never listened");
-            thread::sleep(Duration::from_millis(5));
-        }
+        let later_daemon = daemon_of(&dir, later);
         let sessions = KeptSessions::with_versions(dir.clone(), later, &[PROTOCOL_VERSION]);
-        assert_eq!(sessions.live(), Some(vec![kept.clone()]));
+        assert_eq!(
+            sessions.live(),
+            super::super::kept_sessions::Live {
+                sessions: vec![kept.clone()],
+                unlisted: Vec::new(),
+            }
+        );
         let mut manager = SessionManager::new(
             ResourcePolicy {
                 max_sessions: 2,
@@ -1230,7 +1256,7 @@ mod tests {
         // later daemon keeps serving.
         manager.close(reattached);
         until(&mut manager, |manager, _| manager.usage().closing == 0);
-        earlier_daemon.join().unwrap();
+        earlier_daemon.join().unwrap().unwrap();
         assert_eq!(listed_in(&dir, later), vec![fresh.id.clone()]);
         manager.detach(opened);
         drop(manager);
@@ -1238,7 +1264,7 @@ mod tests {
         let ended = KeptSessions::with_versions(dir.clone(), later, &[PROTOCOL_VERSION]);
         ended.end_all().unwrap();
         drop(ended);
-        later_daemon.join().unwrap();
+        later_daemon.join().unwrap().unwrap();
     }
 
     /// An earlier build still open when the updated one launches gives way,
@@ -1247,29 +1273,14 @@ mod tests {
     #[test]
     fn an_updated_launch_takes_over_from_an_earlier_build_still_open() {
         use super::super::kept_sessions::Claim;
-        use terminal_core::daemon::{DaemonClient, DaemonOptions, PROTOCOL_VERSION, simulated};
+        use terminal_core::daemon::PROTOCOL_VERSION;
         let (_root, dir, earlier_daemon) = daemon();
         let earlier = Claim::default();
         earlier.take_over_running(&dir).unwrap();
         assert!(!earlier.replaced());
 
         let later = PROTOCOL_VERSION + 1;
-        let serving = dir.clone();
-        let later_daemon = thread::spawn(move || {
-            simulated::run(
-                &serving,
-                DaemonOptions {
-                    idle_exit: Duration::from_millis(200),
-                },
-                later,
-            )
-            .unwrap()
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while DaemonClient::connect_to(&dir, later).is_err() {
-            assert!(Instant::now() < deadline, "the later daemon never listened");
-            thread::sleep(Duration::from_millis(5));
-        }
+        let later_daemon = daemon_of(&dir, later);
         let claim = Claim::default();
         claim
             .take_over_versions(&dir, later, &[PROTOCOL_VERSION])
@@ -1285,9 +1296,120 @@ mod tests {
         assert!(!claim.replaced());
         // The earlier build exits; nothing holds its daemon any more.
         drop(earlier);
-        earlier_daemon.join().unwrap();
+        earlier_daemon.join().unwrap().unwrap();
         drop(claim);
-        later_daemon.join().unwrap();
+        later_daemon.join().unwrap().unwrap();
+    }
+
+    /// A daemon of an earlier version that answers with another version
+    /// can't be asked; the sessions of the others are still found, and
+    /// nothing is removed while it is unknown what runs.
+    #[test]
+    fn a_daemon_that_cant_be_asked_holds_back_neither_the_others_nor_their_sessions() {
+        use super::super::kept_sessions::{KeptSessions, Live};
+        use terminal_core::daemon::{DaemonClient, PROTOCOL_VERSION};
+        let (root, dir, daemon) = daemon();
+        let client = DaemonClient::connect(&dir).unwrap();
+        let (session, id) = client.start(options(), Arc::new(|| {})).unwrap();
+        drop(session);
+        let stray = dir.join("abcd");
+        std::fs::create_dir(&stray).unwrap();
+        // An earlier version listens, but this build's client can't speak
+        // it, so asking that daemon fails.
+        const EARLIER: &[u32] = &[7];
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("v7")).unwrap();
+        let sessions = KeptSessions::with_versions(dir.clone(), PROTOCOL_VERSION, EARLIER);
+        assert_eq!(
+            sessions.live(),
+            Live {
+                sessions: vec![SessionRef {
+                    daemon: PROTOCOL_VERSION,
+                    id: id.to_string(),
+                }],
+                unlisted: vec![7],
+            }
+        );
+        assert!(stray.exists(), "removed while some sessions were unknown");
+        client.close(id).unwrap();
+        drop((client, sessions, root));
+        daemon.join().unwrap().unwrap();
+    }
+
+    /// SSH control folders that no running session refers to, left by a
+    /// logout or a session that ended unseen, go once the sessions are known.
+    #[test]
+    fn startup_removes_the_ssh_control_folders_no_session_refers_to() {
+        use super::super::kept_sessions::{SessionData, SshData, live};
+        let (_root, dir, daemon) = daemon();
+        let mut manager = kept(&dir);
+        let pane = PaneId::new(1);
+        manager
+            .start(pane, 1, false, options(), Arc::new(|| {}))
+            .unwrap();
+        let mut reference = None;
+        until(&mut manager, |_, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some()
+        });
+        let reference = reference.unwrap().unwrap();
+        let kept_folder = SshControl::reserve(&dir).unwrap().unwrap();
+        // Asked on a connection of its own: another launch's claim would
+        // take the daemon over from the manager.
+        let data = SessionData {
+            agent: None,
+            ssh: Some(SshData {
+                control: kept_folder.clone(),
+                forwards: Vec::new(),
+            }),
+        };
+        terminal_core::daemon::DaemonClient::connect(&dir)
+            .unwrap()
+            .set_data(
+                reference.id.parse().unwrap(),
+                &serde_json::to_vec(&data).unwrap(),
+            )
+            .unwrap();
+        let stale = SshControl::reserve(&dir).unwrap().unwrap();
+        std::fs::write(&stale, b"").unwrap();
+        let found = live(&dir);
+        assert_eq!(found.sessions, [reference]);
+        assert!(kept_folder.parent().unwrap().exists());
+        assert!(!stale.parent().unwrap().exists());
+        // The daemons' own files stay.
+        assert!(
+            dir.join(format!("v{}", terminal_core::daemon::PROTOCOL_VERSION))
+                .exists()
+        );
+        manager.close(pane);
+        until(&mut manager, |manager, _| manager.usage().closing == 0);
+        drop(manager);
+        daemon.join().unwrap().unwrap();
+    }
+
+    /// A launch that keeps sessions holds the daemon as soon as it does,
+    /// before any terminal starts, so a newer launch always reaches it.
+    #[test]
+    fn keeping_sessions_takes_over_the_daemon_before_any_terminal_starts() {
+        use super::super::kept_sessions::{Claim, KeptSessions};
+        let (_root, dir, daemon) = daemon();
+        let earlier = Claim::default();
+        earlier.take_over_running(&dir).unwrap();
+        let mut manager = SessionManager::new(policy(), false);
+        manager.keep_sessions(KeptSessions::new(
+            dir.clone(),
+            None,
+            Arc::new(Claim::default()),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !earlier.replaced() {
+            assert!(
+                Instant::now() < deadline,
+                "the earlier launch was never told"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop((manager, earlier));
+        daemon.join().unwrap().unwrap();
     }
 
     fn listed_in(dir: &std::path::Path, version: u32) -> Vec<String> {
@@ -1320,7 +1442,7 @@ mod tests {
         );
         assert!(manager.shutdown(Duration::from_secs(2)));
         drop(manager);
-        daemon.join().unwrap();
+        daemon.join().unwrap().unwrap();
     }
 
     #[test]

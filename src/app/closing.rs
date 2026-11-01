@@ -44,20 +44,25 @@ impl App {
         self.config.confirm_close && !self.relaunch
     }
 
+    /// Whether closing `target` quits Neptune: quitting, ending every session,
+    /// or closing the last window.
+    fn quits(&self, target: Close) -> bool {
+        match target {
+            Close::App | Close::AllSessions => true,
+            Close::Window(window) => !self
+                .controller
+                .model()
+                .workspaces()
+                .iter()
+                .any(|workspace| workspace.window() != window),
+            _ => false,
+        }
+    }
+
     /// Quitting, or closing the last window, while sessions are kept detaches
     /// them: their programs keep running, so they need no warning.
     fn detaches(&self, target: Close) -> bool {
-        self.keeps_sessions()
-            && match target {
-                Close::App => true,
-                Close::Window(window) => !self
-                    .controller
-                    .model()
-                    .workspaces()
-                    .iter()
-                    .any(|workspace| workspace.window() != window),
-                _ => false,
-            }
+        self.keeps_sessions() && target != Close::AllSessions && self.quits(target)
     }
 
     pub(super) fn request_close(&mut self, ctx: &egui::Context, target: Close) {
@@ -83,16 +88,28 @@ impl App {
             return;
         }
         let panes = self.close_panes(target);
+        let quits = self.quits(target);
         let mut pending = PendingClose {
             target,
             panes,
             checks: Vec::new(),
             since: Instant::now(),
             running: 0,
-            unknown: usize::from(self.startup.is_some()),
+            // While it starts, no terminal has started yet, and quitting a
+            // restoring launch leaves whatever the session daemons run
+            // alone, so there is nothing to check.
+            unknown: usize::from(
+                self.startup.is_some() && !(quits && self.session_daemon.is_some()),
+            ),
         };
         let detaches = self.detaches(target);
         self.ui.close_detaches = detaches;
+        if self.config.warn_running_processes && quits && !detaches {
+            // Sessions a launch that doesn't keep them found running end as
+            // it quits.
+            pending.running += self.unseen.sessions.len();
+            pending.unknown += self.unseen.unlisted.len();
+        }
         if self.config.warn_running_processes {
             for &(pane, generation) in &pending.panes {
                 // An ended terminal has nothing to stop, even when its handle

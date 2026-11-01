@@ -51,26 +51,21 @@ impl SshControl {
         })
     }
 
-    /// A control socket in a new directory of `parent`, for a kept session.
-    /// The directory is the caller's to remove (see [`Self::remove`]); `None`
-    /// if its socket path would be too long for ssh to listen on.
+    /// A control socket in a new directory of `parent`, which is made
+    /// this user's alone, for a kept session. The directory is the caller's
+    /// to remove (see [`Self::remove`]); `None` if its socket path would be
+    /// too long for ssh to listen on.
     pub fn reserve(parent: &Path) -> std::io::Result<Option<PathBuf>> {
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
-        // The socket is `parent/XXXXXX/s`.
-        if !fits(&parent.join("XXXXXX").join(SOCKET)) {
+        terminal_core::daemon::make_private_dir(parent)?;
+        // The socket is `parent/XXXX/s`: four random characters leave room
+        // for long user names.
+        if !fits(&parent.join("XXXX").join(SOCKET)) {
             return Ok(None);
         }
         let directory = private_directory()
             .prefix("")
-            .rand_bytes(6)
+            .rand_bytes(4)
             .tempdir_in(parent)?
             .keep();
         Ok(Some(directory.join(SOCKET)))
@@ -141,12 +136,20 @@ fn private_directory<'a>() -> tempfile::Builder<'a, 'a> {
 /// Whether ssh can listen on `path`. While it starts listening, it binds a
 /// name 17 bytes longer, and a socket path must fit `sun_path` with its NUL.
 fn fits(path: &Path) -> bool {
-    const SUN_PATH: usize = if cfg!(any(target_os = "macos", target_os = "ios")) {
-        104
-    } else {
-        108
-    };
-    path.as_os_str().len() + 17 < SUN_PATH
+    fits_within(
+        path,
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
+            MACOS_SUN_PATH
+        } else {
+            108
+        },
+    )
+}
+
+const MACOS_SUN_PATH: usize = 104;
+
+fn fits_within(path: &Path, sun_path: usize) -> bool {
+    path.as_os_str().len() + 17 < sun_path
 }
 
 #[cfg(test)]
@@ -166,7 +169,7 @@ mod tests {
     fn a_kept_socket_gets_its_own_private_directory_which_close_removes() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("sessions").join("ssh");
+        let parent = root.path().join("sessions");
         let first = SshControl::reserve(&parent).unwrap().unwrap();
         let second = SshControl::reserve(&parent).unwrap().unwrap();
         assert_ne!(first.parent(), second.parent());
@@ -187,5 +190,30 @@ mod tests {
 
         let long = root.path().join("l".repeat(100));
         assert_eq!(SshControl::reserve(&long).unwrap(), None);
+    }
+
+    /// The default data root on macOS, whose socket addresses are the
+    /// shortest: a kept SSH socket fits with a 16-character user name.
+    #[test]
+    fn a_kept_socket_fits_under_the_macos_data_root_of_a_long_user_name() {
+        let sessions = |user: &str| {
+            PathBuf::from(format!(
+                "/Users/{user}/Library/Application Support/rs.Neptune.neptune/sessions"
+            ))
+        };
+        let socket = |user: &str| sessions(user).join("XXXX").join(SOCKET);
+        assert!(fits_within(&socket(&"u".repeat(16)), MACOS_SUN_PATH));
+        assert!(!fits_within(&socket(&"u".repeat(17)), MACOS_SUN_PATH));
+    }
+
+    /// Neither a folder that is someone else's, nor a file, becomes the
+    /// parent of a kept socket.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_socket_needs_a_parent_of_this_users_own() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(SshControl::reserve(&file).is_err());
     }
 }

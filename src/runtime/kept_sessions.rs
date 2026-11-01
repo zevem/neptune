@@ -54,30 +54,34 @@ pub fn cli(args: &[String]) -> Option<i32> {
         eprintln!("neptune session daemon: {DAEMON_MODE} needs a directory");
         return Some(2);
     };
-    #[cfg(unix)]
-    {
-        close_inherited();
-        // SAFETY: setsid has no memory effects; it fails harmlessly if this
-        // process already leads a session.
-        unsafe { libc::setsid() };
-        Some(
-            match terminal_core::daemon::run(
-                Path::new(dir),
-                terminal_core::daemon::DaemonOptions::default(),
-            ) {
-                Ok(()) => 0,
-                Err(error) => {
-                    eprintln!("neptune session daemon: run: {:?}", error.kind());
-                    1
-                }
-            },
-        )
+    Some(run_daemon(Path::new(dir)))
+}
+
+#[cfg(unix)]
+fn run_daemon(dir: &Path) -> i32 {
+    close_inherited();
+    // SAFETY: setsid has no memory effects; it fails harmlessly if this
+    // process already leads a session.
+    unsafe { libc::setsid() };
+    match terminal_core::daemon::run(dir, terminal_core::daemon::DaemonOptions::default()) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("neptune session daemon: run: {:?}", error.kind());
+            1
+        }
     }
+}
+
+/// Whether a session daemon can listen in `dir`, whose socket path must fit
+/// in its address. A data root deep enough to break that keeps its terminals
+/// in Neptune.
+pub fn fits(dir: &Path) -> bool {
+    #[cfg(unix)]
+    return terminal_core::daemon::fits(dir);
     #[cfg(not(unix))]
     {
         let _ = dir;
-        eprintln!("neptune session daemon: this platform keeps sessions in Neptune");
-        Some(2)
+        false
     }
 }
 
@@ -165,96 +169,26 @@ impl Claim {
         }
         self.replaced.load(Ordering::Acquire)
     }
+}
 
-    /// Take over the daemons serving `dir` that run; none is launched. An
-    /// earlier build may still be open on an earlier version's daemon, so
-    /// those are taken over too.
-    pub fn take_over_running(&self, dir: &Path) -> Result<(), String> {
-        #[cfg(unix)]
-        {
-            use terminal_core::daemon::{EARLIER_PROTOCOL_VERSIONS, PROTOCOL_VERSION};
-            self.take_over_versions(dir, PROTOCOL_VERSION, EARLIER_PROTOCOL_VERSIONS)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = dir;
-            Ok(())
-        }
-    }
-
-    /// Hold the daemon of `current`, and take over those of `earlier`
-    /// versions only to tell whoever holds them: holding an earlier daemon
-    /// would keep it from exiting once its sessions end. A newer launch
-    /// takes over this build's daemon too, which tells this one.
-    #[cfg(unix)]
-    pub(super) fn take_over_versions(
-        &self,
-        dir: &Path,
-        current: u32,
-        earlier: &[u32],
-    ) -> Result<(), String> {
-        use terminal_core::{SessionErrorKind, daemon::DaemonClient};
-        let running = |version| match DaemonClient::connect_to(dir, version) {
-            Err(error) if error.kind() == SessionErrorKind::Unavailable => Ok(None),
-            client => client.map(Some).map_err(|error| format!("{error:#}")),
-        };
-        let mut result = match running(current) {
-            Ok(Some(client)) => self.hold(&client),
-            other => other.map(drop),
-        };
-        if self.replaced() {
-            return Err(REPLACED.into());
-        }
-        for version in earlier {
-            let told = running(*version).and_then(|client| match client {
-                Some(client) => client
-                    .take_over(std::sync::Arc::new(|| {}))
-                    .map(drop)
-                    .map_err(|error| format!("{error:#}")),
-                None => Ok(()),
-            });
-            result = result.and(told);
-        }
-        result
-    }
-
-    /// Hold the daemon `client` reaches, unless this launch already holds it.
-    #[cfg(unix)]
-    fn hold(&self, client: &terminal_core::daemon::DaemonClient) -> Result<(), String> {
-        use std::sync::atomic::Ordering;
-        let mut held = self.held.lock().map_err(|_| REPLACED.to_owned())?;
-        if self.replaced.load(Ordering::Acquire)
-            || held.as_ref().is_some_and(|held| held.replaced())
-        {
-            self.replaced.store(true, Ordering::Release);
-            return Err(REPLACED.into());
-        }
-        // A daemon that went away was replaced by the one `client` reaches.
-        if held
-            .as_ref()
-            .is_some_and(terminal_core::daemon::Takeover::held)
-        {
-            return Ok(());
-        }
-        let replaced = self.replaced.clone();
-        let wake = self.wake.clone();
-        *held = Some(
-            client
-                .take_over(std::sync::Arc::new(move || {
-                    replaced.store(true, Ordering::Release);
-                    wake();
-                }))
-                .map_err(|error| format!("{error:#}"))?,
-        );
-        Ok(())
-    }
+/// The sessions running in a data root's session daemons, as a launch finds
+/// them when it starts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Live {
+    /// The sessions of every daemon that could be asked.
+    pub sessions: Vec<SessionRef>,
+    /// Protocol versions whose daemon is there but couldn't be asked: which
+    /// of their sessions run is unknown.
+    pub unlisted: Vec<u32>,
 }
 
 /// The sessions running in the session daemons that serve `dir`, of this
-/// build's protocol version and every earlier one it attaches to. Without a
-/// daemon there are none. `None` when a daemon is there but couldn't be
-/// asked. Never launches a daemon.
-pub fn live(dir: &Path) -> Option<Vec<SessionRef>> {
+/// build's protocol version and every earlier one it attaches to; without a
+/// daemon there are none. Once every daemon there could be asked, the SSH
+/// control folders that none of their sessions refers to any more, left by a
+/// logout or by a session that ended unseen, are removed. Never launches a
+/// daemon.
+pub fn live(dir: &Path) -> Live {
     KeptSessions::new(dir.to_owned(), None, Default::default()).live()
 }
 
@@ -308,136 +242,13 @@ impl KeptSessions {
         }
     }
 
-    /// See [`live`].
-    pub fn live(&self) -> Option<Vec<SessionRef>> {
-        #[cfg(unix)]
-        {
-            use terminal_core::SessionErrorKind;
-            let mut live = Vec::new();
-            for version in self.versions() {
-                let client = match self.connect_to(version) {
-                    Ok(client) => client,
-                    Err(error) if error.kind() == SessionErrorKind::Unavailable => continue,
-                    Err(_) => return None,
-                };
-                live.extend(client.list().ok()?.into_iter().map(|entry| SessionRef {
-                    daemon: version,
-                    id: entry.id.to_string(),
-                }));
-            }
-            Some(live)
-        }
-        #[cfg(not(unix))]
-        None
-    }
-
-    /// Start a program in the daemon. The reference names its session there.
-    pub fn start(
-        &self,
-        options: SessionOptions,
-        repaint: Repaint,
-    ) -> Result<(TerminalSession, SessionRef), String> {
-        #[cfg(unix)]
-        {
-            let options = with_environment(options);
-            let (session, id) =
-                self.request(|client| client.start(options.clone(), repaint.clone()))?;
-            Ok((
-                session,
-                SessionRef {
-                    daemon: self.current,
-                    id: id.to_string(),
-                },
-            ))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (options, repaint, with_environment);
-            Err(UNSUPPORTED.into())
-        }
-    }
-
-    /// Where kept SSH terminals' control sockets live, each in a directory
-    /// of its own.
+    /// Where kept SSH terminals' control sockets live, each in a folder of
+    /// its own: the daemons' own folder, whose path is short enough for a
+    /// socket to fit in its address with a long user name.
     pub fn ssh_directory(&self) -> PathBuf {
-        self.dir.join("ssh")
-    }
-
-    /// Keep `data` with a session, in place of what it had.
-    pub fn set_data(&self, reference: &SessionRef, data: &SessionData) -> Result<(), String> {
-        #[cfg(unix)]
-        {
-            let bytes = serde_json::to_vec(data).map_err(|error| error.to_string())?;
-            self.on(reference, |client, id| client.set_data(id, &bytes))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (reference, data);
-            Err(UNSUPPORTED.into())
-        }
-    }
-
-    /// Reattach to a kept session, with what Neptune kept with it; it takes
-    /// this size.
-    pub fn attach(
-        &self,
-        reference: &SessionRef,
-        cols: u16,
-        rows: u16,
-        repaint: Repaint,
-    ) -> Result<(TerminalSession, SessionData), String> {
-        #[cfg(unix)]
-        {
-            self.on(reference, |client, id| {
-                client.attach(id, cols, rows, repaint.clone())
-            })
-            .map(|attached| (attached.session, SessionData::decode(&attached.data)))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (reference, cols, rows, repaint);
-            Err(UNSUPPORTED.into())
-        }
+        self.dir.clone()
     }
 }
-
-impl KeptSessions {
-    /// End every session the daemons keep, those of earlier versions too.
-    /// Without a running daemon there is none to end, so this never launches
-    /// one. A daemon that can't be asked doesn't stop the others' ending.
-    pub fn end_all(&self) -> Result<(), String> {
-        // They are a newer launch's now.
-        if self.claim.replaced() {
-            return Err(REPLACED.into());
-        }
-        #[cfg(unix)]
-        {
-            use terminal_core::SessionErrorKind;
-            let mut failure = Ok(());
-            for version in self.versions() {
-                let sessions = match self.connect_to(version) {
-                    Err(error) if error.kind() == SessionErrorKind::Unavailable => continue,
-                    client => client.and_then(|client| Ok((client.list()?, client))),
-                };
-                match sessions {
-                    // One that already ended, or ends meanwhile, is gone either way.
-                    Ok((sessions, client)) => {
-                        for session in sessions {
-                            let _ = client.close(session.id);
-                        }
-                    }
-                    Err(error) => failure = failure.and(Err(format!("{error:#}"))),
-                }
-            }
-            failure
-        }
-        #[cfg(not(unix))]
-        Ok(())
-    }
-}
-
-#[cfg(not(unix))]
-const UNSUPPORTED: &str = "Keeping terminals running after quit needs macOS or Linux";
 
 #[cfg(unix)]
 mod unix {
@@ -456,7 +267,201 @@ mod unix {
     const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
     const LAUNCH_FAILED: &str = "The session daemon could not be launched";
 
+    impl Claim {
+        /// Take over the daemons serving `dir` that run; none is launched. An
+        /// earlier build may still be open on an earlier version's daemon, so
+        /// those are taken over too.
+        pub fn take_over_running(&self, dir: &Path) -> Result<(), String> {
+            use terminal_core::daemon::{EARLIER_PROTOCOL_VERSIONS, PROTOCOL_VERSION};
+            self.take_over_versions(dir, PROTOCOL_VERSION, EARLIER_PROTOCOL_VERSIONS)
+        }
+
+        /// Hold the daemon of `current`, and take over those of `earlier`
+        /// versions only to tell whoever holds them: holding an earlier daemon
+        /// would keep it from exiting once its sessions end. A newer launch
+        /// takes over this build's daemon too, which tells this one.
+        pub(in crate::runtime) fn take_over_versions(
+            &self,
+            dir: &Path,
+            current: u32,
+            earlier: &[u32],
+        ) -> Result<(), String> {
+            let running = |version| match DaemonClient::connect_to(dir, version) {
+                Err(error) if error.kind() == SessionErrorKind::Unavailable => Ok(None),
+                client => client.map(Some).map_err(|error| format!("{error:#}")),
+            };
+            let mut result = match running(current) {
+                Ok(Some(client)) => self.hold(&client),
+                other => other.map(drop),
+            };
+            if self.replaced() {
+                return Err(REPLACED.into());
+            }
+            for version in earlier {
+                let told = running(*version).and_then(|client| match client {
+                    Some(client) => client
+                        .take_over(Arc::new(|| {}))
+                        .map(drop)
+                        .map_err(|error| format!("{error:#}")),
+                    None => Ok(()),
+                });
+                result = result.and(told);
+            }
+            result
+        }
+
+        /// Hold the daemon `client` reaches, unless this launch already holds it.
+        fn hold(&self, client: &DaemonClient) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            let mut held = self.held.lock().map_err(|_| REPLACED.to_owned())?;
+            if self.replaced.load(Ordering::Acquire)
+                || held.as_ref().is_some_and(|held| held.replaced())
+            {
+                self.replaced.store(true, Ordering::Release);
+                return Err(REPLACED.into());
+            }
+            // A daemon that went away was replaced by the one `client` reaches.
+            if held
+                .as_ref()
+                .is_some_and(terminal_core::daemon::Takeover::held)
+            {
+                return Ok(());
+            }
+            let replaced = self.replaced.clone();
+            let wake = self.wake.clone();
+            *held = Some(
+                client
+                    .take_over(Arc::new(move || {
+                        replaced.store(true, Ordering::Release);
+                        wake();
+                    }))
+                    .map_err(|error| format!("{error:#}"))?,
+            );
+            Ok(())
+        }
+    }
+
     impl KeptSessions {
+        /// See [`live`].
+        pub fn live(&self) -> Live {
+            let mut live = Live::default();
+            // The folder of each SSH terminal's control socket that a session
+            // still refers to.
+            let mut controls = Vec::new();
+            for version in self.versions() {
+                let listed = match self.connect_to(version) {
+                    Err(error) if error.kind() == SessionErrorKind::Unavailable => continue,
+                    client => client.and_then(|client| client.list()),
+                };
+                // A daemon that can't be asked holds back no other.
+                let Ok(entries) = listed else {
+                    live.unlisted.push(version);
+                    continue;
+                };
+                for entry in entries {
+                    let data = SessionData::decode(&entry.data);
+                    controls.extend(
+                        data.ssh
+                            .and_then(|ssh| ssh.control.parent().map(Path::to_owned)),
+                    );
+                    live.sessions.push(SessionRef {
+                        daemon: version,
+                        id: entry.id.to_string(),
+                    });
+                }
+            }
+            if live.unlisted.is_empty() {
+                self.remove_ssh_directories_except(&controls);
+            }
+            live
+        }
+
+        /// Remove every SSH control folder but `kept`. Neptune's SSH folders
+        /// are the only folders in the daemons' own; the daemons keep only
+        /// files there.
+        fn remove_ssh_directories_except(&self, kept: &[PathBuf]) {
+            let Ok(entries) = std::fs::read_dir(self.ssh_directory()) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) && !kept.contains(&path) {
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+
+        /// Start a program in the daemon. The reference names its session there.
+        pub fn start(
+            &self,
+            options: SessionOptions,
+            repaint: Repaint,
+        ) -> Result<(TerminalSession, SessionRef), String> {
+            let options = with_environment(options);
+            let (session, id) =
+                self.request(|client| client.start(options.clone(), repaint.clone()))?;
+            Ok((
+                session,
+                SessionRef {
+                    daemon: self.current,
+                    id: id.to_string(),
+                },
+            ))
+        }
+
+        /// Keep `data` with a session, in place of what it had.
+        pub fn set_data(&self, reference: &SessionRef, data: &SessionData) -> Result<(), String> {
+            let bytes = serde_json::to_vec(data).map_err(|error| error.to_string())?;
+            self.on(reference, |client, id| client.set_data(id, &bytes))
+        }
+
+        /// Reattach to a kept session, with what Neptune kept with it; it
+        /// takes this size.
+        pub fn attach(
+            &self,
+            reference: &SessionRef,
+            cols: u16,
+            rows: u16,
+            repaint: Repaint,
+        ) -> Result<(TerminalSession, SessionData), String> {
+            self.on(reference, |client, id| {
+                client.attach(id, cols, rows, repaint.clone())
+            })
+            .map(|attached| (attached.session, SessionData::decode(&attached.data)))
+        }
+
+        /// Connect to the daemon now, launching it if need be, so that this
+        /// launch holds it before any terminal starts: a newer launch then
+        /// always reaches this one to take over.
+        pub fn connect_now(&self) -> Result<(), String> {
+            if self.claim.replaced() {
+                return Err(REPLACED.into());
+            }
+            self.client(None).map(drop)
+        }
+
+        /// End every session the daemons keep, those of earlier versions too,
+        /// each daemon's at once. Without a running daemon there is none to
+        /// end, so this never launches one. A daemon that can't be asked
+        /// doesn't stop the others' ending.
+        pub fn end_all(&self) -> Result<(), String> {
+            // They are a newer launch's now.
+            if self.claim.replaced() {
+                return Err(REPLACED.into());
+            }
+            let mut failure = Ok(());
+            for version in self.versions() {
+                let ended = match self.connect_to(version) {
+                    Err(error) if error.kind() == SessionErrorKind::Unavailable => continue,
+                    client => client.and_then(|client| client.end_all()),
+                };
+                if let Err(error) = ended {
+                    failure = failure.and(Err(format!("{error:#}")));
+                }
+            }
+            failure
+        }
+
         /// This build's protocol version, then the earlier ones.
         pub(super) fn versions(&self) -> impl Iterator<Item = u32> + '_ {
             std::iter::once(self.current).chain(self.earlier.iter().copied())
@@ -604,3 +609,57 @@ mod unix {
             .spawn(move || child.wait());
     }
 }
+
+/// Elsewhere Neptune keeps every session in process: nothing is kept, found
+/// or ended in a daemon.
+#[cfg(not(unix))]
+mod elsewhere {
+    use super::*;
+
+    const UNSUPPORTED: &str = "Keeping terminals running after quit needs macOS or Linux";
+
+    impl Claim {
+        pub fn take_over_running(&self, _: &Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl KeptSessions {
+        pub fn live(&self) -> Live {
+            Live::default()
+        }
+        pub fn start(
+            &self,
+            _: SessionOptions,
+            _: Repaint,
+        ) -> Result<(TerminalSession, SessionRef), String> {
+            let _ = with_environment;
+            Err(UNSUPPORTED.into())
+        }
+        pub fn set_data(&self, _: &SessionRef, _: &SessionData) -> Result<(), String> {
+            Err(UNSUPPORTED.into())
+        }
+        pub fn attach(
+            &self,
+            _: &SessionRef,
+            _: u16,
+            _: u16,
+            _: Repaint,
+        ) -> Result<(TerminalSession, SessionData), String> {
+            Err(UNSUPPORTED.into())
+        }
+        pub fn connect_now(&self) -> Result<(), String> {
+            Ok(())
+        }
+        pub fn end_all(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    pub(super) fn run_daemon(_: &Path) -> i32 {
+        eprintln!("neptune session daemon: this platform keeps sessions in Neptune");
+        2
+    }
+}
+#[cfg(not(unix))]
+use elsewhere::run_daemon;

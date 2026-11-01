@@ -57,10 +57,10 @@ struct Startup {
     config: Config,
     report: LoadReport,
     error: Option<String>,
-    /// The sessions running in the session daemon, listed for a launch that
-    /// keeps sessions. `None` when they couldn't be listed: every terminal
-    /// then tries to reattach, and one that can't is restored.
-    live: Option<Vec<neptune_model::SessionRef>>,
+    /// The sessions running in the session daemons, listed for a launch
+    /// that restores workspaces. A terminal whose daemon couldn't be asked
+    /// tries to reattach, and is restored if it can't.
+    live: Option<crate::runtime::kept_sessions::Live>,
 }
 
 /// Whether a launch restores workspaces. Only such a launch reattaches kept
@@ -74,9 +74,10 @@ fn restores(launch: &crate::Launch) -> bool {
 }
 
 /// Load the configuration and, if the launch restores them, the saved
-/// workspaces. A launch that keeps sessions first takes over the session
-/// daemon `kept` names, so the Neptune it replaces saves nothing after the
-/// state is read, then lists its sessions.
+/// workspaces. A restoring launch first takes over the session daemons
+/// `kept` names, so the Neptune it replaces saves nothing after the state is
+/// read, then lists their sessions: it reattaches them if it keeps sessions,
+/// and otherwise ends them when it quits.
 fn load_startup(
     settings: &Path,
     state: &Path,
@@ -87,10 +88,11 @@ fn load_startup(
         Ok(config) => (config, None),
         Err(error) => (Config::default(), Some(format!("{error:#}"))),
     };
-    let kept =
-        kept.filter(|_| restore && config.restore_workspaces && config.keep_sessions_running);
+    let kept = kept.filter(|_| restore);
     if let Some((dir, claim)) = kept {
-        // Failing here, it takes over once it reaches the daemon.
+        // Failing here, it takes over this version's daemon once it reaches
+        // it. A build still open on an earlier version's daemon isn't told
+        // then: only this takeover reaches those.
         let _ = claim.take_over_running(dir);
     }
     let report = if restore && config.restore_workspaces {
@@ -105,7 +107,7 @@ fn load_startup(
     };
     // Which kept sessions survived, so that each terminal is reattached or
     // restored, and strays are recovered.
-    let live = kept.and_then(|(dir, _)| crate::runtime::kept_sessions::live(dir));
+    let live = kept.map(|(dir, _)| crate::runtime::kept_sessions::live(dir));
     Startup {
         config,
         report,
@@ -171,6 +173,12 @@ pub struct App {
     end_sessions: bool,
     /// This launch's hold on the session daemon it keeps sessions in.
     claim: Arc<crate::runtime::kept_sessions::Claim>,
+    /// The `neptune` executable that launches a session daemon; `None` only
+    /// connects to one that runs.
+    daemon_program: Option<PathBuf>,
+    /// Sessions a launch that doesn't keep them found running in the session
+    /// daemons. It shows none of them, and ends them all when it quits.
+    unseen: crate::runtime::kept_sessions::Live,
     /// A newer launch took over: this one closes and saves nothing more.
     replaced: bool,
     preference_generation: u64,
@@ -330,6 +338,8 @@ impl App {
             ephemeral,
             session_daemon,
             claim,
+            daemon_program: std::env::current_exe().ok(),
+            unseen: Default::default(),
             replaced: false,
             keep_sessions: false,
             end_sessions: false,
@@ -703,23 +713,30 @@ impl App {
         }
         self.controller = Controller::new(startup.report.model.unwrap_or_default());
         self.adopt_restored_host();
-        self.keep_sessions = self.session_daemon.is_some()
-            && self.config.restore_workspaces
-            && self.config.keep_sessions_running;
+        let keeps = self.config.restore_workspaces && self.config.keep_sessions_running;
+        // A data root too deep for a socket address keeps its terminals in
+        // Neptune.
+        let fits = self
+            .session_daemon
+            .as_deref()
+            .is_some_and(crate::runtime::kept_sessions::fits);
+        if keeps && self.session_daemon.is_some() && !fits {
+            self.diagnostics
+                .failure("keep_sessions", None, None, "SocketPath");
+        }
+        self.keep_sessions = keeps && fits;
         self.ui.preference_view.launch_keeps_sessions = self.keep_sessions;
         if self.keep_sessions
             && let Some(dir) = &self.session_daemon
         {
-            // Tests reach a daemon they run themselves; they never launch one.
-            let program = (!cfg!(test))
-                .then(std::env::current_exe)
-                .and_then(Result::ok);
             self.sessions
                 .keep_sessions(crate::runtime::kept_sessions::KeptSessions::new(
                     dir.clone(),
-                    program,
+                    self.daemon_program.clone(),
                     self.claim.clone(),
                 ));
+        } else if let Some(live) = &startup.live {
+            self.unseen = live.clone();
         }
         let repaint = ctx.clone();
         match PersistenceWriter::new(
@@ -2118,8 +2135,12 @@ impl App {
         // A launch that was taken over lets go of every session; they are
         // the newer launch's now.
         let detaches = self.keeps_sessions() && !self.end_sessions;
-        let ends = self.keep_sessions && !detaches && !self.replaced;
-        if ends {
+        let ends = !detaches
+            && !self.replaced
+            && (self.keep_sessions
+                || !self.unseen.sessions.is_empty()
+                || !self.unseen.unlisted.is_empty());
+        if ends && self.keep_sessions {
             self.dispatch(&ctx, Command::ForgetSessions);
         }
         self.save_state();
@@ -2137,8 +2158,17 @@ impl App {
         }
         let complete = self.sessions.shutdown(Duration::from_secs(2));
         self.diagnostics.shutdown(complete);
-        // Ending them reaches the kept sessions no terminal showed, too.
-        if ends && let Err(error) = self.sessions.end_kept() {
+        // Ending them reaches the kept sessions no terminal showed, too, and
+        // those of every daemon version.
+        if ends
+            && let Some(dir) = &self.session_daemon
+            && let Err(error) = crate::runtime::kept_sessions::KeptSessions::new(
+                dir.clone(),
+                None,
+                self.claim.clone(),
+            )
+            .end_all()
+        {
             eprintln!("Could not end the kept sessions: {error}");
         }
         if self.relaunch

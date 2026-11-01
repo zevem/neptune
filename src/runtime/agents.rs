@@ -98,6 +98,15 @@ pub enum Starter {
     Pane(PaneId),
     Project(ProjectId),
 }
+impl Starter {
+    /// Who a terminal answers to: the agent that started it, or else its
+    /// project.
+    pub fn of(pane: &neptune_model::Pane) -> Option<Self> {
+        pane.spawned_by()
+            .map(Self::Pane)
+            .or(pane.project().map(Self::Project))
+    }
+}
 impl From<PaneId> for Starter {
     fn from(pane: PaneId) -> Self {
         Self::Pane(pane)
@@ -1073,25 +1082,7 @@ fn adapter(kind: AgentKind, executable: &std::path::Path, directory: &std::path:
 /// old startup files a launch before left there.
 #[cfg(unix)]
 fn claim(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        result => result?,
-    }
-    let metadata = std::fs::symlink_metadata(dir)?;
-    // SAFETY: geteuid has no preconditions.
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Agent bridge directory belongs to someone else",
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    terminal_core::daemon::make_private_dir(dir)?;
     // A shell reads its startup files only while it starts, so those of
     // terminals still running are no longer needed either.
     for entry in std::fs::read_dir(dir)?.flatten() {
