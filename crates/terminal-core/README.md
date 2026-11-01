@@ -48,7 +48,13 @@ transport. On Unix, a session daemon connection is the other: the `daemon`
 module's session daemon runs each program's authoritative engine, and a
 client's session is a replica rebuilt from a snapshot that then parses the same
 output, which the daemon copies under the terminal lock as it parses so none is
-lost or repeated. Replies to terminal queries share the input queue and its
+lost or repeated. The snapshot is terminal-core's own format, not the backend's:
+both screens with styled history, wrapped lines and wide or combining cells,
+cursors, modes and keyboard flags, title, directories and the prompt mark. A
+synchronized update in progress is applied before it is taken, and output that
+ends inside an escape sequence or character travels with it for the replica to
+parse first. The scroll region, tab stops, character sets and keyboard flags
+below the top of each stack are not carried. Replies to terminal queries share the input queue and its
 budget but reach the sink separately; a replica drops them because the daemon's
 engine already answers the program, and forwards focus changes so that engine
 reports the pane's focus. Dropping a replica detaches; shutting it down closes

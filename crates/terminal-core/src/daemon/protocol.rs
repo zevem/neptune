@@ -4,6 +4,7 @@
 //! strings are length-prefixed. Released encodings never change: a new
 //! encoding needs a new protocol version and socket name.
 use super::*;
+use crate::view;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 pub(super) const MAGIC: &[u8; 16] = b"NEPTUNE-SESSIONS";
@@ -151,6 +152,89 @@ impl Encoder {
             }
         }
     }
+    fn color(&mut self, color: view::Color) -> &mut Self {
+        match color {
+            view::Color::Named(named) => self.u8(0).u16(named as usize as u16),
+            view::Color::Indexed(index) => self.u8(1).u8(index),
+            view::Color::Spec(rgb) => self.u8(2).u8(rgb.r).u8(rgb.g).u8(rgb.b),
+        }
+    }
+    fn cursor(&mut self, cursor: &snapshot::Cursor) -> &mut Self {
+        self.u16(cursor.line)
+            .u16(cursor.column)
+            .u8(cursor.pending_wrap as u8)
+            .u32(cursor.style)
+    }
+    fn screen(&mut self, screen: &snapshot::Screen) -> &mut Self {
+        self.u32(screen.keyboard.bits())
+            .cursor(&screen.cursor)
+            .cursor(&screen.saved_cursor)
+            .u32(screen.lines.len() as u32);
+        for row in &screen.lines {
+            self.u32(row.runs.len() as u32);
+            for run in &row.runs {
+                self.u32(run.style).str(&run.text);
+            }
+            self.u32(row.combining.len() as u32);
+            for (column, text) in &row.combining {
+                self.u16(*column).str(text);
+            }
+        }
+        self
+    }
+    /// A snapshot's encoding in version 1.
+    fn snapshot(&mut self, snapshot: &Snapshot) -> &mut Self {
+        self.u16(snapshot.cols)
+            .u16(snapshot.rows)
+            .u32(snapshot.hyperlinks.len() as u32);
+        for link in &snapshot.hyperlinks {
+            self.str(&link.id).str(&link.uri);
+        }
+        self.u32(snapshot.styles.len() as u32);
+        for style in &snapshot.styles {
+            self.color(style.fg).color(style.bg);
+            match style.underline {
+                None => self.u8(0),
+                Some(color) => self.u8(1).color(color),
+            };
+            self.u16(style.flags.bits());
+            match style.hyperlink {
+                None => self.u8(0),
+                Some(index) => self.u8(1).u32(index),
+            };
+        }
+        self.screen(&snapshot.primary);
+        match &snapshot.alternate {
+            None => self.u8(0),
+            Some(screen) => self.u8(1).screen(screen),
+        };
+        let shape = CURSOR_SHAPES
+            .iter()
+            .position(|shape| *shape == snapshot.cursor_style.shape)
+            .unwrap_or_default() as u8;
+        self.u32(snapshot.modes.bits())
+            .u8(shape)
+            .u8(snapshot.cursor_style.blinking as u8)
+            .u32(snapshot.colors.len() as u32);
+        for (index, rgb) in &snapshot.colors {
+            self.u16(*index).u8(rgb.r).u8(rgb.g).u8(rgb.b);
+        }
+        self.str(&snapshot.title);
+        match &snapshot.reported_cwd {
+            None => self.u8(0),
+            Some(path) => self.u8(1).bytes(path.as_os_str().as_bytes()),
+        };
+        match snapshot.remote_process_id {
+            None => self.u8(0),
+            Some(pid) => self.u8(1).u32(pid),
+        };
+        match snapshot.prompt {
+            None => self.u8(0),
+            Some(prompt) => self.u8(1).u32(prompt.line as u32).u16(prompt.column),
+        };
+        self.u8(snapshot.prompt_redraw as u8)
+            .bytes(&snapshot.pending)
+    }
     fn finish(mut self) -> Vec<u8> {
         let len = (self.0.len() - 4) as u32;
         self.0[..4].copy_from_slice(&len.to_le_bytes());
@@ -219,6 +303,149 @@ impl<'a> Decoder<'a> {
             }),
         })
     }
+    fn color(&mut self) -> io::Result<view::Color> {
+        Ok(match self.u8()? {
+            0 => {
+                let code = usize::from(self.u16()?);
+                view::Color::Named(
+                    *NAMED_COLORS
+                        .iter()
+                        .find(|named| **named as usize == code)
+                        .ok_or_else(invalid)?,
+                )
+            }
+            1 => view::Color::Indexed(self.u8()?),
+            2 => view::Color::Spec(view::Rgb {
+                r: self.u8()?,
+                g: self.u8()?,
+                b: self.u8()?,
+            }),
+            _ => return Err(invalid()),
+        })
+    }
+    fn cursor(&mut self) -> io::Result<snapshot::Cursor> {
+        Ok(snapshot::Cursor {
+            line: self.u16()?,
+            column: self.u16()?,
+            pending_wrap: self.bool()?,
+            style: self.u32()?,
+        })
+    }
+    fn screen(&mut self) -> io::Result<snapshot::Screen> {
+        let keyboard =
+            view::Mode::from_bits_retain(self.u32()?) & view::Mode::KITTY_KEYBOARD_PROTOCOL;
+        let cursor = self.cursor()?;
+        let saved_cursor = self.cursor()?;
+        let lines = (0..self.count()?)
+            .map(|_| {
+                let runs = (0..self.count()?)
+                    .map(|_| {
+                        Ok(snapshot::Run {
+                            style: self.u32()?,
+                            text: self.string()?,
+                        })
+                    })
+                    .collect::<io::Result<_>>()?;
+                let combining = (0..self.count()?)
+                    .map(|_| Ok((self.u16()?, self.string()?)))
+                    .collect::<io::Result<_>>()?;
+                Ok(snapshot::Row { runs, combining })
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(snapshot::Screen {
+            lines,
+            cursor,
+            saved_cursor,
+            keyboard,
+        })
+    }
+    fn snapshot(&mut self) -> io::Result<Snapshot> {
+        let cols = self.u16()?;
+        let rows = self.u16()?;
+        let hyperlinks = (0..self.count()?)
+            .map(|_| {
+                Ok(snapshot::Hyperlink {
+                    id: self.string()?,
+                    uri: self.string()?,
+                })
+            })
+            .collect::<io::Result<_>>()?;
+        let styles = (0..self.count()?)
+            .map(|_| {
+                Ok(snapshot::Style {
+                    fg: self.color()?,
+                    bg: self.color()?,
+                    underline: match self.bool()? {
+                        false => None,
+                        true => Some(self.color()?),
+                    },
+                    flags: view::Flags::from_bits_retain(self.u16()?),
+                    hyperlink: match self.bool()? {
+                        false => None,
+                        true => Some(self.u32()?),
+                    },
+                })
+            })
+            .collect::<io::Result<_>>()?;
+        let primary = self.screen()?;
+        let alternate = match self.bool()? {
+            false => None,
+            true => Some(self.screen()?),
+        };
+        let modes = view::Mode::from_bits_retain(self.u32()?);
+        let cursor_style = snapshot::CursorStyle {
+            shape: *CURSOR_SHAPES
+                .get(usize::from(self.u8()?))
+                .ok_or_else(invalid)?,
+            blinking: self.bool()?,
+        };
+        let colors = (0..self.count()?)
+            .map(|_| {
+                Ok((
+                    self.u16()?,
+                    view::Rgb {
+                        r: self.u8()?,
+                        g: self.u8()?,
+                        b: self.u8()?,
+                    },
+                ))
+            })
+            .collect::<io::Result<_>>()?;
+        let title = self.string()?;
+        let reported_cwd = match self.bool()? {
+            false => None,
+            true => Some(PathBuf::from(std::ffi::OsString::from_vec(self.bytes()?))),
+        };
+        let remote_process_id = match self.bool()? {
+            false => None,
+            true => Some(self.u32()?),
+        };
+        let prompt = match self.bool()? {
+            false => None,
+            true => Some(snapshot::Prompt {
+                line: self.u32()? as i32,
+                column: self.u16()?,
+            }),
+        };
+        let snapshot = Snapshot {
+            cols,
+            rows,
+            styles,
+            hyperlinks,
+            primary,
+            alternate,
+            modes,
+            cursor_style,
+            colors,
+            title,
+            reported_cwd,
+            remote_process_id,
+            prompt,
+            prompt_redraw: self.bool()?,
+            pending: self.bytes()?,
+        };
+        valid(&snapshot).then_some(snapshot).ok_or_else(invalid)
+    }
     fn end(self) -> io::Result<()> {
         if self.0.is_empty() {
             Ok(())
@@ -226,6 +453,109 @@ impl<'a> Decoder<'a> {
             Err(invalid())
         }
     }
+}
+
+const NAMED_COLORS: [view::NamedColor; 29] = {
+    use view::NamedColor::*;
+    [
+        Black,
+        Red,
+        Green,
+        Yellow,
+        Blue,
+        Magenta,
+        Cyan,
+        White,
+        BrightBlack,
+        BrightRed,
+        BrightGreen,
+        BrightYellow,
+        BrightBlue,
+        BrightMagenta,
+        BrightCyan,
+        BrightWhite,
+        Foreground,
+        Background,
+        Cursor,
+        DimBlack,
+        DimRed,
+        DimGreen,
+        DimYellow,
+        DimBlue,
+        DimMagenta,
+        DimCyan,
+        DimWhite,
+        BrightForeground,
+        DimForeground,
+    ]
+};
+
+/// Cursor shapes by their code.
+const CURSOR_SHAPES: [view::CursorShape; 5] = [
+    view::CursorShape::Block,
+    view::CursorShape::Underline,
+    view::CursorShape::Beam,
+    view::CursorShape::HollowBlock,
+    view::CursorShape::Hidden,
+];
+
+/// Whether a decoded snapshot describes a grid a replica can be built from:
+/// every reference resolves and every cell and cursor lies inside it.
+fn valid(snapshot: &Snapshot) -> bool {
+    let (cols, rows) = (usize::from(snapshot.cols), usize::from(snapshot.rows));
+    let styles = snapshot.styles.len() as u32;
+    let cursor = |cursor: &snapshot::Cursor| {
+        usize::from(cursor.line) < rows
+            && usize::from(cursor.column) < cols
+            && cursor.style < styles
+    };
+    let screen = |screen: &snapshot::Screen| {
+        cursor(&screen.cursor)
+            && cursor(&screen.saved_cursor)
+            && screen.lines.iter().all(|row| {
+                row.runs.iter().all(|run| run.style < styles)
+                    && row
+                        .runs
+                        .iter()
+                        .map(|run| run.text.chars().count())
+                        .sum::<usize>()
+                        <= cols
+                    && row
+                        .combining
+                        .iter()
+                        .all(|(column, _)| usize::from(*column) < cols)
+            })
+    };
+    (1..=4096).contains(&cols)
+        && (1..=4096).contains(&rows)
+        && snapshot.primary.lines.len() >= rows
+        && screen(&snapshot.primary)
+        && snapshot
+            .alternate
+            .as_ref()
+            .is_none_or(|alternate| alternate.lines.len() == rows && screen(alternate))
+        && snapshot.styles.iter().all(|style| {
+            style
+                .hyperlink
+                .is_none_or(|index| (index as usize) < snapshot.hyperlinks.len())
+        })
+        && snapshot.colors.iter().all(|(index, _)| *index < 269)
+}
+
+/// The snapshot part of an attach reply, for its contract tests.
+#[cfg(test)]
+pub(in crate::session) fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
+    let mut encoder = Encoder::default();
+    encoder.snapshot(snapshot);
+    encoder.0
+}
+
+#[cfg(test)]
+pub(in crate::session) fn decode_snapshot(bytes: &[u8]) -> io::Result<Snapshot> {
+    let mut decoder = Decoder(bytes);
+    let snapshot = decoder.snapshot()?;
+    decoder.end()?;
+    Ok(snapshot)
 }
 
 fn error_kind_code(kind: SessionErrorKind) -> u8 {
@@ -425,16 +755,7 @@ impl Reply {
                     .bytes(attached.cwd.as_os_str().as_bytes())
                     .u32(attached.scrollback)
                     .bytes(&attached.data);
-                let snapshot = &attached.snapshot;
-                frame
-                    .u16(snapshot.cols)
-                    .u16(snapshot.rows)
-                    .u16(snapshot.cursor.0)
-                    .u16(snapshot.cursor.1)
-                    .u32(snapshot.lines.len() as u32);
-                for line in &snapshot.lines {
-                    frame.str(line);
-                }
+                frame.snapshot(&attached.snapshot);
             }
             Reply::Output(bytes) => {
                 frame = Encoder::frame(kind::OUTPUT);
@@ -485,12 +806,6 @@ impl Reply {
                 let cwd = PathBuf::from(std::ffi::OsString::from_vec(data.bytes()?));
                 let scrollback = data.u32()?;
                 let session_data = data.bytes()?;
-                let cols = data.u16()?;
-                let rows = data.u16()?;
-                let cursor = (data.u16()?, data.u16()?);
-                let lines = (0..data.count()?)
-                    .map(|_| data.string())
-                    .collect::<io::Result<_>>()?;
                 Reply::Attached(Box::new(Attached {
                     id,
                     process_id,
@@ -498,12 +813,7 @@ impl Reply {
                     cwd,
                     scrollback,
                     data: session_data,
-                    snapshot: Snapshot {
-                        cols,
-                        rows,
-                        lines,
-                        cursor,
-                    },
+                    snapshot: data.snapshot()?,
                 }))
             }
             kind::OUTPUT => Reply::Output(data.bytes()?),

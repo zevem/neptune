@@ -582,3 +582,182 @@ fn the_daemon_reports_the_attached_pane_focus_once() {
     wait_for(|| changed.exists());
     assert_eq!(std::fs::read(&changed).unwrap(), b"\x1b[O");
 }
+
+#[test]
+fn a_full_screen_program_keeps_its_screen_and_input_modes_after_reattach() {
+    let daemon = Daemon::start();
+    let input = daemon.root.path().join("input");
+    let client = daemon.client();
+    let (session, id) = client
+        .start(
+            shell(&format!(
+                "printf 'shell prompt\\n'; stty raw -echo; \
+                 printf '\\033[?1049h\\033[H\\033[1;33mFULL SCREEN\\033[m\\033[?1002h\\033[?1006h\\033[?2004hREADY'; \
+                 head -c 23 > '{input}.part'; mv '{input}.part' '{input}'; \
+                 printf '\\033[?1049lBACK'; exec cat",
+                input = input.display()
+            )),
+            repaint(),
+        )
+        .unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    drop(session);
+
+    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    let session = &attached.session;
+    let modes = session.modes();
+    for mode in [
+        terminal_core::Mode::ALT_SCREEN,
+        terminal_core::Mode::MOUSE_DRAG,
+        terminal_core::Mode::SGR_MOUSE,
+        terminal_core::Mode::BRACKETED_PASTE,
+    ] {
+        assert!(modes.contains(mode), "{mode:?} is lost: {modes:?}");
+    }
+    let screen = session.screen_text();
+    assert!(
+        screen.contains("FULL SCREEN") && !screen.contains("shell prompt"),
+        "{screen}"
+    );
+
+    // Input is encoded for the program's modes, as the desktop does.
+    let click = terminal_core::input::mouse(0, 2, 1, true, Default::default(), modes).unwrap();
+    session.write(&click).unwrap();
+    session.paste("hi").unwrap();
+    wait_for(|| input.exists());
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(&input).unwrap()),
+        "\x1b[<0;3;2M\x1b[200~hi\x1b[201~"
+    );
+    // Leaving the alternate screen shows the shell's screen from before it.
+    wait_for(|| session.screen_text().contains("BACK"));
+    let screen = session.screen_text();
+    assert!(screen.contains("shell prompt"), "{screen}");
+}
+
+/// The number each of `session`'s lines holds, up to the first line that
+/// holds none. Any other text there means output was mangled.
+fn numbered_lines(session: &TerminalSession) -> Vec<u32> {
+    session
+        .history_text()
+        .lines()
+        .map(str::trim)
+        .take_while(|line| !line.is_empty() && *line != "DONE")
+        .map(|line| {
+            line.parse()
+                .unwrap_or_else(|_| panic!("mangled output line {line:?}"))
+        })
+        .collect()
+}
+
+#[test]
+fn attaching_during_sustained_output_delivers_every_byte_exactly_once() {
+    const LINES: u32 = 20_000;
+    let daemon = Daemon::start();
+    let client = daemon.client();
+    // Coloured, numbered lines in bursts, so attaches land inside bursts and
+    // inside escape sequences.
+    let options = SessionOptions {
+        cols: 20,
+        scrollback: 25_000,
+        ..shell(&format!(
+            "awk 'BEGIN {{ for (i = 1; i <= {LINES}; i++) {{ \
+             printf \"\\033[3%dm%d\\033[m\\n\", i % 8, i; \
+             if (i % 100 == 0) {{ fflush(); system(\"sleep 0.01\") }} }} }}'; \
+             printf 'DONE'; exec cat"
+        ))
+    };
+    let (session, id) = client.start(options, repaint()).unwrap();
+    drop(session);
+
+    let mut attaches_during_output = 0;
+    let last = loop {
+        let attached = client.attach(id, 20, 12, repaint()).unwrap();
+        if attached.session.screen_text().contains("DONE") {
+            break attached;
+        }
+        attaches_during_output += 1;
+        std::thread::sleep(Duration::from_millis(20));
+        let mut numbers = numbered_lines(&attached.session);
+        // The program may still be writing the last line.
+        numbers.pop();
+        if let Some(index) = (0..numbers.len()).find(|&index| numbers[index] != index as u32 + 1) {
+            panic!(
+                "attach {attaches_during_output} lost or repeated output after line {index}: {:?}",
+                &numbers[index.saturating_sub(3)..(index + 3).min(numbers.len())]
+            );
+        }
+    };
+    assert!(
+        attaches_during_output >= 3,
+        "only {attaches_during_output} attaches happened during the output"
+    );
+    let numbers = numbered_lines(&last.session);
+    assert_eq!(numbers, (1..=LINES).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_exited_session_keeps_its_final_screen_and_status_until_a_client_takes_them() {
+    let daemon = Daemon::start();
+    let go = daemon.root.path().join("go");
+    let client = daemon.client();
+    let (session, id) = client
+        .start(
+            shell(&format!(
+                "printf 'READY\\n'; while [ ! -e '{go}' ]; do sleep 0.02; done; \
+                 printf '\\033[1mfinal words\\033[m'; exit 3",
+                go = go.display()
+            )),
+            repaint(),
+        )
+        .unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    drop(session);
+    // A dropped handle disconnects within its engine's next poll. Exit only
+    // once the daemon has seen that, or the departing client takes the end.
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::write(&go, b"").unwrap();
+    let exited = SessionStatus::Exited {
+        code: 3,
+        signal: None,
+    };
+    wait_for(|| {
+        client
+            .list()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.status == exited)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(client.list().unwrap().len(), 1, "the daemon kept it");
+
+    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    let screen = attached.session.screen_text();
+    assert!(screen.contains("final words"), "{screen}");
+    wait_for(|| attached.session.metadata().status == exited);
+    // Taken, so the daemon releases it.
+    wait_for(|| client.list().unwrap().is_empty());
+    let error = client.attach(id, 80, 12, repaint()).err().unwrap();
+    assert_eq!(error.kind(), terminal_core::SessionErrorKind::NotFound);
+}
+
+#[test]
+fn a_reattached_session_keeps_the_history_its_scrollback_allows() {
+    let daemon = Daemon::start();
+    let client = daemon.client();
+    let options = SessionOptions {
+        scrollback: 50,
+        ..shell(
+            "i=1; while [ $i -le 500 ]; do echo line$i; i=$((i+1)); done; printf 'READY'; exec cat",
+        )
+    };
+    let (session, id) = client.start(options, repaint()).unwrap();
+    wait_for(|| session.screen_text().contains("READY"));
+    let history = session.history_text();
+    drop(session);
+
+    let attached = client.attach(id, 80, 12, repaint()).unwrap();
+    assert_eq!(attached.session.history_size(), 50);
+    assert_eq!(attached.session.history_text(), history);
+    assert!(history.starts_with("line440\n"), "{history}");
+}

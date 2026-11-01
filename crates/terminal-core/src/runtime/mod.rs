@@ -142,7 +142,6 @@ pub(super) fn engine_loop(
     mut process: Box<dyn Process>,
     shared: Arc<Shared>,
 ) {
-    let mut processor: Processor = Processor::new();
     let mut cwd_tracker = CwdTracker::default();
     let mut prompt_scanner = PromptScanner::default();
     let mut notifications = notifications::Scanner::default();
@@ -166,9 +165,8 @@ pub(super) fn engine_loop(
             process.release(&shared);
             conpty_close_started = true;
         }
-        let timeout = processor
-            .sync_timeout()
-            .sync_timeout()
+        let sync_deadline = shared.parser.lock().sync_deadline();
+        let timeout = sync_deadline
             .map(|deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -188,6 +186,7 @@ pub(super) fn engine_loop(
                     });
                     let marks = prompt_scanner.advance(chunk);
                     let mut grid = terminal.lock();
+                    let mut processor = shared.parser.lock();
                     let was_reporting_focus = grid.mode().contains(TermMode::FOCUS_IN_OUT);
                     let started = Instant::now();
                     let mut offset = 0;
@@ -204,6 +203,11 @@ pub(super) fn engine_loop(
                         offset = end;
                     }
                     processor.advance(&mut *grid, &chunk[offset..]);
+                    let synchronized = processor.sync_bytes_count();
+                    drop(processor);
+                    // Directory reports are session state a snapshot carries,
+                    // so they too change only under the terminal lock.
+                    track_directory(&mut cwd_tracker, chunk, &shared);
                     if let Some(tap) = &shared.output_tap.lock().subscriber {
                         tap.push(chunk);
                     }
@@ -214,34 +218,12 @@ pub(super) fn engine_loop(
                         &notification_input,
                     );
                     // Commit visible changes before releasing their grid lock.
-                    if processor.sync_bytes_count() < chunk.len() {
+                    if synchronized < chunk.len() {
                         shared.changed();
                     }
                     shared
                         .parse_nanoseconds
                         .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                }
-                if let Some(report) = cwd_tracker.advance(&buffer[..len]) {
-                    let mut metadata = shared.metadata.lock();
-                    // A host's directory, e.g. from a shell inside `ssh`, is
-                    // kept as reported but never becomes this shell's cwd.
-                    let local = report.local && metadata.cwd != report.path;
-                    if metadata.reported_cwd.as_ref() != Some(&report.path) || local {
-                        if local {
-                            metadata.cwd.clone_from(&report.path);
-                        }
-                        metadata.reported_cwd = Some(report.path);
-                        drop(metadata);
-                        shared.force_repaint();
-                    }
-                }
-                if let Some(pid) = cwd_tracker.remote_pid.take() {
-                    let mut metadata = shared.metadata.lock();
-                    if metadata.remote_process_id != Some(pid) {
-                        metadata.remote_process_id = Some(pid);
-                        drop(metadata);
-                        shared.force_repaint();
-                    }
                 }
                 shared.bytes_parsed.fetch_add(len as u64, Ordering::Relaxed);
                 let _ = pool.try_send(buffer);
@@ -260,14 +242,11 @@ pub(super) fn engine_loop(
             Err(RecvTimeoutError::Disconnected) => eof = true,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        if processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|deadline| deadline <= Instant::now())
-        {
+        let sync_deadline = shared.parser.lock().sync_deadline();
+        if sync_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             let mut grid = terminal.lock();
             let was_reporting_focus = grid.mode().contains(TermMode::FOCUS_IN_OUT);
-            processor.stop_sync(&mut *grid);
+            shared.parser.lock().stop_sync(&mut *grid);
             report_focus_on_enable(&grid, was_reporting_focus, &shared, &notification_input);
             shared.changed();
         }
@@ -344,7 +323,7 @@ pub(super) fn engine_loop(
     }
     {
         let mut grid = terminal.lock();
-        processor.stop_sync(&mut *grid);
+        shared.parser.lock().stop_sync(&mut *grid);
         shared.changed();
     }
     if let Some(status) = exit {
@@ -374,7 +353,32 @@ pub(super) fn engine_loop(
     shared.changed_force();
 }
 
-fn report_focus_on_enable(
+fn track_directory(tracker: &mut CwdTracker, chunk: &[u8], shared: &Shared) {
+    if let Some(report) = tracker.advance(chunk) {
+        let mut metadata = shared.metadata.lock();
+        // A host's directory, e.g. from a shell inside `ssh`, is
+        // kept as reported but never becomes this shell's cwd.
+        let local = report.local && metadata.cwd != report.path;
+        if metadata.reported_cwd.as_ref() != Some(&report.path) || local {
+            if local {
+                metadata.cwd.clone_from(&report.path);
+            }
+            metadata.reported_cwd = Some(report.path);
+            drop(metadata);
+            shared.force_repaint();
+        }
+    }
+    if let Some(pid) = tracker.remote_pid.take() {
+        let mut metadata = shared.metadata.lock();
+        if metadata.remote_process_id != Some(pid) {
+            metadata.remote_process_id = Some(pid);
+            drop(metadata);
+            shared.force_repaint();
+        }
+    }
+}
+
+pub(super) fn report_focus_on_enable(
     terminal: &Term<EventProxy>,
     was_reporting: bool,
     shared: &Shared,

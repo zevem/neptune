@@ -25,7 +25,9 @@ remain private to `session`, `engine`, `runtime`, `transport` and
 
 Grid mutations commit revisions while holding the terminal mutex. Snapshot
 extraction locks terminal before viewport cache; resize locks config then terminal
-before notifying the PTY and updating prompt/size state. Repaint callbacks must
+before notifying the PTY and updating prompt/size state. The parser lock follows
+the terminal lock: the engine parses, and the daemon captures a replica's
+snapshot, under both. Repaint callbacks must
 only schedule work, never synchronously reenter a session. The renderer
 acknowledges repaint before taking its snapshot. Synchronized output must still
 flush its last update on the parser deadline. Worker counts are reserved before

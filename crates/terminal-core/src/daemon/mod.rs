@@ -24,7 +24,7 @@ use std::path::Path;
 use transport::Exit;
 
 mod client;
-mod protocol;
+pub(super) mod protocol;
 mod server;
 pub use client::{Attached, DaemonClient, SessionEntry};
 pub use server::run;

@@ -190,7 +190,9 @@ fn replica(
     let (reader, writer) = setup().map_err(unavailable)?;
     let link = Arc::new(Link::default());
     let writer = Arc::new(Mutex::new(writer));
-    let snapshot = attached.snapshot;
+    let mut snapshot = attached.snapshot;
+    // The engine parses the daemon's unfinished output before the stream.
+    let pending = std::mem::take(&mut snapshot.pending);
     let size = Size {
         cols: snapshot.cols,
         rows: snapshot.rows,
@@ -202,7 +204,7 @@ fn replica(
             stream: reader,
             frames: FrameBuffer::default(),
             scratch: vec![0; READ_SIZE],
-            pending: Vec::new(),
+            pending,
             offset: 0,
             ended: None,
             link: link.clone(),

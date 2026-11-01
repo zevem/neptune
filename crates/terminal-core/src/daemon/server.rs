@@ -346,12 +346,7 @@ impl Daemon {
                 return;
             }
         }
-        let (snapshot, tap) = {
-            let terminal = session.terminal.lock();
-            let snapshot = Snapshot::capture(&terminal);
-            let tap = session.shared.output_tap.lock().subscribe();
-            (snapshot, tap)
-        };
+        let (snapshot, tap) = session.snapshot(|| session.shared.output_tap.lock().subscribe());
         let metadata = session.metadata();
         let attached = AttachedFrame {
             id: hosted.id,
