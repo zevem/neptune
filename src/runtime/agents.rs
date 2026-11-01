@@ -4,16 +4,14 @@ use super::agent_remote as remote;
 use crate::agent_activity::{Activity, Attention};
 use neptune_model::{AgentKind, AgentSession, Attachment, PaneId, Project, ProjectId, PullRequest};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::{
     collections::BTreeMap,
     collections::VecDeque,
     io::{IsTerminal, Read, Write},
-    net::{TcpListener, TcpStream},
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -52,6 +50,22 @@ const MAX_TOOL: usize = 128;
 /// Links waiting for the next frame; the model keeps the most recent per pane.
 const MAX_LINKS: usize = 64;
 const ENDPOINT: &str = "NEPTUNE_AGENT_ENDPOINT";
+/// The bridge's socket, in the directory that also holds the adapters.
+#[cfg(unix)]
+const SOCKET: &str = "bridge.sock";
+/// Held while the socket file is replaced or removed.
+#[cfg(unix)]
+const LOCK: &str = "bridge.lock";
+/// How long a hook waits to reach the bridge, which is not open while
+/// Neptune is closed.
+#[cfg(unix)]
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+/// A terminal's startup files are read while its shell starts. Those a
+/// launch before this one left are removed once they are this old.
+#[cfg(unix)]
+const STARTUP_KEPT: Duration = Duration::from_secs(60 * 60);
+/// What an agent's tool calls say while no Neptune listens.
+const NOT_OPEN: &str = "Neptune isn't open. Its tools work again once Neptune is opened.";
 const TOKEN: &str = "NEPTUNE_AGENT_TOKEN";
 pub(super) const SHIMS: &str = "NEPTUNE_AGENT_SHIMS";
 const ADAPTER_HEADER: &str = "#!/bin/sh\n# Neptune agent adapter\n";
@@ -83,6 +97,15 @@ const PAUSED: &str = "This project is paused, so nothing is started or sent for 
 pub enum Starter {
     Pane(PaneId),
     Project(ProjectId),
+}
+impl Starter {
+    /// Who a terminal answers to: the agent that started it, or else its
+    /// project.
+    pub fn of(pane: &neptune_model::Pane) -> Option<Self> {
+        pane.spawned_by()
+            .map(Self::Pane)
+            .or(pane.project().map(Self::Project))
+    }
 }
 impl From<PaneId> for Starter {
     fn from(pane: PaneId) -> Self {
@@ -609,6 +632,30 @@ impl Child {
         }
     }
     /// Its turn began: whatever it asked before taking its task is answered.
+    /// An agent `parent` started whose conversation is open again, at rest
+    /// as it was saved: no news.
+    fn resumed(parent: Starter, agent: &AgentSession) -> Self {
+        Child {
+            launch: None,
+            session: Some(agent.clone()),
+            owed: 0,
+            started: true,
+            seen: Some(Status::Idle),
+            ..Child::task(
+                parent,
+                Task {
+                    kind: agent.kind,
+                    prompt: String::new(),
+                    model: None,
+                    effort: None,
+                    ultracode: false,
+                    resume: None,
+                    title: None,
+                    worktree: None,
+                },
+            )
+        }
+    }
     fn start(&mut self) {
         self.started = true;
         self.asking = None;
@@ -966,26 +1013,106 @@ struct Shared {
     links: Vec<(PaneId, u64, PullRequest)>,
     attachments: Vec<(PaneId, u64, Attachment)>,
     retired: Vec<tempfile::TempDir>,
+    /// Terminals that kept running while Neptune was closed, with the agent
+    /// each last named, until an invocation in it is heard from.
+    adopted: BTreeMap<PaneId, Option<AgentSession>>,
 }
+/// What a terminal's agents reach the application with. A kept session
+/// holds it, so that the next launch knows the agents that outlived Neptune.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credential {
+    pub token: String,
+    /// The terminal is an SSH connection, whose agents report through it.
+    #[serde(default)]
+    pub remote: bool,
+}
+#[cfg(unix)]
 struct Listener {
-    directory: tempfile::TempDir,
-    address: String,
-    stop: Arc<AtomicBool>,
+    /// Removed with the listener; a launch that keeps sessions has none.
+    _temporary: Option<tempfile::TempDir>,
+    directory: PathBuf,
+    socket: PathBuf,
+    /// The socket file this listener bound, as (device, inode): a later
+    /// launch may have bound its own there since.
+    bound: (u64, u64),
+    /// Closing it stops the worker. The socket's path may lead to a later
+    /// launch's listener by then, so it cannot wake this one.
+    stop: Option<UnixStream>,
     worker: Option<thread::JoinHandle<()>>,
 }
+#[cfg(unix)]
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let _ = TcpStream::connect(&self.address);
+        use std::os::unix::fs::MetadataExt;
+        self.stop = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        // A launch binding there now owns the path, socket file and all.
+        let Ok(_held) = Ownership::try_take(&self.directory) else {
+            return;
+        };
+        if std::fs::symlink_metadata(&self.socket)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.bound)
+        {
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+}
+/// The hold on a bridge directory's socket path, while a launch replaces
+/// the socket file there or removes its own: another launch may be doing
+/// either at the same time.
+#[cfg(unix)]
+struct Ownership {
+    _lock: std::fs::File,
+}
+#[cfg(unix)]
+impl Ownership {
+    fn try_take(dir: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(dir.join(LOCK))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { _lock: file })
+    }
+    /// Waits briefly: the holder is removing or binding one file.
+    fn take(dir: &std::path::Path) -> std::io::Result<Self> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match Self::try_take(dir) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                held => return held,
+            }
         }
     }
 }
 #[derive(Default)]
 pub struct AgentBridge {
+    #[cfg(unix)]
     listener: Mutex<Option<Listener>>,
+    /// Where the bridge listens and keeps its adapters, the same for every
+    /// launch, and whether a newer launch took this one over; without it, a
+    /// directory of this launch's own.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    home: std::sync::OnceLock<(PathBuf, super::persistence::Stop)>,
     shared: Arc<Mutex<Shared>>,
+}
+/// Where the bridge of a launch that restores the data root's workspaces
+/// listens and keeps its adapters.
+pub fn directory(data_root: &std::path::Path) -> PathBuf {
+    data_root.join("agents")
 }
 #[cfg(unix)]
 fn adapter(kind: AgentKind, executable: &std::path::Path, directory: &std::path::Path) -> String {
@@ -996,68 +1123,175 @@ fn adapter(kind: AgentKind, executable: &std::path::Path, directory: &std::path:
         kind.executable()
     )
 }
+/// Makes `dir` the bridge's: this user's alone, without the socket and the
+/// old startup files a launch before left there. Bind the new socket while
+/// holding what it returns.
+#[cfg(unix)]
+fn claim(dir: &std::path::Path) -> std::io::Result<Ownership> {
+    terminal_core::daemon::make_private_dir(dir)?;
+    let held = Ownership::take(dir)?;
+    // A shell reads its startup files only while it starts, so those of
+    // terminals still running are no longer needed either.
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age >= STARTUP_KEPT));
+        if old && entry.file_name().to_string_lossy().starts_with("pane-") {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    match std::fs::remove_file(dir.join(SOCKET)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(held),
+    }
+}
+/// Writes `content` to `path` whole: a shell may be running the file it
+/// replaces.
+#[cfg(unix)]
+fn install(path: &std::path::Path, content: &str, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut file = tempfile::Builder::new()
+        .prefix(".install-")
+        .tempfile_in(directory)?;
+    file.write_all(content.as_bytes())?;
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+#[cfg(unix)]
+impl Listener {
+    /// Writes the adapters into `directory` and listens there.
+    fn open(
+        directory: PathBuf,
+        temporary: Option<tempfile::TempDir>,
+        shared: Arc<Mutex<Shared>>,
+    ) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let executable = std::env::current_exe()?;
+        let plugins = directory.join(PLUGINS);
+        std::fs::create_dir_all(&plugins)?;
+        install(&plugins.join("opencode.js"), OPENCODE_PLUGIN, 0o600)?;
+        install(&plugins.join("pi.js"), PI_EXTENSION, 0o600)?;
+        for kind in AgentKind::ALL {
+            install(
+                &directory.join(kind.executable()),
+                &adapter(kind, &executable, &directory),
+                0o700,
+            )?;
+        }
+        let socket = directory.join(SOCKET);
+        let listener = UnixListener::bind(&socket)?;
+        let metadata = std::fs::symlink_metadata(&socket)?;
+        listener.set_nonblocking(true)?;
+        let (stop, stopping) = UnixStream::pair()?;
+        let worker = thread::Builder::new()
+            .name("neptune-agent-hooks".into())
+            .spawn(move || {
+                while let Some(stream) = accept(&listener, &stopping) {
+                    let Ok(mut stream) = stream else { break };
+                    // Some systems hand out the listener's nonblocking mode.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    let mut bytes = Vec::new();
+                    if read_message(&mut stream, &mut bytes).is_err() {
+                        continue;
+                    }
+                    let reply = match serde_json::from_slice::<Message>(&bytes) {
+                        Ok(message) if message.event.is_request() => {
+                            serde_json::to_vec(&answer(&shared, message)).unwrap_or_default()
+                        }
+                        Ok(message) => {
+                            let taken = apply_message(&shared, message);
+                            if taken { b"ok" } else { b"no" }.to_vec()
+                        }
+                        Err(_) => b"no".to_vec(),
+                    };
+                    let _ = stream.write_all(&reply);
+                }
+            })?;
+        Ok(Self {
+            _temporary: temporary,
+            directory,
+            socket,
+            bound: (metadata.dev(), metadata.ino()),
+            stop: Some(stop),
+            worker: Some(worker),
+        })
+    }
+}
+/// The next caller of `listener`, waiting without a timeout; `None` once
+/// `stop`'s other end is closed.
+#[cfg(unix)]
+fn accept(listener: &UnixListener, stop: &UnixStream) -> Option<std::io::Result<UnixStream>> {
+    use std::os::fd::AsRawFd;
+    loop {
+        let mut ready = [listener.as_raw_fd(), stop.as_raw_fd()].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        if unsafe { libc::poll(ready.as_mut_ptr(), 2, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Some(Err(error));
+        }
+        if ready[1].revents != 0 {
+            return None;
+        }
+        match listener.accept() {
+            // The caller gave up before it was answered.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            accepted => return Some(accepted.map(|(stream, _)| stream)),
+        }
+    }
+}
 impl AgentBridge {
+    /// Listen in `dir` from the first terminal on, as every launch that
+    /// keeps sessions does, so that the terminals an earlier launch left
+    /// running reach this one. Without it, the bridge has a directory of
+    /// its own that goes with it. Once `replaced`, `dir` is the newer
+    /// launch's.
+    pub fn listen_in(&self, dir: PathBuf, replaced: super::persistence::Stop) {
+        let _ = self.home.set((dir, replaced));
+    }
     /// The listener every local caller reports to, started on first use.
     /// It binds a socket and writes the adapters, so only workers call it.
     #[cfg(unix)]
     fn listening(&self) -> std::io::Result<std::sync::MutexGuard<'_, Option<Listener>>> {
-        use std::os::unix::fs::PermissionsExt;
         let mut state = self
             .listener
             .lock()
             .map_err(|_| std::io::Error::other("Agent bridge unavailable"))?;
         if state.is_none() {
-            let directory = tempfile::Builder::new()
-                .prefix("neptune-agents-")
-                .tempdir()?;
-            let executable = std::env::current_exe()?;
-            let plugins = directory.path().join(PLUGINS);
-            std::fs::create_dir(&plugins)?;
-            std::fs::write(plugins.join("opencode.js"), OPENCODE_PLUGIN)?;
-            std::fs::write(plugins.join("pi.js"), PI_EXTENSION)?;
-            for kind in AgentKind::ALL {
-                let path = directory.path().join(kind.executable());
-                std::fs::write(&path, adapter(kind, &executable, directory.path()))?;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-            }
-            let socket = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-            let address = socket.local_addr()?.to_string();
-            let stop = Arc::new(AtomicBool::new(false));
-            let stopping = stop.clone();
-            let shared = self.shared.clone();
-            let worker = thread::Builder::new()
-                .name("neptune-agent-hooks".into())
-                .spawn(move || {
-                    for stream in socket.incoming() {
-                        if stopping.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let Ok(mut stream) = stream else { break };
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                        let mut bytes = Vec::new();
-                        if read_message(&mut stream, &mut bytes).is_err() {
-                            continue;
-                        }
-                        let reply = match serde_json::from_slice::<Message>(&bytes) {
-                            Ok(message) if message.event.is_request() => {
-                                serde_json::to_vec(&answer(&shared, message)).unwrap_or_default()
-                            }
-                            Ok(message) => {
-                                let taken = apply_message(&shared, message);
-                                if taken { b"ok" } else { b"no" }.to_vec()
-                            }
-                            Err(_) => b"no".to_vec(),
-                        };
-                        let _ = stream.write_all(&reply);
-                    }
-                })?;
-            *state = Some(Listener {
-                directory,
-                address,
-                stop,
-                worker: Some(worker),
+            // Once taken over, the directory is the newer launch's.
+            let kept = self.home.get().filter(|(_, replaced)| !replaced());
+            let kept = kept.and_then(|(dir, _)| {
+                let _held = claim(dir).ok()?;
+                Listener::open(dir.clone(), None, self.shared.clone()).ok()
             });
+            let listener = match kept {
+                Some(listener) => listener,
+                // A directory it cannot use (a socket path too long, say)
+                // costs only the agents' reattaching.
+                None => {
+                    let temporary = tempfile::Builder::new()
+                        .prefix("neptune-agents-")
+                        .tempdir()?;
+                    Listener::open(
+                        temporary.path().to_owned(),
+                        Some(temporary),
+                        self.shared.clone(),
+                    )?
+                }
+            };
+            *state = Some(listener);
         }
         Ok(state)
     }
@@ -1086,7 +1320,7 @@ impl AgentBridge {
                 let nonce = tempfile::Builder::new()
                     .prefix(prefix)
                     .rand_bytes(32)
-                    .tempfile_in(listener.directory.path())?;
+                    .tempfile_in(&listener.directory)?;
                 Ok(nonce
                     .path()
                     .file_name()
@@ -1095,7 +1329,7 @@ impl AgentBridge {
                     .into_owned())
             };
             Ok(LeadEnv {
-                endpoint: listener.address.clone(),
+                endpoint: listener.socket.to_string_lossy().into_owned(),
                 token: name("lead-")?,
                 run: name("run-")?,
             })
@@ -1337,11 +1571,11 @@ impl AgentBridge {
         resume: Option<&AgentSession>,
         spawned_by: Option<Starter>,
         wake: Wake,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Option<Credential>> {
         #[cfg(not(unix))]
         {
             let _ = (pane, generation, options, resume, spawned_by, wake);
-            return Ok(());
+            return Ok(None);
         }
         #[cfg(unix)]
         {
@@ -1351,20 +1585,23 @@ impl AgentBridge {
                 .ok_or_else(|| std::io::Error::other("Agent bridge unavailable"))?;
             let nonce = tempfile::Builder::new()
                 .rand_bytes(32)
-                .tempfile_in(listener.directory.path())?;
+                .tempfile_in(&listener.directory)?;
             let token = nonce
                 .path()
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let shim_path = listener.directory.path().to_string_lossy().into_owned();
+            let shim_path = listener.directory.to_string_lossy().into_owned();
             let startup = tempfile::Builder::new()
                 .prefix("pane-")
-                .tempdir_in(listener.directory.path())?;
+                .tempdir_in(&listener.directory)?;
             let path = option_env(options, "PATH").unwrap_or_default();
             options.env.extend([
-                (ENDPOINT.into(), listener.address.clone()),
+                (
+                    ENDPOINT.into(),
+                    listener.socket.to_string_lossy().into_owned(),
+                ),
                 (TOKEN.into(), token.clone()),
                 (SHIMS.into(), shim_path.clone()),
                 (RUN.into(), String::new()),
@@ -1390,30 +1627,7 @@ impl AgentBridge {
                             Starter::Pane(_) => Role::Spawned,
                             Starter::Project(_) => Role::Member,
                         };
-                        shared.children.insert(
-                            pane,
-                            Child {
-                                launch: None,
-                                session: Some(agent.clone()),
-                                owed: 0,
-                                started: true,
-                                // At rest when it was saved: no news.
-                                seen: Some(Status::Idle),
-                                ..Child::task(
-                                    parent,
-                                    Task {
-                                        kind: agent.kind,
-                                        prompt: String::new(),
-                                        model: None,
-                                        effort: None,
-                                        ultracode: false,
-                                        resume: None,
-                                        title: None,
-                                        worktree: None,
-                                    },
-                                )
-                            },
-                        );
+                        shared.children.insert(pane, Child::resumed(parent, agent));
                         Start::Resume(agent, role)
                     }
                     (_, resume) => {
@@ -1432,6 +1646,7 @@ impl AgentBridge {
                     .map_err(|_| std::io::Error::other("Agent bridge unavailable"))?;
                 shared.changes.remove(&pane);
                 shared.activity.remove(&pane);
+                shared.adopted.remove(&pane);
                 shared.links.retain(|link| link.0 != pane);
                 shared.attachments.retain(|file| file.0 != pane);
                 shared.requests.retain(|request| !request.targets(pane));
@@ -1439,7 +1654,7 @@ impl AgentBridge {
                     pane,
                     Slot {
                         generation,
-                        token,
+                        token: token.clone(),
                         run: None,
                         remote: false,
                         kind: None,
@@ -1455,7 +1670,10 @@ impl AgentBridge {
                 (old, std::mem::take(&mut shared.retired))
             };
             drop((old, retired));
-            Ok(())
+            Ok(Some(Credential {
+                token,
+                remote: false,
+            }))
         }
     }
     /// Called only by a startup worker, for a terminal that is an SSH
@@ -1468,7 +1686,7 @@ impl AgentBridge {
         generation: u64,
         options: &mut SessionOptions,
         wake: Wake,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Option<Credential>> {
         let nonce = tempfile::Builder::new()
             .prefix("")
             .rand_bytes(32)
@@ -1481,7 +1699,7 @@ impl AgentBridge {
             .into_owned();
         drop(nonce);
         let Some(command) = options.args.last_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         command.push_str(&format!(
             " {} {}",
@@ -1498,13 +1716,14 @@ impl AgentBridge {
             }
             shared.changes.remove(&pane);
             shared.activity.remove(&pane);
+            shared.adopted.remove(&pane);
             shared.links.retain(|link| link.0 != pane);
             shared.requests.retain(|request| !request.targets(pane));
             let old = shared.slots.insert(
                 pane,
                 Slot {
                     generation,
-                    token,
+                    token: token.clone(),
                     run: None,
                     remote: true,
                     kind: None,
@@ -1520,7 +1739,61 @@ impl AgentBridge {
             (old, std::mem::take(&mut shared.retired))
         };
         drop((old, retired));
-        Ok(())
+        Ok(Some(Credential {
+            token,
+            remote: true,
+        }))
+    }
+    /// Called only by a startup worker, for a terminal that kept running in
+    /// the session daemon while Neptune was closed and is reattached as
+    /// `generation`. Its agents still hold `credential`. The agent the pane
+    /// last named is known again from the first invocation that is heard
+    /// from, which is the one that kept running.
+    pub fn adopt(
+        &self,
+        pane: PaneId,
+        generation: u64,
+        credential: &Credential,
+        agent: Option<&AgentSession>,
+        spawned_by: Option<Starter>,
+        wake: Wake,
+    ) {
+        // Its agents reach this launch where they reached the last one.
+        #[cfg(unix)]
+        drop(self.listening());
+        let Ok(mut shared) = self.shared.lock() else {
+            return;
+        };
+        let agent = agent.filter(|agent| agent.is_valid()).cloned();
+        if let (Some(parent), Some(agent)) = (spawned_by, &agent) {
+            shared.children.insert(pane, Child::resumed(parent, agent));
+        }
+        shared.changes.remove(&pane);
+        shared.activity.remove(&pane);
+        shared.links.retain(|link| link.0 != pane);
+        shared.attachments.retain(|file| file.0 != pane);
+        shared.requests.retain(|request| !request.targets(pane));
+        shared.adopted.insert(pane, agent);
+        let old = shared.slots.insert(
+            pane,
+            Slot {
+                generation,
+                token: credential.token.clone(),
+                run: None,
+                remote: credential.remote,
+                kind: None,
+                conversation: None,
+                prompted: false,
+                activity: None,
+                shown: None,
+                since: Instant::now(),
+                wake,
+                _startup: None,
+            },
+        );
+        let retired = std::mem::take(&mut shared.retired);
+        drop(shared);
+        drop((old, retired));
     }
     /// A line the terminal in `pane` addressed to the application. It counts
     /// only from an SSH terminal and with that terminal's credential, which
@@ -1536,6 +1809,17 @@ impl AgentBridge {
             return false;
         };
         let shared = &mut *guard;
+        if shared
+            .slots
+            .get(&pane)
+            .is_some_and(|slot| slot.remote && slot.generation == generation && slot.token == token)
+        {
+            if verb == "open" {
+                shared.adopted.remove(&pane);
+            } else {
+                shared.rejoin(pane, run);
+            }
+        }
         let Some(slot) = shared
             .slots
             .get_mut(&pane)
@@ -1964,6 +2248,25 @@ impl AgentRequest {
     }
 }
 impl Shared {
+    /// A terminal reattached after Neptune was closed takes the first
+    /// invocation heard from in it for the agent it last named.
+    fn rejoin(&mut self, pane: PaneId, run: &str) {
+        if run.is_empty() || run.len() > 64 {
+            return;
+        }
+        let Some(slot) = self.slots.get_mut(&pane).filter(|slot| slot.run.is_none()) else {
+            return;
+        };
+        let Some(agent) = self.adopted.remove(&pane) else {
+            return;
+        };
+        slot.run = Some(run.into());
+        slot.kind = agent.as_ref().map(|agent| agent.kind);
+        slot.conversation = agent;
+        slot.activity = Some(Tracked::idle());
+        slot.shown = None;
+        slot.since = Instant::now();
+    }
     /// Takes a hook's signal for the agent open in `pane`. `None` without
     /// one; otherwise whether it is news for the application.
     fn signal(&mut self, pane: PaneId, signal: Signal, now: Instant) -> Option<bool> {
@@ -2135,6 +2438,7 @@ impl Shared {
         }
         self.changes.remove(&pane);
         self.activity.remove(&pane);
+        self.adopted.remove(&pane);
         self.links.retain(|link| link.0 != pane);
         self.attachments.retain(|file| file.0 != pane);
         self.requests.retain(|request| !request.targets(pane));
@@ -2351,7 +2655,8 @@ fn configure_shell(
     }
     Ok(())
 }
-fn read_message(stream: &mut TcpStream, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+#[cfg(unix)]
+fn read_message(stream: &mut UnixStream, bytes: &mut Vec<u8>) -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_millis(200);
     let mut buffer = [0; 4096];
     loop {
@@ -2386,11 +2691,21 @@ fn apply_message(shared: &Mutex<Shared>, message: Message) -> bool {
         return false;
     };
     let shared = &mut *guard;
-    let Some((&pane, slot)) = shared
+    let Some(pane) = shared
         .slots
-        .iter_mut()
+        .iter()
         .find(|(_, slot)| !slot.remote && slot.token == message.token)
+        .map(|(pane, _)| *pane)
     else {
+        return false;
+    };
+    // An invocation that opens is known by that alone.
+    if matches!(message.event, Event::Open { .. }) {
+        shared.adopted.remove(&pane);
+    } else {
+        shared.rejoin(pane, &message.run);
+    }
+    let Some(slot) = shared.slots.get_mut(&pane) else {
         return false;
     };
     let now = Instant::now();
@@ -2635,6 +2950,14 @@ fn respond(shared: &Mutex<Shared>, message: Message) -> (Answer, Option<Wake>) {
     let shared = &mut *guard;
     // A terminal's credential first, then a lead's: the one that asks is who
     // its credential says, whatever else it claims.
+    if let Some(pane) = shared
+        .slots
+        .iter()
+        .find(|(_, slot)| !slot.remote && slot.token == message.token)
+        .map(|(pane, _)| *pane)
+    {
+        shared.rejoin(pane, &message.run);
+    }
     let slot = shared
         .slots
         .iter()
@@ -3051,22 +3374,48 @@ fn send(event: Event, run: &str) -> anyhow::Result<bool> {
 }
 /// Makes a request of the application for the agent open in this terminal.
 fn ask(event: Event, run: &str) -> Answer {
-    exchange(event, run)
-        .ok()
-        .and_then(|reply| serde_json::from_slice(&reply).ok())
-        .unwrap_or(Answer::Refused {
-            reason: "Neptune did not answer. This terminal may have been restarted.".into(),
-        })
+    match exchange(event, run) {
+        Ok(reply) => serde_json::from_slice(&reply).ok(),
+        Err(error) if error.is::<NotOpen>() => Some(Answer::Refused {
+            reason: NOT_OPEN.into(),
+        }),
+        Err(_) => None,
+    }
+    .unwrap_or(Answer::Refused {
+        reason: "Neptune did not answer. This terminal may have been restarted.".into(),
+    })
 }
+/// Nothing listens at the bridge: Neptune is closed, or still opening.
+#[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct NotOpen;
+impl std::fmt::Display for NotOpen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(NOT_OPEN)
+    }
+}
+impl std::error::Error for NotOpen {}
 fn exchange(event: Event, run: &str) -> anyhow::Result<Vec<u8>> {
-    let endpoint: std::net::SocketAddr = std::env::var(ENDPOINT)?.parse()?;
-    anyhow::ensure!(endpoint.ip().is_loopback(), "Invalid agent bridge address");
+    exchange_with(
+        &std::env::var(ENDPOINT)?,
+        &std::env::var(TOKEN)?,
+        event,
+        run,
+    )
+}
+#[cfg(unix)]
+pub(super) fn exchange_with(
+    endpoint: &str,
+    token: &str,
+    event: Event,
+    run: &str,
+) -> anyhow::Result<Vec<u8>> {
     let message = Message {
-        token: std::env::var(TOKEN)?,
+        token: token.into(),
         run: run.into(),
         event,
     };
-    let mut stream = TcpStream::connect_timeout(&endpoint, Duration::from_millis(200))?;
+    let mut stream = connect(std::path::Path::new(endpoint))?;
     stream.set_write_timeout(Some(Duration::from_millis(200)))?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.write_all(&serde_json::to_vec(&message)?)?;
@@ -3074,6 +3423,74 @@ fn exchange(event: Event, run: &str) -> anyhow::Result<Vec<u8>> {
     let mut reply = Vec::new();
     stream.take(MAX_ANSWER).read_to_end(&mut reply)?;
     Ok(reply)
+}
+#[cfg(not(unix))]
+pub(super) fn exchange_with(_: &str, _: &str, _: Event, _: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("Agent bridge unavailable")
+}
+/// Reaches the bridge's socket, which must be this user's, within
+/// [`CONNECT_TIMEOUT`]: a hook never holds up its agent for long.
+#[cfg(unix)]
+fn connect(socket: &std::path::Path) -> anyhow::Result<UnixStream> {
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, MetadataExt},
+        io::{AsRawFd, FromRawFd},
+    };
+    anyhow::ensure!(socket.is_absolute(), "Invalid agent bridge address");
+    let metadata = std::fs::symlink_metadata(socket).map_err(|_| NotOpen)?;
+    // SAFETY: geteuid has no preconditions.
+    anyhow::ensure!(
+        metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
+        "Invalid agent bridge address"
+    );
+    // SAFETY: an all-zero sockaddr_un is valid, and leaves the path
+    // terminated.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let path = socket.as_os_str().as_bytes();
+    anyhow::ensure!(
+        path.len() < address.sun_path.len(),
+        "Invalid agent bridge address"
+    );
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(path) {
+        *slot = *byte as libc::c_char;
+    }
+    // SAFETY: socket has no memory effects; the stream owns what it returns.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: fd is open; the flag only closes it in programs the hook runs.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    stream.set_nonblocking(true)?;
+    // SAFETY: address is a sockaddr_un of the length given.
+    let connected = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            (&raw const address).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if connected != 0 {
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINPROGRESS) {
+            // Refused, or a listener too far behind to take one more.
+            return Err(NotOpen.into());
+        }
+        let mut ready = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let timeout = CONNECT_TIMEOUT.as_millis() as libc::c_int;
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut ready, 1, timeout) } != 1 || stream.take_error()?.is_some() {
+            return Err(NotOpen.into());
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
 }
 /// Private CLI entry points, handled before desktop initialization. Never logs hook input.
 pub fn cli(args: &[String]) -> anyhow::Result<Option<i32>> {
@@ -3910,6 +4327,7 @@ fn run_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     fn agent(id: &str) -> AgentSession {
         AgentSession {
             kind: AgentKind::Claude,
@@ -6529,7 +6947,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let bridge = AgentBridge::default();
         let listener = bridge.listening().unwrap();
-        let adapters = listener.as_ref().unwrap().directory.path();
+        let adapters = listener.as_ref().unwrap().directory.as_path();
         let bin = tempfile::tempdir().unwrap();
         let path = std::env::join_paths([adapters, bin.path()]).unwrap();
         for kind in AgentKind::ALL {
@@ -6778,5 +7196,173 @@ mod tests {
         // `shift 4` leaves the shell and its own arguments for `exec "$@"`.
         assert_eq!(options.args[4], "--agent-restore");
         assert_eq!(options.args[6..], ["", "/bin/zsh", "-l"]);
+    }
+    /// What a local terminal's shell is given to reach the bridge, and the
+    /// credential its pane keeps.
+    #[cfg(unix)]
+    fn reached(bridge: &AgentBridge, pane: u64) -> (String, String, Credential) {
+        let mut options = SessionOptions {
+            shell: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "true".into()],
+            ..Default::default()
+        };
+        let credential = bridge
+            .prepare(
+                PaneId::new(pane),
+                7,
+                &mut options,
+                None,
+                None,
+                Arc::new(|| {}),
+            )
+            .unwrap()
+            .expect("a local terminal has a credential");
+        (
+            option_env(&options, ENDPOINT).unwrap(),
+            option_env(&options, SHIMS).unwrap(),
+            credential,
+        )
+    }
+    #[cfg(unix)]
+    #[test]
+    fn each_launch_listens_where_the_last_one_did_and_only_its_user_reaches_it() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents");
+        let first = AgentBridge::default();
+        first.listen_in(dir.clone(), Arc::new(|| false));
+        let (endpoint, shims, _) = reached(&first, 1);
+        assert_eq!(std::path::Path::new(&shims), dir);
+        assert_eq!(std::path::Path::new(&endpoint), dir.join("bridge.sock"));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(
+            std::fs::symlink_metadata(&endpoint)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        assert!(dir.join("claude").is_file());
+        drop(first);
+
+        // While no Neptune listens, a hook gives up at once.
+        let asked = Instant::now();
+        assert!(exchange_with(&endpoint, "any", Event::Close, "run").is_err());
+        assert!(asked.elapsed() < Duration::from_secs(1));
+
+        let second = AgentBridge::default();
+        second.listen_in(dir.clone(), Arc::new(|| false));
+        let (again, shims_again, credential) = reached(&second, 1);
+        assert_eq!((&again, &shims_again), (&endpoint, &shims));
+        let open = || Event::Open {
+            agent: agent(FIRST),
+        };
+        assert_eq!(
+            exchange_with(&again, &credential.token, open(), "run").unwrap(),
+            b"ok"
+        );
+        assert_eq!(
+            exchange_with(&again, "guess", open(), "run").unwrap(),
+            b"no"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_a_newer_one_listened_over_stops_without_taking_its_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents");
+        let earlier = AgentBridge::default();
+        earlier.listen_in(dir.clone(), Arc::new(|| false));
+        let (endpoint, _, _) = reached(&earlier, 1);
+        let newer = AgentBridge::default();
+        newer.listen_in(dir.clone(), Arc::new(|| false));
+        let (again, _, credential) = reached(&newer, 1);
+        assert_eq!(again, endpoint);
+
+        // The earlier launch quits while the newer one listens at the path.
+        let (done, stopped) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(earlier);
+            let _ = done.send(());
+        });
+        assert!(
+            stopped.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the earlier bridge never stopped listening"
+        );
+        let open = Event::Open {
+            agent: agent(FIRST),
+        };
+        assert_eq!(
+            exchange_with(&endpoint, &credential.token, open, "run").unwrap(),
+            b"ok"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_taken_over_never_listens_where_the_newer_one_does() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents");
+        let newer = AgentBridge::default();
+        newer.listen_in(dir.clone(), Arc::new(|| false));
+        let (endpoint, _, credential) = reached(&newer, 1);
+        // Frozen before its first terminal started, it resumes taken over.
+        let earlier = AgentBridge::default();
+        earlier.listen_in(dir.clone(), Arc::new(|| true));
+        let (elsewhere, _, _) = reached(&earlier, 1);
+        assert_ne!(elsewhere, endpoint);
+        drop(earlier);
+        let open = Event::Open {
+            agent: agent(FIRST),
+        };
+        assert_eq!(
+            exchange_with(&endpoint, &credential.token, open, "run").unwrap(),
+            b"ok"
+        );
+    }
+    #[test]
+    fn an_agent_that_outlived_neptune_is_known_again_from_its_next_hook() {
+        let bridge = AgentBridge::default();
+        let pane = PaneId::new(1);
+        let kept = Credential {
+            token: "kept".into(),
+            remote: false,
+        };
+        bridge.adopt(pane, 3, &kept, Some(&agent(FIRST)), None, Arc::new(|| {}));
+        let emit = |token: &str, run: &str, event| {
+            apply_message(&bridge.shared, message(token, run, event))
+        };
+        let activity = |signal| Event::Activity { signal };
+        // Another credential still says nothing.
+        assert!(!emit("guess", "a", activity(Signal::Tool)));
+        assert!(bridge.drain_activity().is_empty());
+        // The invocation that kept running is heard from in its turn.
+        assert!(emit("kept", "a", activity(Signal::Tool)));
+        assert_eq!(
+            bridge.drain_activity(),
+            [(pane, 3, Some(Activity::Working), None)]
+        );
+        // From then on it is the open one: another invocation does not
+        // describe the pane, and its own leaving is heard.
+        assert!(!emit("kept", "b", activity(Signal::Prompt)));
+        assert!(emit("kept", "a", Event::Close));
+        assert_eq!(bridge.drain_activity(), [(pane, 3, None, None)]);
+        assert_eq!(bridge.drain(), [(pane, 3, None)]);
+
+        // An SSH terminal's host reports through it with its own credential.
+        let far = PaneId::new(2);
+        let remote = Credential {
+            token: "far".into(),
+            remote: true,
+        };
+        bridge.adopt(far, 4, &remote, None, None, Arc::new(|| {}));
+        assert!(!bridge.report(far, 4, "kept;r;open;claude"));
+        assert!(bridge.report(far, 4, "far;r;open;claude"));
+        assert!(bridge.report(far, 4, "far;r;hook;UserPromptSubmit"));
+        assert_eq!(
+            bridge.drain_activity(),
+            [(far, 4, Some(Activity::Working), Some(AgentKind::Claude))]
+        );
+        // A local hook cannot use it.
+        assert!(!emit("far", "r", activity(Signal::Tool)));
     }
 }

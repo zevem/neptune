@@ -657,6 +657,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane: exited,
                 generation: 1,
+                session: None,
             })
             .unwrap();
         let effects = controller
@@ -746,6 +747,7 @@ mod tests {
                     .dispatch(Command::SessionStarted {
                         pane: shown,
                         generation: 1,
+                        session: None,
                     })
                     .unwrap();
                 controller.dispatch(Command::SessionExited {
@@ -1128,6 +1130,7 @@ mod tests {
                 spawned_by: None,
                 project: None,
                 worktree: None,
+                session: None,
             }];
             plain.layout = crate::Layout::pane(PaneId::new(50));
             plain.active = PaneId::new(50);

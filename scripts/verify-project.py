@@ -230,7 +230,7 @@ def main():
     # A run started from a Neptune terminal or a Claude Code session must reach neither.
     env = {key: value for key, value in os.environ.items() if not key.startswith(('NEPTUNE_', 'CLAUDE', 'GIT_'))}
     env.pop('WAYLAND_DISPLAY', None)
-    parts = [part for part in env['PATH'].split(':') if '/neptune-agents-' not in part]
+    parts = [part for part in env['PATH'].split(':') if '/neptune-agents-' not in part and part != os.environ.get('NEPTUNE_AGENT_SHIMS')]
     env.update(HOME=str(home), EGUI_INSPECTION=endpoint, PROJECT_TEST_LOG=str(output/'events.jsonl'), PROJECT_TEST_PULL=PULL+'102',
                PROJECT_TEST_WORK=str(work), TMPDIR=str(scratch), PATH=':'.join([str(fixtures), *parts]))
     def git(*args, cwd=work):

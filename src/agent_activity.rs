@@ -850,6 +850,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane: id,
                 generation: generation + 1,
+                session: None,
             })
             .unwrap();
         agents.retain(controller.model());

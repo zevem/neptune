@@ -60,6 +60,8 @@ pub struct ChromeView<'a> {
     pub panel: Option<bool>,
     /// An agent waits for input where the panel does not show it.
     pub panel_attention: bool,
+    /// Quitting keeps the terminals running, so ending them is offered.
+    pub keeps_sessions: bool,
 }
 
 const SIDEBAR_WIDTH: std::ops::RangeInclusive<f32> = 170.0..=360.0;
@@ -806,8 +808,9 @@ fn actions_menu(ui: &mut Ui, p: Palette, view: &ChromeView, actions: &mut Vec<Ac
         .align(egui::RectAlign::BOTTOM_END)
         .show(|ui| {
             menu_layout(ui, 230.0);
-            let mut item = |ui: &mut Ui, icon, label, binding, action| {
-                if menu_item(ui, p, icon, label, &hint(binding), false) {
+            let mut item = |ui: &mut Ui, icon, label, binding: Option<Binding>, action| {
+                let hint = binding.map(hint).unwrap_or_default();
+                if menu_item(ui, p, icon, label, &hint, false) {
                     actions.push(action);
                     ui.close();
                 }
@@ -816,48 +819,57 @@ fn actions_menu(ui: &mut Ui, p: Palette, view: &ChromeView, actions: &mut Vec<Ac
                 ui,
                 Icon::Command,
                 "Command palette",
-                Binding::CommandPalette,
+                Some(Binding::CommandPalette),
                 Action::Palette,
             );
-            let Some(pane) = view.pane else {
-                return;
-            };
-            item(
-                ui,
-                Icon::Search,
-                "Find in terminal",
-                Binding::Find,
-                Action::Find,
-            );
-            menu_separator(ui, p);
-            item(
-                ui,
-                Icon::Terminal,
-                "New tab",
-                Binding::NewTab,
-                Action::NewTab(pane),
-            );
-            item(
-                ui,
-                Icon::Globe,
-                "New browser tab",
-                Binding::NewBrowser,
-                Action::NewBrowser(pane, None, None),
-            );
-            item(
-                ui,
-                Icon::SplitVertical,
-                "Split right",
-                Binding::SplitRight,
-                Action::Split(pane, neptune_model::Axis::Vertical),
-            );
-            item(
-                ui,
-                Icon::SplitHorizontal,
-                "Split below",
-                Binding::SplitBelow,
-                Action::Split(pane, neptune_model::Axis::Horizontal),
-            );
+            if let Some(pane) = view.pane {
+                item(
+                    ui,
+                    Icon::Search,
+                    "Find in terminal",
+                    Some(Binding::Find),
+                    Action::Find,
+                );
+                menu_separator(ui, p);
+                item(
+                    ui,
+                    Icon::Terminal,
+                    "New tab",
+                    Some(Binding::NewTab),
+                    Action::NewTab(pane),
+                );
+                item(
+                    ui,
+                    Icon::Globe,
+                    "New browser tab",
+                    Some(Binding::NewBrowser),
+                    Action::NewBrowser(pane, None, None),
+                );
+                item(
+                    ui,
+                    Icon::SplitVertical,
+                    "Split right",
+                    Some(Binding::SplitRight),
+                    Action::Split(pane, neptune_model::Axis::Vertical),
+                );
+                item(
+                    ui,
+                    Icon::SplitHorizontal,
+                    "Split below",
+                    Some(Binding::SplitBelow),
+                    Action::Split(pane, neptune_model::Axis::Horizontal),
+                );
+            }
+            if view.keeps_sessions {
+                menu_separator(ui, p);
+                item(
+                    ui,
+                    Icon::Close,
+                    "End all sessions and quit",
+                    None,
+                    Action::EndAllSessions,
+                );
+            }
         });
 }
 
@@ -2571,6 +2583,7 @@ mod tests {
                 pane_drag: None,
                 panel: None,
                 panel_attention: false,
+                keeps_sessions: false,
             };
             let p = Palette::new(Config::default().theme);
             let side = Rect::from_min_size(Pos2::ZERO, vec2(216.0, self.height));
@@ -2650,6 +2663,7 @@ mod tests {
                         spawned_by: None,
                         project: None,
                         worktree: None,
+                        session: None,
                     }],
                     layout: neptune_model::Layout::pane(PaneId::new(*id)),
                     active: PaneId::new(*id),
@@ -3395,6 +3409,7 @@ mod tests {
                             pane_drag: drag,
                             panel: None,
                             panel_attention: false,
+                            keeps_sessions: false,
                         },
                         &mut UiState::default(),
                         &mut actions,
@@ -3446,6 +3461,106 @@ mod tests {
                     .into_iter()
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    #[test]
+    fn the_more_actions_menu_offers_ending_all_sessions_while_quitting_would_keep_them() {
+        for keeps_sessions in [true, false] {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+            let config = Config::default();
+            theme::apply(&ctx, &config);
+            ctx.enable_accesskit();
+            let view = ChromeView {
+                keybindings: &Default::default(),
+                workspaces: &[],
+                groups: &[],
+                sidebar_order: &[],
+                windows: &[],
+                active: None,
+                pane: Some(PaneId::new(1)),
+                pane_kind: neptune_model::PaneKind::Terminal,
+                subtitle: "",
+                pull_requests: &[],
+                attached: &[],
+                spawned: &[],
+                worktree: None,
+                ports: &[],
+                pane_generation: 1,
+                zoomed: false,
+                window: Rect::from_min_size(Pos2::ZERO, vec2(420.0, 600.0)),
+                sidebar: 0.0,
+                sidebar_open: false,
+                sidebar_width: 216.0,
+                sidebar_available: false,
+                pane_drag: None,
+                panel: None,
+                panel_attention: false,
+                keeps_sessions,
+            };
+            // The actions a frame emits, and where each labelled control is.
+            let frame = |events: Vec<Event>| {
+                let mut actions = Vec::new();
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(420.0, 600.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            actions_menu(ui, Palette::for_config(&config), &view, &mut actions)
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+                let controls: Vec<(String, Pos2)> = output
+                    .platform_output
+                    .accesskit_update
+                    .iter()
+                    .flat_map(|update| &update.nodes)
+                    .filter_map(|(_, node)| {
+                        let bounds = node.bounds()?;
+                        Some((
+                            node.label()?.to_owned(),
+                            Pos2::new(
+                                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                            ),
+                        ))
+                    })
+                    .collect();
+                (actions, controls)
+            };
+            let click = |pos: Pos2| {
+                let press = |pressed| Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                frame(vec![Event::PointerMoved(pos), press(true)]);
+                frame(vec![press(false)]).0
+            };
+            let at = |controls: &[(String, Pos2)], label: &str| {
+                controls
+                    .iter()
+                    .find(|(name, _)| name == label)
+                    .map(|(_, pos)| *pos)
+            };
+            let (_, controls) = frame(vec![]);
+            click(at(&controls, "More actions").unwrap());
+            let (_, controls) = frame(vec![]);
+            assert!(at(&controls, "Command palette").is_some());
+            let end = at(&controls, "End all sessions and quit");
+            if !keeps_sessions {
+                // Quitting already ends them.
+                assert_eq!(end, None);
+                continue;
+            }
+            let actions = click(end.unwrap());
+            assert!(matches!(actions.as_slice(), [Action::EndAllSessions]));
         }
     }
 

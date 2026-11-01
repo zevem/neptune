@@ -7,6 +7,9 @@ use crate::runtime::persistence::SaveKind;
 
 /// The system OpenSSH client, resolved through `PATH`.
 pub(super) const SSH_CLIENT: &str = "ssh";
+/// Said once in a launch whose kept sessions didn't all survive.
+const SESSIONS_RESTORED: &str =
+    "Some sessions didn't survive, so their terminals were restored with fresh shells.";
 
 /// A local pane runs the configured shell. A remote pane runs the SSH client
 /// in the same local directory and gets the login shell of its host. A remote
@@ -158,11 +161,7 @@ impl App {
                     }
                     // An agent's terminal answers to the agent that started
                     // it, a project's to the project.
-                    let spawned_by = self.controller.model().pane(pane).and_then(|pane| {
-                        pane.spawned_by()
-                            .map(Starter::Pane)
-                            .or(pane.project().map(Starter::Project))
-                    });
+                    let spawned_by = self.controller.model().pane(pane).and_then(Starter::of);
                     // The task of an agent being started is held for its
                     // shell before the session is requested.
                     if let (Some(parent), Some(spawning)) =
@@ -175,6 +174,7 @@ impl App {
                     let launch = crate::runtime::sessions::SessionLaunch {
                         terminal: options,
                         ssh_control: remote.is_some(),
+                        attach: None,
                         agent: if remote.is_none() {
                             crate::runtime::sessions::AgentLaunch::Local {
                                 resume: self
@@ -209,6 +209,66 @@ impl App {
                         self.ui.error = Some(format!("Pane {pane}: {error}"));
                     }
                 }
+                Effect::AttachSession {
+                    pane,
+                    generation,
+                    session,
+                } => {
+                    if !self.keep_sessions {
+                        // This launch doesn't keep sessions: the terminal
+                        // gets a new shell, and forgets the kept one.
+                        if let Some(start) = self.start_afresh(pane, generation) {
+                            self.execute(ctx, vec![start]);
+                        }
+                        continue;
+                    }
+                    self.renders.insert(pane, PaneRender::new(pane));
+                    let wake = ctx.clone();
+                    let launch = crate::runtime::sessions::SessionLaunch {
+                        // Only the size matters; the session keeps its program.
+                        terminal: session_options(
+                            &self.config,
+                            &self.ssh_client,
+                            default_cwd(),
+                            None,
+                            None,
+                        ),
+                        // The agents still running in it are known again
+                        // by the credential the session kept.
+                        agent: if self.remote_of(pane).is_some() {
+                            crate::runtime::sessions::AgentLaunch::Remote
+                        } else {
+                            let pane = self.controller.model().pane(pane);
+                            crate::runtime::sessions::AgentLaunch::Local {
+                                resume: pane.and_then(|pane| pane.agent()).cloned(),
+                                spawned_by: pane.and_then(Starter::of),
+                            }
+                        },
+                        ssh_control: false,
+                        attach: Some(session),
+                    };
+                    if let Err(error) = self.sessions.start(
+                        pane,
+                        generation,
+                        false,
+                        launch,
+                        Arc::new(move || wake.request_repaint_of(egui::ViewportId::ROOT)),
+                    ) {
+                        self.diagnostics
+                            .failure("attach", Some(pane), Some(generation), "Runtime");
+                        self.dispatch(
+                            ctx,
+                            Command::SessionFailed {
+                                pane,
+                                generation,
+                                error: error.clone(),
+                            },
+                        );
+                        self.ui.error = Some(format!("Pane {pane}: {error}"));
+                    }
+                }
+                Effect::DetachSession { pane, .. } => self.sessions.detach(pane),
+                Effect::SessionsRestored => self.ui.say(ctx, SESSIONS_RESTORED.into()),
                 Effect::StopSession { pane, .. } => {
                     self.browsers.close(pane);
                     self.desktop_notifier.cancel(pane);
@@ -261,6 +321,75 @@ impl App {
                 }
             }
         }
+    }
+    /// Start the restored workspaces. With `live`, the kept sessions that
+    /// survived, each terminal reattaches to its session or, if it is gone,
+    /// is restored with a fresh shell, and sessions no terminal refers to are
+    /// adopted as Recovered sessions. A terminal whose daemon couldn't be
+    /// asked tries to reattach, and is restored if it can't.
+    pub(super) fn reattach(
+        &mut self,
+        ctx: &egui::Context,
+        live: Option<crate::runtime::kept_sessions::Live>,
+    ) {
+        let model = self.controller.model();
+        let plan = live
+            .filter(|_| self.keep_sessions)
+            .map(|live| {
+                let mut sessions = live.sessions;
+                sessions.extend(
+                    model
+                        .workspaces()
+                        .iter()
+                        .flat_map(|workspace| workspace.panes())
+                        .filter_map(|pane| pane.session())
+                        .filter(|session| live.unlisted.contains(&session.daemon))
+                        .cloned(),
+                );
+                model.plan_reattach(&sessions)
+            })
+            .unwrap_or_default();
+        let mut effects = self.controller.start_effects();
+        effects.retain(|effect| {
+            !matches!(effect, Effect::AttachSession { pane, .. } if plan.restore.contains(pane))
+        });
+        self.execute(ctx, effects);
+        for pane in plan.restore {
+            if let Some(generation) = self.controller.model().pane(pane).map(|p| p.generation()) {
+                self.dispatch(ctx, Command::SessionLost { pane, generation });
+            }
+        }
+        if !plan.recovered.is_empty() {
+            self.dispatch(
+                ctx,
+                Command::AdoptSessions {
+                    sessions: plan.recovered,
+                    cwd: default_cwd(),
+                },
+            );
+        }
+    }
+    /// Whether `pane` is still reattaching to its kept session.
+    pub(super) fn reattaching(&self, pane: PaneId, generation: u64) -> bool {
+        self.keep_sessions
+            && self.controller.model().pane(pane).is_some_and(|item| {
+                item.generation() == generation
+                    && item.lifecycle() == &neptune_model::Lifecycle::Starting
+                    && item.session().is_some()
+            })
+    }
+    /// A new shell in a terminal's saved directory, as a launch that doesn't
+    /// keep sessions starts every terminal.
+    fn start_afresh(&self, pane: PaneId, generation: u64) -> Option<Effect> {
+        let item = self.controller.model().pane(pane)?;
+        Some(Effect::StartSession {
+            pane,
+            generation,
+            cwd: item.cwd().into(),
+            remote: self.remote_of(pane).cloned(),
+            remote_cwd: item.remote_cwd().map(Into::into),
+            replacement: false,
+        })
     }
     pub(super) fn save_state(&mut self) {
         if self.ephemeral || !self.state_writable {
@@ -658,6 +787,10 @@ impl App {
             Action::Quit => {
                 self.relaunch = false;
                 self.request_close(ctx, Close::App);
+            }
+            Action::EndAllSessions => {
+                self.relaunch = false;
+                self.request_close(ctx, Close::AllSessions);
             }
             Action::New => {
                 if let Some(dirs) = directories::BaseDirs::new() {

@@ -16,7 +16,7 @@ if ($l.Provider.Name -eq 'FileSystem') { \
 /// Windows shells report no directory by default. Add an OSC 9;9 report to
 /// each prompt of a plain local cmd or PowerShell without editing user files.
 #[cfg(windows)]
-pub(super) fn report_cwd(command: &mut CommandBuilder, shell: &str) {
+pub(super) fn report_cwd(command: &mut portable_pty::CommandBuilder, shell: &str) {
     let name = std::path::Path::new(shell)
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_ascii_lowercase());
@@ -323,6 +323,37 @@ impl PromptState {
             }
             PromptMark::Output => self.anchor = None,
         }
+    }
+
+    /// Where the current prompt starts, searched from the newest line.
+    pub(super) fn anchor_point<T: EventListener>(
+        &self,
+        terminal: &Term<T>,
+    ) -> Option<(Line, usize)> {
+        let anchor = self.anchor.as_ref()?;
+        (terminal.topmost_line().0..terminal.screen_lines() as i32)
+            .rev()
+            .map(Line)
+            .find(|line| row_identity(terminal, *line) == anchor.row_identity)
+            .map(|line| (line, anchor.column))
+    }
+
+    pub(super) fn redraw(&self) -> bool {
+        self.redraw
+    }
+
+    /// Mark a prompt at `point` of a rebuilt grid, as a snapshot recorded it.
+    pub(super) fn restore<T: EventListener>(
+        &mut self,
+        terminal: &Term<T>,
+        point: Option<(Line, usize)>,
+        redraw: bool,
+    ) {
+        self.redraw = redraw;
+        self.anchor = point.map(|(line, column)| PromptAnchor {
+            row_identity: row_identity(terminal, line),
+            column,
+        });
     }
 
     pub(super) fn resize<T: EventListener>(&mut self, terminal: &mut Term<T>, size: Size) {

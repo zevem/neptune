@@ -10,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Version 16 adds each terminal's kept session: the session daemon's protocol
+/// version and the session's id, never a socket, path or terminal contents.
 /// Version 15 adds native window membership and each window's selected workspace
 /// and sidebar visibility. Window geometry remains a separate desktop file.
 /// Version 14 adds browser pane kinds. Browser addresses and profiles are never saved here.
@@ -22,8 +24,8 @@ use std::{
 /// earlier build would take for damage. Version 9 added the pane whose agent
 /// started a pane's agent. Version 8 added workspace group default
 /// directories and the pull requests an agent linked to its pane. Versions
-/// 1–14 remain readable.
-pub const SCHEMA_VERSION: u32 = 15;
+/// 1–15 remain readable.
+pub const SCHEMA_VERSION: u32 = 16;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// This DTO is the disk contract. Runtime layout serialization cannot change it.
@@ -227,6 +229,9 @@ pub struct SavedPane {
     /// The files the agent attached, from schema version 11.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<SavedAttachment>,
+    /// The kept session the terminal reattaches to, from schema version 16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<neptune_model::SessionRef>,
 }
 
 /// Where an attached file is and what the agent called it; never its contents.
@@ -305,6 +310,7 @@ impl StateSnapshot {
                             spawned_by: pane.spawned_by().filter(|_| pane.agent().is_some()),
                             project: pane.project().filter(|_| pane.agent().is_some()),
                             worktree: pane.worktree().cloned(),
+                            session: pane.session().cloned(),
                             attachments: pane
                                 .attachments()
                                 .iter()
@@ -451,6 +457,7 @@ impl SavedWorkspace {
                         .filter_map(SavedAttachment::restore)
                         .collect(),
                     agent: pane.agent,
+                    session: pane.session,
                 })
                 .collect(),
             layout: self.layout.into_layout(),
@@ -761,6 +768,15 @@ fn restore_versioned(snapshot: StateSnapshot, limits: Limits, report: &mut LoadR
                     pane.id
                 ));
                 pane.worktree = None;
+            }
+            if pane.session.as_ref().is_some_and(|session| {
+                !session.is_valid() || pane.kind == neptune_model::PaneKind::Browser
+            }) {
+                report.diagnostics.push(format!(
+                    "Pane {}: its kept session cannot be found; opening a new shell",
+                    pane.id
+                ));
+                pane.session = None;
             }
             // A file that has since been moved or deleted stays listed: the
             // list says so when it is opened, and reading it here would not
@@ -1188,6 +1204,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 spawned_by: None,
                 project: None,
                 worktree: None,
+                session: None,
             });
         }
         if panes.is_empty() {
@@ -1209,6 +1226,7 @@ fn restore_legacy(legacy: LegacyState, limits: Limits, report: &mut LoadReport) 
                 spawned_by: None,
                 project: None,
                 worktree: None,
+                session: None,
             });
             next_pane += 1;
         }
@@ -1403,6 +1421,7 @@ mod tests {
             .dispatch(Command::SessionStarted {
                 pane,
                 generation: 2,
+                session: None,
             })
             .unwrap();
         let snapshot = StateSnapshot::from_model(controller.model());
@@ -1592,6 +1611,63 @@ mod tests {
                 .iter()
                 .flat_map(|w| w.panes())
                 .all(|p| p.kind() == neptune_model::PaneKind::Terminal)
+        );
+    }
+
+    #[test]
+    fn session_references_round_trip_and_unusable_ones_open_fresh_shells() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let mut controller =
+            Controller::new(sample(root.path()).into_model(Limits::default()).unwrap());
+        let pane = controller.model().active_pane().unwrap();
+        let session = neptune_model::SessionRef {
+            daemon: 1,
+            id: "00000000000000a1".into(),
+        };
+        controller
+            .complete(neptune_model::Completion::Started {
+                pane,
+                generation: 1,
+                session: Some(session.clone()),
+            })
+            .unwrap();
+        let snapshot = StateSnapshot::from_model(controller.model());
+        assert_eq!(snapshot.version, 16);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(serialized.contains(r#""session":{"daemon":1,"id":"00000000000000a1"}"#));
+        // No daemon socket or directory is saved with the reference.
+        assert!(!serialized.contains("sock"));
+        std::fs::write(&path, &serialized).unwrap();
+        let report = load_state(&path, Limits::default());
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        let controller = Controller::new(report.model.unwrap());
+        assert!(
+            controller
+                .start_effects()
+                .contains(&neptune_model::Effect::AttachSession {
+                    pane,
+                    generation: 1,
+                    session,
+                })
+        );
+        let mut bad: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        bad["workspaces"][0]["panes"][1]["session"]["id"] = "../../socket".into();
+        std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        let report = load_state(&path, Limits::default());
+        // The damaged file is kept aside before it can be replaced.
+        assert_eq!(report.diagnostics.len(), 2, "{:?}", report.diagnostics);
+        assert_eq!(
+            report.diagnostics[0],
+            format!("Pane {pane}: its kept session cannot be found; opening a new shell")
+        );
+        let model = report.model.unwrap();
+        assert!(
+            model
+                .workspaces()
+                .iter()
+                .flat_map(|w| w.panes())
+                .all(|p| p.session().is_none())
         );
     }
 
@@ -2129,6 +2205,7 @@ mod tests {
             spawned_by: None,
             project: None,
             worktree: None,
+            session: None,
         }];
         second.layout = SavedLayout::Pane {
             pane: PaneId::new(3),

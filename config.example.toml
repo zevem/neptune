@@ -75,8 +75,14 @@ cursor_blink = false
 # Sidebar width: 170–360 logical pixels.
 sidebar_width = 216.0
 
-# Restore workspace organization; every terminal starts a new process.
+# Restore workspace organization. Terminals start new processes, unless they
+# were kept running after quit.
 restore_workspaces = true
+
+# macOS and Linux: quitting leaves terminals running in a session daemon, and
+# the next launch reattaches to them. Needs restore_workspaces. Sessions end when
+# you log out or restart. Turning it on applies from the next launch.
+keep_sessions_running = false
 
 # The profile new browser tabs start in: "default" keeps sign-ins on this
 # computer, "private" keeps nothing, or the id of a profile below.

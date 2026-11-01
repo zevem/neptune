@@ -49,6 +49,8 @@ struct Job {
     payload: Payload,
 }
 type WriteOperation = dyn Fn(&Job) -> Result<(), String> + Send + Sync;
+/// Once it returns true, nothing more is written.
+pub type Stop = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Default)]
 struct Queue {
@@ -66,6 +68,7 @@ struct Queue {
 struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
+    stop: Mutex<Option<Stop>>,
 }
 
 pub struct PersistenceWriter {
@@ -128,6 +131,14 @@ impl PersistenceWriter {
             worker: Some(worker),
             enabled,
         })
+    }
+
+    /// Write nothing more once `stop` returns true, checked just before each
+    /// write, including work already submitted.
+    pub fn stop_when(&self, stop: Stop) {
+        if let Ok(mut current) = self.shared.stop.lock() {
+            *current = Some(stop);
+        }
     }
 
     pub fn submit_state(&self, generation: u64, snapshot: StateSnapshot) -> Result<(), String> {
@@ -328,10 +339,20 @@ fn worker_loop(
                 return;
             }
         };
+        let stopped = shared
+            .stop
+            .lock()
+            .ok()
+            .and_then(|stop| stop.clone())
+            .is_some_and(|stop| stop());
         let event = SaveEvent {
             kind: job.kind,
             generation: job.generation,
-            result: operation(&job),
+            result: if stopped {
+                Err("Another Neptune took over; nothing more is saved".into())
+            } else {
+                operation(&job)
+            },
         };
         if let Ok(mut queue) = shared.queue.lock() {
             let index = event.kind.index();
@@ -433,6 +454,33 @@ mod tests {
         assert_eq!(*saved.lock().unwrap(), vec![1, 100]);
         assert_eq!(writer.drain_events()[0].generation, 100);
         writer.shutdown(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn a_stopped_writer_drops_even_work_submitted_before_it_stopped() {
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let op_saved = Arc::clone(&saved);
+        let mut writer = PersistenceWriter::with_operation(
+            true,
+            Arc::new(|| {}),
+            Arc::new(move |job| {
+                op_saved.lock().unwrap().push(job.generation);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        let stop = Arc::clone(&stopped);
+        writer.stop_when(Arc::new(move || stop.load(Ordering::Acquire)));
+        writer.submit_state(1, snapshot("before")).unwrap();
+        writer.flush().unwrap();
+        // Submitted while writing was allowed, but written after it stopped.
+        writer.submit_state(2, snapshot("pending")).unwrap();
+        stopped.store(true, Ordering::Release);
+        writer.submit_window(1, WindowState::default()).unwrap();
+        assert!(writer.flush().is_err());
+        assert_eq!(*saved.lock().unwrap(), vec![1]);
+        let _ = writer.shutdown(Duration::from_secs(2));
     }
 
     #[test]

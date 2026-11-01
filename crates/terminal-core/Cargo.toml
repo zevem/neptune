@@ -18,6 +18,11 @@ bitflags = "2"
 regex = "1"
 base64 = "0.22.1"
 
+[features]
+# Test support only: `daemon::simulated` runs this build's session daemon
+# under another protocol version, so tests can run daemons of several versions.
+simulated-daemon-versions = []
+
 [dev-dependencies]
 tempfile = "3"
 

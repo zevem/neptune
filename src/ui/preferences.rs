@@ -29,6 +29,8 @@ const SIDEBAR: f32 = 176.0;
 /// A sheet too narrow for names keeps the source list as icons.
 const RAIL: f32 = 44.0;
 const COMPACT_BELOW: f32 = 540.0;
+/// Terminals can keep running after quit only on macOS and Linux.
+const KEEPS_SESSIONS: bool = cfg!(unix);
 
 /// A screen of related settings, chosen from the sheet's source list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -85,6 +87,9 @@ pub struct View {
     keybinding_reference: Option<String>,
     /// The search field takes the keyboard when the sheet appears.
     focus_search: bool,
+    /// This launch keeps its terminals running after quit. Turning the
+    /// setting on applies from the next launch.
+    pub launch_keeps_sessions: bool,
 }
 
 impl View {
@@ -155,6 +160,7 @@ impl FontPicker {
 enum Setting {
     FileEditor,
     RestoreWorkspaces,
+    KeepSessions,
     ConfirmClose,
     WarnProcesses,
     Keybindings,
@@ -176,7 +182,7 @@ enum Setting {
 
 /// Each setting with its pane, its label and the other words people use for
 /// it. A search reads the pane's name and the label as well as these.
-const INDEX: [(Setting, Pane, &str, &str); 19] = [
+const INDEX: [(Setting, Pane, &str, &str); 20] = [
     (
         Setting::FileEditor,
         Pane::General,
@@ -188,6 +194,12 @@ const INDEX: [(Setting, Pane, &str, &str); 19] = [
         Pane::General,
         "Restore workspaces on launch",
         "startup start open reopen resume session sessions layout layouts folders tabs windows remember previous last",
+    ),
+    (
+        Setting::KeepSessions,
+        Pane::General,
+        "Keep terminals running after quit",
+        "persist persistent sessions session background detach reattach daemon processes programs shells survive quit exit close",
     ),
     (
         Setting::ConfirmClose,
@@ -346,6 +358,9 @@ fn search(query: &str) -> Option<Vec<Setting>> {
     let mut exact = Vec::new();
     let mut near = Vec::new();
     for (setting, pane, label, terms) in INDEX {
+        if setting == Setting::KeepSessions && !KEEPS_SESSIONS {
+            continue;
+        }
         let known: Vec<String> = words(pane.title())
             .chain(words(label))
             .chain(words(terms))
@@ -571,6 +586,7 @@ pub fn show(
                                         &mut config,
                                         &mut view.keybinding_reference,
                                         &mut view.editors,
+                                        view.launch_keeps_sessions,
                                         actions,
                                     );
                                 }
@@ -716,6 +732,8 @@ fn sidebar(ui: &mut Ui, p: Palette, view: &mut View, found: Option<&[Setting]>, 
         });
 }
 
+// Each part of the view the pane reads is borrowed on its own.
+#[allow(clippy::too_many_arguments)]
 fn general(
     ui: &mut Ui,
     p: Palette,
@@ -723,9 +741,12 @@ fn general(
     config: &mut Config,
     reference: &mut Option<String>,
     editors: &mut crate::platform::editor::Detection,
+    launch_keeps_sessions: bool,
     actions: &mut Vec<Action>,
 ) {
-    use Setting::{ConfirmClose, Keybindings, Reset, RestoreWorkspaces, WarnProcesses};
+    use Setting::{
+        ConfirmClose, KeepSessions, Keybindings, Reset, RestoreWorkspaces, WarnProcesses,
+    };
     let pane = Pane::General;
     card(
         ui,
@@ -771,17 +792,51 @@ fn general(
         shown,
         pane,
         "Startup",
-        &[RestoreWorkspaces],
+        &[RestoreWorkspaces, KeepSessions][..if KEEPS_SESSIONS { 2 } else { 1 }],
         |ui, rows| {
-            rows.row(ui, "Restore workspaces on launch", |ui| {
-                toggle(
+            let keeps = KEEPS_SESSIONS && config.keep_sessions_running;
+            if shown.has(RestoreWorkspaces) {
+                rows.row(ui, "Restore workspaces on launch", |ui| {
+                    toggle(
+                        ui,
+                        p,
+                        &mut config.restore_workspaces,
+                        "Restore workspaces on launch",
+                    );
+                });
+                rows.note(
                     ui,
-                    p,
-                    &mut config.restore_workspaces,
-                    "Restore workspaces on launch",
+                    if keeps {
+                        "Reopens folders and layouts."
+                    } else {
+                        "Reopens folders and layouts with fresh shells."
+                    },
                 );
-            });
-            rows.note(ui, "Reopens folders and layouts with fresh shells.");
+            }
+            if KEEPS_SESSIONS && shown.has(KeepSessions) {
+                // Reattaching needs the saved layout.
+                ui.add_enabled_ui(config.restore_workspaces, |ui| {
+                    rows.row(ui, "Keep terminals running after quit", |ui| {
+                        toggle(
+                            ui,
+                            p,
+                            &mut config.keep_sessions_running,
+                            "Keep terminals running after quit",
+                        );
+                    });
+                    rows.note(
+                        ui,
+                        "Shells and programs keep running when Neptune quits, and reopen where you left them. They end when you log out or restart your computer.",
+                    );
+                    if config.restore_workspaces && keeps && !launch_keeps_sessions {
+                        rows.note(ui, "Applies from the next launch.");
+                    }
+                });
+                // Readable while the row above is dimmed.
+                if !config.restore_workspaces {
+                    rows.note(ui, "Needs Restore workspaces on launch.");
+                }
+            }
         },
     );
     card(
@@ -1621,7 +1676,109 @@ mod tests {
         for (index, (setting, pane, label, _)) in INDEX.iter().enumerate() {
             assert_eq!(pane_of(*setting), *pane);
             assert!(!INDEX[..index].iter().any(|entry| entry.0 == *setting));
+            // A hidden setting is never found; Windows hides this one.
+            if *setting == Setting::KeepSessions && !KEEPS_SESSIONS {
+                assert!(!finds(label).contains(setting), "{label}");
+                continue;
+            }
             assert!(finds(label).contains(setting), "{label}");
+        }
+    }
+
+    /// Whether the General pane shows "Keep terminals running after quit",
+    /// and enabled, and the text it shows.
+    fn keep_running_row(config: &Config, launch_keeps: bool) -> (Option<bool>, String) {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::platform::fonts::bundled_definitions());
+        theme::apply(&ctx, config);
+        ctx.enable_accesskit();
+        let mut view = View {
+            launch_keeps_sessions: launch_keeps,
+            ..View::default()
+        };
+        let (updates, fonts) = (Updates::default(), Fonts::bundled());
+        let (mut state, mut shells) = (theme_browser::State::default(), ShellPicker::default());
+        let mut row = (None, String::new());
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 900.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    show(
+                        ui.ctx(),
+                        config,
+                        &updates,
+                        &fonts,
+                        &mut state,
+                        &mut view,
+                        &mut shells,
+                        &mut Vec::new(),
+                    )
+                },
+            );
+            output.textures_delta.clear();
+            let toggle = output
+                .platform_output
+                .accesskit_update
+                .iter()
+                .flat_map(|update| &update.nodes)
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::CheckBox
+                        && node.label() == Some("Keep terminals running after quit")
+                })
+                .map(|(_, node)| !node.is_disabled());
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            row = (toggle, text);
+        }
+        row
+    }
+
+    #[test]
+    fn keeping_terminals_running_sits_beside_restore_and_needs_it() {
+        const HELP: &str = "Shells and programs keep running when Neptune quits, and reopen where you left them. They end when you log out or restart your computer.";
+        const NEXT_LAUNCH: &str = "Applies from the next launch.";
+        const NEEDS_RESTORE: &str = "Needs Restore workspaces on launch.";
+        let off = Config::default();
+        let (toggle, text) = keep_running_row(&off, false);
+        if cfg!(windows) {
+            assert_eq!(toggle, None);
+            return;
+        }
+        assert_eq!(toggle, Some(true));
+        assert!(text.contains(HELP), "{text}");
+        assert!(!text.contains(NEXT_LAUNCH), "{text}");
+        assert!(!text.contains(NEEDS_RESTORE), "{text}");
+        // Reattaching needs the saved layout, and the row says so.
+        let unrestored = Config {
+            restore_workspaces: false,
+            ..Config::default()
+        };
+        let (toggle, text) = keep_running_row(&unrestored, false);
+        assert_eq!(toggle, Some(false));
+        assert!(text.contains(NEEDS_RESTORE), "{text}");
+        // Turned on after this launch started its terminals.
+        let on = Config {
+            keep_sessions_running: true,
+            ..Config::default()
+        };
+        let (toggle, text) = keep_running_row(&on, false);
+        assert_eq!(toggle, Some(true));
+        assert!(text.contains(NEXT_LAUNCH), "{text}");
+        // This launch already keeps them.
+        assert!(!keep_running_row(&on, true).1.contains(NEXT_LAUNCH));
+        // Found by the words people use for it.
+        for query in ["keep running", "persist", "detach", "background sessions"] {
+            assert!(finds(query).contains(&Setting::KeepSessions), "{query}");
         }
     }
 

@@ -156,6 +156,9 @@ pub fn pane_label(metadata: &SessionMetadata) -> String {
     }
 }
 
+/// How terminal-core reports a kept session's lost connection.
+const SESSION_LOST: &str = "Session ended unexpectedly";
+
 fn status_text(status: &SessionStatus) -> Option<(String, bool)> {
     match status {
         SessionStatus::Running => None,
@@ -165,6 +168,10 @@ fn status_text(status: &SessionStatus) -> Option<(String, bool)> {
         } => Some((format!("Stopped by {signal}"), true)),
         SessionStatus::Exited { code: 0, .. } => Some(("Process exited".into(), false)),
         SessionStatus::Exited { code, .. } => Some((format!("Exited with code {code}"), true)),
+        // A kept session whose session daemon went away.
+        SessionStatus::Error(error) if error.ends_with(SESSION_LOST) => {
+            Some((SESSION_LOST.into(), true))
+        }
         SessionStatus::Error(_) => Some(("Could not start shell".into(), true)),
     }
 }
@@ -2291,6 +2298,13 @@ mod tests {
         assert_eq!(
             status_text(&SessionStatus::Error("missing".into())),
             Some(("Could not start shell".into(), true))
+        );
+        // What a kept session reports once its session daemon is gone.
+        assert_eq!(
+            status_text(&SessionStatus::Error(
+                "Wait for shell: Session ended unexpectedly".into()
+            )),
+            Some(("Session ended unexpectedly".into(), true))
         );
     }
 }

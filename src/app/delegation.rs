@@ -274,10 +274,7 @@ impl App {
             .iter()
             .flat_map(|workspace| workspace.panes())
             .filter_map(|pane| {
-                let parent = pane
-                    .spawned_by()
-                    .map(Starter::Pane)
-                    .or(pane.project().map(Starter::Project))?;
+                let parent = Starter::of(pane)?;
                 if let Some((activity, _)) = self.agents.get(pane.id()) {
                     self.sessions
                         .agents()

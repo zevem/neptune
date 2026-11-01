@@ -28,6 +28,19 @@ pub(in crate::session) fn process_activity(pid: u32, master: &dyn MasterPty) -> 
     }
 }
 
+/// A program on this host whose terminal another process holds, such as a
+/// session daemon's. Without its foreground group, a shell with no child
+/// process is at its prompt.
+#[cfg(unix)]
+pub(in crate::session) fn shell_activity(pid: u32) -> ProcessActivity {
+    match inspect_process(pid) {
+        (Some(true), _) => ProcessActivity::Running,
+        (_, Some(executable)) if !is_shell(&executable) => ProcessActivity::Running,
+        (Some(false), Some(_)) => ProcessActivity::Idle,
+        _ => ProcessActivity::Unknown,
+    }
+}
+
 fn is_shell(path: &std::path::Path) -> bool {
     let name = path.file_stem().unwrap_or_default().to_string_lossy();
     matches!(

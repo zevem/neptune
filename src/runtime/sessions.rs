@@ -1,8 +1,12 @@
 //! Owns live, starting and closing sessions. No PTY is opened on the UI thread.
 //! Closing sessions retain their reservation until every worker has stopped.
-use neptune_model::PaneId;
+use super::{
+    kept_sessions::{KeptSessions, SessionData, SshData},
+    ssh_control::SshControl,
+};
+use neptune_model::{PaneId, SessionRef};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -45,6 +49,8 @@ pub struct SessionLaunch {
     pub agent: AgentLaunch,
     /// Give this SSH pane its own private connection-sharing socket.
     pub ssh_control: bool,
+    /// Reattach to this kept session rather than start a program.
+    pub attach: Option<SessionRef>,
 }
 pub enum AgentLaunch {
     Disabled,
@@ -64,6 +70,7 @@ impl From<SessionOptions> for SessionLaunch {
             terminal,
             agent: AgentLaunch::Disabled,
             ssh_control: false,
+            attach: None,
         }
     }
 }
@@ -72,6 +79,8 @@ struct Request {
     generation: u64,
     launch: SessionLaunch,
     wake: Wake,
+    /// Where sessions are kept, while Neptune keeps them.
+    kept: Option<Arc<KeptSessions>>,
 }
 struct Completion {
     pane: PaneId,
@@ -88,13 +97,15 @@ struct Closing {
     generation: u64,
     session: TerminalSession,
     since: Instant,
-    _control: Option<Arc<tempfile::TempDir>>,
+    control: Option<Arc<SshControl>>,
 }
 pub enum SessionCompletion {
     Started {
         pane: PaneId,
         generation: u64,
         elapsed: Duration,
+        /// The kept session it started in or reattached to.
+        session: Option<SessionRef>,
     },
     Failed {
         pane: PaneId,
@@ -105,7 +116,9 @@ pub enum SessionCompletion {
 struct Entry {
     generation: u64,
     session: TerminalSession,
-    control: Option<Arc<tempfile::TempDir>>,
+    control: Option<Arc<SshControl>>,
+    /// Names the kept session in the session daemon; `None` runs in Neptune.
+    reference: Option<SessionRef>,
 }
 
 pub struct SessionManager {
@@ -120,6 +133,11 @@ pub struct SessionManager {
     in_flight: BTreeMap<(PaneId, u64), Instant>,
     diagnostics: bool,
     agents: Arc<super::agents::AgentBridge>,
+    kept: Option<Arc<KeptSessions>>,
+    /// Starts whose results are let go of, not closed, when they arrive.
+    detached: BTreeSet<(PaneId, u64)>,
+    /// Removes the SSH control folders of closed sessions, off the frame.
+    cleanup: Option<mpsc::Sender<Arc<SshControl>>>,
 }
 impl SessionManager {
     pub fn new(policy: ResourcePolicy, diagnostics: bool) -> Self {
@@ -161,16 +179,77 @@ impl SessionManager {
                             continue;
                         };
                         let tick = Instant::now();
+                        // A kept SSH session's control socket, reserved for it.
+                        let mut reserved = None;
                         let result = (|| {
+                            if let Some(reference) = request.launch.attach.take() {
+                                let kept = request
+                                    .kept
+                                    .as_ref()
+                                    .ok_or("Terminals are not kept running after quit")?;
+                                let terminal = &request.launch.terminal;
+                                let (session, data) = kept.attach(
+                                    &reference,
+                                    terminal.cols,
+                                    terminal.rows,
+                                    request.wake.clone(),
+                                )?;
+                                // It keeps the history this launch's budget
+                                // allows, whichever build started it; the
+                                // budget always fits its grid. Without it, the
+                                // terminal still works.
+                                if let Err(error) = session.set_scrollback(terminal.scrollback) {
+                                    eprintln!(
+                                        "Could not limit a reattached terminal's history: {:?}",
+                                        error.kind()
+                                    );
+                                }
+                                // Its agents reach this launch with the
+                                // credential they were started with.
+                                if let Some(credential) = &data.agent {
+                                    let (agent, spawned_by) = match &request.launch.agent {
+                                        AgentLaunch::Local { resume, spawned_by } => {
+                                            (resume.as_ref(), *spawned_by)
+                                        }
+                                        _ => (None, None),
+                                    };
+                                    agents.adopt(
+                                        request.pane,
+                                        request.generation,
+                                        credential,
+                                        agent,
+                                        spawned_by,
+                                        request.wake.clone(),
+                                    );
+                                }
+                                return Ok(Entry {
+                                    generation: request.generation,
+                                    session,
+                                    control: kept_control(kept, &reference, data),
+                                    reference: Some(reference),
+                                });
+                            }
+                            // A kept session's control socket lives with it;
+                            // otherwise it goes with Neptune.
                             let mut control = None;
                             if request.launch.ssh_control && cfg!(unix) {
-                                let directory = tempfile::Builder::new()
-                                    .prefix("neptune-ssh-")
-                                    .tempdir()
-                                    .map_err(|_| {
-                                        "Could not prepare SSH connection sharing".to_owned()
-                                    })?;
-                                let path = directory.path().join("control");
+                                const FAILED: &str = "Could not prepare SSH connection sharing";
+                                reserved = match &request.kept {
+                                    Some(kept) => SshControl::reserve(&kept.ssh_directory())
+                                        .map_err(|_| FAILED.to_owned())?,
+                                    None => None,
+                                };
+                                let path = match &reserved {
+                                    Some(path) => path.clone(),
+                                    None => {
+                                        let private = Arc::new(
+                                            SshControl::private().map_err(|_| FAILED.to_owned())?,
+                                        );
+                                        let path = private.path().to_owned();
+                                        control = Some(private);
+                                        path
+                                    }
+                                };
                                 request.launch.terminal.args.splice(
                                     0..0,
                                     [
@@ -182,11 +261,11 @@ impl SessionManager {
                                         format!("ControlPath={}", path.display()),
                                     ],
                                 );
-                                control = Some(Arc::new(directory));
                             }
+                            let mut credential = None;
                             if let AgentLaunch::Local { resume, spawned_by } = &request.launch.agent
                             {
-                                agents
+                                credential = agents
                                     .prepare(
                                         request.pane,
                                         request.generation,
@@ -198,7 +277,7 @@ impl SessionManager {
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
                             }
                             if matches!(request.launch.agent, AgentLaunch::Remote) {
-                                agents
+                                credential = agents
                                     .prepare_remote(
                                         request.pane,
                                         request.generation,
@@ -207,14 +286,46 @@ impl SessionManager {
                                     )
                                     .map_err(|_| "Agent integration could not start".to_owned())?;
                             }
-                            TerminalSession::spawn(request.launch.terminal, request.wake.clone())
-                                .map(|session| Entry {
-                                    generation: request.generation,
-                                    session,
-                                    control,
-                                })
-                                .map_err(|error| format!("{error:#}"))
+                            let (session, reference) = match &request.kept {
+                                Some(kept) => {
+                                    let (session, reference) =
+                                        kept.start(request.launch.terminal, request.wake.clone())?;
+                                    let data = SessionData {
+                                        agent: credential,
+                                        ssh: reserved.clone().map(|control| SshData {
+                                            control,
+                                            forwards: Vec::new(),
+                                        }),
+                                    };
+                                    if data != SessionData::default() {
+                                        // Without it, the session still runs; only its
+                                        // agents go unrecognized and its forwards
+                                        // unlisted after a reattach.
+                                        let _ = kept.set_data(&reference, &data);
+                                    }
+                                    control =
+                                        control.or_else(|| kept_control(kept, &reference, data));
+                                    (session, Some(reference))
+                                }
+                                None => TerminalSession::spawn(
+                                    request.launch.terminal,
+                                    request.wake.clone(),
+                                )
+                                .map(|session| (session, None))
+                                .map_err(|error| format!("{error:#}"))?,
+                            };
+                            Ok(Entry {
+                                generation: request.generation,
+                                session,
+                                control,
+                                reference,
+                            })
                         })();
+                        if result.is_err()
+                            && let Some(directory) = reserved.as_deref().and_then(|s| s.parent())
+                        {
+                            let _ = std::fs::remove_dir_all(directory);
+                        }
                         if sender
                             .send(Completion {
                                 pane: request.pane,
@@ -245,7 +356,24 @@ impl SessionManager {
             in_flight: BTreeMap::new(),
             diagnostics,
             agents,
+            kept: None,
+            detached: BTreeSet::new(),
+            cleanup: None,
         }
+    }
+    /// From now on, start and attach terminals in the session daemon `kept`
+    /// reaches, so that they outlive Neptune. It connects at once, off the
+    /// frame, so that a newer launch can take over before any terminal starts.
+    pub fn keep_sessions(&mut self, kept: KeptSessions) {
+        let kept = Arc::new(kept);
+        let connecting = kept.clone();
+        let _ = thread::Builder::new()
+            .name("neptune-kept-sessions".into())
+            .spawn(move || {
+                // Failing now, it connects when a terminal starts.
+                let _ = connecting.connect_now();
+            });
+        self.kept = Some(kept);
     }
     pub fn policy(&self) -> &ResourcePolicy {
         &self.policy
@@ -253,7 +381,7 @@ impl SessionManager {
     pub fn get(&self, pane: PaneId) -> Option<&TerminalSession> {
         self.live.get(&pane).map(|entry| &entry.session)
     }
-    pub fn ssh_control(&self, pane: PaneId) -> Option<Arc<tempfile::TempDir>> {
+    pub fn ssh_control(&self, pane: PaneId) -> Option<Arc<SshControl>> {
         self.live.get(&pane).and_then(|entry| entry.control.clone())
     }
     pub fn generation(&self, pane: PaneId) -> Option<u64> {
@@ -328,7 +456,7 @@ impl SessionManager {
                 generation: old.generation,
                 session: old.session,
                 since: Instant::now(),
-                _control: old.control,
+                control: old.control,
             });
         }
         let request = Request {
@@ -336,6 +464,7 @@ impl SessionManager {
             generation,
             launch,
             wake,
+            kept: self.kept.clone(),
         };
         if count >= self.policy.max_sessions || self.in_flight.keys().any(|(id, _)| *id == pane) {
             self.deferred.insert(pane, request);
@@ -412,16 +541,72 @@ impl SessionManager {
                 generation: entry.generation,
                 session: entry.session,
                 since: Instant::now(),
-                _control: entry.control,
+                control: entry.control,
             });
         }
     }
+    /// Let go of a pane's kept session without ending it, as Neptune quits.
+    /// A start or reattach still under way is let go of when it completes.
+    /// A session that runs in Neptune closes.
+    pub fn detach(&mut self, pane: PaneId) {
+        if self
+            .live
+            .get(&pane)
+            .is_some_and(|entry| entry.reference.is_none())
+        {
+            return self.close(pane);
+        }
+        self.desired.remove(&pane);
+        self.cancel_pending(pane);
+        // Dropping a daemon-backed handle detaches it.
+        self.live.remove(&pane);
+        self.detached
+            .extend(self.in_flight.keys().filter(|(id, _)| *id == pane).copied());
+    }
+    /// Let go of every kept session, those still starting or reattaching
+    /// too, as a launch that was taken over closes.
+    pub fn detach_all(&mut self) {
+        let panes: Vec<_> = self.desired.keys().copied().collect();
+        for pane in panes {
+            self.detach(pane);
+        }
+    }
     fn reap(&mut self) {
-        self.closing.retain(|closing| {
+        let mut controls = Vec::new();
+        self.closing.retain_mut(|closing| {
             let pending = closing.session.metrics().active_workers != 0;
+            if !pending && let Some(control) = closing.control.take() {
+                controls.push(control);
+            }
             if !pending && self.diagnostics { eprintln!("{}", serde_json::json!({"operation":"cleanup","pane":closing.pane.get(),"session_generation":closing.generation,"elapsed_ms":closing.since.elapsed().as_secs_f64()*1000.0})); }
             pending
         });
+        for control in controls {
+            self.remove_later(control);
+        }
+    }
+    /// A kept session's control socket outlives Neptune, but not its close.
+    /// Its folder is removed on a worker, never on the frame.
+    fn remove_later(&mut self, control: Arc<SshControl>) {
+        if self.cleanup.is_none() {
+            let (sender, controls) = mpsc::channel::<Arc<SshControl>>();
+            if thread::Builder::new()
+                .name("neptune-ssh-cleanup".into())
+                .spawn(move || {
+                    for control in controls {
+                        control.remove();
+                    }
+                })
+                .is_ok()
+            {
+                self.cleanup = Some(sender);
+            }
+        }
+        // Without the worker, the folder stays until the next launch
+        // removes it.
+        if let Some(cleanup) = &self.cleanup {
+            let _ = cleanup.send(control);
+        }
     }
     pub fn poll(&mut self) -> Vec<SessionCompletion> {
         self.reap();
@@ -429,6 +614,12 @@ impl SessionManager {
         while let Ok(completion) = self.completions.try_recv() {
             self.in_flight
                 .remove(&(completion.pane, completion.generation));
+            if self
+                .detached
+                .remove(&(completion.pane, completion.generation))
+            {
+                continue;
+            }
             if self.desired.get(&completion.pane) != Some(&completion.generation) {
                 self.agents
                     .close_generation(completion.pane, completion.generation);
@@ -439,18 +630,20 @@ impl SessionManager {
                         generation: completion.generation,
                         session: entry.session,
                         since: Instant::now(),
-                        _control: entry.control,
+                        control: entry.control,
                     });
                 }
                 continue;
             }
             match completion.result {
                 Ok(entry) => {
+                    let session = entry.reference.clone();
                     self.live.insert(completion.pane, entry);
                     events.push(SessionCompletion::Started {
                         pane: completion.pane,
                         generation: completion.generation,
                         elapsed: completion.elapsed,
+                        session,
                     });
                 }
                 Err(message) => {
@@ -545,6 +738,36 @@ impl SessionManager {
         }
     }
 }
+/// A kept SSH terminal's control socket, as recorded with its session. Each
+/// change to the forwards made through it is kept with the session too.
+fn kept_control(
+    kept: &Arc<KeptSessions>,
+    reference: &SessionRef,
+    data: SessionData,
+) -> Option<Arc<SshControl>> {
+    let ssh = data.ssh.clone()?;
+    // Only a socket in a directory of Neptune's own is ever removed.
+    let directory = ssh.control.parent()?;
+    if directory.parent() != Some(kept.ssh_directory().as_path()) {
+        return None;
+    }
+    let (kept, reference, data) = (kept.clone(), reference.clone(), Mutex::new(data));
+    SshControl::kept(
+        ssh.control,
+        ssh.forwards,
+        Box::new(move |forwards| {
+            let Ok(mut data) = data.lock() else {
+                return;
+            };
+            if let Some(ssh) = &mut data.ssh {
+                ssh.forwards = forwards.to_vec();
+            }
+            let _ = kept.set_data(&reference, &data);
+        }),
+    )
+    .map(Arc::new)
+}
+
 impl Drop for SessionManager {
     fn drop(&mut self) {
         self.shutdown(Duration::from_secs(2));
@@ -612,6 +835,616 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
     }
+    /// A session daemon serving a temporary directory, on a thread of this
+    /// test. It exits shortly after its last session and client are gone.
+    fn daemon() -> (tempfile::TempDir, std::path::PathBuf, Daemon) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = super::super::kept_sessions::directory(root.path());
+        let daemon = daemon_of(&dir, terminal_core::daemon::PROTOCOL_VERSION);
+        (root, dir, daemon)
+    }
+    type Daemon = thread::JoinHandle<Result<(), terminal_core::SessionError>>;
+    /// A session daemon of `version` serving `dir`, which exits shortly
+    /// after its last session and client are gone.
+    fn daemon_of(dir: &std::path::Path, version: u32) -> Daemon {
+        terminal_core::daemon::simulated::spawn(
+            dir,
+            terminal_core::daemon::DaemonOptions {
+                idle_exit: Duration::from_millis(200),
+                ..Default::default()
+            },
+            version,
+        )
+    }
+    fn kept(dir: &std::path::Path) -> SessionManager {
+        let mut manager = SessionManager::new(policy(), false);
+        manager.keep_sessions(super::super::kept_sessions::KeptSessions::new(
+            dir.into(),
+            None,
+            Default::default(),
+        ));
+        manager
+    }
+    fn started(events: &[SessionCompletion]) -> Option<Option<SessionRef>> {
+        events.first().map(|event| match event {
+            SessionCompletion::Started { session, .. } => session.clone(),
+            SessionCompletion::Failed { message, .. } => panic!("{message}"),
+        })
+    }
+    fn listed(dir: &std::path::Path) -> Vec<(String, terminal_core::SessionStatus)> {
+        terminal_core::daemon::DaemonClient::connect(dir)
+            .unwrap()
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.id.to_string(), entry.status))
+            .collect()
+    }
+    fn activity(manager: &SessionManager, pane: PaneId) -> terminal_core::ProcessActivity {
+        manager
+            .get(pane)
+            .unwrap()
+            .check_process_activity()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+    }
+
+    #[test]
+    fn kept_sessions_outlive_their_manager_reattach_and_end_on_close() {
+        let (_root, dir, daemon) = daemon();
+        let pane = PaneId::new(1);
+        let wake: Wake = Arc::new(|| {});
+        let mut first = kept(&dir);
+        first
+            .start(pane, 1, false, options(), wake.clone())
+            .unwrap();
+        let mut reference = None;
+        until(&mut first, |manager, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some()
+                && manager
+                    .get(pane)
+                    .is_some_and(|session| session.screen_text().contains("READY"))
+        });
+        let reference = reference.unwrap().expect("a kept session has a reference");
+        // Its shell has a program running, which a close would stop.
+        assert_eq!(
+            activity(&first, pane),
+            terminal_core::ProcessActivity::Running
+        );
+        first.detach(pane);
+        assert!(first.shutdown(Duration::from_secs(2)));
+        drop(first);
+        assert_eq!(
+            listed(&dir),
+            vec![(reference.id.clone(), terminal_core::SessionStatus::Running)]
+        );
+
+        let mut second = kept(&dir);
+        second
+            .start(
+                pane,
+                1,
+                false,
+                SessionLaunch {
+                    attach: Some(reference.clone()),
+                    ..options().into()
+                },
+                wake.clone(),
+            )
+            .unwrap();
+        let mut attached = None;
+        until(&mut second, |manager, events| {
+            attached = attached.take().or_else(|| started(events));
+            attached.is_some()
+                && manager
+                    .get(pane)
+                    .is_some_and(|session| session.screen_text().contains("READY"))
+        });
+        assert_eq!(attached, Some(Some(reference)));
+        second.close(pane);
+        until(&mut second, |manager, _| manager.usage().closing == 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !listed(&dir).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "closing left the session running"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(second);
+        daemon.join().unwrap().unwrap();
+    }
+
+    /// A kept SSH terminal's control socket lives with its session: it
+    /// outlives the manager that started it, comes back with the forwards
+    /// made through it on reattach, and goes when the session closes.
+    #[test]
+    fn a_kept_ssh_terminals_control_socket_outlives_neptune_and_goes_with_close() {
+        use super::super::ssh_control::KeptForward;
+        use std::os::unix::fs::PermissionsExt;
+        let (root, dir, daemon) = daemon();
+        // An ssh stand-in that listens where it is told to, as a master.
+        let client = root.path().join("ssh");
+        std::fs::write(
+            &client,
+            "#!/bin/sh\nwhile [ \"$1\" = -o ]; do case \"$2\" in ControlPath=*) : > \"${2#ControlPath=}\";; esac; shift 2; done\nprintf 'READY\\r\\n'\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pane = PaneId::new(1);
+        let wake: Wake = Arc::new(|| {});
+        let launch = |attach: Option<SessionRef>| SessionLaunch {
+            terminal: SessionOptions {
+                shell: Some(client.to_str().unwrap().into()),
+                args: Vec::new(),
+                ..options()
+            },
+            agent: AgentLaunch::Disabled,
+            ssh_control: attach.is_none(),
+            attach,
+        };
+        let ready = |manager: &SessionManager| {
+            manager
+                .get(pane)
+                .is_some_and(|session| session.screen_text().contains("READY"))
+        };
+        let mut first = kept(&dir);
+        first
+            .start(pane, 1, false, launch(None), wake.clone())
+            .unwrap();
+        let mut reference = None;
+        until(&mut first, |manager, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some() && ready(manager)
+        });
+        let reference = reference.unwrap().unwrap();
+        let control = first.ssh_control(pane).unwrap();
+        let socket = control.path().to_owned();
+        assert_eq!(socket.parent().unwrap().parent(), Some(dir.as_path()));
+        assert!(socket.exists());
+        let forward = KeptForward {
+            listener: crate::platform::ports::Listener {
+                address: std::net::Ipv4Addr::LOCALHOST.into(),
+                port: 3000,
+            },
+            local: 4000,
+        };
+        control.record(&[forward]);
+        drop(control);
+        first.detach(pane);
+        assert!(first.shutdown(Duration::from_secs(2)));
+        drop(first);
+        assert!(
+            socket.exists(),
+            "Neptune quitting removed the control socket"
+        );
+
+        let mut second = kept(&dir);
+        second
+            .start(pane, 2, false, launch(Some(reference)), wake.clone())
+            .unwrap();
+        until(&mut second, |manager, _| ready(manager));
+        let control = second.ssh_control(pane).unwrap();
+        assert_eq!(control.path(), socket);
+        assert_eq!(control.forwards(), [forward]);
+        drop(control);
+        second.close(pane);
+        until(&mut second, |manager, _| manager.usage().closing == 0);
+        // It goes on a worker, after the session has closed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while socket.parent().unwrap().exists() {
+            assert!(Instant::now() < deadline, "closing left the control socket");
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(second);
+        daemon.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_kept_terminals_agents_reach_the_launch_that_reattaches_it() {
+        use super::super::agents::{Event, Signal, exchange_with};
+        let (root, dir, daemon) = daemon();
+        let bridge = root.path().join("agents");
+        let pane = PaneId::new(1);
+        let wake: Wake = Arc::new(|| {});
+        let terminal = SessionOptions {
+            args: vec![
+                "-c".into(),
+                "printf 'AT=%s\\r\\nAS=%s\\r\\n' \"$NEPTUNE_AGENT_ENDPOINT\" \"$NEPTUNE_AGENT_TOKEN\"; sleep 30"
+                    .into(),
+            ],
+            ..options()
+        };
+        let launch = |resume, attach| SessionLaunch {
+            terminal: terminal.clone(),
+            agent: AgentLaunch::Local {
+                resume,
+                spawned_by: None,
+            },
+            ssh_control: false,
+            attach,
+        };
+        let mut first = kept(&dir);
+        first.agents().listen_in(bridge.clone(), Arc::new(|| false));
+        first
+            .start(pane, 1, false, launch(None, None), wake.clone())
+            .unwrap();
+        let mut reference = None;
+        until(&mut first, |manager, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some()
+                && manager
+                    .get(pane)
+                    .is_some_and(|session| session.screen_text().contains("AS="))
+        });
+        let reference = reference.unwrap().unwrap();
+        let screen = first.get(pane).unwrap().screen_text();
+        let shown = |name: &str| {
+            screen
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(name))
+                .unwrap()
+                .to_owned()
+        };
+        let (endpoint, token) = (shown("AT="), shown("AS="));
+        assert_eq!(std::path::Path::new(&endpoint), bridge.join("bridge.sock"));
+        first.detach(pane);
+        assert!(first.shutdown(Duration::from_secs(2)));
+        drop(first);
+        // Its startup workers let go of the bridge as they stop; Neptune's
+        // own process would have exited.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&endpoint).exists() {
+            assert!(Instant::now() < deadline, "the bridge outlived its launch");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let tool = || Event::Activity {
+            signal: Signal::Tool,
+        };
+        // While Neptune is closed, its agents are not heard, and not held up.
+        let asked = Instant::now();
+        assert!(exchange_with(&endpoint, &token, tool(), "a").is_err());
+        assert!(asked.elapsed() < Duration::from_secs(1));
+
+        // The next launch knows the agent it saved from its next hook.
+        let saved = neptune_model::AgentSession {
+            kind: neptune_model::AgentKind::Claude,
+            session_id: Some("019a1234-5678-7000-8000-123456789abc".into()),
+            cwd: root.path().into(),
+        };
+        let mut second = kept(&dir);
+        second.agents().listen_in(bridge, Arc::new(|| false));
+        second
+            .start(
+                pane,
+                2,
+                false,
+                launch(Some(saved), Some(reference)),
+                wake.clone(),
+            )
+            .unwrap();
+        until(&mut second, |manager, _| manager.get(pane).is_some());
+        assert_eq!(
+            exchange_with(&endpoint, "guess", tool(), "a").unwrap(),
+            b"no"
+        );
+        assert_eq!(
+            exchange_with(&endpoint, &token, tool(), "a").unwrap(),
+            b"ok"
+        );
+        assert_eq!(
+            second.agent_activity(),
+            [(
+                pane,
+                2,
+                Some(crate::agent_activity::Activity::Working),
+                None
+            )]
+        );
+        second.close(pane);
+        until(&mut second, |manager, _| manager.usage().closing == 0);
+        drop(second);
+        daemon.join().unwrap().unwrap();
+    }
+
+    /// An update relaunch, as two builds whose protocol versions differ:
+    /// the later one reattaches the earlier daemon's session, starts new
+    /// terminals in a daemon of its own version, counts every attached
+    /// session against its limits, and the earlier daemon exits once its
+    /// last session closes.
+    #[test]
+    fn an_update_reattaches_the_earlier_daemons_sessions_and_starts_new_ones_in_its_own() {
+        use super::super::kept_sessions::KeptSessions;
+        use terminal_core::daemon::{DaemonClient, PROTOCOL_VERSION};
+        let (_root, dir, earlier_daemon) = daemon();
+        // The earlier build kept a session whose history its budget allowed.
+        let earlier = DaemonClient::connect(&dir).unwrap();
+        let (session, id) = earlier
+            .start(
+                SessionOptions {
+                    args: vec![
+                        "-c".into(),
+                        "i=0; while [ $i -lt 300 ]; do echo line$i; i=$((i+1)); done; printf 'READY\\r\\n'; sleep 30".into(),
+                    ],
+                    scrollback: 1000,
+                    ..options()
+                },
+                Arc::new(|| {}),
+            )
+            .unwrap();
+        drop(session);
+        drop(earlier);
+        let kept = SessionRef {
+            daemon: PROTOCOL_VERSION,
+            id: id.to_string(),
+        };
+
+        // The update speaks a later version, and attaches to the earlier one.
+        let later = PROTOCOL_VERSION + 1;
+        let later_daemon = daemon_of(&dir, later);
+        let sessions = KeptSessions::with_versions(dir.clone(), later, &[PROTOCOL_VERSION]);
+        assert_eq!(
+            sessions.live(),
+            super::super::kept_sessions::Live {
+                sessions: vec![kept.clone()],
+                unlisted: Vec::new(),
+            }
+        );
+        let mut manager = SessionManager::new(
+            ResourcePolicy {
+                max_sessions: 2,
+                ..policy()
+            },
+            false,
+        );
+        manager.keep_sessions(sessions);
+        let wake: Wake = Arc::new(|| {});
+        let (reattached, opened) = (PaneId::new(1), PaneId::new(2));
+        manager
+            .start(
+                reattached,
+                1,
+                false,
+                SessionLaunch {
+                    attach: Some(kept.clone()),
+                    ..options().into()
+                },
+                wake.clone(),
+            )
+            .unwrap();
+        manager
+            .start(opened, 1, false, options(), wake.clone())
+            .unwrap();
+        let mut references = BTreeMap::new();
+        until(&mut manager, |manager, events| {
+            for event in events {
+                match event {
+                    SessionCompletion::Started { pane, session, .. } => {
+                        references.insert(*pane, session.clone());
+                    }
+                    SessionCompletion::Failed { message, .. } => panic!("{message}"),
+                }
+            }
+            [reattached, opened].iter().all(|pane| {
+                manager
+                    .get(*pane)
+                    .is_some_and(|session| session.screen_text().contains("READY"))
+            })
+        });
+        assert_eq!(references[&reattached], Some(kept.clone()));
+        let fresh = references[&opened].clone().unwrap();
+        assert_eq!(fresh.daemon, later);
+        // Both count against the limits, whichever daemon runs them.
+        assert_eq!(manager.usage().running, 2);
+        assert!(
+            manager
+                .start(PaneId::new(3), 1, false, options(), wake.clone())
+                .unwrap_err()
+                .starts_with("Up to 2 sessions")
+        );
+        // The reattached terminal keeps only the history this launch's
+        // budget allows, though the earlier build kept more.
+        let allowed = manager.history_limit(80, 12, usize::MAX);
+        let history = manager.get(reattached).unwrap().history_size();
+        assert!(
+            history <= allowed,
+            "{history} lines of history, {allowed} allowed"
+        );
+
+        // Closing the earlier daemon's last session lets it exit, while the
+        // later daemon keeps serving.
+        manager.close(reattached);
+        until(&mut manager, |manager, _| manager.usage().closing == 0);
+        earlier_daemon.join().unwrap().unwrap();
+        assert_eq!(listed_in(&dir, later), vec![fresh.id.clone()]);
+        manager.detach(opened);
+        drop(manager);
+        assert_eq!(listed_in(&dir, later), vec![fresh.id.clone()]);
+        let ended = KeptSessions::with_versions(dir.clone(), later, &[PROTOCOL_VERSION]);
+        ended.end_all().unwrap();
+        drop(ended);
+        later_daemon.join().unwrap().unwrap();
+    }
+
+    /// An earlier build still open when the updated one launches gives way,
+    /// though it holds only its own version's daemon, and that daemon still
+    /// exits once it has no session.
+    #[test]
+    fn an_updated_launch_takes_over_from_an_earlier_build_still_open() {
+        use super::super::kept_sessions::Claim;
+        use terminal_core::daemon::PROTOCOL_VERSION;
+        let (_root, dir, earlier_daemon) = daemon();
+        let earlier = Claim::default();
+        earlier.take_over_running(&dir).unwrap();
+        assert!(!earlier.replaced());
+
+        let later = PROTOCOL_VERSION + 1;
+        let later_daemon = daemon_of(&dir, later);
+        let claim = Claim::default();
+        claim
+            .take_over_versions(&dir, later, &[PROTOCOL_VERSION])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !earlier.replaced() {
+            assert!(
+                Instant::now() < deadline,
+                "the earlier build was never told"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!claim.replaced());
+        // The earlier build exits; nothing holds its daemon any more.
+        drop(earlier);
+        earlier_daemon.join().unwrap().unwrap();
+        drop(claim);
+        later_daemon.join().unwrap().unwrap();
+    }
+
+    /// A daemon of an earlier version that answers with another version
+    /// can't be asked; the sessions of the others are still found, and
+    /// nothing is removed while it is unknown what runs.
+    #[test]
+    fn a_daemon_that_cant_be_asked_holds_back_neither_the_others_nor_their_sessions() {
+        use super::super::kept_sessions::{KeptSessions, Live};
+        use terminal_core::daemon::{DaemonClient, PROTOCOL_VERSION};
+        let (root, dir, daemon) = daemon();
+        let client = DaemonClient::connect(&dir).unwrap();
+        let (session, id) = client.start(options(), Arc::new(|| {})).unwrap();
+        drop(session);
+        let stray = dir.join("abcd");
+        std::fs::create_dir(&stray).unwrap();
+        // An earlier version listens, but this build's client can't speak
+        // it, so asking that daemon fails.
+        const EARLIER: &[u32] = &[7];
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("v7")).unwrap();
+        let sessions = KeptSessions::with_versions(dir.clone(), PROTOCOL_VERSION, EARLIER);
+        assert_eq!(
+            sessions.live(),
+            Live {
+                sessions: vec![SessionRef {
+                    daemon: PROTOCOL_VERSION,
+                    id: id.to_string(),
+                }],
+                unlisted: vec![7],
+            }
+        );
+        assert!(stray.exists(), "removed while some sessions were unknown");
+        client.close(id).unwrap();
+        drop((client, sessions, root));
+        daemon.join().unwrap().unwrap();
+    }
+
+    /// SSH control folders that no running session refers to, left by a
+    /// logout or a session that ended unseen, go once the sessions are known.
+    #[test]
+    fn startup_removes_the_ssh_control_folders_no_session_refers_to() {
+        use super::super::kept_sessions::{SessionData, SshData, live};
+        let (_root, dir, daemon) = daemon();
+        let mut manager = kept(&dir);
+        let pane = PaneId::new(1);
+        manager
+            .start(pane, 1, false, options(), Arc::new(|| {}))
+            .unwrap();
+        let mut reference = None;
+        until(&mut manager, |_, events| {
+            reference = reference.take().or_else(|| started(events));
+            reference.is_some()
+        });
+        let reference = reference.unwrap().unwrap();
+        let kept_folder = SshControl::reserve(&dir).unwrap().unwrap();
+        // Asked on a connection of its own: another launch's claim would
+        // take the daemon over from the manager.
+        let data = SessionData {
+            agent: None,
+            ssh: Some(SshData {
+                control: kept_folder.clone(),
+                forwards: Vec::new(),
+            }),
+        };
+        terminal_core::daemon::DaemonClient::connect(&dir)
+            .unwrap()
+            .set_data(
+                reference.id.parse().unwrap(),
+                &serde_json::to_vec(&data).unwrap(),
+            )
+            .unwrap();
+        let stale = SshControl::reserve(&dir).unwrap().unwrap();
+        std::fs::write(&stale, b"").unwrap();
+        let found = live(&dir);
+        assert_eq!(found.sessions, [reference]);
+        assert!(kept_folder.parent().unwrap().exists());
+        assert!(!stale.parent().unwrap().exists());
+        // The daemons' own files stay.
+        assert!(
+            dir.join(format!("v{}", terminal_core::daemon::PROTOCOL_VERSION))
+                .exists()
+        );
+        manager.close(pane);
+        until(&mut manager, |manager, _| manager.usage().closing == 0);
+        drop(manager);
+        daemon.join().unwrap().unwrap();
+    }
+
+    /// A launch that keeps sessions holds the daemon as soon as it does,
+    /// before any terminal starts, so a newer launch always reaches it.
+    #[test]
+    fn keeping_sessions_takes_over_the_daemon_before_any_terminal_starts() {
+        use super::super::kept_sessions::{Claim, KeptSessions};
+        let (_root, dir, daemon) = daemon();
+        let earlier = Claim::default();
+        earlier.take_over_running(&dir).unwrap();
+        let mut manager = SessionManager::new(policy(), false);
+        manager.keep_sessions(KeptSessions::new(
+            dir.clone(),
+            None,
+            Arc::new(Claim::default()),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !earlier.replaced() {
+            assert!(
+                Instant::now() < deadline,
+                "the earlier launch was never told"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop((manager, earlier));
+        daemon.join().unwrap().unwrap();
+    }
+
+    fn listed_in(dir: &std::path::Path, version: u32) -> Vec<String> {
+        terminal_core::daemon::DaemonClient::connect_to(dir, version)
+            .unwrap()
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_kept_shell_at_its_prompt_is_idle() {
+        let (_root, dir, daemon) = daemon();
+        let pane = PaneId::new(1);
+        let mut manager = kept(&dir);
+        let shell = SessionOptions {
+            shell: Some("/bin/sh".into()),
+            args: Vec::new(),
+            ..options()
+        };
+        manager
+            .start(pane, 1, false, shell, Arc::new(|| {}))
+            .unwrap();
+        until(&mut manager, |manager, _| manager.get(pane).is_some());
+        assert_eq!(
+            activity(&manager, pane),
+            terminal_core::ProcessActivity::Idle
+        );
+        assert!(manager.shutdown(Duration::from_secs(2)));
+        drop(manager);
+        daemon.join().unwrap().unwrap();
+    }
+
     #[test]
     fn aggregate_history_policy_accounts_for_both_visible_grids() {
         let manager = SessionManager::new(policy(), false);

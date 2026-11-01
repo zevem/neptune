@@ -64,9 +64,16 @@ sha1 = "0.10"
 winresource = { version = "0.1.31", default-features = false }
 
 [dev-dependencies]
+# Kept-session tests run daemons of two protocol versions side by side.
+terminal-core = { path = "crates/terminal-core", features = ["simulated-daemon-versions"] }
 # Already Neptune's window backend. Allows the Linux native visual test to run
 # its event loop on the Rust test thread, without a production fixture switch.
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
+
+[target.'cfg(unix)'.dependencies]
+# Already part of the dependency tree. The session daemon leaves the session
+# of whatever launched Neptune.
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
@@ -98,6 +105,9 @@ strip = "debuginfo"
 
 [profile.dev]
 opt-level = 1
+# Line tables keep file:line in backtraces while compiling and linking faster
+# than full debuginfo. Debuggers cannot inspect locals in these builds.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2

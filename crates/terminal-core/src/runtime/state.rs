@@ -1,6 +1,7 @@
-//! Session synchronization and bounded event delivery. Lock ordering: config, terminal, prompt/size; viewport extraction locks terminal then its cache.
+//! Session synchronization and bounded event delivery. Lock ordering: config, terminal, parser, prompt/size/metadata; viewport extraction locks terminal then its cache.
 use super::*;
 use alacritty_terminal::event::{Event, WindowSize};
+use parking_lot::Condvar;
 use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,8 +45,33 @@ impl Size {
 }
 
 pub(super) enum Input {
+    /// Bytes typed or pasted into the session.
     Write(Vec<u8>),
+    /// Bytes the engine generated in answer to the program's output.
+    Reply(Vec<u8>),
     Resize(Size),
+    /// The pane's focus, for a session whose program another engine answers.
+    Focus(bool),
+    /// The history limit and palette of a replica, for the engine that
+    /// answers its program.
+    Scrollback(usize),
+    Color(usize, crate::Rgb),
+    /// Make the program redraw its screen, as after a resize.
+    Redraw,
+}
+
+impl Input {
+    /// Bytes counted against the pending input budget.
+    pub(super) fn queued_bytes(&self) -> usize {
+        match self {
+            Input::Write(bytes) | Input::Reply(bytes) => bytes.len(),
+            Input::Resize(_)
+            | Input::Focus(_)
+            | Input::Scrollback(_)
+            | Input::Color(..)
+            | Input::Redraw => 0,
+        }
+    }
 }
 
 pub(super) enum Output {
@@ -82,6 +108,14 @@ pub(super) struct Shared {
     pub(super) snapshot_rows: AtomicU64,
     pub(super) snapshot_count: AtomicU64,
     pub(super) shutdown_started: Mutex<Option<Instant>>,
+    /// Another engine (the session daemon's) is authoritative for the program;
+    /// this one is its replica. Set once, before the workers start.
+    pub(super) replica: AtomicBool,
+    /// A replica stopping because its handle was dropped leaves the program running.
+    pub(super) detached: AtomicBool,
+    pub(super) output_tap: Mutex<OutputTap>,
+    /// Locked after the terminal, by the engine and by snapshots.
+    pub(super) parser: Mutex<Parser>,
 }
 
 impl Shared {
@@ -119,6 +153,10 @@ impl Shared {
             snapshot_rows: AtomicU64::new(0),
             snapshot_count: AtomicU64::new(0),
             shutdown_started: Mutex::new(None),
+            replica: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
+            output_tap: Mutex::new(OutputTap::default()),
+            parser: Mutex::new(Parser::default()),
         }
     }
 
@@ -127,10 +165,7 @@ impl Shared {
         sender: &SyncSender<Input>,
         input: Input,
     ) -> std::result::Result<(), SessionError> {
-        let bytes = match &input {
-            Input::Write(bytes) => bytes.len(),
-            Input::Resize(_) => 0,
-        };
+        let bytes = input.queued_bytes();
         if self
             .queued_input_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
@@ -216,7 +251,7 @@ impl Shared {
     }
 }
 
-/// PTY replies never run on the UI thread or recursively lock the terminal.
+/// Engine replies never run on the UI thread or recursively lock the terminal.
 #[derive(Clone)]
 pub(super) struct EventProxy {
     pub(super) shared: Arc<Shared>,
@@ -227,7 +262,7 @@ impl EventProxy {
     fn reply(&self, text: String) {
         if let Err(error) = self
             .shared
-            .enqueue(&self.input, Input::Write(text.into_bytes()))
+            .enqueue(&self.input, Input::Reply(text.into_bytes()))
         {
             self.shared.error(error);
         }
@@ -298,4 +333,133 @@ impl EventListener for EventProxy {
     }
 }
 
-pub(super) type Master = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+/// Where an authoritative engine copies the output it has parsed. Chunks are
+/// pushed under the terminal lock, so a snapshot taken under that lock and the
+/// chunks that follow it neither overlap nor leave a gap.
+#[derive(Default)]
+pub(super) struct OutputTap {
+    pub(super) subscriber: Option<Arc<Tap>>,
+    /// The engine has stopped; nothing more will be pushed.
+    pub(super) ended: bool,
+}
+
+impl OutputTap {
+    /// Replace any earlier subscriber, which is closed.
+    #[cfg(unix)]
+    pub(super) fn subscribe(&mut self) -> Arc<Tap> {
+        let tap = Arc::new(Tap::default());
+        if self.ended {
+            tap.end();
+        }
+        if let Some(earlier) = self.subscriber.replace(tap.clone()) {
+            earlier.close();
+        }
+        tap
+    }
+
+    #[cfg(unix)]
+    pub(super) fn unsubscribe(&mut self, tap: &Arc<Tap>) {
+        if self
+            .subscriber
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, tap))
+        {
+            self.subscriber = None;
+        }
+        tap.close();
+    }
+
+    pub(super) fn end(&mut self) {
+        self.ended = true;
+        if let Some(tap) = &self.subscriber {
+            tap.end();
+        }
+    }
+}
+
+/// Output queued for one attached client, drained by its connection writer.
+#[derive(Default)]
+pub(super) struct Tap {
+    state: Mutex<TapState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct TapState {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    ended: bool,
+    closed: bool,
+}
+
+#[cfg(unix)]
+pub(super) enum Tapped {
+    Bytes(Vec<u8>),
+    /// Every chunk was taken and the engine has stopped.
+    Ended,
+    /// The subscriber was replaced or went away.
+    Closed,
+}
+
+/// Queued output above which the engine waits for the client to catch up, so
+/// a slow client applies backpressure to the program as a local pane does.
+pub(super) const TAP_HIGH_WATER: usize = 2 * READ_SIZE;
+
+impl Tap {
+    pub(super) fn push(&self, chunk: &[u8]) {
+        let mut state = self.state.lock();
+        if state.closed {
+            return;
+        }
+        state.bytes += chunk.len();
+        state.chunks.push_back(chunk.to_vec());
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    fn end(&self) {
+        self.state.lock().ended = true;
+        self.ready.notify_all();
+    }
+
+    #[cfg(unix)]
+    pub(super) fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.chunks.clear();
+        state.bytes = 0;
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    #[cfg(unix)]
+    pub(super) fn next(&self) -> Tapped {
+        let mut state = self.state.lock();
+        loop {
+            if state.closed {
+                return Tapped::Closed;
+            }
+            if let Some(chunk) = state.chunks.pop_front() {
+                state.bytes -= chunk.len();
+                drop(state);
+                self.ready.notify_all();
+                return Tapped::Bytes(chunk);
+            }
+            if state.ended {
+                return Tapped::Ended;
+            }
+            self.ready.wait(&mut state);
+        }
+    }
+
+    /// Called by the engine without the terminal lock.
+    pub(super) fn wait_for_room(&self, shared: &Shared) {
+        let mut state = self.state.lock();
+        while state.bytes > TAP_HIGH_WATER
+            && !state.closed
+            && !shared.stopped.load(Ordering::Acquire)
+        {
+            self.ready.wait_for(&mut state, Duration::from_millis(100));
+        }
+    }
+}

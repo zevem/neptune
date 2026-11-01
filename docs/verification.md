@@ -528,6 +528,58 @@ project field has the keyboard, operating-system keyboard input in general,
 screen-reader navigation of the tab, and idle cost while the Context segment
 re-reads its folder every two seconds.
 
+## Persistent sessions verification: 2026-11-01
+
+Keep terminals running after quit
+([ADR 0001](adr/0001-sessions-outlive-neptune-in-a-session-daemon.md)) was
+exercised with release builds of `4ded16d` that had the `inspection` feature
+enabled, compiled with the pinned rustc 1.97.1 and `--locked`:
+
+- **Linux:** Dell G15, Ubuntu 26.04, kernel 7.0.0-38, NVIDIA RTX 4060 Laptop
+  (driver 595.99.02, Vulkan), GNOME. Driven through X11 at scale 2.0, except
+  the Wayland case.
+- **macOS:** MacBook Air M1 (8 GB), macOS 26.5.2 (25F84). The binary was
+  launched directly from an ssh session and driven through the inspection
+  endpoint, plus `agent-desktop` for the operating-system quit.
+
+Every launch used a fresh `--data-root` with `/bin/sh` as the shell, and every
+process was tracked by pid. Checks read process tables, daemon sockets, saved
+state and the accessibility tree. Running-app screenshots of each state were
+reviewed.
+
+| Scenario | Linux | macOS |
+| --- | --- | --- |
+| Quit, closing the last window and `kill -9` reattach the same daemon and shell with no restore notice; End all ends both (macOS also quits through the OS) | Pass | Pass |
+| Update relaunch: the installed build is replaced while its daemon runs; the new build reattaches; a later daemon starts from the new build. macOS replaces the whole app bundle the way the updater does | Pass | Pass |
+| A full-screen program (vim, then `less`) redraws correctly after reattach | Pass | Pass |
+| Output written while Neptune was closed is in the terminal and found by Find | Pass | Pass |
+| A cursor-position query sent while closed is answered once, with no stray bytes | Pass | Pass |
+| A program that exits while closed shows its exit status and Restart after reattach | Pass | Pass |
+| Takeover: a second launch takes over; a frozen launch is taken over; another data root stays independent | Pass | **Fail**: a frozen launch, once taken over and resumed, hung while exiting in 4 of 6 attempts and kept its daemon alive after End all. Linux passed 6 of 6 |
+| Sessions the saved state doesn't name open in a Recovered sessions workspace | Pass | Pass |
+| A daemon killed while Neptune is open (panes end, Restart starts a new daemon, quit doesn't prompt) or closed (restore notice, fresh shells) | Pass | Pass |
+| An SSH port forward to the other machine keeps answering while Neptune is closed, is listed and answers after reattach, and stopping it from the palette closes its local listener | Pass | Pass |
+| A Claude Code pane keeps working while Neptune is closed; the agent bridge is gone while closed; the agents tab shows the agent again after its next hook | Pass | Pass (see below) |
+| Neptune launched from a terminal survives that terminal closing (bash; zsh on macOS); on Linux, stopping Neptune's systemd scope leaves the daemon in its own scope | Pass | Pass |
+| Changed screens: Preferences row (on, off, disabled while restore is off, applying on next launch), palette entries, the detaching quit and last-window sheets, End all with a running program, at full size and 640×600 | Pass | Pass |
+| Native Wayland | Pass | N/A |
+
+The macOS agent pane was started from ssh, where Claude Code cannot reach the
+login keychain, so it was signed out and ran no tools. Its reattach check
+submits a second prompt and waits for the agent's row, which is restored by the
+`UserPromptSubmit` hook. The Mac screen locked during that run, so its last
+screenshots are missing. The macOS takeover hang has a recorded `sample`: the
+main thread waits forever in the agent bridge listener's drop. The listener
+wakes itself through `<data root>/agents/bridge.sock`, a path the newer launch
+has already rebound.
+
+Not established: logout and reboot, which are expected to end every session;
+any Windows behaviour; a signed and notarized macOS bundle replaced by the real
+updater (the replacement used the updater's rename steps on a local bundle);
+agents other than Claude Code; and multi-display setups.
+Performance results are in
+[performance.md](performance.md#keep-terminals-running-after-quit-resource-cost).
+
 ## Historical visual acceptance
 
 The following acceptance record predates the architecture refactor. It is useful
@@ -581,6 +633,11 @@ and distributions for performance claims.
 
 Current scope excludes Kitty graphics and comprehensive complex-script shaping.
 Keyboard encoding also inherits egui's missing keypad identity, lock-state, and
-some physical/layout information. Workspace restoration launches new shells, or
-new SSH connections for a remote workspace; it does not restore live processes. Those boundaries must remain explicit in release
-notes until implementation and native verification expand them.
+some physical/layout information. Restoring workspaces with fresh sessions
+launches new shells, or new SSH connections for a remote workspace. Keeping
+sessions running after quit ([ADR 0001](adr/0001-sessions-outlive-neptune-in-a-session-daemon.md))
+preserves live processes only while their session daemon survives: nothing
+survives a logout or reboot, and Windows keeps fresh shells until its own path
+is built and verified. Those boundaries must remain explicit in release notes,
+which claim only the preservation that implementation and native verification
+on each platform establish.

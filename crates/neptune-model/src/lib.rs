@@ -8,6 +8,7 @@ mod ids;
 mod layout;
 mod project;
 mod remote;
+mod session;
 mod window;
 mod workspace;
 mod worktree;
@@ -20,6 +21,7 @@ pub use ids::{
 pub use layout::{Axis, Edge, FocusDirection, Layout};
 pub use project::{Project, ProjectKey, ProjectSpec};
 pub use remote::Remote;
+pub use session::{ReattachPlan, SessionRef};
 pub use window::{Window, WindowSpec};
 pub use workspace::{
     Error, Lifecycle, Limits, Model, Pane, PaneKind, PaneSpec, Workspace, WorkspaceSpec,

@@ -15,7 +15,7 @@ pub(super) fn selection_type(kind: view::SelectionType) -> SelectionType {
 fn point(point: Point) -> view::Point {
     view::Point::new(point.line.0, point.column.0)
 }
-fn color(color: alacritty_terminal::vte::ansi::Color) -> view::Color {
+pub(super) fn color(color: alacritty_terminal::vte::ansi::Color) -> view::Color {
     use alacritty_terminal::vte::ansi::{Color, NamedColor};
     match color {
         Color::Spec(rgb) => view::Color::Spec(view::Rgb {
@@ -57,7 +57,7 @@ fn color(color: alacritty_terminal::vte::ansi::Color) -> view::Color {
         }),
     }
 }
-fn cursor_shape(shape: alacritty_terminal::vte::ansi::CursorShape) -> view::CursorShape {
+pub(super) fn cursor_shape(shape: alacritty_terminal::vte::ansi::CursorShape) -> view::CursorShape {
     use alacritty_terminal::vte::ansi::CursorShape;
     match shape {
         CursorShape::Block => view::CursorShape::Block,
@@ -65,6 +65,60 @@ fn cursor_shape(shape: alacritty_terminal::vte::ansi::CursorShape) -> view::Curs
         CursorShape::Beam => view::CursorShape::Beam,
         CursorShape::HollowBlock => view::CursorShape::HollowBlock,
         CursorShape::Hidden => view::CursorShape::Hidden,
+    }
+}
+pub(super) fn backend_color(color: view::Color) -> alacritty_terminal::vte::ansi::Color {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    match color {
+        view::Color::Spec(rgb) => Color::Spec(Rgb {
+            r: rgb.r,
+            g: rgb.g,
+            b: rgb.b,
+        }),
+        view::Color::Indexed(index) => Color::Indexed(index),
+        view::Color::Named(named) => Color::Named(match named {
+            view::NamedColor::Black => NamedColor::Black,
+            view::NamedColor::Red => NamedColor::Red,
+            view::NamedColor::Green => NamedColor::Green,
+            view::NamedColor::Yellow => NamedColor::Yellow,
+            view::NamedColor::Blue => NamedColor::Blue,
+            view::NamedColor::Magenta => NamedColor::Magenta,
+            view::NamedColor::Cyan => NamedColor::Cyan,
+            view::NamedColor::White => NamedColor::White,
+            view::NamedColor::BrightBlack => NamedColor::BrightBlack,
+            view::NamedColor::BrightRed => NamedColor::BrightRed,
+            view::NamedColor::BrightGreen => NamedColor::BrightGreen,
+            view::NamedColor::BrightYellow => NamedColor::BrightYellow,
+            view::NamedColor::BrightBlue => NamedColor::BrightBlue,
+            view::NamedColor::BrightMagenta => NamedColor::BrightMagenta,
+            view::NamedColor::BrightCyan => NamedColor::BrightCyan,
+            view::NamedColor::BrightWhite => NamedColor::BrightWhite,
+            view::NamedColor::Foreground => NamedColor::Foreground,
+            view::NamedColor::Background => NamedColor::Background,
+            view::NamedColor::Cursor => NamedColor::Cursor,
+            view::NamedColor::DimBlack => NamedColor::DimBlack,
+            view::NamedColor::DimRed => NamedColor::DimRed,
+            view::NamedColor::DimGreen => NamedColor::DimGreen,
+            view::NamedColor::DimYellow => NamedColor::DimYellow,
+            view::NamedColor::DimBlue => NamedColor::DimBlue,
+            view::NamedColor::DimMagenta => NamedColor::DimMagenta,
+            view::NamedColor::DimCyan => NamedColor::DimCyan,
+            view::NamedColor::DimWhite => NamedColor::DimWhite,
+            view::NamedColor::BrightForeground => NamedColor::BrightForeground,
+            view::NamedColor::DimForeground => NamedColor::DimForeground,
+        }),
+    }
+}
+pub(super) fn backend_cursor_shape(
+    shape: view::CursorShape,
+) -> alacritty_terminal::vte::ansi::CursorShape {
+    use alacritty_terminal::vte::ansi::CursorShape;
+    match shape {
+        view::CursorShape::Block => CursorShape::Block,
+        view::CursorShape::Underline => CursorShape::Underline,
+        view::CursorShape::Beam => CursorShape::Beam,
+        view::CursorShape::HollowBlock => CursorShape::HollowBlock,
+        view::CursorShape::Hidden => CursorShape::Hidden,
     }
 }
 impl TerminalSession {
@@ -250,6 +304,13 @@ impl TerminalSession {
     }
     /// Update focus and send a report only when requested by the application.
     pub fn focus(&self, focused: bool) -> std::result::Result<(), crate::SessionError> {
+        if self.shared.replica.load(Ordering::Acquire) {
+            // The authoritative engine reports focus, including when a
+            // program enables reports later, so it needs every change.
+            self.terminal.lock().is_focused = focused;
+            self.shared.changed();
+            return self.shared.enqueue(&self.input, Input::Focus(focused));
+        }
         let reporting = {
             let mut terminal = self.terminal.lock();
             terminal.is_focused = focused;

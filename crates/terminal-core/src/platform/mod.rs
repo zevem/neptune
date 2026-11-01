@@ -3,9 +3,15 @@ use super::*;
 
 mod processes;
 pub(super) use processes::process_activity;
+#[cfg(unix)]
+pub(in crate::session) use processes::shell_activity;
 
 #[cfg(unix)]
-pub(super) fn poll_pty(fd: libc::c_int, events: libc::c_short, shared: &Shared) -> bool {
+pub(in crate::session) fn poll_pty(
+    fd: libc::c_int,
+    events: libc::c_short,
+    shared: &Shared,
+) -> bool {
     while !shared.stopped.load(Ordering::Acquire) {
         let mut descriptor = libc::pollfd {
             fd,
@@ -46,11 +52,11 @@ pub(super) fn close_conpty(master: &Master, shared: &Arc<Shared>) {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn process_cwd(pid: u32) -> Option<PathBuf> {
+pub(in crate::session) fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 #[cfg(not(target_os = "linux"))]
-pub(super) fn process_cwd(_pid: u32) -> Option<PathBuf> {
+pub(in crate::session) fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 

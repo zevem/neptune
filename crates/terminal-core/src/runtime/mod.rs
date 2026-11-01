@@ -1,12 +1,7 @@
-//! Bounded PTY transport and parser workers. No desktop thread performs process cleanup.
+//! Bounded reader, writer and parser workers over a session transport. No
+//! desktop thread performs process cleanup.
 use super::*;
-#[path = "../platform/mod.rs"]
-mod platform;
-#[cfg(windows)]
-use platform::close_conpty;
-#[cfg(unix)]
-use platform::poll_pty;
-use platform::process_cwd;
+use transport::{Process, Sink, Source, process_cwd, write_all};
 
 pub(super) struct Worker(Arc<Shared>);
 
@@ -47,11 +42,10 @@ impl Drop for Worker {
 }
 
 pub(super) fn read_loop(
-    mut reader: Box<dyn Read + Send>,
+    mut source: Box<dyn Source>,
     output: SyncSender<Output>,
     pool: Receiver<Vec<u8>>,
     shared: Arc<Shared>,
-    #[cfg(unix)] poll_fd: libc::c_int,
 ) {
     let mut buffer = vec![0; READ_SIZE];
     #[cfg(windows)]
@@ -61,7 +55,7 @@ pub(super) fn read_loop(
         if shared.stopped.load(Ordering::Acquire) {
             break;
         }
-        match reader.read(&mut buffer) {
+        match source.read(&mut buffer) {
             Ok(0) => {
                 let _ = output.send(Output::End);
                 break;
@@ -94,10 +88,14 @@ pub(super) fn read_loop(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            #[cfg(unix)]
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !poll_pty(poll_fd, libc::POLLIN, &shared) {
-                    break;
+                match source.wait_readable(&shared) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        let _ = output.send(Output::Error(error));
+                        break;
+                    }
                 }
             }
             Err(error) => {
@@ -108,53 +106,24 @@ pub(super) fn read_loop(
     }
 }
 
-pub(super) fn write_loop(
-    mut writer: Box<dyn Write + Send>,
-    input: Receiver<Input>,
-    master: Master,
-    shared: Arc<Shared>,
-    #[cfg(unix)] poll_fd: libc::c_int,
-) {
+pub(super) fn write_loop(mut sink: Box<dyn Sink>, input: Receiver<Input>, shared: Arc<Shared>) {
     while !shared.stopped.load(Ordering::Acquire) {
         let command = match input.recv_timeout(Duration::from_millis(100)) {
             Ok(command) => command,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        shared
+            .queued_input_bytes
+            .fetch_sub(command.queued_bytes(), Ordering::AcqRel);
         let result = match command {
-            Input::Resize(size) => master
-                .lock()
-                .as_ref()
-                .map(|master| master.resize(size.pty()))
-                .unwrap_or(Ok(())),
-            Input::Write(bytes) => {
-                shared
-                    .queued_input_bytes
-                    .fetch_sub(bytes.len(), Ordering::AcqRel);
-                let mut remaining = bytes.as_slice();
-                let mut result = Ok(());
-                while !remaining.is_empty() && !shared.stopped.load(Ordering::Acquire) {
-                    match writer.write(&remaining[..remaining.len().min(8192)]) {
-                        Ok(0) => {
-                            result = Err(io::Error::from(io::ErrorKind::WriteZero).into());
-                            break;
-                        }
-                        Ok(len) => remaining = &remaining[len..],
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        #[cfg(unix)]
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            if !poll_pty(poll_fd, libc::POLLOUT, &shared) {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            result = Err(error.into());
-                            break;
-                        }
-                    }
-                }
-                result
-            }
+            Input::Resize(size) => sink.resize(size),
+            Input::Write(bytes) => write_all(&mut *sink, &bytes, &shared),
+            Input::Reply(bytes) => sink.reply(&bytes, &shared),
+            Input::Focus(focused) => sink.focus(focused),
+            Input::Scrollback(lines) => sink.scrollback(lines),
+            Input::Color(index, color) => sink.color(index, color),
+            Input::Redraw => sink.redraw(),
         };
         if let Err(error) = result {
             shared.error(format!("PTY write: {error}"));
@@ -162,11 +131,9 @@ pub(super) fn write_loop(
         }
     }
     for command in input.try_iter() {
-        if let Input::Write(bytes) = command {
-            shared
-                .queued_input_bytes
-                .fetch_sub(bytes.len(), Ordering::AcqRel);
-        }
+        shared
+            .queued_input_bytes
+            .fetch_sub(command.queued_bytes(), Ordering::AcqRel);
     }
 }
 
@@ -175,11 +142,9 @@ pub(super) fn engine_loop(
     output: Receiver<Output>,
     pool: SyncSender<Vec<u8>>,
     notification_input: SyncSender<Input>,
-    mut child: Box<dyn Child + Send + Sync>,
+    mut process: Box<dyn Process>,
     shared: Arc<Shared>,
-    master: Master,
 ) {
-    let mut processor: Processor = Processor::new();
     let mut cwd_tracker = CwdTracker::default();
     let mut prompt_scanner = PromptScanner::default();
     let mut notifications = notifications::Scanner::default();
@@ -195,20 +160,16 @@ pub(super) fn engine_loop(
             break;
             #[cfg(windows)]
             if exit.is_none() {
-                let _ = child.kill();
-                if let Ok(status) = child.wait() {
-                    exit = Some(status);
-                }
+                exit = process.terminate();
             }
         }
         #[cfg(windows)]
         if exit.is_some() && !conpty_close_started {
-            close_conpty(&master, &shared);
+            process.release(&shared);
             conpty_close_started = true;
         }
-        let timeout = processor
-            .sync_timeout()
-            .sync_timeout()
+        let sync_deadline = shared.parser.lock().sync_deadline();
+        let timeout = sync_deadline
             .map(|deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -223,11 +184,12 @@ pub(super) fn engine_loop(
                         notifications::Command::Reply(text) => {
                             // Use the same bounded writer as terminal protocol replies.
                             let _ = shared
-                                .enqueue(&notification_input, Input::Write(text.into_bytes()));
+                                .enqueue(&notification_input, Input::Reply(text.into_bytes()));
                         }
                     });
                     let marks = prompt_scanner.advance(chunk);
                     let mut grid = terminal.lock();
+                    let mut processor = shared.parser.lock();
                     let was_reporting_focus = grid.mode().contains(TermMode::FOCUS_IN_OUT);
                     let started = Instant::now();
                     let mut offset = 0;
@@ -244,6 +206,14 @@ pub(super) fn engine_loop(
                         offset = end;
                     }
                     processor.advance(&mut *grid, &chunk[offset..]);
+                    let synchronized = processor.sync_bytes_count();
+                    drop(processor);
+                    // Directory reports are session state a snapshot carries,
+                    // so they too change only under the terminal lock.
+                    track_directory(&mut cwd_tracker, chunk, &shared);
+                    if let Some(tap) = &shared.output_tap.lock().subscriber {
+                        tap.push(chunk);
+                    }
                     report_focus_on_enable(
                         &grid,
                         was_reporting_focus,
@@ -251,37 +221,19 @@ pub(super) fn engine_loop(
                         &notification_input,
                     );
                     // Commit visible changes before releasing their grid lock.
-                    if processor.sync_bytes_count() < chunk.len() {
+                    if synchronized < chunk.len() {
                         shared.changed();
                     }
                     shared
                         .parse_nanoseconds
                         .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
-                if let Some(report) = cwd_tracker.advance(&buffer[..len]) {
-                    let mut metadata = shared.metadata.lock();
-                    // A host's directory, e.g. from a shell inside `ssh`, is
-                    // kept as reported but never becomes this shell's cwd.
-                    let local = report.local && metadata.cwd != report.path;
-                    if metadata.reported_cwd.as_ref() != Some(&report.path) || local {
-                        if local {
-                            metadata.cwd.clone_from(&report.path);
-                        }
-                        metadata.reported_cwd = Some(report.path);
-                        drop(metadata);
-                        shared.force_repaint();
-                    }
-                }
-                if let Some(pid) = cwd_tracker.remote_pid.take() {
-                    let mut metadata = shared.metadata.lock();
-                    if metadata.remote_process_id != Some(pid) {
-                        metadata.remote_process_id = Some(pid);
-                        drop(metadata);
-                        shared.force_repaint();
-                    }
-                }
                 shared.bytes_parsed.fetch_add(len as u64, Ordering::Relaxed);
                 let _ = pool.try_send(buffer);
+                let tap = shared.output_tap.lock().subscriber.clone();
+                if let Some(tap) = tap {
+                    tap.wait_for_room(&shared);
+                }
                 // Follow Alacritty's wakeup policy: a synchronized application
                 // frame should not rebuild visible rows for every buffered chunk.
             }
@@ -293,14 +245,11 @@ pub(super) fn engine_loop(
             Err(RecvTimeoutError::Disconnected) => eof = true,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        if processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|deadline| deadline <= Instant::now())
-        {
+        let sync_deadline = shared.parser.lock().sync_deadline();
+        if sync_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
             let mut grid = terminal.lock();
             let was_reporting_focus = grid.mode().contains(TermMode::FOCUS_IN_OUT);
-            processor.stop_sync(&mut *grid);
+            shared.parser.lock().stop_sync(&mut *grid);
             report_focus_on_enable(&grid, was_reporting_focus, &shared, &notification_input);
             shared.changed();
         }
@@ -308,7 +257,7 @@ pub(super) fn engine_loop(
         // syscall. EOF still polls immediately, and busy or idle streams detect
         // exit within the same 100ms bound used by the receive timeout.
         if exit.is_none() && (eof || last_child_poll.elapsed() >= Duration::from_millis(100)) {
-            match child.try_wait() {
+            match process.try_wait() {
                 Ok(status) => exit = status,
                 Err(error) => {
                     shared.error(format!("Wait for shell: {error}"));
@@ -319,7 +268,7 @@ pub(super) fn engine_loop(
         }
         #[cfg(windows)]
         if exit.is_some() && !conpty_close_started {
-            close_conpty(&master, &shared);
+            process.release(&shared);
             conpty_close_started = true;
         }
         if exit.is_some() && eof {
@@ -333,10 +282,9 @@ pub(super) fn engine_loop(
                 ProcessActivity::Unknown
             } else {
                 let pid = shared.metadata.lock().process_id;
-                let master = master.lock();
-                match (pid, master.as_ref()) {
-                    (Some(pid), Some(master)) => platform::process_activity(pid, &**master),
-                    _ => ProcessActivity::Unknown,
+                match pid {
+                    Some(pid) => process.activity(pid),
+                    None => ProcessActivity::Unknown,
                 }
             };
             let _ = reply.try_send(activity);
@@ -369,28 +317,26 @@ pub(super) fn engine_loop(
         // the child; otherwise wait() can outlive the retiring I/O workers.
         shared.stopped.store(true, Ordering::Release);
         drop(output);
-        master.lock().take();
+        process.release(&shared);
     }
     if exit.is_none() {
         // The worker owns the authoritative child handle, so a stale cloned
         // process id can never signal a process after the shell was reaped.
-        let _ = child.kill();
-        if let Ok(status) = child.wait() {
-            exit = Some(status);
-        }
+        exit = process.terminate();
     }
     {
         let mut grid = terminal.lock();
-        processor.stop_sync(&mut *grid);
+        shared.parser.lock().stop_sync(&mut *grid);
         shared.changed();
     }
     if let Some(status) = exit {
         shared.metadata.lock().status = SessionStatus::Exited {
-            code: status.exit_code(),
-            signal: status.signal().map(str::to_owned),
+            code: status.code,
+            signal: status.signal,
         };
     }
     shared.stopped.store(true, Ordering::Release);
+    shared.output_tap.lock().end();
     if let Some(reply) = shared.process_check.lock().take() {
         let _ = reply.try_send(ProcessActivity::Idle);
     }
@@ -405,12 +351,37 @@ pub(super) fn engine_loop(
     drop(output);
     #[cfg(windows)]
     if !conpty_close_started {
-        close_conpty(&master, &shared);
+        process.release(&shared);
     }
     shared.changed_force();
 }
 
-fn report_focus_on_enable(
+fn track_directory(tracker: &mut CwdTracker, chunk: &[u8], shared: &Shared) {
+    if let Some(report) = tracker.advance(chunk) {
+        let mut metadata = shared.metadata.lock();
+        // A host's directory, e.g. from a shell inside `ssh`, is
+        // kept as reported but never becomes this shell's cwd.
+        let local = report.local && metadata.cwd != report.path;
+        if metadata.reported_cwd.as_ref() != Some(&report.path) || local {
+            if local {
+                metadata.cwd.clone_from(&report.path);
+            }
+            metadata.reported_cwd = Some(report.path);
+            drop(metadata);
+            shared.force_repaint();
+        }
+    }
+    if let Some(pid) = tracker.remote_pid.take() {
+        let mut metadata = shared.metadata.lock();
+        if metadata.remote_process_id != Some(pid) {
+            metadata.remote_process_id = Some(pid);
+            drop(metadata);
+            shared.force_repaint();
+        }
+    }
+}
+
+pub(super) fn report_focus_on_enable(
     terminal: &Term<EventProxy>,
     was_reporting: bool,
     shared: &Shared,
@@ -424,13 +395,8 @@ fn report_focus_on_enable(
         } else {
             b"\x1b[O"
         };
-        if let Err(error) = shared.enqueue(input, Input::Write(bytes.to_vec())) {
+        if let Err(error) = shared.enqueue(input, Input::Reply(bytes.to_vec())) {
             shared.error(error);
         }
     }
-}
-
-#[cfg(unix)]
-pub(super) fn prepare_nonblocking(master: &dyn MasterPty) -> Result<libc::c_int> {
-    platform::prepare_nonblocking(master)
 }

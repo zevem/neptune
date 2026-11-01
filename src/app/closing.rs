@@ -44,6 +44,27 @@ impl App {
         self.config.confirm_close && !self.relaunch
     }
 
+    /// Whether closing `target` quits Neptune: quitting, ending every session,
+    /// or closing the last window.
+    fn quits(&self, target: Close) -> bool {
+        match target {
+            Close::App | Close::AllSessions => true,
+            Close::Window(window) => !self
+                .controller
+                .model()
+                .workspaces()
+                .iter()
+                .any(|workspace| workspace.window() != window),
+            _ => false,
+        }
+    }
+
+    /// Quitting, or closing the last window, while sessions are kept detaches
+    /// them: their programs keep running, so they need no warning.
+    fn detaches(&self, target: Close) -> bool {
+        self.keeps_sessions() && target != Close::AllSessions && self.quits(target)
+    }
+
     pub(super) fn request_close(&mut self, ctx: &egui::Context, target: Close) {
         if self
             .pending_close
@@ -67,22 +88,37 @@ impl App {
             return;
         }
         let panes = self.close_panes(target);
+        let quits = self.quits(target);
         let mut pending = PendingClose {
             target,
             panes,
             checks: Vec::new(),
             since: Instant::now(),
             running: 0,
-            unknown: usize::from(self.startup.is_some()),
+            // While it starts, no terminal has started yet, and quitting a
+            // restoring launch leaves whatever the session daemons run
+            // alone, so there is nothing to check.
+            unknown: usize::from(
+                self.startup.is_some() && !(quits && self.session_daemon.is_some()),
+            ),
         };
+        let detaches = self.detaches(target);
+        self.ui.close_detaches = detaches;
+        if self.config.warn_running_processes && quits && !detaches {
+            // Sessions a launch that doesn't keep them found running end as
+            // it quits.
+            pending.running += self.unseen.sessions.len();
+            pending.unknown += self.unseen.unlisted.len();
+        }
         if self.config.warn_running_processes {
             for &(pane, generation) in &pending.panes {
-                if self
-                    .controller
-                    .model()
-                    .pane(pane)
-                    .is_some_and(|p| p.kind() == neptune_model::PaneKind::Browser)
-                {
+                // An ended terminal has nothing to stop, even when its handle
+                // remains, as one does whose session daemon went away.
+                if self.controller.model().pane(pane).is_some_and(|p| {
+                    p.kind() == neptune_model::PaneKind::Browser
+                        || (detaches && p.session().is_some())
+                        || matches!(p.lifecycle(), Lifecycle::Exited | Lifecycle::Failed(_))
+                }) {
                     continue;
                 }
                 if let Some(session) = self.sessions.get(pane)
@@ -184,7 +220,8 @@ impl App {
         self.pending_close = None;
         self.ui.overlay = OverlayState::None;
         match target {
-            Close::App => {
+            Close::App | Close::AllSessions => {
+                self.end_sessions = target == Close::AllSessions;
                 self.exit_approved = true;
                 // Quit can be requested from any window. Closing a child
                 // viewport alone would leave the application running.
@@ -272,7 +309,7 @@ mod tests {
     fn has_close_sheet(shapes: &[egui::epaint::ClippedShape], target: Close) -> bool {
         shapes.iter().any(|shape| {
             matches!(&shape.shape, egui::Shape::Text(text)
-                if text.galley.text() == ui::dialogs::close_copy(target).0)
+                if text.galley.text() == ui::dialogs::close_copy(target, false).0)
         })
     }
 
@@ -468,6 +505,7 @@ mod tests {
                     .dispatch(Command::SessionStarted {
                         pane,
                         generation: 1,
+                        session: None,
                     })
                     .unwrap();
                 Command::SessionExited {
@@ -480,6 +518,159 @@ mod tests {
             assert!(app.controller.model().pane(pane).is_none());
             assert_eq!(app.ui.overlay, OverlayState::None);
         }
+    }
+
+    /// A kept session whose session daemon went away still has its handle,
+    /// whose engine has stopped and answers no process check. Its terminal
+    /// shows "Session ended unexpectedly" and has nothing left to stop.
+    #[cfg(unix)]
+    #[test]
+    fn close_skips_terminals_that_ended_even_while_their_handle_remains() {
+        let (mut app, ctx, root, pane) = setup();
+        app.config.confirm_close = false;
+        app.sessions
+            .start(
+                pane,
+                1,
+                false,
+                terminal_core::SessionOptions {
+                    cwd: root.path().into(),
+                    shell: Some("/bin/sh".into()),
+                    args: vec!["-c".into(), "sleep 30".into()],
+                    ..Default::default()
+                },
+                std::sync::Arc::new(|| {}),
+            )
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.sessions.get(pane).is_none() {
+            assert!(Instant::now() < deadline, "the session never started");
+            app.sessions.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for command in [
+            Command::SessionStarted {
+                pane,
+                generation: 1,
+                session: None,
+            },
+            Command::SessionExited {
+                pane,
+                generation: 1,
+            },
+        ] {
+            app.controller.dispatch(command).unwrap();
+        }
+        app.request_close(&ctx, Close::Pane(pane));
+        assert_eq!(app.ui.overlay, OverlayState::None);
+        assert!(app.controller.model().pane(pane).is_none());
+    }
+
+    #[test]
+    fn quitting_with_kept_sessions_skips_the_process_warning_but_closing_a_pane_does_not() {
+        for keep in [false, true] {
+            for target in ["quit", "last window", "pane"] {
+                let (mut app, ctx, _root, pane) = setup();
+                app.config.confirm_close = false;
+                app.config.keep_sessions_running = keep;
+                app.keep_sessions = keep;
+                // A terminal reattaching to its kept session, so no process
+                // check can say it is idle.
+                app.controller
+                    .dispatch(Command::SessionStarted {
+                        pane,
+                        generation: 1,
+                        session: Some(neptune_model::SessionRef {
+                            daemon: 1,
+                            id: "00000000000000a1".into(),
+                        }),
+                    })
+                    .unwrap();
+                let close = match target {
+                    "quit" => Close::App,
+                    "last window" => Close::Window(neptune_model::WindowId::ROOT),
+                    _ => Close::Pane(pane),
+                };
+                app.request_close(&ctx, close);
+                let detaches = keep && target != "pane";
+                assert_eq!(
+                    app.ui.overlay == OverlayState::None,
+                    detaches,
+                    "{target}, kept: {keep}"
+                );
+                if !detaches {
+                    assert_eq!(app.ui.close_status, CloseStatus::Unknown);
+                }
+                assert_eq!(app.exit_approved, detaches);
+            }
+        }
+    }
+
+    #[test]
+    fn turning_kept_sessions_off_applies_at_once_but_turning_them_on_waits_for_the_next_launch() {
+        // (this launch keeps sessions, the setting after the change)
+        for (launched, now) in [(true, false), (false, true)] {
+            let (mut app, ctx, _root, pane) = setup();
+            app.config.confirm_close = false;
+            app.config.keep_sessions_running = launched;
+            app.keep_sessions = launched;
+            app.controller
+                .dispatch(Command::SessionStarted {
+                    pane,
+                    generation: 1,
+                    session: launched.then(|| neptune_model::SessionRef {
+                        daemon: 1,
+                        id: "00000000000000a1".into(),
+                    }),
+                })
+                .unwrap();
+            let config = Config {
+                keep_sessions_running: now,
+                ..app.config.clone()
+            };
+            app.action(&ctx, Action::Preferences(Box::new(config)));
+            assert_eq!(app.config.keep_sessions_running, now);
+            // This quit ends the terminal, so it still warns.
+            app.action(&ctx, Action::Quit);
+            assert_eq!(
+                app.ui.overlay,
+                OverlayState::ConfirmClose(Close::App),
+                "launched keeping: {launched}"
+            );
+            assert!(!app.ui.close_detaches);
+            assert!(!app.exit_approved);
+        }
+    }
+
+    #[test]
+    fn ending_all_sessions_warns_even_while_quitting_would_keep_them() {
+        let (mut app, ctx, _root, pane) = setup();
+        app.config.confirm_close = false;
+        app.config.keep_sessions_running = true;
+        app.keep_sessions = true;
+        app.controller
+            .dispatch(Command::SessionStarted {
+                pane,
+                generation: 1,
+                session: Some(neptune_model::SessionRef {
+                    daemon: 1,
+                    id: "00000000000000a1".into(),
+                }),
+            })
+            .unwrap();
+        app.action(&ctx, Action::EndAllSessions);
+        assert_eq!(
+            app.ui.overlay,
+            OverlayState::ConfirmClose(Close::AllSessions)
+        );
+        assert!(!app.ui.close_detaches);
+        assert!(!app.exit_approved);
+        app.action(&ctx, Action::CancelClose);
+        assert!(!app.exit_approved);
+        // A plain quit keeps it running, so it doesn't ask.
+        app.action(&ctx, Action::Quit);
+        assert_eq!(app.ui.overlay, OverlayState::None);
+        assert!(app.exit_approved);
     }
 
     #[test]

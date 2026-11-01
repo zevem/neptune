@@ -44,7 +44,7 @@ use eframe::egui::{self, Pos2, Rect, Stroke, Vec2, emath::GuiRounding as _};
 use neptune_model::{Command, Controller, Effect, Lifecycle, Limits, Model, PaneId, Remote};
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -57,6 +57,63 @@ struct Startup {
     config: Config,
     report: LoadReport,
     error: Option<String>,
+    /// The sessions running in the session daemons, listed for a launch
+    /// that restores workspaces. A terminal whose daemon couldn't be asked
+    /// tries to reattach, and is restored if it can't.
+    live: Option<crate::runtime::kept_sessions::Live>,
+}
+
+/// Whether a launch restores workspaces. Only such a launch reattaches kept
+/// sessions, or takes over from a Neptune that is running; others keep their
+/// sessions in process and leave kept ones alone.
+fn restores(launch: &crate::Launch) -> bool {
+    !launch.no_restore
+        && launch.cwd.is_none()
+        && launch.ssh.is_none()
+        && launch.screenshot.is_none()
+}
+
+/// Load the configuration and, if the launch restores them, the saved
+/// workspaces. A restoring launch first takes over the session daemons
+/// `kept` names, so the Neptune it replaces saves nothing after the state is
+/// read, then lists their sessions: it reattaches them if it keeps sessions,
+/// and otherwise ends them when it quits.
+fn load_startup(
+    settings: &Path,
+    state: &Path,
+    restore: bool,
+    kept: Option<(&Path, &crate::runtime::kept_sessions::Claim)>,
+) -> Startup {
+    let (config, error) = match Config::load(settings) {
+        Ok(config) => (config, None),
+        Err(error) => (Config::default(), Some(format!("{error:#}"))),
+    };
+    let kept = kept.filter(|_| restore);
+    if let Some((dir, claim)) = kept {
+        // Failing here, it takes over this version's daemon once it reaches
+        // it. A build still open on an earlier version's daemon isn't told
+        // then: only this takeover reaches those.
+        let _ = claim.take_over_running(dir);
+    }
+    let report = if restore && config.restore_workspaces {
+        load_state(state, Limits::default())
+    } else {
+        LoadReport {
+            model: None,
+            diagnostics: Vec::new(),
+            can_write: true,
+            migrated: false,
+        }
+    };
+    // Which kept sessions survived, so that each terminal is reattached or
+    // restored, and strays are recovered.
+    let live = kept.map(|(dir, _)| crate::runtime::kept_sessions::live(dir));
+    Startup {
+        config,
+        report,
+        error,
+        live,
+    }
 }
 struct ActiveSearch {
     pane: PaneId,
@@ -106,6 +163,24 @@ pub struct App {
     directory_check: Option<directory::PendingDirectory>,
     folder_picker: crate::platform::folders::Picker,
     ephemeral: bool,
+    /// Where this launch's kept sessions run. Only a launch that restores
+    /// workspaces, on Unix, may keep them.
+    session_daemon: Option<PathBuf>,
+    /// This launch runs its terminals in the session daemon. Fixed at
+    /// startup; turning the setting on applies from the next launch.
+    keep_sessions: bool,
+    /// Quitting ends every session, kept ones included.
+    end_sessions: bool,
+    /// This launch's hold on the session daemon it keeps sessions in.
+    claim: Arc<crate::runtime::kept_sessions::Claim>,
+    /// The `neptune` executable that launches a session daemon; `None` only
+    /// connects to one that runs.
+    daemon_program: Option<PathBuf>,
+    /// Sessions a launch that doesn't keep them found running in the session
+    /// daemons. It shows none of them, and ends them all when it quits.
+    unseen: crate::runtime::kept_sessions::Live,
+    /// A newer launch took over: this one closes and saves nothing more.
+    replaced: bool,
     preference_generation: u64,
     /// An input-method composition is in progress.
     ime_composing: bool,
@@ -181,38 +256,29 @@ impl App {
                 serde_json::json!({"operation":"renderer","backend":format!("{:?}",a.backend),"adapter":a.name,"scale":cc.egui_ctx.pixels_per_point(),"platform":std::env::consts::OS,"version":env!("CARGO_PKG_VERSION")})
             );
         }
+        let restore = restores(&launch);
         let data = launch.data_root.unwrap_or_else(config::data_dir);
         let config_path = launch.config.unwrap_or_else(|| data.join("config.toml"));
         let state_path = data.join("workspaces.json");
         let ephemeral = launch.screenshot.is_some();
-        let restore =
-            !launch.no_restore && launch.cwd.is_none() && launch.ssh.is_none() && !ephemeral;
+        let session_daemon =
+            (restore && cfg!(unix)).then(|| crate::runtime::kept_sessions::directory(&data));
+        let claim = {
+            let wake = cc.egui_ctx.clone();
+            Arc::new(crate::runtime::kept_sessions::Claim::new(Arc::new(
+                move || wake.request_repaint(),
+            )))
+        };
         let (sender, startup) = mpsc::sync_channel(1);
         let settings = config_path.clone();
         let state = state_path.clone();
         let wake = cc.egui_ctx.clone();
+        let kept = session_daemon.clone().map(|dir| (dir, claim.clone()));
         let thread_result = std::thread::Builder::new()
             .name("neptune-restore".into())
             .spawn(move || {
-                let (config, error) = match Config::load(&settings) {
-                    Ok(config) => (config, None),
-                    Err(error) => (Config::default(), Some(format!("{error:#}"))),
-                };
-                let report = if restore && config.restore_workspaces {
-                    load_state(&state, Limits::default())
-                } else {
-                    LoadReport {
-                        model: None,
-                        diagnostics: Vec::new(),
-                        can_write: true,
-                        migrated: false,
-                    }
-                };
-                let _ = sender.send(Startup {
-                    config,
-                    report,
-                    error,
-                });
+                let kept = kept.as_ref().map(|(dir, claim)| (dir.as_path(), &**claim));
+                let _ = sender.send(load_startup(&settings, &state, restore, kept));
                 wake.request_repaint();
             });
         let mut ui = UiState {
@@ -225,7 +291,19 @@ impl App {
         Self {
             _font_shortcut_monitor: crate::platform::keyboard::FontShortcutMonitor::install(),
             controller: Controller::new(Model::default()),
-            sessions: SessionManager::new(ResourcePolicy::default(), launch.diagnostics),
+            sessions: {
+                let sessions = SessionManager::new(ResourcePolicy::default(), launch.diagnostics);
+                // Terminals an earlier launch kept running reach the one
+                // that restores after it where they reached that one.
+                if restore {
+                    let claim = claim.clone();
+                    sessions.agents().listen_in(
+                        crate::runtime::agents::directory(&data),
+                        Arc::new(move || claim.replaced()),
+                    );
+                }
+                sessions
+            },
             renders: BTreeMap::new(),
             config: Config::default(),
             config_path,
@@ -260,6 +338,13 @@ impl App {
             directory_check: None,
             folder_picker: crate::platform::folders::Picker::new(cc),
             ephemeral,
+            session_daemon,
+            claim,
+            daemon_program: std::env::current_exe().ok(),
+            unseen: Default::default(),
+            replaced: false,
+            keep_sessions: false,
+            end_sessions: false,
             preference_generation: 0,
             ime_composing: false,
             terminal_focus: None,
@@ -309,6 +394,14 @@ impl App {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        // Before anything else: once taken over, its terminals are let go
+        // of, and nothing they report may change what this launch shows.
+        if self.replaced {
+            return;
+        }
+        if self.claim.replaced() {
+            return self.give_way(ctx);
+        }
         let local_window = self.viewport_of(self.presentation_window()) == ctx.viewport_id()
             && (ctx.viewport_id() != egui::ViewportId::ROOT || self.host_exists());
         let shown = self.visible_panes(ctx);
@@ -363,6 +456,7 @@ impl App {
                         migrated: false,
                     },
                     error: Some("Restoration worker stopped before returning state".into()),
+                    live: None,
                 }),
                 Err(mpsc::TryRecvError::Empty) => None,
             });
@@ -380,6 +474,7 @@ impl App {
                     pane,
                     generation,
                     elapsed,
+                    session,
                 } => {
                     if let Some(render) = self.renders.get_mut(&pane) {
                         render.cache.retry_resize();
@@ -389,7 +484,14 @@ impl App {
                         set_session_palette(session, Palette::for_config(&self.config));
                         let _ = session.focus(self.pane_native_focused(ctx, pane));
                     }
-                    self.dispatch(ctx, Command::SessionStarted { pane, generation });
+                    self.dispatch(
+                        ctx,
+                        Command::SessionStarted {
+                            pane,
+                            generation,
+                            session,
+                        },
+                    );
                     self.diagnostics
                         .operation("spawn", pane, generation, elapsed);
                 }
@@ -398,6 +500,13 @@ impl App {
                     generation,
                     message,
                 } => {
+                    if self.reattaching(pane, generation) {
+                        // Its kept session is gone: restore the terminal.
+                        self.diagnostics
+                            .failure("attach", Some(pane), Some(generation), "Attach");
+                        self.dispatch(ctx, Command::SessionLost { pane, generation });
+                        continue;
+                    }
                     self.diagnostics
                         .failure("spawn", Some(pane), Some(generation), "Spawn");
                     self.dispatch(
@@ -606,6 +715,31 @@ impl App {
         }
         self.controller = Controller::new(startup.report.model.unwrap_or_default());
         self.adopt_restored_host();
+        let keeps = self.config.restore_workspaces && self.config.keep_sessions_running;
+        // A data root too deep for a socket address keeps its terminals in
+        // Neptune.
+        let fits = self
+            .session_daemon
+            .as_deref()
+            .is_some_and(crate::runtime::kept_sessions::fits);
+        if keeps && self.session_daemon.is_some() && !fits {
+            self.diagnostics
+                .failure("keep_sessions", None, None, "SocketPath");
+        }
+        self.keep_sessions = keeps && fits;
+        self.ui.preference_view.launch_keeps_sessions = self.keep_sessions;
+        if self.keep_sessions
+            && let Some(dir) = &self.session_daemon
+        {
+            self.sessions
+                .keep_sessions(crate::runtime::kept_sessions::KeptSessions::new(
+                    dir.clone(),
+                    self.daemon_program.clone(),
+                    self.claim.clone(),
+                ));
+        } else if let Some(live) = &startup.live {
+            self.unseen = live.clone();
+        }
         let repaint = ctx.clone();
         match PersistenceWriter::new(
             self.state_path.clone(),
@@ -614,14 +748,20 @@ impl App {
             !self.ephemeral,
             Arc::new(move || repaint.request_repaint()),
         ) {
-            Ok(writer) => self.writer = Some(writer),
+            Ok(writer) => {
+                // A Neptune frozen while a newer one took over may resume
+                // with a save pending; it is never written.
+                let claim = self.claim.clone();
+                writer.stop_when(Arc::new(move || claim.replaced()));
+                self.writer = Some(writer);
+            }
             Err(error) => {
                 self.diagnostics
                     .failure("persistence_worker", None, None, "Persistence");
                 self.ui.error = Some(format!("Persistence worker: {error}"));
             }
         }
-        self.execute(ctx, self.controller.start_effects());
+        self.reattach(ctx, startup.live);
         if self.controller.model().workspaces().is_empty() {
             let cwd = self.initial_cwd.take().unwrap_or_else(default_cwd);
             let remote = self.initial_remote.take();
@@ -638,11 +778,15 @@ impl App {
             self.open_beside(ctx, pane, None);
         }
         // Bind the CLI command before queued user actions can change focus.
+        // It is typed into a new shell, never into a program kept running.
         self.command_target = self.controller.model().active_pane().and_then(|id| {
             self.controller
                 .model()
                 .pane(id)
-                .filter(|pane| pane.kind() == neptune_model::PaneKind::Terminal)
+                .filter(|pane| {
+                    pane.kind() == neptune_model::PaneKind::Terminal
+                        && !(self.keep_sessions && pane.session().is_some())
+                })
                 .map(|pane| (id, pane.generation()))
         });
         if self.command.is_some() && self.command_target.is_none() {
@@ -1415,6 +1559,7 @@ impl App {
             panel: panel_available.then_some(self.ui.panel.open),
             panel_attention: (!agents_shown && self.agents.waiting_count() > 0)
                 || (!project_shown && project_needs > 0),
+            keeps_sessions: self.keeps_sessions(),
         };
         if edge > 0.0 {
             let side = Rect::from_min_size(
@@ -1727,6 +1872,7 @@ impl App {
         ui::helpers::scrim(ui.painter(), bounds, radius, p, dim);
         let zoomed = self.ui.zoomed;
         let message = self.ui.error.is_some();
+        let keeps_sessions = self.keeps_sessions();
         match self.ui.overlay {
             OverlayState::Notifications => {
                 let model = self.controller.model();
@@ -1854,6 +2000,7 @@ impl App {
                     config: &self.config,
                     zoomed,
                     message,
+                    keeps_sessions,
                 },
                 &mut actions,
             ),
@@ -1915,7 +2062,29 @@ impl App {
         self.sync_carried_workspace(&ctx);
         self.record_window_keyboard(&ctx);
     }
+    /// Whether quitting now leaves the terminals running: this launch keeps
+    /// them, and the setting is still on. Turning it off applies at once.
+    pub(super) fn keeps_sessions(&self) -> bool {
+        self.keep_sessions && self.config.keep_sessions_running && self.config.restore_workspaces
+    }
+    /// A newer launch took over this one's sessions. Close every window
+    /// without asking or ending them, and save nothing more.
+    fn give_way(&mut self, ctx: &egui::Context) {
+        self.replaced = true;
+        self.state_writable = false;
+        self.window_writable = false;
+        self.config_writable = false;
+        self.end_sessions = false;
+        self.relaunch = false;
+        self.pending_close = None;
+        self.ui.overlay = OverlayState::None;
+        self.exit_approved = true;
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+    }
     fn exit(&mut self) {
+        if !self.replaced && self.claim.replaced() {
+            self.give_way(&egui::Context::default());
+        }
         self.browsers.shutdown();
         self.usage.shutdown();
         // Leads are let go first, so each has until the shells have closed
@@ -1963,6 +2132,19 @@ impl App {
                 },
             );
         }
+        // Quitting lets go of kept sessions; every other session ends. Ended
+        // ones are forgotten, so the next launch doesn't look for them.
+        // A launch that was taken over lets go of every session; they are
+        // the newer launch's now.
+        let detaches = self.keeps_sessions() && !self.end_sessions;
+        let ends = !detaches
+            && !self.replaced
+            && (self.keep_sessions
+                || !self.unseen.sessions.is_empty()
+                || !self.unseen.unlisted.is_empty());
+        if ends && self.keep_sessions {
+            self.dispatch(&ctx, Command::ForgetSessions);
+        }
         self.save_state();
         self.save_window();
         if let Some(writer) = &self.writer
@@ -1970,8 +2152,27 @@ impl App {
         {
             eprintln!("Could not flush latest persisted state: {error}");
         }
+        if self.replaced {
+            self.sessions.detach_all();
+        } else if detaches {
+            let detach = self.controller.exit_effects();
+            self.execute(&ctx, detach);
+        }
         let complete = self.sessions.shutdown(Duration::from_secs(2));
         self.diagnostics.shutdown(complete);
+        // Ending them reaches the kept sessions no terminal showed, too, and
+        // those of every daemon version.
+        if ends
+            && let Some(dir) = &self.session_daemon
+            && let Err(error) = crate::runtime::kept_sessions::KeptSessions::new(
+                dir.clone(),
+                None,
+                self.claim.clone(),
+            )
+            .end_all()
+        {
+            eprintln!("Could not end the kept sessions: {error}");
+        }
         if self.relaunch
             && let Some(target) = self.updates.installed()
             && let Err(error) = crate::platform::updates::relaunch(target, &self.relaunch_arguments)

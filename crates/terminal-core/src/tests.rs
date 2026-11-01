@@ -3,11 +3,10 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::Color;
 
-#[cfg(unix)]
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
-        assert!(Instant::now() < deadline, "PTY condition timed out");
+        assert!(Instant::now() < deadline, "Session condition timed out");
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -502,10 +501,156 @@ fn fixture(cols: u16, rows: u16, history: usize) -> TerminalSession {
         viewport_cache: Mutex::new(None),
     }
 }
+
+/// What a session sent to its transport, in order.
+#[derive(Debug, PartialEq, Eq)]
+enum Sent {
+    Input(Vec<u8>),
+    Reply(Vec<u8>),
+    Resize(u16, u16),
+    Release,
+    Terminate,
+}
+
+struct FakeSource(mpsc::Receiver<Vec<u8>>);
+impl transport::Source for FakeSource {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self.0.recv() {
+            Ok(bytes) => {
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            Err(_) => Ok(0),
+        }
+    }
+    fn wait_readable(&mut self, _: &Shared) -> io::Result<bool> {
+        Ok(false)
+    }
+}
+
+struct FakeSink(mpsc::Sender<Sent>);
+impl transport::Sink for FakeSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let _ = self.0.send(Sent::Input(bytes.to_vec()));
+        Ok(bytes.len())
+    }
+    fn wait_writable(&mut self, _: &Shared) -> io::Result<bool> {
+        Ok(false)
+    }
+    fn resize(&mut self, size: Size) -> Result<()> {
+        let _ = self.0.send(Sent::Resize(size.cols, size.rows));
+        Ok(())
+    }
+    fn reply(&mut self, bytes: &[u8], _: &Shared) -> Result<()> {
+        let _ = self.0.send(Sent::Reply(bytes.to_vec()));
+        Ok(())
+    }
+}
+
+struct FakeProcess(mpsc::Sender<Sent>);
+impl transport::Process for FakeProcess {
+    fn try_wait(&mut self) -> io::Result<Option<transport::Exit>> {
+        Ok(None)
+    }
+    fn terminate(&mut self) -> Option<transport::Exit> {
+        let _ = self.0.send(Sent::Terminate);
+        Some(transport::Exit {
+            code: 1,
+            signal: Some("Hangup".into()),
+        })
+    }
+    fn activity(&self, _: u32) -> ProcessActivity {
+        ProcessActivity::Unknown
+    }
+    fn release(&mut self, _: &Arc<Shared>) {
+        let _ = self.0.send(Sent::Release);
+    }
+}
+
+/// A session engine fed by a fake transport: the test writes the program's
+/// output and observes everything the engine sends back.
+fn fake_session(cols: u16, rows: u16) -> (mpsc::Sender<Vec<u8>>, Receiver<Sent>, TerminalSession) {
+    let (output, source) = mpsc::channel();
+    let (sent_tx, sent) = mpsc::channel();
+    let transport = transport::Transport {
+        source: Box::new(FakeSource(source)),
+        sink: Box::new(FakeSink(sent_tx.clone())),
+        process: Box::new(FakeProcess(sent_tx)),
+        shell: "fake".into(),
+        process_id: None,
+        replica: None,
+    };
+    let size = Size {
+        cols,
+        rows,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let session =
+        TerminalSession::start(transport, PathBuf::from("."), size, 16, Arc::new(|| {})).unwrap();
+    (output, sent, session)
+}
+
+fn next_sent(sent: &Receiver<Sent>) -> Sent {
+    sent.recv_timeout(Duration::from_secs(5))
+        .expect("the session sent nothing to its transport")
+}
+
+#[test]
+fn engine_replies_input_and_resize_all_go_through_the_transport() {
+    let (output, sent, session) = fake_session(12, 4);
+
+    // A cursor-position query is answered by the engine, not typed by the user.
+    output.send(b"\x1b[6n".to_vec()).unwrap();
+    assert_eq!(next_sent(&sent), Sent::Reply(b"\x1b[1;1R".to_vec()));
+    // So is a notification capability query.
+    output.send(b"\x1b]99;i=7:p=?;\x1b\\".to_vec()).unwrap();
+    assert!(matches!(
+        next_sent(&sent),
+        Sent::Reply(reply) if reply.starts_with(b"\x1b]99;i=7:p=?;")
+    ));
+    // And the focus state a program receives when it turns on focus reports.
+    output.send(b"\x1b[?1004h".to_vec()).unwrap();
+    assert_eq!(next_sent(&sent), Sent::Reply(b"\x1b[O".to_vec()));
+
+    session.write(b"ls\r").unwrap();
+    assert_eq!(next_sent(&sent), Sent::Input(b"ls\r".to_vec()));
+    session.paste("a\nb").unwrap();
+    assert_eq!(next_sent(&sent), Sent::Input(b"a\rb".to_vec()));
+    session.resize(20, 6, 200, 120).unwrap();
+    assert_eq!(next_sent(&sent), Sent::Resize(20, 6));
+    assert!(sent.try_recv().is_err());
+}
+
+#[test]
+fn teardown_releases_the_device_and_ends_the_process_in_platform_order() {
+    let (output, sent, session) = fake_session(12, 4);
+    let completion = session.shutdown_completion();
+    session.shutdown();
+    // The source reaches end of output once its process is gone.
+    drop(output);
+    wait_for(|| completion.is_complete());
+
+    let teardown: Vec<Sent> = sent.try_iter().collect();
+    // Unix closes the terminal device before ending the child; Windows ends
+    // the child first and then closes ConPTY on a counted worker.
+    #[cfg(unix)]
+    assert_eq!(teardown, vec![Sent::Release, Sent::Terminate]);
+    #[cfg(windows)]
+    assert_eq!(teardown, vec![Sent::Terminate, Sent::Release]);
+    assert_eq!(
+        session.metadata().status,
+        SessionStatus::Exited {
+            code: 1,
+            signal: Some("Hangup".into())
+        }
+    );
+    assert_eq!(session.metrics().active_workers, 0);
+}
+
 fn feed(session: &TerminalSession, bytes: &[u8]) {
     let mut terminal = session.terminal.lock();
-    let mut parser: Processor = Processor::new();
-    parser.advance(&mut *terminal, bytes);
+    session.shared.parser.lock().advance(&mut *terminal, bytes);
     session.shared.changed();
 }
 
@@ -905,4 +1050,245 @@ fn successive_single_cell_searches_advance_and_wrap_in_both_directions() {
         panic!("wrapped match missing");
     };
     assert_eq!(last.start, second.start);
+}
+
+/// Rebuild a second engine from `source`'s snapshot, as a replica is: the
+/// snapshot crosses the daemon's wire encoding, then the replica parses the
+/// output its engine had read but not finished parsing.
+fn rebuild(source: &TerminalSession) -> TerminalSession {
+    let (snapshot, ()) = source.snapshot(|| ());
+    #[cfg(unix)]
+    let snapshot = daemon::protocol::decode_snapshot(&daemon::protocol::encode_snapshot(&snapshot))
+        .expect("the snapshot survives its wire encoding");
+    let history = source.shared.config.lock().scrolling_history;
+    let replica = fixture(snapshot.cols, snapshot.rows, history);
+    snapshot.restore(&mut replica.terminal.lock(), &replica.shared);
+    feed(&replica, &snapshot.pending);
+    replica
+}
+
+/// Everything a person or a program can observe of the two engines matches.
+fn assert_same_terminal(case: &str, expected: &TerminalSession, actual: &TerminalSession) {
+    let (want, got) = (expected.viewport(), actual.viewport());
+    assert_eq!(
+        (want.columns, want.screen_lines, want.display_offset),
+        (got.columns, got.screen_lines, got.display_offset),
+        "{case}: geometry"
+    );
+    assert_eq!(want.rows, got.rows, "{case}: viewport rows");
+    assert_eq!(want.cursor, got.cursor, "{case}: cursor");
+    assert_eq!(want.mode, got.mode, "{case}: modes");
+    assert_eq!(want.colors, got.colors, "{case}: colours");
+    assert_eq!(
+        expected.history_size(),
+        actual.history_size(),
+        "{case}: history size"
+    );
+    assert_eq!(
+        expected.history_text(),
+        actual.history_text(),
+        "{case}: history text"
+    );
+    let (want_revision, top, bottom, _) = expected.search_bounds();
+    let (got_revision, got_top, got_bottom, _) = actual.search_bounds();
+    assert_eq!((top, bottom), (got_top, got_bottom), "{case}: grid bounds");
+    for line in top..=bottom {
+        assert_eq!(
+            expected.search_row(line, want_revision),
+            actual.search_row(line, got_revision),
+            "{case}: cells, styles and wraps of line {line}"
+        );
+    }
+    // The backend's own cells and cursors, including what the owned view
+    // leaves out: underline colours, hyperlink ids, pending wraps and the
+    // cursor's current attributes.
+    let (want, got) = (expected.terminal.lock(), actual.terminal.lock());
+    for line in top..=bottom {
+        for column in 0..want.columns() {
+            let point = Point::new(Line(line), Column(column));
+            assert_eq!(
+                want.grid()[point],
+                got.grid()[point],
+                "{case}: cell {point:?}"
+            );
+        }
+    }
+    assert_eq!(
+        want.grid().cursor,
+        got.grid().cursor,
+        "{case}: backend cursor"
+    );
+    assert_eq!(
+        want.grid().saved_cursor,
+        got.grid().saved_cursor,
+        "{case}: saved cursor"
+    );
+    assert_eq!(want.mode(), got.mode(), "{case}: backend modes");
+    assert_eq!(
+        want.cursor_style(),
+        got.cursor_style(),
+        "{case}: cursor style"
+    );
+    drop((want, got));
+    let (want, got) = (expected.metadata(), actual.metadata());
+    assert_eq!(want.title, got.title, "{case}: title");
+    assert_eq!(
+        want.reported_cwd, got.reported_cwd,
+        "{case}: reported directory"
+    );
+    assert_eq!(
+        want.remote_process_id, got.remote_process_id,
+        "{case}: remote process id"
+    );
+}
+
+/// Output that exercises cursor state, saved cursors, pending wraps, styles
+/// and screens after the snapshot, so drift a static comparison misses shows.
+const FOLLOW_UP: &[u8] = b"\x1b8after\x1b[?1049l\x1b8back\r\nnext \x1b[1;31mred\x1b[m line\r\n";
+
+#[test]
+fn a_rebuilt_engine_matches_its_source_across_the_fixture_corpus() {
+    let mut history = String::new();
+    for line in 0..40 {
+        history.push_str(&format!("history line {line}\r\n"));
+    }
+    let corpus: &[(&str, &[u8])] = &[
+        ("history and cursor", history.as_bytes()),
+        (
+            "SGR and truecolor",
+            b"\x1b[1;3;4mbold italic\x1b[0m \x1b[38;2;91;166;201;48;5;17mtrue\x1b[7;9;2mattrs\x1b[58;2;1;2;3;4:3mcurl\x1b[m\r\n\x1b[44m    \x1b[m\r\n",
+        ),
+        (
+            "alternate screen",
+            b"primary\r\nshell \x1b[>1u\x1b[?1049h\x1b[>5u\x1b[2;3Hfull\x1b[33mscreen\x1b7\x1b[5;1Hstatus",
+        ),
+        (
+            "wide and combining characters",
+            "\u{754c}e\u{301} \u{1f600}x\u{20dd}\r\n0123456789012345678\u{754c}tail\r\n".as_bytes(),
+        ),
+        (
+            "wrapped lines",
+            b"a line long enough to wrap twice around twenty\r\nexact twenty columns\r\nfull",
+        ),
+        (
+            "keyboard protocol flags",
+            b"\x1b[>1u\x1b[>3u\x1b[=8;2u",
+        ),
+        (
+            "mouse modes",
+            b"\x1b[?1002h\x1b[?1006h\x1b[?1004h",
+        ),
+        (
+            "bracketed paste and input modes",
+            b"\x1b[?2004h\x1b[?1h\x1b=\x1b[4h\x1b[?7l",
+        ),
+        (
+            "hyperlinks",
+            b"\x1b]8;id=docs;https://example.com/a\x1b\\docs\x1b]8;;\x1b\\ \x1b]8;;file:///tmp\x07tmp\x1b]8;;\x07 open\x1b]8;;https://open.example\x07",
+        ),
+        (
+            "title, colours and cursor style",
+            b"\x1b]0;build: running\x07\x1b]4;1;rgb:12/34/56\x07\x1b]11;rgb:01/02/03\x07\x1b[5 q\x1b[?12h",
+        ),
+        (
+            "pending wrap at the last column",
+            b"01234567890123456789",
+        ),
+        (
+            "saved cursor and origin mode",
+            b"top\x1b[3;5H\x1b[1;32m\x1b7\x1b[m\x1b[?6h\x1b[2;2Hfrom origin",
+        ),
+    ];
+    for (case, bytes) in corpus {
+        let source = fixture(20, 6, 64);
+        feed(&source, bytes);
+        let replica = rebuild(&source);
+        assert_same_terminal(case, &source, &replica);
+        feed(&source, FOLLOW_UP);
+        feed(&replica, FOLLOW_UP);
+        assert_same_terminal(&format!("{case}, then more output"), &source, &replica);
+    }
+}
+
+#[test]
+fn output_cut_anywhere_by_a_snapshot_is_parsed_once_by_the_replica() {
+    let stream = "a\x1b]0;tit le\x07b\x1b]2;st\x1b\\c\x1b[1;38;2;1;2;3mD\x1b[m\u{1f600}\u{754c}e\
+        \x1bPq#0;2;0;0;0~\x1b\\f\x1b_apc\x1b\\g\x1b(0q\x1b(Bh\x1b]8;;http://x\x07link\x1b]8;;\x07\x1b[?1049h\x1b[2Jalt";
+    let bytes = stream.as_bytes();
+    for cut in 0..=bytes.len() {
+        let source = fixture(40, 4, 16);
+        feed(&source, &bytes[..cut]);
+        let replica = rebuild(&source);
+        feed(&source, &bytes[cut..]);
+        feed(&replica, &bytes[cut..]);
+        assert_same_terminal(&format!("output cut at byte {cut}"), &source, &replica);
+    }
+}
+
+#[test]
+fn a_synchronized_update_in_progress_is_applied_before_the_snapshot() {
+    let source = fixture(20, 4, 16);
+    feed(&source, b"old\x1b[?2026h\r\x1b[Knew frame");
+    assert!(
+        source.screen_text().starts_with("old"),
+        "the update is held"
+    );
+    let replica = rebuild(&source);
+    assert!(source.screen_text().starts_with("new frame"));
+    assert_same_terminal("update applied", &source, &replica);
+    feed(&source, b" ends\x1b[?2026l");
+    feed(&replica, b" ends\x1b[?2026l");
+    assert_same_terminal("update ended", &source, &replica);
+}
+
+fn resize_grid(session: &TerminalSession, cols: u16, rows: u16) {
+    let size = Size {
+        cols,
+        rows,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let mut terminal = session.terminal.lock();
+    session.shared.prompt.lock().resize(&mut *terminal, size);
+    session.shared.changed();
+}
+
+#[test]
+fn a_rebuilt_engine_keeps_the_prompt_mark_its_shell_redraws_from() {
+    let source = fixture(20, 6, 16);
+    feed(&source, b"output\r\n$ ");
+    {
+        let terminal = source.terminal.lock();
+        source
+            .shared
+            .prompt
+            .lock()
+            .mark(&*terminal, PromptMark::Start { redraw: None });
+    }
+    feed(&source, b"a command long enough to wrap");
+    let replica = rebuild(&source);
+    // A shell redraws its prompt after a resize, so the old one is cleared.
+    resize_grid(&source, 12, 6);
+    resize_grid(&replica, 12, 6);
+    assert!(
+        !source.screen_text().contains("command"),
+        "the typed command was cleared"
+    );
+    assert_same_terminal("after resize", &source, &replica);
+}
+
+#[test]
+fn a_rebuilt_engine_keeps_only_the_newest_history_its_limit_allows() {
+    let source = fixture(20, 4, 100);
+    for line in 0..200 {
+        feed(&source, format!("line {line}\r\n").as_bytes());
+    }
+    let (snapshot, ()) = source.snapshot(|| ());
+    let replica = fixture(20, 4, 10);
+    snapshot.restore(&mut replica.terminal.lock(), &replica.shared);
+    assert_eq!(replica.history_size(), 10);
+    let history = replica.history_text();
+    let first = history.lines().next().unwrap();
+    assert_eq!(first, "line 187");
+    assert_eq!(replica.screen_text(), source.screen_text());
 }

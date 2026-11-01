@@ -166,6 +166,8 @@ pub struct Pane {
     pub(crate) spawned_by: Option<PaneId>,
     pub(crate) project: Option<ProjectId>,
     pub(crate) worktree: Option<crate::Worktree>,
+    /// The session daemon's session this terminal shows, once it has started.
+    pub(crate) session: Option<crate::SessionRef>,
     pub(crate) generation: u64,
     pub(crate) lifecycle: Lifecycle,
 }
@@ -197,6 +199,10 @@ impl Pane {
     /// The git worktree Neptune made for this terminal's agent.
     pub fn worktree(&self) -> Option<&crate::Worktree> {
         self.worktree.as_ref()
+    }
+    /// The kept session this terminal shows, which outlives Neptune.
+    pub fn session(&self) -> Option<&crate::SessionRef> {
+        self.session.as_ref()
     }
     pub fn id(&self) -> PaneId {
         self.id
@@ -232,6 +238,8 @@ pub struct PaneSpec {
     pub project: Option<ProjectId>,
     /// The git worktree Neptune made for this terminal's agent.
     pub worktree: Option<crate::Worktree>,
+    /// The kept session this terminal reattaches to.
+    pub session: Option<crate::SessionRef>,
 }
 #[derive(Debug, Clone)]
 pub struct WorkspaceSpec {
@@ -885,7 +893,8 @@ impl Model {
         let mut workspace_ids = HashSet::new();
         let mut pane_ids = HashSet::new();
         let mut split_ids = HashSet::new();
-        for spec in specs {
+        let mut sessions = HashSet::new();
+        for mut spec in specs {
             if let Some(group) = spec.group
                 && !group_ids.contains(&group)
             {
@@ -904,6 +913,15 @@ impl Model {
             if spec.panes.len() > limits.panes_per_workspace {
                 return Err(Error::PaneLimit);
             }
+            // Two terminals can't show one kept session: the first keeps it,
+            // and any other starts afresh.
+            for pane in &mut spec.panes {
+                if let Some(session) = &pane.session
+                    && !sessions.insert(session.clone())
+                {
+                    pane.session = None;
+                }
+            }
             let mut members = HashSet::new();
             for pane in &spec.panes {
                 if pane.kind == PaneKind::Browser
@@ -911,9 +929,17 @@ impl Model {
                         || pane.remote_cwd.is_some()
                         || pane.spawned_by.is_some()
                         || pane.project.is_some()
-                        || pane.worktree.is_some())
+                        || pane.worktree.is_some()
+                        || pane.session.is_some())
                 {
                     return Err(Error::InvalidLayout("browser has terminal state"));
+                }
+                if pane
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| !session.is_valid())
+                {
+                    return Err(Error::InvalidLayout("invalid session reference"));
                 }
                 if pane
                     .agent
@@ -1003,6 +1029,7 @@ impl Model {
                         spawned_by: pane.spawned_by,
                         project: pane.project,
                         worktree: pane.worktree,
+                        session: pane.session,
                         generation: 1,
                         lifecycle: Lifecycle::Starting,
                     })
@@ -1132,6 +1159,7 @@ impl Model {
                         spawned_by: pane.spawned_by,
                         project: pane.project,
                         worktree: pane.worktree.clone(),
+                        session: pane.session.clone(),
                     })
                     .collect(),
                 layout: workspace.layout.clone(),
