@@ -329,17 +329,28 @@ of one core for Neptune plus the daemon, excluding shells, producers and the GPU
 | … context switches | 41.2k/s | 92.7k/s |
 | Fixed-rate output, 1 producer among 8 panes: CPU | 16.0 % | 25.6 % |
 | Fixed-rate output, 8 panes all producing: CPU | 62.1 % | 69.8 % |
-| Idle, 1 / 8 / 32 panes: context switches | 206 / 416 / 1141 /s | 232 / 658 / 2099 /s |
-| Idle, 32 panes: CPU | 8.0 % | 12.2 % |
+| Idle, 1 / 8 / 32 panes: context switches | 179 / 177 / 197 /s | 182 / 179 / 191 /s |
+| Idle, 32 panes: CPU | 4.7 % | 4.7 % |
 | Echo: key request to the program's read, p50 / p95 | 4.58 / 5.98 ms | 5.26 / 6.14 ms |
 | One terminal, 10,000 rows filled: PSS | 213 MiB | 239 MiB (daemon 27.5 MiB) |
 | Idle, 32 panes, 1,000 rows each: RSS | 290 MiB | 312 MiB |
 
 Throughput is unchanged within run-to-run noise (off ranged from 130 to
-145 MiB/s). The cost shows as CPU, because output is parsed twice. At rest,
-each session's engine, reader and writer threads wake 10 times a second, so the
-daemon adds exactly 30 wakeups a second per pane. Neptune's own wakeups are
-unchanged (`measure-idle.py` per-thread counts). The echo difference is within
+145 MiB/s). The cost shows as CPU, because output is parsed twice.
+
+The two idle rows were measured again on 2026-11-11 (kernel 7.0.0-42, release
+`inspection` build of `12603b1`, three repetitions of each setting, medians),
+after a quiet session's engine, reader and writer threads stopped waking 10
+times a second. Before that change the same host measured 209 / 420 / 1148 /s
+off and 250 / 666 / 2103 /s on, with 8.5 % and 9.8 % CPU at 32 panes. Now the
+session workers do not wake at rest: the daemon's context switches are
+0.03 /s at 1, 8 and 32 panes, and `measure-idle.py` counts 0.0 wakeups a second
+for every `terminal-engine`, `terminal-reader` and `terminal-writer` thread in
+both processes at 8 panes. What remains is Neptune's interface and GPU threads,
+which do not grow with the number of panes. The host was running other work
+during these runs, and CPU varied between repetitions more than context
+switches did (4.6 to 12.5 % off at 32 panes), so the CPU values are weaker
+evidence than the wakeup counts. The echo difference is within
 the spread between runs (off 2.8–5.2 ms, on 4.9–5.5 ms). The echo case's
 output leg, which times when a delayed draw becomes visible in a screenshot,
 moved by 0.15 ms. None of these are keyboard-to-screen measurements. Neptune's
