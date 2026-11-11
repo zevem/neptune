@@ -108,11 +108,8 @@ pub(super) fn read_loop(
 
 pub(super) fn write_loop(mut sink: Box<dyn Sink>, input: Receiver<Input>, shared: Arc<Shared>) {
     while !shared.stopped.load(Ordering::Acquire) {
-        let command = match input.recv_timeout(Duration::from_millis(100)) {
-            Ok(command) => command,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
+        // A quiet session has nothing to write: `Shared::stop` ends this wait.
+        let Ok(command) = input.recv() else { break };
         shared
             .queued_input_bytes
             .fetch_sub(command.queued_bytes(), Ordering::AcqRel);
@@ -124,6 +121,7 @@ pub(super) fn write_loop(mut sink: Box<dyn Sink>, input: Receiver<Input>, shared
             Input::Scrollback(lines) => sink.scrollback(lines),
             Input::Color(index, color) => sink.color(index, color),
             Input::Redraw => sink.redraw(),
+            Input::Stop => break,
         };
         if let Err(error) = result {
             shared.error(format!("PTY write: {error}"));
@@ -136,6 +134,18 @@ pub(super) fn write_loop(mut sink: Box<dyn Sink>, input: Receiver<Input>, shared
             .fetch_sub(command.queued_bytes(), Ordering::AcqRel);
     }
 }
+
+/// How long the engine waits for output with no deadline pending. ConPTY's
+/// output does not end when its program exits, so Windows polls the child.
+#[cfg(windows)]
+const CHILD_POLL: Option<Duration> = Some(Duration::from_millis(100));
+#[cfg(not(windows))]
+const CHILD_POLL: Option<Duration> = None;
+/// End of output can precede the wait result by a few milliseconds.
+const REAP_POLL: Duration = Duration::from_millis(10);
+/// How long after output the program's directory is read. A shell changes
+/// directory after echoing the command, so reading at once could be too early.
+const CWD_SETTLE: Duration = Duration::from_secs(1);
 
 pub(super) fn engine_loop(
     terminal: Arc<Mutex<Term<EventProxy>>>,
@@ -150,7 +160,9 @@ pub(super) fn engine_loop(
     let mut notifications = notifications::Scanner::default();
     let mut eof = false;
     let mut exit = None;
-    let mut last_cwd = Instant::now();
+    // The program's directory is read only after output, which a shell
+    // changing directory always produces, so a quiet session arms no timer.
+    let mut cwd_due = None;
     let mut last_child_poll = Instant::now();
     #[cfg(windows)]
     let mut conpty_close_started = false;
@@ -168,16 +180,26 @@ pub(super) fn engine_loop(
             process.release(&shared);
             conpty_close_started = true;
         }
+        // A quiet session waits for as long as it takes: only a pending
+        // deadline arms a timeout. `Shared::stop` and a process check end the
+        // wait with `Output::Wake`.
+        let now = Instant::now();
         let sync_deadline = shared.parser.lock().sync_deadline();
-        let timeout = sync_deadline
-            .map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(100))
-            })
-            .unwrap_or(Duration::from_millis(100));
-        match output.recv_timeout(timeout) {
+        let timeout = [sync_deadline, cwd_due]
+            .into_iter()
+            .flatten()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .chain(if eof { Some(REAP_POLL) } else { CHILD_POLL })
+            .min();
+        let received = match timeout {
+            Some(timeout) => output.recv_timeout(timeout),
+            None => output.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match received {
             Ok(Output::Bytes(buffer, len)) => {
+                if cfg!(target_os = "linux") {
+                    cwd_due.get_or_insert(Instant::now() + CWD_SETTLE);
+                }
                 for chunk in buffer[..len].chunks(PARSE_SLICE) {
                     notifications.advance(chunk, |command| match command {
                         notifications::Command::Event(event) => shared.push_event(event),
@@ -232,12 +254,20 @@ pub(super) fn engine_loop(
                 let _ = pool.try_send(buffer);
                 let tap = shared.output_tap.lock().subscriber.clone();
                 if let Some(tap) = tap {
+                    // Output the reader has already read comes next, and is
+                    // sent with this; otherwise the client gets it now.
+                    if shared.bytes_received.load(Ordering::Relaxed)
+                        == shared.bytes_parsed.load(Ordering::Relaxed)
+                    {
+                        tap.flush();
+                    }
                     tap.wait_for_room(&shared);
                 }
                 // Follow Alacritty's wakeup policy: a synchronized application
                 // frame should not rebuild visible rows for every buffered chunk.
             }
             Ok(Output::End) => eof = true,
+            Ok(Output::Wake) => {}
             Ok(Output::Error(error)) => {
                 shared.error(format!("PTY read: {error}"));
                 eof = true;
@@ -254,8 +284,9 @@ pub(super) fn engine_loop(
             shared.changed();
         }
         // Small PTY reads should not each cause a waitpid/WaitForSingleObject
-        // syscall. EOF still polls immediately, and busy or idle streams detect
-        // exit within the same 100ms bound used by the receive timeout.
+        // syscall. EOF still polls immediately, which is how a quiet Unix
+        // session learns of its program's exit: the PTY, or the daemon's
+        // stream, ends with the program. Windows polls on `CHILD_POLL`.
         if exit.is_none() && (eof || last_child_poll.elapsed() >= Duration::from_millis(100)) {
             match process.try_wait() {
                 Ok(status) => exit = status,
@@ -290,7 +321,8 @@ pub(super) fn engine_loop(
             let _ = reply.try_send(activity);
             shared.force_repaint();
         }
-        if last_cwd.elapsed() >= Duration::from_secs(1) {
+        if cwd_due.is_some_and(|due| due <= Instant::now()) {
+            cwd_due = None;
             let pid = shared.metadata.lock().process_id;
             if let Some(pid) = pid
                 && let Some(cwd) = process_cwd(pid)
@@ -302,12 +334,6 @@ pub(super) fn engine_loop(
                     shared.changed_force();
                 }
             }
-            last_cwd = Instant::now();
-        }
-        // EOF can precede the wait result by a few milliseconds. Avoid spinning
-        // on a disconnected output receiver while the OS reaps the child.
-        if eof && exit.is_none() {
-            thread::sleep(Duration::from_millis(10));
         }
     }
     #[cfg(not(windows))]
@@ -315,7 +341,7 @@ pub(super) fn engine_loop(
         // BSD slave close can wait for terminal output to drain. Once parsing
         // stops, release blocked sends and every master handle before reaping
         // the child; otherwise wait() can outlive the retiring I/O workers.
-        shared.stopped.store(true, Ordering::Release);
+        shared.stop();
         drop(output);
         process.release(&shared);
     }
@@ -335,7 +361,7 @@ pub(super) fn engine_loop(
             signal: status.signal,
         };
     }
-    shared.stopped.store(true, Ordering::Release);
+    shared.stop();
     shared.output_tap.lock().end();
     if let Some(reply) = shared.process_check.lock().take() {
         let _ = reply.try_send(ProcessActivity::Idle);

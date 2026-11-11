@@ -58,6 +58,8 @@ pub(super) enum Input {
     Color(usize, crate::Rgb),
     /// Make the program redraw its screen, as after a resize.
     Redraw,
+    /// The session stopped: the writer, which waits only on this queue, ends.
+    Stop,
 }
 
 impl Input {
@@ -69,7 +71,8 @@ impl Input {
             | Input::Focus(_)
             | Input::Scrollback(_)
             | Input::Color(..)
-            | Input::Redraw => 0,
+            | Input::Redraw
+            | Input::Stop => 0,
         }
     }
 }
@@ -78,6 +81,9 @@ pub(super) enum Output {
     Bytes(Vec<u8>, usize),
     End,
     Error(io::Error),
+    /// Nothing was read: the session stopped or a process check is waiting,
+    /// and the engine, which waits only on this queue, must look.
+    Wake,
 }
 
 pub(super) struct Shared {
@@ -116,6 +122,13 @@ pub(super) struct Shared {
     pub(super) output_tap: Mutex<OutputTap>,
     /// Locked after the terminal, by the engine and by snapshots.
     pub(super) parser: Mutex<Parser>,
+    /// The workers' queues and descriptor waits have no timeout while a
+    /// session is quiet, so whatever else needs a worker wakes it through
+    /// these.
+    engine_wake: SyncSender<Output>,
+    writer_wake: SyncSender<Input>,
+    #[cfg(unix)]
+    pub(super) stop_signal: transport::StopSignal,
 }
 
 impl Shared {
@@ -124,8 +137,10 @@ impl Shared {
         size: Size,
         config: Config,
         repaint: Repaint,
-    ) -> Self {
-        Self {
+        engine_wake: SyncSender<Output>,
+        writer_wake: SyncSender<Input>,
+    ) -> io::Result<Self> {
+        Ok(Self {
             process_check: Mutex::new(None),
             metadata: Mutex::new(metadata),
             size: Mutex::new(size),
@@ -157,7 +172,32 @@ impl Shared {
             detached: AtomicBool::new(false),
             output_tap: Mutex::new(OutputTap::default()),
             parser: Mutex::new(Parser::default()),
+            engine_wake,
+            writer_wake,
+            #[cfg(unix)]
+            stop_signal: transport::StopSignal::new()?,
+        })
+    }
+
+    /// Stop the session and end every worker's wait. Returns whether it had
+    /// already stopped.
+    pub(super) fn stop(&self) -> bool {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return true;
         }
+        #[cfg(unix)]
+        self.stop_signal.raise();
+        // A full queue has a worker that is not waiting, and each rechecks
+        // `stopped` before it waits again.
+        let _ = self.writer_wake.try_send(Input::Stop);
+        self.wake_engine();
+        false
+    }
+
+    /// Have the engine run the checks that follow its wait for output.
+    pub(super) fn wake_engine(&self) {
+        // As in `stop`, a full queue needs no wake.
+        let _ = self.engine_wake.try_send(Output::Wake);
     }
 
     pub(super) fn enqueue(
@@ -377,7 +417,11 @@ impl OutputTap {
     }
 }
 
-/// Output queued for one attached client, drained by its connection writer.
+/// Output queued for one attached client, drained by its connection writer
+/// in batches: the writer is woken once [`TAP_BATCH`] bytes are queued or the
+/// engine has parsed everything it was given, never by a timer, so a
+/// keystroke's echo leaves as soon as it is parsed while sustained output
+/// crosses in few large frames.
 #[derive(Default)]
 pub(super) struct Tap {
     state: Mutex<TapState>,
@@ -386,8 +430,9 @@ pub(super) struct Tap {
 
 #[derive(Default)]
 struct TapState {
-    chunks: VecDeque<Vec<u8>>,
-    bytes: usize,
+    bytes: Vec<u8>,
+    /// The writer may take what is queued.
+    flush: bool,
     ended: bool,
     closed: bool,
 }
@@ -395,11 +440,14 @@ struct TapState {
 #[cfg(unix)]
 pub(super) enum Tapped {
     Bytes(Vec<u8>),
-    /// Every chunk was taken and the engine has stopped.
+    /// Every byte was taken and the engine has stopped.
     Ended,
     /// The subscriber was replaced or went away.
     Closed,
 }
+
+/// Queued output at which the writer is woken while more is still to parse.
+pub(super) const TAP_BATCH: usize = READ_SIZE;
 
 /// Queued output above which the engine waits for the client to catch up, so
 /// a slow client applies backpressure to the program as a local pane does.
@@ -411,10 +459,23 @@ impl Tap {
         if state.closed {
             return;
         }
-        state.bytes += chunk.len();
-        state.chunks.push_back(chunk.to_vec());
-        drop(state);
-        self.ready.notify_all();
+        state.bytes.extend_from_slice(chunk);
+        if state.bytes.len() >= TAP_BATCH && !state.flush {
+            state.flush = true;
+            drop(state);
+            self.ready.notify_all();
+        }
+    }
+
+    /// Hand what is queued to the writer now. The engine calls this once it
+    /// has parsed all the output read so far.
+    pub(super) fn flush(&self) {
+        let mut state = self.state.lock();
+        if !state.bytes.is_empty() && !state.flush {
+            state.flush = true;
+            drop(state);
+            self.ready.notify_all();
+        }
     }
 
     fn end(&self) {
@@ -426,12 +487,12 @@ impl Tap {
     pub(super) fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
-        state.chunks.clear();
-        state.bytes = 0;
+        state.bytes = Vec::new();
         drop(state);
         self.ready.notify_all();
     }
 
+    /// Everything queued, once it is due: as one batch, in order.
     #[cfg(unix)]
     pub(super) fn next(&self) -> Tapped {
         let mut state = self.state.lock();
@@ -439,11 +500,13 @@ impl Tap {
             if state.closed {
                 return Tapped::Closed;
             }
-            if let Some(chunk) = state.chunks.pop_front() {
-                state.bytes -= chunk.len();
+            if !state.bytes.is_empty() && (state.flush || state.ended) {
+                state.flush = false;
+                let bytes = std::mem::take(&mut state.bytes);
                 drop(state);
+                // The engine may be waiting for room.
                 self.ready.notify_all();
-                return Tapped::Bytes(chunk);
+                return Tapped::Bytes(bytes);
             }
             if state.ended {
                 return Tapped::Ended;
@@ -455,7 +518,7 @@ impl Tap {
     /// Called by the engine without the terminal lock.
     pub(super) fn wait_for_room(&self, shared: &Shared) {
         let mut state = self.state.lock();
-        while state.bytes > TAP_HIGH_WATER
+        while state.bytes.len() > TAP_HIGH_WATER
             && !state.closed
             && !shared.stopped.load(Ordering::Acquire)
         {

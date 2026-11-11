@@ -316,30 +316,72 @@ python3 scripts/measure-scale.py --keep-sessions on --counts 1 8 32 --scenarios 
 python3 scripts/measure-memory.py --keep-sessions on --scenarios terminal --output /tmp/perf/on
 ```
 
-The 2026-11-01 run used the Dell G15 in
-[verification.md](verification.md#persistent-sessions-verification-2026-11-01),
-X11 at scale 2.0, and a release `inspection` build of `4ded16d`. Off and on
-alternated, with three repetitions of each. Values are medians. CPU is percent
-of one core for Neptune plus the daemon, excluding shells, producers and the GPU.
+The daemon forwards output to Neptune in batches: the connection's writer is
+woken once 64 KiB is queued or the daemon's engine has parsed all the output
+read so far, never by a timer. Before that, every PTY read crossed as a frame
+of its own. The 2026-11-11 run measured the output cases before (`a2bb3e3`)
+and after that change on the Dell G15 (Core i9-13900HX with 16 logical CPUs
+online, `powersave` governor, Ubuntu 26.04.1, Linux 7.0.0-42, X11 at scale
+2.0, release `inspection` builds, Rust 1.97.1). Off and on alternated. The
+throughput case and the one-producer-among-8-panes case have six repetitions
+of each, the other cases three. Values are medians. CPU is percent of one core
+for Neptune plus the daemon, excluding shells, producers and the GPU.
+
+| Case | Off | On before | On after |
+| --- | ---: | ---: | ---: |
+| 512 MiB unthrottled, 1 pane: producer rate | 123 MiB/s | 123 MiB/s | 123 MiB/s |
+| … CPU | 149 % | 249 % (daemon 111 %) | 234 % (daemon 102 %) |
+| … context switches | 42.0k/s | 75.2k/s | 41.5k/s |
+| … frame CPU p95 | 1.10 ms | 1.12 ms | 1.14 ms |
+| Fixed-rate output, 1 pane, 1 producer: CPU | 16.4–17.5 % | 14.6–18.5 % | 17.3–19.1 % (daemon 1.0–1.2 %) |
+| Fixed-rate output, 1 producer among 8 panes: CPU | 21.1 % | 18.5 % | 23.6 % (daemon 1.7 %) |
+| Fixed-rate output, 8 panes all producing: CPU | 65.9 % | 78.0 % | 74.3 % (daemon 7.1 %) |
+
+Off is the build with the change; the build before it measured the same
+(149 %, 42.4k/s). The two one-pane rows give the `visible-output` and
+`several-output` scenarios, which are the same load with one pane. Throughput
+is unchanged within run-to-run noise. In 3 of the 24 throughput runs, off and
+on and before and after alike, the producer ran at 53–71 MiB/s with Neptune
+using about 30 points more; the medians are not affected, and the cause was
+not found. With the setting on, the unthrottled case now costs 1.57 times the
+CPU of off (1.67 before) and as many context switches (1.78 times before).
+Per-thread CPU accounting from `/proc` (`perf` is not permitted on this host)
+shows where the rest goes: the daemon's engine parses at about 90 % of a core and
+its PTY reader takes 21 %, which Neptune's own reader no longer spends, while
+forwarding is down from 24 % to 10 % (the daemon's writer and Neptune's
+reader). The second parse is the remaining cost, and it is what ADR 0001
+chose. In the fixed-rate cases the daemon adds 1 to 2 points per producing
+pane; Neptune's own CPU varied between identical runs by more than that
+(12–25 % with one producer among 8 panes), so the differences between their
+columns are not established.
+
+The remaining rows are from the 2026-11-01 run on the same machine
+([verification.md](verification.md#persistent-sessions-verification-2026-11-01),
+release `inspection` build of `4ded16d`, three alternating repetitions,
+medians), which the change above does not affect, except the two idle rows,
+which are described after the table.
 
 | Case | Off | On |
 | --- | ---: | ---: |
-| 512 MiB unthrottled, 1 pane: producer rate | 142 MiB/s | 140 MiB/s |
-| … CPU | 151 % | 250 % (daemon 113 %) |
-| … context switches | 41.2k/s | 92.7k/s |
-| Fixed-rate output, 1 producer among 8 panes: CPU | 16.0 % | 25.6 % |
-| Fixed-rate output, 8 panes all producing: CPU | 62.1 % | 69.8 % |
-| Idle, 1 / 8 / 32 panes: context switches | 206 / 416 / 1141 /s | 232 / 658 / 2099 /s |
-| Idle, 32 panes: CPU | 8.0 % | 12.2 % |
+| Idle, 1 / 8 / 32 panes: context switches | 179 / 177 / 197 /s | 182 / 179 / 191 /s |
+| Idle, 32 panes: CPU | 4.7 % | 4.7 % |
 | Echo: key request to the program's read, p50 / p95 | 4.58 / 5.98 ms | 5.26 / 6.14 ms |
 | One terminal, 10,000 rows filled: PSS | 213 MiB | 239 MiB (daemon 27.5 MiB) |
 | Idle, 32 panes, 1,000 rows each: RSS | 290 MiB | 312 MiB |
 
-Throughput is unchanged within run-to-run noise (off ranged from 130 to
-145 MiB/s). The cost shows as CPU, because output is parsed twice. At rest,
-each session's engine, reader and writer threads wake 10 times a second, so the
-daemon adds exactly 30 wakeups a second per pane. Neptune's own wakeups are
-unchanged (`measure-idle.py` per-thread counts). The echo difference is within
+The two idle rows were measured again on 2026-11-11 (kernel 7.0.0-42, release
+`inspection` build of `12603b1`, three repetitions of each setting, medians),
+after a quiet session's engine, reader and writer threads stopped waking 10
+times a second. Before that change the same host measured 209 / 420 / 1148 /s
+off and 250 / 666 / 2103 /s on, with 8.5 % and 9.8 % CPU at 32 panes. Now the
+session workers do not wake at rest: the daemon's context switches are
+0.03 /s at 1, 8 and 32 panes, and `measure-idle.py` counts 0.0 wakeups a second
+for every `terminal-engine`, `terminal-reader` and `terminal-writer` thread in
+both processes at 8 panes. What remains is Neptune's interface and GPU threads,
+which do not grow with the number of panes. The host was running other work
+during these runs, and CPU varied between repetitions more than context
+switches did (4.6 to 12.5 % off at 32 panes), so the CPU values are weaker
+evidence than the wakeup counts. The echo difference is within
 the spread between runs (off 2.8–5.2 ms, on 4.9–5.5 ms). The echo case's
 output leg, which times when a delayed draw becomes visible in a screenshot,
 moved by 0.15 ms. None of these are keyboard-to-screen measurements. Neptune's

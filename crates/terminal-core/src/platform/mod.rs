@@ -6,27 +6,61 @@ pub(super) use processes::process_activity;
 #[cfg(unix)]
 pub(in crate::session) use processes::shell_activity;
 
+/// Becomes readable, and stays so, once its session stops: what ends a
+/// worker's wait on a descriptor that has nothing for it.
+#[cfg(unix)]
+pub(in crate::session) struct StopSignal {
+    raised: io::PipeReader,
+    raise: io::PipeWriter,
+}
+
+#[cfg(unix)]
+impl StopSignal {
+    pub(in crate::session) fn new() -> io::Result<Self> {
+        let (raised, raise) = io::pipe()?;
+        Ok(Self { raised, raise })
+    }
+
+    pub(in crate::session) fn raise(&self) {
+        // One byte always fits, and is never read back.
+        let _ = (&self.raise).write(&[0]);
+    }
+}
+
+/// Wait, for as long as it takes, until `fd` is ready for `events`.
+/// `Ok(false)` means the session stopped first.
 #[cfg(unix)]
 pub(in crate::session) fn poll_pty(
     fd: libc::c_int,
     events: libc::c_short,
     shared: &Shared,
-) -> bool {
+) -> io::Result<bool> {
     while !shared.stopped.load(Ordering::Acquire) {
-        let mut descriptor = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, 100) };
+        let mut descriptors = [
+            libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&shared.stop_signal.raised),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two valid descriptors, both open for as long as the call.
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
         if result > 0 {
-            return !shared.stopped.load(Ordering::Acquire);
+            return Ok(!shared.stopped.load(Ordering::Acquire));
         }
-        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return false;
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
     }
-    false
+    Ok(false)
 }
 
 /// ConPTY remains open after its final child exits. Closing it can wait for VT

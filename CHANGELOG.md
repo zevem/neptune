@@ -11,6 +11,16 @@ their preparation records remain in Git history.
 
 ### What's New
 
+- Idle terminals no longer wake Neptune or its background session process.
+  Each one used to wake them about 30 times a second, and twice that with
+  **Keep terminals running after quit** on, so many open terminals now use
+  less CPU at rest ([#177](https://github.com/zevem/neptune/issues/177)).
+- With **Keep terminals running after quit** on, heavy output is passed to
+  Neptune in larger batches. Flooding a terminal now causes no more wakeups
+  than with the setting off, and uses about 1.6 times the CPU instead of 1.7,
+  because output is still read twice
+  ([#178](https://github.com/zevem/neptune/issues/178)).
+
 ## [0.1.0-rc.9] - 2026-11-01
 
 ### What's New
