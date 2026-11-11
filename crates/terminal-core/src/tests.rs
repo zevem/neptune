@@ -474,22 +474,28 @@ fn fixture(cols: u16, rows: u16, history: usize) -> TerminalSession {
         kitty_keyboard: true,
         ..Config::default()
     };
-    let shared = Arc::new(Shared::new(
-        SessionMetadata {
-            title: String::new(),
-            shell: "fake".into(),
-            cwd: PathBuf::from("."),
-            reported_cwd: None,
-            process_id: None,
-            remote_process_id: None,
-            status: SessionStatus::Running,
-            bell_count: 0,
-        },
-        size,
-        config.clone(),
-        Arc::new(|| {}),
-    ));
     let (input, _) = mpsc::sync_channel(INPUT_QUEUE);
+    let (output, _) = mpsc::sync_channel(OUTPUT_QUEUE);
+    let shared = Arc::new(
+        Shared::new(
+            SessionMetadata {
+                title: String::new(),
+                shell: "fake".into(),
+                cwd: PathBuf::from("."),
+                reported_cwd: None,
+                process_id: None,
+                remote_process_id: None,
+                status: SessionStatus::Running,
+                bell_count: 0,
+            },
+            size,
+            config.clone(),
+            Arc::new(|| {}),
+            output,
+            input.clone(),
+        )
+        .unwrap(),
+    );
     let proxy = EventProxy {
         shared: shared.clone(),
         input: input.clone(),

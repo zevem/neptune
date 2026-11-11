@@ -146,6 +146,22 @@ fn closing_an_idle_shell_terminates_every_io_worker() {
 }
 
 #[test]
+fn a_program_exiting_while_its_session_is_quiet_ends_every_worker() {
+    let session = shell("printf 'READY\r\n'; sleep 2; exit 7");
+    wait_for(|| screen(&session).contains("READY"));
+    wait_for(|| {
+        session.metadata().status
+            == SessionStatus::Exited {
+                code: 7,
+                signal: None,
+            }
+    });
+    // The writer has nothing queued; the engine's stop is what ends its wait.
+    wait_for(|| session.metrics().active_workers == 0);
+    assert!(session.write(b"still alive?").is_err());
+}
+
+#[test]
 fn closing_a_shell_ignoring_hup_escalates_and_reaps_it() {
     let session = shell("trap '' HUP; printf 'READY\r\n'; while :; do :; done");
     wait_for(|| screen(&session).contains("READY"));

@@ -58,6 +58,8 @@ pub(super) enum Input {
     Color(usize, crate::Rgb),
     /// Make the program redraw its screen, as after a resize.
     Redraw,
+    /// The session stopped: the writer, which waits only on this queue, ends.
+    Stop,
 }
 
 impl Input {
@@ -69,7 +71,8 @@ impl Input {
             | Input::Focus(_)
             | Input::Scrollback(_)
             | Input::Color(..)
-            | Input::Redraw => 0,
+            | Input::Redraw
+            | Input::Stop => 0,
         }
     }
 }
@@ -78,6 +81,9 @@ pub(super) enum Output {
     Bytes(Vec<u8>, usize),
     End,
     Error(io::Error),
+    /// Nothing was read: the session stopped or a process check is waiting,
+    /// and the engine, which waits only on this queue, must look.
+    Wake,
 }
 
 pub(super) struct Shared {
@@ -116,6 +122,13 @@ pub(super) struct Shared {
     pub(super) output_tap: Mutex<OutputTap>,
     /// Locked after the terminal, by the engine and by snapshots.
     pub(super) parser: Mutex<Parser>,
+    /// The workers' queues and descriptor waits have no timeout while a
+    /// session is quiet, so whatever else needs a worker wakes it through
+    /// these.
+    engine_wake: SyncSender<Output>,
+    writer_wake: SyncSender<Input>,
+    #[cfg(unix)]
+    pub(super) stop_signal: transport::StopSignal,
 }
 
 impl Shared {
@@ -124,8 +137,10 @@ impl Shared {
         size: Size,
         config: Config,
         repaint: Repaint,
-    ) -> Self {
-        Self {
+        engine_wake: SyncSender<Output>,
+        writer_wake: SyncSender<Input>,
+    ) -> io::Result<Self> {
+        Ok(Self {
             process_check: Mutex::new(None),
             metadata: Mutex::new(metadata),
             size: Mutex::new(size),
@@ -157,7 +172,32 @@ impl Shared {
             detached: AtomicBool::new(false),
             output_tap: Mutex::new(OutputTap::default()),
             parser: Mutex::new(Parser::default()),
+            engine_wake,
+            writer_wake,
+            #[cfg(unix)]
+            stop_signal: transport::StopSignal::new()?,
+        })
+    }
+
+    /// Stop the session and end every worker's wait. Returns whether it had
+    /// already stopped.
+    pub(super) fn stop(&self) -> bool {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return true;
         }
+        #[cfg(unix)]
+        self.stop_signal.raise();
+        // A full queue has a worker that is not waiting, and each rechecks
+        // `stopped` before it waits again.
+        let _ = self.writer_wake.try_send(Input::Stop);
+        self.wake_engine();
+        false
+    }
+
+    /// Have the engine run the checks that follow its wait for output.
+    pub(super) fn wake_engine(&self) {
+        // As in `stop`, a full queue needs no wake.
+        let _ = self.engine_wake.try_send(Output::Wake);
     }
 
     pub(super) fn enqueue(

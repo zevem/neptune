@@ -115,14 +115,21 @@ Shutdown requests return without joining workers. A cloneable
 `shutdown_completion()` handle reports completion after all workers stop, even
 when the session itself is released. Worker reservations exist before threads
 start, so a rapid close cannot mistake unstarted workers for complete cleanup. Unix I/O uses nonblocking
-descriptors and interruptible polling. Unix shutdown releases the output channel
+descriptors and interruptible polling. A quiet session's workers wait without a
+timeout: the reader on its descriptor, the writer and the engine on their
+queues. Stopping a session ends each of those waits through a per-session stop
+signal and a queue message, and the engine arms a timeout only for a pending
+synchronized-update deadline or the directory read that follows output. Unix shutdown releases the output channel
 and PTY master handles before reaping the child, so BSD terminal output draining
 cannot wait on readers that have already stopped. Windows starts a short-lived close worker
 after the child exits because `ClosePseudoConsole` can wait for final output to
 drain. The reader and parser remain active until that output reaches EOF. Child
 processes are reaped by their owning worker.
 While output is flowing, child liveness is polled at most once per 100 ms rather
-than on every PTY read; EOF still triggers an immediate exit check.
+than on every PTY read; EOF still triggers an immediate exit check, which is how
+a quiet Unix session learns that its program exited. ConPTY's output does not
+end with its program, so on Windows the engine still polls the child every
+100 ms.
 
 ## Verification
 

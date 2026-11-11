@@ -188,6 +188,7 @@ impl TerminalSession {
             let _ = sender.try_send(ProcessActivity::Unknown);
         } else {
             *self.shared.process_check.lock() = Some(sender);
+            self.shared.wake_engine();
         }
         receiver
     }
@@ -263,21 +264,26 @@ impl TerminalSession {
             kitty_keyboard: true,
             ..Config::default()
         };
-        let shared = Arc::new(Shared::new(
-            SessionMetadata {
-                title: String::new(),
-                shell,
-                cwd,
-                reported_cwd: None,
-                process_id,
-                remote_process_id: None,
-                status: SessionStatus::Running,
-                bell_count: 0,
-            },
-            size,
-            config.clone(),
-            repaint,
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                SessionMetadata {
+                    title: String::new(),
+                    shell,
+                    cwd,
+                    reported_cwd: None,
+                    process_id,
+                    remote_process_id: None,
+                    status: SessionStatus::Running,
+                    bell_count: 0,
+                },
+                size,
+                config.clone(),
+                repaint,
+                output_tx.clone(),
+                input.clone(),
+            )
+            .context("Create session stop signal")?,
+        );
         let proxy = EventProxy {
             shared: shared.clone(),
             input: input.clone(),
@@ -570,7 +576,7 @@ impl TerminalSession {
     /// last Unix PTY descriptor also hangs up its foreground process group.
     pub fn shutdown(&self) {
         let mut started = self.shared.shutdown_started.lock();
-        if self.shared.stopped.swap(true, Ordering::AcqRel) {
+        if self.shared.stop() {
             return;
         }
         *started = Some(Instant::now());

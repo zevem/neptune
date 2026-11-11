@@ -438,11 +438,7 @@ impl transport::Source for ReplicaSource {
     }
 
     fn wait_readable(&mut self, shared: &Shared) -> io::Result<bool> {
-        Ok(transport::poll_pty(
-            self.stream.as_raw_fd(),
-            libc::POLLIN,
-            shared,
-        ))
+        transport::poll_pty(self.stream.as_raw_fd(), libc::POLLIN, shared)
     }
 }
 

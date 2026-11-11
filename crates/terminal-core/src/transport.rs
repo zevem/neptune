@@ -10,11 +10,11 @@ use runtime::Worker;
 mod platform;
 #[cfg(windows)]
 use platform::close_conpty;
-#[cfg(unix)]
-pub(super) use platform::poll_pty;
 pub(super) use platform::process_cwd;
 #[cfg(unix)]
 pub(super) use platform::shell_activity;
+#[cfg(unix)]
+pub(super) use platform::{StopSignal, poll_pty};
 
 /// One session's transport, split across the reader, writer and engine workers.
 pub(super) struct Transport {
@@ -204,7 +204,7 @@ impl Source for PtySource {
 
     #[cfg(unix)]
     fn wait_readable(&mut self, shared: &Shared) -> io::Result<bool> {
-        Ok(poll_pty(self.poll_fd, libc::POLLIN, shared))
+        poll_pty(self.poll_fd, libc::POLLIN, shared)
     }
 
     /// ConPTY pipes block; `WouldBlock` is an ordinary read failure there.
@@ -228,7 +228,7 @@ impl Sink for PtySink {
 
     #[cfg(unix)]
     fn wait_writable(&mut self, shared: &Shared) -> io::Result<bool> {
-        Ok(poll_pty(self.poll_fd, libc::POLLOUT, shared))
+        poll_pty(self.poll_fd, libc::POLLOUT, shared)
     }
 
     /// ConPTY pipes block; `WouldBlock` is an ordinary write failure there.
