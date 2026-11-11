@@ -271,9 +271,10 @@ export function Internals() {
           Output notifications coalesce until the renderer catches up, so a flood of small
           reads does not become a flood of redraws.
         </Card>
-        <Card title="Saves the layout, not the session" visual={<Saved />}>
-          Folders, splits and focus come back on launch with fresh shells. Commands and
-          process memory are never written, and SSH keeps only the destination.
+        <Card title="Terminals keep running after quit" visual={<Saved />}>
+          On macOS and Linux, shells and programs keep running when Neptune quits, and
+          the next launch reattaches them. Only the layout is saved: never commands,
+          process memory or terminal contents.
         </Card>
         <Card title="The shell keeps its keys" visual={<Keys />}>
           Tab, arrows and Escape go to the terminal. Every action has a shortcut and a
