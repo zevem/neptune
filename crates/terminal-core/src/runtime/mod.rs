@@ -254,6 +254,13 @@ pub(super) fn engine_loop(
                 let _ = pool.try_send(buffer);
                 let tap = shared.output_tap.lock().subscriber.clone();
                 if let Some(tap) = tap {
+                    // Output the reader has already read comes next, and is
+                    // sent with this; otherwise the client gets it now.
+                    if shared.bytes_received.load(Ordering::Relaxed)
+                        == shared.bytes_parsed.load(Ordering::Relaxed)
+                    {
+                        tap.flush();
+                    }
                     tap.wait_for_room(&shared);
                 }
                 // Follow Alacritty's wakeup policy: a synchronized application

@@ -59,7 +59,10 @@ budget but reach the sink separately; a replica drops them because the daemon's
 engine already answers the program, and forwards focus changes so that engine
 reports the pane's focus. Dropping a replica detaches; shutting it down closes
 its session. The daemon's queued output per client is bounded, so a slow client
-applies backpressure to the program. The reader uses
+applies backpressure to the program. It crosses in batches: the connection's
+writer is woken once 64 KiB is queued or the engine has parsed all the output
+read so far, never by a timer, so an echo leaves as soon as it is parsed and
+sustained output takes few frames and wakeups. The reader uses
 pooled 64 KiB buffers and an eight-message output channel. Parsing releases the
 grid mutex between 16 KiB slices. Input accepts at most one MiB per call and two
 MiB pending across at most 64 messages. Clipboard delivery holds at most 64

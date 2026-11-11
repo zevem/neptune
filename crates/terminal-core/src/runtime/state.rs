@@ -417,7 +417,11 @@ impl OutputTap {
     }
 }
 
-/// Output queued for one attached client, drained by its connection writer.
+/// Output queued for one attached client, drained by its connection writer
+/// in batches: the writer is woken once [`TAP_BATCH`] bytes are queued or the
+/// engine has parsed everything it was given, never by a timer, so a
+/// keystroke's echo leaves as soon as it is parsed while sustained output
+/// crosses in few large frames.
 #[derive(Default)]
 pub(super) struct Tap {
     state: Mutex<TapState>,
@@ -426,8 +430,9 @@ pub(super) struct Tap {
 
 #[derive(Default)]
 struct TapState {
-    chunks: VecDeque<Vec<u8>>,
-    bytes: usize,
+    bytes: Vec<u8>,
+    /// The writer may take what is queued.
+    flush: bool,
     ended: bool,
     closed: bool,
 }
@@ -435,11 +440,14 @@ struct TapState {
 #[cfg(unix)]
 pub(super) enum Tapped {
     Bytes(Vec<u8>),
-    /// Every chunk was taken and the engine has stopped.
+    /// Every byte was taken and the engine has stopped.
     Ended,
     /// The subscriber was replaced or went away.
     Closed,
 }
+
+/// Queued output at which the writer is woken while more is still to parse.
+pub(super) const TAP_BATCH: usize = READ_SIZE;
 
 /// Queued output above which the engine waits for the client to catch up, so
 /// a slow client applies backpressure to the program as a local pane does.
@@ -451,10 +459,23 @@ impl Tap {
         if state.closed {
             return;
         }
-        state.bytes += chunk.len();
-        state.chunks.push_back(chunk.to_vec());
-        drop(state);
-        self.ready.notify_all();
+        state.bytes.extend_from_slice(chunk);
+        if state.bytes.len() >= TAP_BATCH && !state.flush {
+            state.flush = true;
+            drop(state);
+            self.ready.notify_all();
+        }
+    }
+
+    /// Hand what is queued to the writer now. The engine calls this once it
+    /// has parsed all the output read so far.
+    pub(super) fn flush(&self) {
+        let mut state = self.state.lock();
+        if !state.bytes.is_empty() && !state.flush {
+            state.flush = true;
+            drop(state);
+            self.ready.notify_all();
+        }
     }
 
     fn end(&self) {
@@ -466,12 +487,12 @@ impl Tap {
     pub(super) fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
-        state.chunks.clear();
-        state.bytes = 0;
+        state.bytes = Vec::new();
         drop(state);
         self.ready.notify_all();
     }
 
+    /// Everything queued, once it is due: as one batch, in order.
     #[cfg(unix)]
     pub(super) fn next(&self) -> Tapped {
         let mut state = self.state.lock();
@@ -479,11 +500,13 @@ impl Tap {
             if state.closed {
                 return Tapped::Closed;
             }
-            if let Some(chunk) = state.chunks.pop_front() {
-                state.bytes -= chunk.len();
+            if !state.bytes.is_empty() && (state.flush || state.ended) {
+                state.flush = false;
+                let bytes = std::mem::take(&mut state.bytes);
                 drop(state);
+                // The engine may be waiting for room.
                 self.ready.notify_all();
-                return Tapped::Bytes(chunk);
+                return Tapped::Bytes(bytes);
             }
             if state.ended {
                 return Tapped::Ended;
@@ -495,7 +518,7 @@ impl Tap {
     /// Called by the engine without the terminal lock.
     pub(super) fn wait_for_room(&self, shared: &Shared) {
         let mut state = self.state.lock();
-        while state.bytes > TAP_HIGH_WATER
+        while state.bytes.len() > TAP_HIGH_WATER
             && !state.closed
             && !shared.stopped.load(Ordering::Acquire)
         {

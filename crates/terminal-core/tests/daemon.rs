@@ -733,6 +733,35 @@ fn attaching_during_sustained_output_delivers_every_byte_exactly_once() {
     assert_eq!(numbers, (1..=LINES).collect::<Vec<_>>());
 }
 
+/// Output is forwarded in batches. The end of a burst, and then a single
+/// echoed line, must reach the client without any further output to push them.
+#[test]
+fn the_end_of_a_burst_and_an_echo_reach_the_client_without_more_output() {
+    const LINES: u32 = 60_000;
+    let daemon = Daemon::start();
+    let client = daemon.client();
+    let options = SessionOptions {
+        cols: 20,
+        scrollback: 70_000,
+        ..shell(&format!(
+            "awk 'BEGIN {{ for (i = 1; i <= {LINES}; i++) print i }}'; \
+             printf 'DONE'; while IFS= read -r line; do printf '<%s>' \"$line\"; done"
+        ))
+    };
+    let (session, id) = client.start(options, repaint()).unwrap();
+    wait_for(|| session.screen_text().contains("DONE"));
+    assert_eq!(numbered_lines(&session), (1..=LINES).collect::<Vec<_>>());
+    session.write(b"echoed\r").unwrap();
+    wait_for(|| session.screen_text().contains("<echoed>"));
+    let (screen, history) = (session.screen_text(), session.history_text());
+    drop(session);
+
+    // What the detached client had been sent is what the daemon kept.
+    let attached = client.attach(id, 20, 12, repaint()).unwrap();
+    assert_eq!(attached.session.screen_text(), screen);
+    assert_eq!(attached.session.history_text(), history);
+}
+
 /// A program that prints READY, then its last words and exits 3 once `go` exists.
 fn exits_on(go: &Path) -> SessionOptions {
     shell(&format!(

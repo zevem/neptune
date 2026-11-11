@@ -1298,3 +1298,103 @@ fn a_rebuilt_engine_keeps_only_the_newest_history_its_limit_allows() {
     assert_eq!(first, "line 187");
     assert_eq!(replica.screen_text(), source.screen_text());
 }
+
+/// What a tap's writer gets within a moment, or `None` while it is left waiting.
+#[cfg(unix)]
+fn taken(tap: &Arc<Tap>) -> Option<Tapped> {
+    let (sender, receiver) = mpsc::channel();
+    let writer = tap.clone();
+    let waiting = thread::spawn(move || {
+        let _ = sender.send(writer.next());
+    });
+    let taken = receiver.recv_timeout(Duration::from_millis(100)).ok();
+    if taken.is_none() {
+        // Release the writer left waiting; a closed tap holds nothing.
+        tap.close();
+    }
+    waiting.join().unwrap();
+    taken
+}
+
+#[cfg(unix)]
+fn bytes_of(tapped: Option<Tapped>) -> Vec<u8> {
+    match tapped {
+        Some(Tapped::Bytes(bytes)) => bytes,
+        Some(Tapped::Ended) => panic!("the tap ended"),
+        Some(Tapped::Closed) => panic!("the tap closed"),
+        None => panic!("the writer was left waiting"),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_tap_holds_output_for_its_writer_until_the_engine_has_caught_up() {
+    let tap = Arc::new(Tap::default());
+    tap.push(b"echo");
+    tap.push(b"ed");
+    tap.flush();
+    // Both chunks leave as one batch, in order, as soon as they are flushed.
+    assert_eq!(bytes_of(taken(&tap)), b"echoed");
+
+    // Without a flush, less than a batch waits for the output that follows.
+    let held = Arc::new(Tap::default());
+    held.push(b"more to come");
+    assert!(taken(&held).is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_tap_wakes_its_writer_for_a_full_batch_while_the_engine_is_still_behind() {
+    let tap = Arc::new(Tap::default());
+    let slice = vec![b'x'; PARSE_SLICE];
+    let mut pushed = 0;
+    while pushed < TAP_BATCH {
+        tap.push(&slice);
+        pushed += slice.len();
+    }
+    assert_eq!(bytes_of(taken(&tap)).len(), pushed);
+    // The batch was taken whole: what follows starts another.
+    tap.push(b"tail");
+    tap.flush();
+    assert_eq!(bytes_of(taken(&tap)), b"tail");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_tap_delivers_unflushed_output_before_its_end_and_drops_it_when_closed() {
+    let tap = Arc::new(Tap::default());
+    tap.push(b"final words");
+    let mut output = OutputTap {
+        subscriber: Some(tap.clone()),
+        ended: false,
+    };
+    output.end();
+    assert_eq!(bytes_of(taken(&tap)), b"final words");
+    assert!(matches!(taken(&tap), Some(Tapped::Ended)));
+
+    // A client that detaches takes nothing more; the engine keeps the output.
+    let detached = Arc::new(Tap::default());
+    detached.push(b"unsent");
+    detached.close();
+    detached.push(b"later");
+    detached.flush();
+    assert!(matches!(taken(&detached), Some(Tapped::Closed)));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_full_tap_holds_the_engine_until_its_writer_takes_the_batch() {
+    let session = fixture(20, 4, 0);
+    let tap = Arc::new(Tap::default());
+    tap.push(&vec![b'x'; TAP_HIGH_WATER + 1]);
+    let (sender, receiver) = mpsc::channel();
+    let (engine, shared) = (tap.clone(), session.shared.clone());
+    let waiting = thread::spawn(move || {
+        engine.wait_for_room(&shared);
+        let _ = sender.send(());
+    });
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    assert_eq!(bytes_of(taken(&tap)).len(), TAP_HIGH_WATER + 1);
+    receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    waiting.join().unwrap();
+}
